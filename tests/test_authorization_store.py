@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import os
+from pathlib import Path
 import uuid
 
 import psycopg
@@ -247,3 +248,27 @@ def test_verified_receipt_is_bound_to_exact_decision_payload(store):
 
     accepted = store.register_verified_decision(decision, receipt, now=now)
     assert accepted["registered"] is True
+
+
+def test_existing_permission_status_constraint_migrates_for_consumed_state(store):
+    permission_id, _now = seed_permission(store)
+    with store._connect() as connection:
+        connection.execute(
+            "ALTER TABLE permissions ADD CONSTRAINT permissions_status_check "
+            "CHECK (status IN ('DENY','REQUIRE_HUMAN','ALLOW_ONCE','EXPIRED'))"
+        )
+
+    migration_path = Path(__file__).resolve().parents[1] / "db" / "migrations" / "20261029_permission_decision_consumed.sql"
+    statements = migration_path.read_text(encoding="utf-8").split(";")
+    with store._connect() as connection:
+        for statement in statements:
+            if statement.strip():
+                connection.execute(statement)
+        connection.execute(
+            "UPDATE permissions SET status = 'DECISION_CONSUMED' WHERE permission_id::text = %s",
+            (permission_id,),
+        )
+        state = connection.execute(
+            "SELECT status FROM permissions WHERE permission_id::text = %s", (permission_id,)
+        ).fetchone()
+    assert state == ("DECISION_CONSUMED",)

@@ -49,6 +49,12 @@ CREATE TABLE IF NOT EXISTS permissions (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Idempotent migration for databases created before the decision registry was added.
+ALTER TABLE permissions DROP CONSTRAINT IF EXISTS permissions_status_check;
+ALTER TABLE permissions
+  ADD CONSTRAINT permissions_status_check
+  CHECK (status IN ('DENY','REQUIRE_HUMAN','ALLOW_ONCE','EXPIRED','DECISION_CONSUMED'));
+
 CREATE TABLE IF NOT EXISTS order_commands (
   command_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   client_order_id TEXT NOT NULL UNIQUE,
