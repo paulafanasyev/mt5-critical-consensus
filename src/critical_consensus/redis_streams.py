@@ -63,14 +63,14 @@ def _decode(value: Any) -> Any:
 
 def _validate_stream_name(stream: Any) -> str:
     if (not isinstance(stream, str) or not stream.startswith("cc:")
-            or len(stream) > MAX_STREAM_NAME_LENGTH or any(ch in stream for ch in "\\r\\n")):
+            or len(stream) > MAX_STREAM_NAME_LENGTH or any(ch in stream for ch in "\r\n")):
         raise ValueError("stream must be a bounded string in the cc: namespace")
     return stream
 
 
 def _validate_identifier(value: Any, name: str, max_length: int = MAX_CONSUMER_NAME_LENGTH) -> str:
     if (not isinstance(value, str) or not value.strip() or len(value) > max_length
-            or any(ch in value for ch in "\\r\\n")):
+            or any(ch in value for ch in "\r\n")):
         raise ValueError(f"{name} must be a non-empty bounded string")
     return value
 
