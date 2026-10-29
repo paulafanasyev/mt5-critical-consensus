@@ -289,3 +289,53 @@ def test_self_adversarial_pass_does_not_approve_low_confidence():
                                    counterarguments=["x", "y", "z"], contradictions=[], sources=sources)
     assert reject["verdict"] == "REJECT"
     assert "CONFIDENCE_BELOW_REJECTION_FLOOR" in reject["blockers"]
+
+
+def test_chief_gate_rejects_coerced_nested_evidence_and_reasons():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    def valid_reasoning():
+        reasoning = {"reasoning_id": "chief-r-strict", "signal_id": "sig-strict", "created_at": now.isoformat(),
+            "verdict": "CONFIRM",
+            "steps": {k: {"passed": True, "detail": "evidence checked", "evidence_refs": [f"ev-{k}"]} for k in "abcdefghi"},
+            "reasons_against": ["macro", "news", "correlation", "liquidity", "regime"],
+            "tail_risk_probability": 0.01,
+            "tail_risk_scenarios": [{"scenario": "shock", "probability": 0.01, "impact": "repricing", "evidence_refs": ["risk-1"]}],
+            "open_challenges": [], "all_challenges_read": True, "challenge_ledger_snapshot": [],
+            "challenge_ledger_hash": canonical_hash([]), "reviewed_challenge_ids": []}
+        reasoning["reasoning_hash"] = canonical_hash(reasoning)
+        return reasoning
+    mutations = []
+    bad = valid_reasoning(); bad["steps"]["a"]["detail"] = 42; mutations.append(bad)
+    bad = valid_reasoning(); bad["steps"]["a"]["evidence_refs"] = [42]; mutations.append(bad)
+    bad = valid_reasoning(); bad["reasons_against"] = ["macro", "news", "correlation", "liquidity", 5]; mutations.append(bad)
+    bad = valid_reasoning(); bad["tail_risk_scenarios"][0]["scenario"] = 123; mutations.append(bad)
+    for reasoning in mutations:
+        reasoning["reasoning_hash"] = canonical_hash({k: v for k, v in reasoning.items() if k != "reasoning_hash"})
+        result = chief_skeptic_pass(reasoning, now=now)
+        assert result["verdict"] == "HOLD"
+        assert result["trade_allowed"] is False
+
+
+def test_user_authorization_requires_id_and_bounded_integer_ttl():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    permission = {"status": "REQUIRE_HUMAN", "permission_id": "p3", "mode": "demo",
+                  "expires_at": (now + timedelta(minutes=5)).isoformat()}
+    base = {"decision_id": "decision-3", "decision": "APPROVE", "user_id": "operator-1",
+            "reason": "reviewed", "permission_id": "p3", "timestamp": now.isoformat(), "ttl_seconds": 300}
+    for mutation in ("missing_id", "over_max", "float_ttl", "lowercase_decision"):
+        decision = dict(base)
+        if mutation == "missing_id": decision.pop("decision_id")
+        elif mutation == "over_max": decision["ttl_seconds"] = 601
+        elif mutation == "float_ttl": decision["ttl_seconds"] = 300.0
+        else: decision["decision"] = "approve"
+        result = user_authorization_gate(permission, decision, now=now)
+        assert result["status"] == "DENY"
+        assert result["authorized"] is False
+
+
+def test_certainty_gate_rejects_duplicate_source_ids():
+    payload = good_payload()
+    payload["key_sources"].append(dict(payload["key_sources"][0]))
+    result = certainty_gate(payload, POLICY)
+    assert result["status"] == "GATHER_MORE"
+    assert "KEY_SOURCE_IDS_INVALID_OR_DUPLICATE" in result["blockers"]
