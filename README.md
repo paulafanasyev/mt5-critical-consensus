@@ -82,9 +82,21 @@ assert result["trade_allowed"] is False
 
 ## Проверка текущего каркаса
 
-- Локальная проверка исходников: `pytest -q` — **78 тестов PASS**. Последний проверенный GitHub Actions прогон: **84 passed in 0.81s**, Python 3.12, без pytest warnings: [тесты](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40849840096). Отдельный аудит зависимостей: [PASS](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40849840095), `pip-audit` сообщил `No known vulnerabilities found`; зафиксировано требование `pytest>=9.0.3` после исправления `PYSEC-2026-1845`. CI использует `ubuntu-22.04`, `actions/checkout@v7`, `actions/setup-python@v7` и `httpx2` для TestClient. Это синтетические тесты функций/API, а не брокерные испытания.
-- Проверяются fail-closed gates, integrity binding между ChiefReasoning/consensus/source summary и PermissionRequest, выдача полного human review packet, hash chain, API key gate и Redis Streams helpers.
-- Проверка зелёных тестов доказывает поведение локальных функций на синтетических входах, но не проверяет брокер, MQL5-компиляцию, реальную очередь, рыночные данные или доходность.
+### Актуальная интеграционная ветка
+
+- Ветка: `integration/safety-gates-merged`, интеграционный PR: [#7](https://github.com/paulafanasyev/mt5-critical-consensus/pull/7). Последний проверенный кодовый коммит до этого обновления документации: `9c7c16355ac7f9811bf99b64a78dbb3951965943`.
+- GitHub Actions: **153 passed in 1.17s** на Python 3.12 с PostgreSQL 16 service container. [Тесты](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40896031670).
+- [Аудит безопасности](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40896031772): `pip-audit` сообщил `No known vulnerabilities found`, Bandit — `No issues identified`.
+- В тесты входят строгая валидация API/policy gates, структурные и семантические проверки рыночных снимков, protective levels, PostgreSQL-реестр решений и read-only MT5 adapter с тестовым fake-клиентом.
+- PostgreSQL-реестр решений является storage primitive и не подключён к публичному endpoint авторизации. Реальный provider аутентификации/MFA/signature не реализован; успешная регистрация/потребление записи не разрешает торговлю.
+- `/v1/authorization/check` и `/v1/execution/submit` остаются HTTP 423. `execution_enabled=false`, `live_enabled=false`; ордер не создаётся и не отправляется.
+- **Не проверено в реальной среде:** работа с запущенным Windows MT5 terminal/брокером; MetaEditor-компиляция MQL5; рыночный feed с подтверждённым происхождением; свежий Vercel Preview именно интеграционной ветки; прибыльность или готовность к production.
+
+### Исторический baseline ветки `main`
+
+Предыдущие замеры относятся к более раннему состоянию репозитория, а не к интеграционной ветке: локально 78 тестов и один CI-прогон с 84 тестами ([старый прогон](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40849840096), [старый аудит](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40849840095)). Не используйте эти числа как текущую оценку интегрированного кода.
+
+- Зелёные синтетические тесты проверяют поведение функций и интеграцию с тестовой PostgreSQL, но не доказывают работу брокера, реального MT5 terminal, production-хранилища или доходность.
 - ChiefReasoning hash вычисляется по каноническому JSON без поля `reasoning_hash`; изменение любого шага делает hash невалидным.
 
 ## Официальные точки интеграции
