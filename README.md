@@ -88,7 +88,7 @@ assert result["trade_allowed"] is False
 ### Актуальная интеграционная ветка
 
 - Ветка: `integration/safety-gates-merged`, интеграционный PR: [#7](https://github.com/paulafanasyev/mt5-critical-consensus/pull/7). Проверенный кодовый коммит: `54c59fe8effae4a83fc553f17480c6c83598dea5`.
-- GitHub Actions: **172 passed in 3.14s** на Python 3.12 с PostgreSQL 16 service container. [Тесты](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40908492490).
+- GitHub Actions на последнем кодовом коммите `091211d7a9e8a70993bcaa1812868ab3941d6f98`: **220 passed in 2.84s** на Python 3.12 с PostgreSQL 16 service container. [Тесты](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40914754982). [Аудит безопасности](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40914755214): `pip-audit` — `No known vulnerabilities found`, Bandit — `No issues identified`.
 - [Аудит безопасности](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40908492260): `pip-audit` сообщил `No known vulnerabilities found`, Bandit — `No issues identified`.
 - Тесты покрывают защищённый `POST /v1/market/snapshot/validate`, strict policy gates, рыночные снимки, protective levels, одноразовую PostgreSQL-авторизацию без выдачи торгового разрешения, read-only MT5 adapter с fake-клиентом, append-only audit store и связку pipeline → PostgreSQL → повторная проверка trace.
 - `evaluate_signal_bundle(..., audit_store=store)` передаёт готовую hash-linked трассу в внедрённое хранилище. Если сохранение/проверка не подтверждены, итог становится `DENY` с `AUDIT_PERSISTENCE_FAILED`. DB store не создаётся автоматически — deployment должен передать настроенный PostgreSQL adapter.
