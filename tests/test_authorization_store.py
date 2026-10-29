@@ -106,7 +106,7 @@ def test_registered_decision_can_be_consumed_once_only(store):
 def test_mismatched_payload_cannot_consume_registered_decision(store):
     permission_id, now = seed_permission(store)
     decision = make_decision(permission_id, now)
-    assert store.register_verified_decision(decision, make_receipt(now), now=now)["registered"] is True
+    assert store.register_verified_decision(decision, make_receipt(now, decision), now=now)["registered"] is True
     permission = {"status": "REQUIRE_HUMAN", "permission_id": permission_id}
 
     forged = dict(decision)
@@ -118,20 +118,20 @@ def test_mismatched_payload_cannot_consume_registered_decision(store):
 def test_store_refuses_expired_permission_and_duplicate_decision_id(store):
     permission_id, now = seed_permission(store, expires_at=datetime.now(timezone.utc) - timedelta(seconds=1))
     decision = make_decision(permission_id, now)
-    result = store.register_verified_decision(decision, make_receipt(now), now=now)
+    result = store.register_verified_decision(decision, make_receipt(now, decision), now=now)
     assert result["registered"] is False
     assert "EXPIRED" in result["blockers"][0]
 
     permission_id, now = seed_permission(store)
     decision = make_decision(permission_id, now)
-    receipt = make_receipt(now)
+    receipt = make_receipt(now, decision)
     assert store.register_verified_decision(decision, receipt, now=now)["registered"] is True
     duplicate_id = store.register_verified_decision(decision, receipt, now=now)
     assert duplicate_id["registered"] is False
     assert "ALREADY_REGISTERED" in duplicate_id["blockers"][0]
 
     second_decision = make_decision(permission_id, now)
-    duplicate_permission = store.register_verified_decision(second_decision, make_receipt(now), now=now)
+    duplicate_permission = store.register_verified_decision(second_decision, make_receipt(now, decision), now=now)
     assert duplicate_permission["registered"] is False
     assert "ALREADY_REGISTERED" in duplicate_permission["blockers"][0]
 
@@ -144,7 +144,7 @@ def test_live_approval_requires_verified_second_factor_and_signature(store):
     assert result["registered"] is False
     assert "LIVE_2FA_OR_SIGNATURE_VERIFICATION_REQUIRED" in result["blockers"][0]
 
-    valid_proof = make_receipt(now, two_fa=True, signature=True)
+    valid_proof = make_receipt(now, decision, two_fa=True, signature=True)
     result = store.register_verified_decision(decision, valid_proof, now=now)
     assert result["registered"] is True
 
@@ -152,7 +152,7 @@ def test_live_approval_requires_verified_second_factor_and_signature(store):
 def test_rejected_human_decision_is_consumed_but_never_authorizes(store):
     permission_id, now = seed_permission(store)
     decision = make_decision(permission_id, now, decision="REJECT")
-    assert store.register_verified_decision(decision, make_receipt(now), now=now)["registered"] is True
+    assert store.register_verified_decision(decision, make_receipt(now, decision), now=now)["registered"] is True
     result = store.consume_decision({"status": "REQUIRE_HUMAN", "permission_id": permission_id},
                                     decision, now=now + timedelta(seconds=1))
     assert result["status"] == "CONSUMED_REJECT"
@@ -168,7 +168,7 @@ def test_rejected_human_decision_is_consumed_but_never_authorizes(store):
 def test_concurrent_consume_has_exactly_one_winner(store):
     permission_id, now = seed_permission(store)
     decision = make_decision(permission_id, now)
-    assert store.register_verified_decision(decision, make_receipt(now), now=now)["registered"] is True
+    assert store.register_verified_decision(decision, make_receipt(now, decision), now=now)["registered"] is True
     permission = {"status": "REQUIRE_HUMAN", "permission_id": permission_id}
 
     def consume():
@@ -188,7 +188,7 @@ def test_concurrent_consume_has_exactly_one_winner(store):
 def test_store_fails_closed_for_unverified_receipt_and_ttl_outside_cap(store):
     permission_id, now = seed_permission(store)
     decision = make_decision(permission_id, now, ttl_seconds=301)
-    result = store.register_verified_decision(decision, make_receipt(now), now=now)
+    result = store.register_verified_decision(decision, make_receipt(now, decision), now=now)
     assert result["registered"] is False
     assert "TTL_INVALID" in result["blockers"][0]
 
@@ -201,7 +201,7 @@ def test_store_fails_closed_for_unverified_receipt_and_ttl_outside_cap(store):
 def test_consumed_approval_closes_permission_without_granting_trade(store):
     permission_id, now = seed_permission(store)
     decision = make_decision(permission_id, now)
-    assert store.register_verified_decision(decision, make_receipt(now), now=now)["registered"] is True
+    assert store.register_verified_decision(decision, make_receipt(now, decision), now=now)["registered"] is True
 
     result = store.consume_decision(
         {"status": "REQUIRE_HUMAN", "permission_id": permission_id}, decision,
@@ -219,7 +219,7 @@ def test_consumed_approval_closes_permission_without_granting_trade(store):
 def test_revoked_permission_cannot_consume_registered_decision(store):
     permission_id, now = seed_permission(store)
     decision = make_decision(permission_id, now)
-    assert store.register_verified_decision(decision, make_receipt(now), now=now)["registered"] is True
+    assert store.register_verified_decision(decision, make_receipt(now, decision), now=now)["registered"] is True
     with store._connect() as connection:
         connection.execute("UPDATE permissions SET status = 'DENY' WHERE permission_id::text = %s",
                            (permission_id,))
