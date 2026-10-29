@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "src/critical_consensus/api.py": {
+      "maxDuration": 30,
+      "includeFiles": "{config/**/*.yaml,schemas/**/*.json}"
+    }
+  }
+}

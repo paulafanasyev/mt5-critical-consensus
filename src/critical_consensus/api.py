@@ -54,6 +54,20 @@ class GenericPayload(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+@app.get("/")
+def root() -> dict[str, Any]:
+    """Give a useful response when a deployment's base URL is opened in a browser."""
+    return {
+        "service": "critical-consensus-policy-api",
+        "status": "ok",
+        "message": "Policy API is running. Use /health for safe status and /docs for API documentation.",
+        "health_path": "/health",
+        "docs_path": "/docs",
+        "execution_enabled": False,
+        "live_enabled": False,
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     """Non-sensitive liveness endpoint; reports the execution state, never credentials."""
@@ -100,6 +114,6 @@ def next_execution_command():
 @app.post("/v1/execution/submit", dependencies=[Depends(require_bridge_key)])
 def submit_execution() -> None:
     raise HTTPException(
-        status_code=status.HTTP_423_LOCKED,
+        status_code=423,
         detail="Execution disabled in reference scaffold; no order was sent",
     )
