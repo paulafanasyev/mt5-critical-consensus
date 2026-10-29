@@ -86,13 +86,13 @@ assert result["trade_allowed"] is False
 
 ### Актуальная интеграционная ветка
 
-- Ветка: `integration/safety-gates-merged`, интеграционный PR: [#7](https://github.com/paulafanasyev/mt5-critical-consensus/pull/7). Последний проверенный кодовый коммит до этого обновления документации: `9c7c16355ac7f9811bf99b64a78dbb3951965943`.
-- GitHub Actions: **153 passed in 1.17s** на Python 3.12 с PostgreSQL 16 service container. [Тесты](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40896031670).
-- [Аудит безопасности](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40896031772): `pip-audit` сообщил `No known vulnerabilities found`, Bandit — `No issues identified`.
-- В тесты входят строгая валидация API/policy gates, структурные и семантические проверки рыночных снимков, protective levels, PostgreSQL-реестр решений и read-only MT5 adapter с тестовым fake-клиентом.
-- PostgreSQL-реестр решений является storage primitive и не подключён к публичному endpoint авторизации. Реальный provider аутентификации/MFA/signature не реализован; успешная регистрация/потребление записи не разрешает торговлю.
+- Ветка: `integration/safety-gates-merged`, интеграционный PR: [#7](https://github.com/paulafanasyev/mt5-critical-consensus/pull/7). Проверенный кодовый коммит: `05650e7b7c4dee7dd99526b6efaa4be22b12d644`.
+- GitHub Actions: **161 passed in 1.75s** на Python 3.12 с PostgreSQL 16 service container. [Тесты](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40906531330).
+- [Аудит безопасности](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40906531313): `pip-audit` сообщил `No known vulnerabilities found`, Bandit — `No issues identified`.
+- В тесты входят strict API/policy gates, защищённый `POST /v1/market/snapshot/validate`, структурная и семантическая проверка котировок, PostgreSQL-реестр и миграция одноразового решения, а также read-only MT5 adapter с fake-клиентом.
+- PostgreSQL-реестр решений не подключён к публичному endpoint авторизации. Реальный provider аутентификации/MFA/signature не реализован; запись или потребление решения само по себе не разрешает торговлю.
 - `/v1/authorization/check` и `/v1/execution/submit` остаются HTTP 423. `execution_enabled=false`, `live_enabled=false`; ордер не создаётся и не отправляется.
-- **Не проверено в реальной среде:** работа с запущенным Windows MT5 terminal/брокером; MetaEditor-компиляция MQL5; рыночный feed с подтверждённым происхождением; свежий Vercel Preview именно интеграционной ветки; прибыльность или готовность к production.
+- **NOT PROVEN / pending:** Vercel Preview для текущей интеграционной ветки. Создание деплоя было отклонено ограничением `api-deployments-free-per-day` (более 100 деплоев за сутки, повторная попытка через 24 часа); production не менялся и остаётся на `main` commit `1774971700fed478479ed657082f9300989505df`. Также не проверены запущенный Windows MT5 terminal/брокер, компиляция MQL5 в MetaEditor, подлинность рыночного feed, прибыльность и готовность к production.
 
 ### Исторический baseline ветки `main`
 
