@@ -6,19 +6,68 @@ Durable append-only persistence must be supplied by the deployment adapter.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import math
+import re
 from typing import Any, Mapping, Sequence
 
 from .audit import canonical_hash, make_audit_event, verify_audit_chain
 from .calibration import weighted_consensus
 from .gates import certainty_gate, chief_skeptic_pass, permission_gate, user_authorization_gate
 
+_VERDICT_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_VERDICT_FUTURE_SKEW_SECONDS = 30
+
 
 def _as_records(value: Any) -> list[Mapping[str, Any]]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         return []
     return [item for item in value if isinstance(item, Mapping)]
+
+
+def _validate_verdict_metadata(
+    verdict: Mapping[str, Any], signal_id: str, current: datetime
+) -> list[str]:
+    """Bind a verdict to this signal and reject malformed or stale metadata."""
+    blockers: list[str] = []
+    if not str(verdict.get("verdict_id", "")).strip():
+        blockers.append("VERDICT_ID_MISSING")
+    if not str(verdict.get("agent_id", "")).strip():
+        blockers.append("VERDICT_AGENT_ID_MISSING")
+    if not signal_id or str(verdict.get("signal_id", "")).strip() != signal_id:
+        blockers.append("VERDICT_SIGNAL_ID_MISMATCH")
+
+    input_hash = verdict.get("input_hash")
+    if not isinstance(input_hash, str) or _VERDICT_HASH_RE.fullmatch(input_hash) is None:
+        blockers.append("VERDICT_INPUT_HASH_INVALID")
+
+    raw_ttl = verdict.get("ttl_seconds")
+    if isinstance(raw_ttl, bool) or not isinstance(raw_ttl, int) or raw_ttl <= 0:
+        blockers.append("VERDICT_TTL_INVALID")
+        ttl_seconds = None
+    else:
+        ttl_seconds = raw_ttl
+
+    raw_created_at = verdict.get("created_at")
+    created_at: datetime | None = None
+    if not isinstance(raw_created_at, str) or not raw_created_at.strip():
+        blockers.append("VERDICT_CREATED_AT_MISSING_OR_INVALID")
+    else:
+        try:
+            parsed = datetime.fromisoformat(raw_created_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError("timezone required")
+            created_at = parsed.astimezone(timezone.utc)
+        except (ValueError, TypeError, OverflowError):
+            blockers.append("VERDICT_CREATED_AT_MISSING_OR_INVALID")
+
+    if created_at is not None:
+        age_seconds = (current - created_at).total_seconds()
+        if age_seconds < -_VERDICT_FUTURE_SKEW_SECONDS:
+            blockers.append("VERDICT_CREATED_AT_IN_FUTURE")
+        elif ttl_seconds is not None and age_seconds > ttl_seconds:
+            blockers.append("VERDICT_EXPIRED")
+    return blockers
 
 
 def evaluate_signal_bundle(
@@ -37,9 +86,17 @@ def evaluate_signal_bundle(
     if not isinstance(bundle, Mapping):
         return {"status": "GATHER_MORE", "trade_allowed": False, "blockers": ["INVALID_SIGNAL_BUNDLE"], "audit_events": []}
 
+    try:
+        current = datetime.now(timezone.utc) if now is None else now
+        if current.tzinfo is None or current.utcoffset() is None:
+            raise ValueError("timezone required")
+        current = current.astimezone(timezone.utc)
+    except (ValueError, TypeError, OverflowError):
+        return {"status": "GATHER_MORE", "trade_allowed": False, "blockers": ["INVALID_CURRENT_TIME"], "audit_events": []}
+
     trace: list[dict[str, Any]] = []
     previous_hash: str | None = None
-    signal_id = str(bundle.get("signal_id", "unknown"))
+    signal_id = str(bundle.get("signal_id", "")).strip()
 
     def emit(event_type: str, payload: Mapping[str, Any]) -> None:
         nonlocal previous_hash
@@ -48,22 +105,40 @@ def evaluate_signal_bundle(
         previous_hash = event["event_hash"]
 
     def finish(status: str, blockers: list[str], **details: Any) -> dict[str, Any]:
-        emit("PIPELINE_RESULT", {"signal_id": signal_id, "status": status,
+        emit("PIPELINE_RESULT", {"signal_id": signal_id or "unknown", "status": status,
                                  "blockers": sorted(set(blockers)),
                                  "detail_hash": canonical_hash(details)})
         chain_check = verify_audit_chain(trace)
-        return {"signal_id": signal_id, "status": status, "trade_allowed": False,
+        return {"signal_id": signal_id or "unknown", "status": status, "trade_allowed": False,
                 "blockers": sorted(set(blockers)), "details": details,
                 "audit_events": trace, "audit_chain_valid": chain_check.get("valid") is True,
                 "audit_chain_check": chain_check}
 
-    emit("SIGNAL_RECEIVED", {"signal_id": signal_id, "bundle_hash": canonical_hash(bundle)})
+    emit("SIGNAL_RECEIVED", {"signal_id": signal_id or "unknown", "bundle_hash": canonical_hash(bundle)})
 
     raw_verdicts = bundle.get("verdicts")
     verdicts = [dict(v) for v in _as_records(raw_verdicts)]
     if not verdicts:
-        emit("VERDICT_VALIDATION", {"signal_id": signal_id, "status": "FAILED"})
+        emit("VERDICT_VALIDATION", {"signal_id": signal_id or "unknown", "status": "FAILED"})
         return finish("GATHER_MORE", ["VERDICTS_MISSING_OR_INVALID"])
+
+    metadata_blockers: list[str] = []
+    if not signal_id:
+        metadata_blockers.append("SIGNAL_ID_MISSING")
+    if not isinstance(raw_verdicts, Sequence) or isinstance(raw_verdicts, (str, bytes)) or len(verdicts) != len(raw_verdicts):
+        metadata_blockers.append("VERDICT_RECORD_INVALID")
+    for index, verdict in enumerate(verdicts):
+        metadata_blockers.extend(
+            f"VERDICT_{index}:{blocker}"
+            for blocker in _validate_verdict_metadata(verdict, signal_id, current)
+        )
+    if metadata_blockers:
+        emit("VERDICT_METADATA_VALIDATION", {"signal_id": signal_id or "unknown", "status": "FAILED",
+                                               "blockers": sorted(set(metadata_blockers))})
+        return finish("GATHER_MORE", metadata_blockers,
+                      verdict_metadata_validation={"status": "FAILED", "blockers": sorted(set(metadata_blockers))})
+    emit("VERDICT_METADATA_VALIDATION", {"signal_id": signal_id, "status": "PASSED",
+                                           "verdict_count": len(verdicts)})
 
     reviews = _as_records(bundle.get("peer_reviews"))
     review_index: dict[str, set[str]] = {}
@@ -91,7 +166,6 @@ def evaluate_signal_bundle(
         if stance == "CHALLENGE":
             challenge_reviews.append(review)
 
-    # The review service's records, not caller-provided reviewer_count, determine coverage.
     verdict_ids: set[str] = set()
     for verdict in verdicts:
         verdict_id = str(verdict.get("verdict_id", "")).strip()
@@ -206,7 +280,7 @@ def evaluate_signal_bundle(
     elif supplied_reasoning_hash != expected_hash:
         emit("CHIEF_REVIEW", {"signal_id": signal_id, "status": "HOLD", "reason": "CHIEF_REASONING_HASH_MISMATCH"})
         return finish("HOLD", ["CHIEF_REASONING_HASH_MISMATCH"], certainty=certainty)
-    chief = chief_skeptic_pass(chief_input, now=now)
+    chief = chief_skeptic_pass(chief_input, now=current)
     emit("CHIEF_REVIEW", {"signal_id": signal_id, "status": chief.get("verdict"),
                           "reasoning_hash": chief.get("reasoning_hash"), "blockers": chief.get("blockers", [])})
     if chief.get("verdict") == "REJECT":
@@ -219,7 +293,6 @@ def evaluate_signal_bundle(
         emit("PERMISSION_GATE", {"signal_id": signal_id, "status": "DENY", "reason": "PERMISSION_REQUEST_MISSING"})
         return finish("DENY", ["PERMISSION_REQUEST_MISSING"], certainty=certainty, chief=chief)
     req = dict(permission_request)
-    # Bind the permission request to this exact, reviewed signal and analysis.
     metadata_blockers: list[str] = []
     if str(req.get("signal_id", "")) != signal_id:
         metadata_blockers.append("PERMISSION_SIGNAL_ID_MISMATCH")
@@ -280,13 +353,12 @@ def evaluate_signal_bundle(
     req["certainty_status"] = certainty.get("status")
     req["compliance_status"] = bundle.get("compliance_status")
     req["risk_flags"] = all_risk_flags
-    permission = permission_gate(req, permission_matrix, now=now)
+    permission = permission_gate(req, permission_matrix, now=current)
     emit("PERMISSION_GATE", {"signal_id": signal_id, "status": permission.get("status"),
                               "blockers": permission.get("blockers", []), "permission_id": permission.get("permission_id")})
     if permission.get("status") == "DENY":
         return finish("DENY", list(permission.get("blockers", [])), certainty=certainty, chief=chief, permission=permission)
 
-    # This packet is intended for the human review UI; never hide dissent/tail risk behind a BUY/SELL label.
     human_review_packet = {
         "signal_id": signal_id,
         "peer_reviews": [dict(review) for review in reviews],
@@ -307,7 +379,7 @@ def evaluate_signal_bundle(
         return finish("REQUIRE_HUMAN", [], certainty=certainty, chief=chief, permission=permission,
                       human_review_packet=human_review_packet,
                       message="Human review is required; no order command has been created.")
-    authorization = user_authorization_gate(permission, user_decision, now=now)
+    authorization = user_authorization_gate(permission, user_decision, now=current)
     emit("USER_AUTHORIZATION", {"signal_id": signal_id, "status": authorization.get("status"),
                                  "permission_id": authorization.get("permission_id"),
                                  "blockers": authorization.get("blockers", [])})

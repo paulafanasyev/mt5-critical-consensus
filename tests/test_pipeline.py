@@ -41,9 +41,12 @@ PERMISSION_MATRIX = {
 def make_bundle():
     agents = ["PlatformScoutAgent", "TechnicalAnalystAgent", "RiskManagerAgent", "ComplianceAgent"]
     verdicts = [
-        {"verdict_id": f"v-{i}", "agent_id": agent, "verdict": "APPROVE", "confidence": 0.99,
-         "reviewer_count": 999, "calibration_meta": {"brier_score": 0.05, "sample_size": 100,
-                                                       "calibration_status": "CALIBRATED"}}
+        {"verdict_id": f"v-{i}", "signal_id": "sig-100", "agent_id": agent,
+         "verdict": "APPROVE", "confidence": 0.99,
+         "reviewer_count": 999, "created_at": NOW.isoformat(), "ttl_seconds": 300,
+         "input_hash": "sha256:" + "a" * 64,
+         "calibration_meta": {"brier_score": 0.05, "sample_size": 100,
+                               "calibration_status": "CALIBRATED"}}
         for i, agent in enumerate(agents)
     ]
     reviews = []
@@ -211,7 +214,6 @@ def test_pipeline_human_packet_contains_full_challenge_ledger_and_sources():
 def test_pipeline_rejects_chief_reasoning_for_another_signal():
     bundle = make_bundle()
     bundle["chief_reasoning"]["signal_id"] = "different-signal"
-    # The payload's hash must also be internally consistent to prove that identity binding is checked first.
     unsigned = dict(bundle["chief_reasoning"])
     unsigned.pop("reasoning_hash", None)
     bundle["chief_reasoning"]["reasoning_hash"] = canonical_hash(unsigned)
@@ -227,3 +229,57 @@ def test_pipeline_rejects_permission_source_summary_tampering():
     result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
     assert result["status"] == "DENY"
     assert "PERMISSION_SOURCE_SUMMARY_MISMATCH" in result["blockers"]
+
+
+def test_verdict_for_another_signal_is_rejected_before_consensus():
+    bundle = make_bundle()
+    bundle["verdicts"][0]["signal_id"] = "different-signal"
+    result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
+    assert result["status"] == "GATHER_MORE"
+    assert result["trade_allowed"] is False
+    assert "VERDICT_0:VERDICT_SIGNAL_ID_MISMATCH" in result["blockers"]
+    assert "certainty" not in result["details"]
+
+
+def test_expired_verdict_is_rejected_before_consensus():
+    bundle = make_bundle()
+    bundle["verdicts"][0]["created_at"] = (NOW - timedelta(seconds=301)).isoformat()
+    bundle["verdicts"][0]["ttl_seconds"] = 300
+    result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
+    assert result["status"] == "GATHER_MORE"
+    assert "VERDICT_0:VERDICT_EXPIRED" in result["blockers"]
+    assert result["trade_allowed"] is False
+
+
+def test_verdict_with_future_timestamp_beyond_clock_skew_is_rejected():
+    bundle = make_bundle()
+    bundle["verdicts"][0]["created_at"] = (NOW + timedelta(seconds=31)).isoformat()
+    result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
+    assert result["status"] == "GATHER_MORE"
+    assert "VERDICT_0:VERDICT_CREATED_AT_IN_FUTURE" in result["blockers"]
+
+
+def test_verdict_missing_or_invalid_contract_metadata_is_rejected():
+    for field, value, expected_blocker in (
+        ("created_at", None, "VERDICT_CREATED_AT_MISSING_OR_INVALID"),
+        ("created_at", "2026-10-29T12:00:00", "VERDICT_CREATED_AT_MISSING_OR_INVALID"),
+        ("ttl_seconds", True, "VERDICT_TTL_INVALID"),
+        ("ttl_seconds", 0, "VERDICT_TTL_INVALID"),
+        ("input_hash", "sha256:bad", "VERDICT_INPUT_HASH_INVALID"),
+    ):
+        bundle = make_bundle()
+        bundle["verdicts"][0][field] = value
+        result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
+        assert result["status"] == "GATHER_MORE"
+        assert f"VERDICT_0:{expected_blocker}" in result["blockers"]
+        assert result["trade_allowed"] is False
+
+
+def test_verdict_at_exact_ttl_boundary_is_accepted():
+    bundle = make_bundle()
+    bundle["verdicts"][0]["created_at"] = (NOW - timedelta(seconds=300)).isoformat()
+    result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
+    assert result["status"] == "REQUIRE_HUMAN"
+    assert result["details"]["certainty"]["status"] == "PASS"
+    assert result["trade_allowed"] is False
+    assert "order_command" not in result
