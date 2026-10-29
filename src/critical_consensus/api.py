@@ -34,7 +34,6 @@ def _yaml(name: str) -> dict:
 
 
 def require_bridge_key(x_bridge_key: str | None = Header(default=None, alias="X-Bridge-Key")) -> None:
-    """Shared-secret transport gate for the localhost bridge; not a user-signature verifier."""
     expected = os.getenv("MT5_BRIDGE_TOKEN", "")
     if len(expected) < 24:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -53,19 +52,21 @@ class GenericPayload(BaseModel):
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    """Non-sensitive liveness endpoint; reports the execution state, never credentials."""
     return {"status": "ok", "service": "policy-api", "execution_enabled": False,
             "live_enabled": False, "authenticated_policy_endpoints": True}
 
 
 @app.post("/v1/certainty/evaluate", dependencies=[Depends(require_bridge_key)])
 def evaluate_certainty(body: GenericPayload) -> dict[str, Any]:
+    valid, _ = validate_contract("certainty_payload.schema.json", body.payload)
+    if not valid:
+        return {"status": "GATHER_MORE", "passed": False, "trade_allowed": False,
+                "blockers": ["CERTAINTY_PAYLOAD_SCHEMA_INVALID"], "checks": {}}
     return certainty_gate(body.payload, _yaml("certainty_thresholds.yaml"))
 
 
 @app.post("/v1/chief/review", dependencies=[Depends(require_bridge_key)])
 def review_chief(body: GenericPayload) -> dict[str, Any]:
-    """Review only complete, self-consistent, fresh Chief reasoning records."""
     reasoning = body.payload
     created_raw = reasoning.get("created_at")
     if not isinstance(created_raw, str) or not created_raw.strip():

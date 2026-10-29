@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/critical-consensus/certainty_payload.schema.json",
+  "title": "Certainty Evaluation Payload",
+  "description": "Complete evidence packet required for certainty analysis. PASS is not authorization.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdicts", "consensus_score", "open_challenges", "challenge_resolution_status", "contradictions_last_n_hours", "key_sources", "devil_advocate_report", "dissent_rate", "dissent_sample_size", "false_certainty_rate", "false_certainty_sample_size", "risk_flags"],
+  "properties": {
+    "verdicts": {"type": "array", "minItems": 1, "items": {"$ref": "agent_verdict_v2.schema.json"}},
+    "consensus_score": {"type": "number", "minimum": 0, "maximum": 1},
+    "open_challenges": {"type": "array", "items": {"$ref": "challenge_record.schema.json"}},
+    "challenge_resolution_status": {"enum": ["RESOLVED", "NONE", "DEADLOCK", "OPEN"]},
+    "contradictions_last_n_hours": {"type": "integer", "minimum": 0},
+    "key_sources": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["source_id", "credibility", "age_seconds", "ttl_seconds"], "properties": {"source_id": {"type": "string", "minLength": 1, "pattern": "\\S"}, "credibility": {"type": "number", "minimum": 0, "maximum": 1}, "age_seconds": {"type": "number", "minimum": 0}, "ttl_seconds": {"type": "number", "exclusiveMinimum": 0}, "independence_group": {"type": "string", "minLength": 1, "pattern": "\\S"}, "legal_tag": {"type": "string"}}}},
+    "news_or_rumor": {"type": "boolean"},
+    "devil_advocate_report": {"type": "object", "required": ["status", "counter_hypotheses"], "properties": {"status": {"enum": ["PASS", "BLOCKED"]}, "counter_hypotheses": {"type": "array", "minItems": 3, "items": {"type": "object", "required": ["hypothesis", "evidence_refs"], "properties": {"hypothesis": {"type": "string", "minLength": 1, "pattern": "\\S"}, "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "pattern": "\\S"}}, "additionalProperties": true}}}, "additionalProperties": true},
+    "dissent_rate": {"type": "number", "minimum": 0, "maximum": 1},
+    "dissent_sample_size": {"type": "integer", "minimum": 0},
+    "false_certainty_rate": {"type": "number", "minimum": 0, "maximum": 1},
+    "false_certainty_sample_size": {"type": "integer", "minimum": 0},
+    "risk_flags": {"type": "array", "items": {"type": "string", "minLength": 1, "pattern": "\\S"}},
+    "mandatory_agents": {"type": "array", "items": {"type": "string", "minLength": 1, "pattern": "\\S"}}
+  }
+}
