@@ -18,6 +18,7 @@
 - `src/critical_consensus/api.py` — FastAPI policy endpoints, including protected read-only market-snapshot validation; authorization and order submission remain deliberately disabled until a real 2FA/signature verifier and a separately audited execution boundary exist.
 - `src/critical_consensus/market_data.py`, `src/critical_consensus/mt5_readonly.py` — fail-closed snapshot checks and a quote-only adapter for an external MT5 host; its CI test uses a fake terminal client.
 - `src/critical_consensus/authorization_store.py` — PostgreSQL one-time decision registry with atomic consume/replay prevention; not connected to public authorization API and does not authorize trades.
+- `src/critical_consensus/audit_store.py` — append-only PostgreSQL audit trace storage with post-write verification and idempotent retries; caller integration remains explicit.
 - `src/critical_consensus/redis_streams.py` — idempotent event publishing, consumer-group helpers, retry handling and DLQ (at-least-once; worker deployment is not included).
 - `schemas/` — JSON Schema Draft 2020-12 для 11 контрактов.
 - `config/` — deny-by-default policy thresholds и permissions.
