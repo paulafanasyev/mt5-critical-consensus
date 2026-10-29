@@ -126,7 +126,7 @@ def test_pipeline_live_mode_denied_by_policy():
     assert result["status"] == "DENY" and "LIVE_MODE_DISABLED" in result["blockers"]
 
 
-def test_pipeline_valid_human_approval_is_only_authorized_once():
+def test_pipeline_denies_human_approval_without_replay_protection():
     bundle = make_bundle(); bundle["user_decision"] = {"decision_id": "decision-1", "decision": "APPROVE",
         "user_id": "operator-1", "reason": "Reviewed dissent and tail risk", "permission_id": "perm-1",
         "timestamp": NOW.isoformat(), "ttl_seconds": 300}
