@@ -30,7 +30,7 @@ PERMISSION_MATRIX = {
         "allowed_directions": ["BUY", "SELL"], "allowed_time_utc": {"start": "07:00", "end": "19:00"},
         "rollover_block_utc": {"start": "20:55", "end": "21:10"}, "blocked_around_news": True,
         "news_block_minutes_before": 15, "news_block_minutes_after": 30,
-        "blocked_flags": ["sanctions", "mnmi", "mnmi_suspect", "technical_halt", "liquidity", "kill_switch"],
+        "blocked_flags": ["sanctions", "mnpi", "mnpi_suspect", "technical_halt", "liquidity", "kill_switch"],
         "min_expected_rr": 1.5, "expected_rr_tolerance_fraction": 0.10,
         "require_stop_loss": True, "require_take_profit": True, "max_command_ttl_seconds": 600,
         "demo_enabled": True, "live_enabled": False,
@@ -273,3 +273,13 @@ def test_verdict_missing_or_invalid_contract_metadata_is_rejected():
         assert result["status"] == "GATHER_MORE"
         assert f"VERDICT_0:{expected_blocker}" in result["blockers"]
         assert result["trade_allowed"] is False
+
+
+def test_verdict_at_exact_ttl_boundary_is_accepted():
+    bundle = make_bundle()
+    bundle["verdicts"][0]["created_at"] = (NOW - timedelta(seconds=300)).isoformat()
+    result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
+    assert result["status"] == "REQUIRE_HUMAN"
+    assert result["details"]["certainty"]["status"] == "PASS"
+    assert result["trade_allowed"] is False
+    assert "order_command" not in result
