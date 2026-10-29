@@ -179,7 +179,7 @@ def test_permission_gate_fails_closed_when_risk_snapshot_missing():
     assert "RISK_SNAPSHOT_MISSING" in permission_gate(req, matrix, now=now)["blockers"]
 
 
-def test_valid_demo_approval_is_one_time_allow_not_order_execution():
+def test_valid_demo_approval_metadata_is_denied_without_replay_protection():
     now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
     permission = {"status": "REQUIRE_HUMAN", "permission_id": "p2", "mode": "demo", "expires_at": (now + timedelta(minutes=5)).isoformat()}
     decision = {"decision_id": "decision-p2", "decision": "APPROVE", "user_id": "operator-1", "reason": "reviewed dissent and tail risk",
