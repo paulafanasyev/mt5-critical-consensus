@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import importlib.util
 from datetime import datetime, timezone
 import os
 import uuid
@@ -10,9 +11,21 @@ import pytest
 
 from critical_consensus.audit import make_audit_event
 from critical_consensus.audit_store import AuditStoreError, PostgresAuditStore
+from critical_consensus.pipeline import evaluate_signal_bundle
 
 DATABASE_URL = os.getenv("TEST_DATABASE_URL")
 pytestmark = pytest.mark.skipif(not DATABASE_URL, reason="TEST_DATABASE_URL is not configured")
+
+_pipeline_spec = importlib.util.spec_from_file_location(
+    "pipeline_test_fixtures", Path(__file__).with_name("test_pipeline.py")
+)
+assert _pipeline_spec is not None and _pipeline_spec.loader is not None
+_pipeline_fixtures = importlib.util.module_from_spec(_pipeline_spec)
+_pipeline_spec.loader.exec_module(_pipeline_fixtures)
+CERTAINTY_POLICY = _pipeline_fixtures.CERTAINTY_POLICY
+PERMISSION_MATRIX = _pipeline_fixtures.PERMISSION_MATRIX
+PIPELINE_NOW = _pipeline_fixtures.NOW
+make_bundle = _pipeline_fixtures.make_bundle
 
 
 @pytest.fixture
@@ -125,3 +138,23 @@ def test_verify_trace_rejects_invalid_id(store):
     result = store.verify_trace("not-a-uuid")
     assert result["valid"] is False
     assert "AUDIT_TRACE_ID_INVALID" in result["blockers"]
+
+
+def test_pipeline_result_is_persisted_and_read_back_from_postgres(store):
+    result = evaluate_signal_bundle(
+        make_bundle(),
+        CERTAINTY_POLICY,
+        PERMISSION_MATRIX,
+        now=PIPELINE_NOW,
+        audit_store=store,
+    )
+    assert result["status"] == "REQUIRE_HUMAN"
+    assert result["trade_allowed"] is False
+    assert result["audit_persistence"]["persisted"] is True
+    assert result["audit_persistence"]["verified"] is True
+
+    verified = store.verify_trace(result["audit_persistence"]["trace_id"])
+    assert verified["valid"] is True
+    assert verified["events"] == result["audit_events"]
+    assert verified["pipeline_status"] == "REQUIRE_HUMAN"
+    assert verified["trade_allowed"] is False
