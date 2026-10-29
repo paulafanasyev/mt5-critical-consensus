@@ -5,6 +5,17 @@ from critical_consensus.api import app
 client = TestClient(app)
 
 
+def test_root_describes_api_and_points_to_health_without_enabling_execution():
+    response = client.get("/")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["service"] == "critical-consensus-policy-api"
+    assert body["health_path"] == "/health"
+    assert body["docs_path"] == "/docs"
+    assert body["execution_enabled"] is False
+    assert body["live_enabled"] is False
+
+
 def test_health_is_available_but_never_enables_execution():
     response = client.get("/health")
     assert response.status_code == 200
@@ -29,9 +40,11 @@ def test_policy_endpoint_rejects_missing_or_wrong_bridge_key(monkeypatch):
 
 def test_policy_endpoint_accepts_correct_bridge_key(monkeypatch):
     monkeypatch.setenv("MT5_BRIDGE_TOKEN", "test-bridge-secret-that-is-long-enough")
-    response = client.post("/v1/certainty/evaluate",
-                           headers={"X-Bridge-Key": "test-bridge-secret-that-is-long-enough"},
-                           json={"payload": {}})
+    response = client.post(
+        "/v1/certainty/evaluate",
+        headers={"X-Bridge-Key": "test-bridge-secret-that-is-long-enough"},
+        json={"payload": {}},
+    )
     assert response.status_code == 200
     assert response.json()["status"] == "GATHER_MORE"
     assert response.json()["trade_allowed"] is False
@@ -39,7 +52,10 @@ def test_policy_endpoint_accepts_correct_bridge_key(monkeypatch):
 
 def test_order_submission_endpoint_stays_disabled_even_with_bridge_key(monkeypatch):
     monkeypatch.setenv("MT5_BRIDGE_TOKEN", "test-bridge-secret-that-is-long-enough")
-    response = client.post("/v1/execution/submit", headers={"X-Bridge-Key": "test-bridge-secret-that-is-long-enough"})
+    response = client.post(
+        "/v1/execution/submit",
+        headers={"X-Bridge-Key": "test-bridge-secret-that-is-long-enough"},
+    )
     assert response.status_code == 423
     assert "no order was sent" in response.json()["detail"]
 
