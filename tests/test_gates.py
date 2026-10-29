@@ -185,9 +185,10 @@ def test_valid_demo_approval_is_one_time_allow_not_order_execution():
     decision = {"decision_id": "decision-p2", "decision": "APPROVE", "user_id": "operator-1", "reason": "reviewed dissent and tail risk",
                 "permission_id": "p2", "timestamp": now.isoformat(), "ttl_seconds": 300}
     result = user_authorization_gate(permission, decision, now=now)
-    assert result["status"] == "ALLOW_ONCE"
-    assert result["authorized"] is True
+    assert result["status"] == "DENY"
+    assert result["authorized"] is False
     assert result["trade_allowed"] is False
+    assert "DURABLE_REPLAY_PROTECTION_NOT_IMPLEMENTED" in result["blockers"]
 
 
 def test_policy_owned_mandatory_agents_cannot_be_overridden_by_payload():
