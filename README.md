@@ -87,14 +87,14 @@ assert result["trade_allowed"] is False
 
 ### Актуальная интеграционная ветка
 
-- Ветка: `integration/safety-gates-merged`, интеграционный PR: [#7](https://github.com/paulafanasyev/mt5-critical-consensus/pull/7). Проверенный кодовый коммит: `05650e7b7c4dee7dd99526b6efaa4be22b12d644`.
-- GitHub Actions: **161 passed in 1.75s** на Python 3.12 с PostgreSQL 16 service container. [Тесты](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40906531330).
-- [Аудит безопасности](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40906531313): `pip-audit` сообщил `No known vulnerabilities found`, Bandit — `No issues identified`.
-- В тесты входят strict API/policy gates, защищённый `POST /v1/market/snapshot/validate`, структурная и семантическая проверка котировок, PostgreSQL-реестр и миграция одноразового решения, а также read-only MT5 adapter с fake-клиентом.
-- PostgreSQL-реестр решений не подключён к публичному endpoint авторизации. Реальный provider аутентификации/MFA/signature не реализован; запись или потребление решения само по себе не разрешает торговлю.
+- Ветка: `integration/safety-gates-merged`, интеграционный PR: [#7](https://github.com/paulafanasyev/mt5-critical-consensus/pull/7). Проверенный кодовый коммит: `54c59fe8effae4a83fc553f17480c6c83598dea5`.
+- GitHub Actions: **172 passed in 3.14s** на Python 3.12 с PostgreSQL 16 service container. [Тесты](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40908492490).
+- [Аудит безопасности](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40908492260): `pip-audit` сообщил `No known vulnerabilities found`, Bandit — `No issues identified`.
+- Тесты покрывают защищённый `POST /v1/market/snapshot/validate`, strict policy gates, рыночные снимки, protective levels, одноразовую PostgreSQL-авторизацию без выдачи торгового разрешения, read-only MT5 adapter с fake-клиентом, append-only audit store и связку pipeline → PostgreSQL → повторная проверка trace.
+- `evaluate_signal_bundle(..., audit_store=store)` передаёт готовую hash-linked трассу в внедрённое хранилище. Если сохранение/проверка не подтверждены, итог становится `DENY` с `AUDIT_PERSISTENCE_FAILED`. DB store не создаётся автоматически — deployment должен передать настроенный PostgreSQL adapter.
+- PostgreSQL-реестр решений и audit store не подключены к публичному authorization endpoint автоматически. Реальный provider аутентификации/MFA/signature не реализован; запись или потребление решения не разрешает торговлю.
 - `/v1/authorization/check` и `/v1/execution/submit` остаются HTTP 423. `execution_enabled=false`, `live_enabled=false`; ордер не создаётся и не отправляется.
-- **NOT PROVEN / pending:** Vercel Preview для текущей интеграционной ветки. Создание деплоя было отклонено ограничением `api-deployments-free-per-day` (более 100 деплоев за сутки, повторная попытка через 24 часа); production не менялся и остаётся на `main` commit `1774971700fed478479ed657082f9300989505df`. Также не проверены запущенный Windows MT5 terminal/брокер, компиляция MQL5 в MetaEditor, подлинность рыночного feed, прибыльность и готовность к production.
-
+- **NOT PROVEN / pending:** Vercel Preview текущей интеграционной ветки. Создание деплоя отклонено лимитом `api-deployments-free-per-day` (свыше 100 деплоев за сутки; Vercel предлагает повторить через 24 часа). Production не менялся и остаётся на `main` commit `1774971700fed478479ed657082f9300989505df`. Также не проверены запущенный Windows MT5 terminal/брокер, компиляция MQL5 в MetaEditor, подлинность рыночного feed, прибыльность и production readiness.
 ### Исторический baseline ветки `main`
 
 Предыдущие замеры относятся к более раннему состоянию репозитория, а не к интеграционной ветке: локально 78 тестов и один CI-прогон с 84 тестами ([старый прогон](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40849840096), [старый аудит](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40849840095)). Не используйте эти числа как текущую оценку интегрированного кода.
