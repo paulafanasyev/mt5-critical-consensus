@@ -240,3 +240,56 @@ async def test_process_message_batch_rejects_oversized_batch_and_noncallable_han
     with pytest.raises(ValueError, match="handler"):
         await process_message_batch(FakeRedis(), "cc:signals:v1", "workers",
                                     [], None)
+
+
+@pytest.mark.asyncio
+async def test_consumer_dead_letters_oversized_stream_event_without_calling_handler():
+    redis = FakeRedis()
+    raw = json.dumps({**event(), "payload": {"blob": "x" * 1_100_000}})
+    called = False
+
+    async def handler(_event):
+        nonlocal called
+        called = True
+
+    stats = await process_message_batch(
+        redis, "cc:signals:v1", "workers", [("13-0", {"event": raw})], handler
+    )
+    assert stats["invalid"] == 1
+    assert stats["dead_lettered"] == 1
+    assert stats["processed"] == 0
+    assert called is False
+    assert redis.acks == [("cc:signals:v1", "workers", "13-0")]
+    dlq = json.loads(redis.streams[STREAM_DLQ][0][1]["dead_letter"])
+    assert dlq["error_code"] == "EVENT_TOO_LARGE"
+    assert dlq["raw_hash"].startswith("sha256:")
+    assert "x" * 100 not in redis.streams[STREAM_DLQ][0][1]["dead_letter"]
+
+
+@pytest.mark.parametrize("raw", [
+    '{"event_id":"e-1","event_type":"SIGNAL","schema_version":1,'
+    '"created_at":"2026-10-29T12:00:00Z","payload":{"value":NaN}}',
+    '{"event_id":"e-1","event_id":"e-2","event_type":"SIGNAL","schema_version":1,'
+    '"created_at":"2026-10-29T12:00:00Z","payload":{"signal_id":"sig-1"}}',
+    '{"event_id":"e-1","event_type":"SIGNAL","schema_version":1,'
+    '"created_at":"2026-10-29T12:00:00Z","payload":{"signal_id":"sig-1","signal_id":"sig-2"}}',
+])
+@pytest.mark.asyncio
+async def test_consumer_dead_letters_non_strict_json_before_handler(raw):
+    redis = FakeRedis()
+    called = False
+
+    async def handler(_event):
+        nonlocal called
+        called = True
+
+    stats = await process_message_batch(
+        redis, "cc:signals:v1", "workers", [("14-0", {"event": raw})], handler
+    )
+    assert stats["invalid"] == 1
+    assert stats["dead_lettered"] == 1
+    assert stats["processed"] == 0
+    assert called is False
+    assert redis.acks == [("cc:signals:v1", "workers", "14-0")]
+    dlq = json.loads(redis.streams[STREAM_DLQ][0][1]["dead_letter"])
+    assert dlq["error_code"] == "NON_STRICT_EVENT_JSON"

@@ -94,3 +94,6 @@ flowchart TB
 
 
 - Redis Streams consumer arguments are now type-checked and bounded: `max_attempts` 1–100, read/reclaim batch count 1–1000, read block timeout 0–60000 ms, reclaim idle threshold 0–24 hours, and stream/group/consumer names have bounded string length. Booleans, floats and stringified numbers are rejected rather than implicitly accepted.
+
+
+- The stream consumer independently rejects messages over 1 MiB, duplicate JSON object keys, non-finite JSON constants, and parser exhaustion before calling handlers. Invalid input is written to the DLQ before the source entry is acknowledged; the original raw content is not copied into the DLQ, only its SHA-256 digest is retained.

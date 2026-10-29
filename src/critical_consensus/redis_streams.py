@@ -141,21 +141,45 @@ async def ensure_consumer_group(redis_client, stream: str, group: str, *, start_
             raise
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError("non-standard JSON numeric constant")
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
 def _message_event(fields: Mapping[Any, Any]) -> tuple[dict[str, Any] | None, str | None, str]:
     normalized = {_decode(k): _decode(v) for k, v in fields.items()}
     raw = normalized.get("event")
     if not isinstance(raw, str):
         return None, "EVENT_FIELD_MISSING", ""
+    if len(raw.encode("utf-8", errors="replace")) > MAX_EVENT_BYTES:
+        return None, "EVENT_TOO_LARGE", raw
     try:
-        parsed = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+        parsed = json.loads(
+            raw,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except json.JSONDecodeError:
         return None, "INVALID_EVENT_JSON", raw
+    except (TypeError, ValueError, RecursionError):
+        # Duplicate keys, non-finite numeric constants and parser exhaustion are invalid input.
+        return None, "NON_STRICT_EVENT_JSON", raw
     if not isinstance(parsed, dict):
         return None, "EVENT_JSON_NOT_OBJECT", raw
     try:
         _validate_event(parsed)
-    except ValueError as exc:
-        # Return a stable reason code rather than logging untrusted input or exception data.
+        # The consumer independently enforces strict JSON values even if Redis was written
+        # by a different client that bypassed publish_event().
+        json.dumps(parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
         reason = str(exc).split(":", 1)[0].upper().replace(" ", "_")
         return None, f"SCHEMA_VALIDATION_FAILED:{reason}", raw
     return parsed, None, raw
