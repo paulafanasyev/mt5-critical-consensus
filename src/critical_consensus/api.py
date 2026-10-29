@@ -50,6 +50,20 @@ class GenericPayload(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+@app.get("/")
+def root() -> dict[str, Any]:
+    """Safe discovery endpoint; it does not expose credentials or enable execution."""
+    return {
+        "service": "critical-consensus-policy-api",
+        "status": "ok",
+        "message": "Policy API is running. Use /health for safe status and /docs for API documentation.",
+        "health_path": "/health",
+        "docs_path": "/docs",
+        "execution_enabled": False,
+        "live_enabled": False,
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {"status": "ok", "service": "policy-api", "execution_enabled": False,

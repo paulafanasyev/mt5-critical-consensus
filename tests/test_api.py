@@ -5,6 +5,17 @@ from critical_consensus.api import app
 client = TestClient(app)
 TOKEN = "test-bridge-secret-that-is-long-enough"
 
+def test_root_describes_api_and_points_to_health_without_enabling_execution():
+    response = client.get("/")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["service"] == "critical-consensus-policy-api"
+    assert body["health_path"] == "/health"
+    assert body["docs_path"] == "/docs"
+    assert body["execution_enabled"] is False
+    assert body["live_enabled"] is False
+
+
 
 def test_health_is_available_but_never_enables_execution():
     response = client.get("/health")
