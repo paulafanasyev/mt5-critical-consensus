@@ -18,18 +18,18 @@
     "schema_version": {"type": "integer", "const": 1},
     "snapshot_id": {"type": "string", "minLength": 1, "pattern": "\\S"},
     "source_id": {"type": "string", "minLength": 1, "pattern": "\\S"},
-    "symbol": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,32}$"},
+    "symbol": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,32}(?![\\s\\S])"},
     "bid": {"type": "number", "exclusiveMinimum": 0},
     "ask": {"type": "number", "exclusiveMinimum": 0},
     "event_time": {
       "type": "string",
       "format": "date-time",
-      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})(?![\\s\\S])"
     },
     "received_time": {
       "type": "string",
       "format": "date-time",
-      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})(?![\\s\\S])"
     }
   }
 }

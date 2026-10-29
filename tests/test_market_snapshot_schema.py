@@ -57,6 +57,22 @@ def test_schema_is_structural_and_runtime_owns_semantic_quote_checks():
     assert "CROSSED_QUOTE" in result["blockers"]
 
 
+def test_schema_and_runtime_reject_trailing_line_terminators():
+    for field, bad_value, blocker in (
+        ("symbol", "EURUSD\n", "SYMBOL_INVALID"),
+        ("event_time", valid_snapshot()["event_time"] + "\n", "EVENT_TIME_INVALID"),
+        ("received_time", valid_snapshot()["received_time"] + "\n", "RECEIVED_TIME_INVALID"),
+    ):
+        snapshot = valid_snapshot()
+        snapshot[field] = bad_value
+        assert list(VALIDATOR.iter_errors(snapshot))
+        result = validate_market_snapshot(
+            snapshot, now=NOW, max_age_seconds=5, future_skew_seconds=2
+        )
+        assert result["valid"] is False
+        assert blocker in result["blockers"]
+
+
 def test_runtime_rejects_non_datetime_now_and_boolean_freshness_policies():
     snapshot = valid_snapshot()
     bad_clock = validate_market_snapshot(
