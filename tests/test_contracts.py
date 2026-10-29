@@ -33,3 +33,11 @@ def test_agent_verdict_abstain_requires_formal_reason():
     assert list(validator.iter_errors(sample))
     sample["abstain_reason"] = "Input feed has a gap"
     assert not list(validator.iter_errors(sample))
+
+
+def test_package_version_matches_project_metadata():
+    import tomllib
+    import critical_consensus
+
+    project = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+    assert critical_consensus.__version__ == project["project"]["version"]
