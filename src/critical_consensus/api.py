@@ -11,8 +11,9 @@ import yaml
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
-from .gates import certainty_gate, chief_skeptic_pass, permission_gate
 from .audit import canonical_hash
+from .contracts import validate_contract
+from .gates import certainty_gate, chief_skeptic_pass, permission_gate
 
 ROOT = Path(os.getenv("POLICY_DIR", str(Path(__file__).resolve().parents[2] / "config")))
 CHIEF_MAX_AGE_SECONDS = 300
@@ -63,7 +64,7 @@ def evaluate_certainty(body: GenericPayload) -> dict[str, Any]:
 
 @app.post("/v1/chief/review", dependencies=[Depends(require_bridge_key)])
 def review_chief(body: GenericPayload) -> dict[str, Any]:
-    """Review Chief reasoning only when its timestamp/hash are explicit and fresh."""
+    """Review only complete, self-consistent, fresh Chief reasoning records."""
     reasoning = body.payload
     created_raw = reasoning.get("created_at")
     if not isinstance(created_raw, str) or not created_raw.strip():
@@ -93,6 +94,10 @@ def review_chief(body: GenericPayload) -> dict[str, Any]:
     if supplied_hash != canonical_hash(unsigned):
         return {"verdict": "HOLD", "passed": False, "trade_allowed": False,
                 "blockers": ["CHIEF_REASONING_HASH_MISMATCH"]}
+    valid, _ = validate_contract("chief_reasoning.schema.json", reasoning)
+    if not valid:
+        return {"verdict": "HOLD", "passed": False, "trade_allowed": False,
+                "blockers": ["CHIEF_REASONING_SCHEMA_INVALID"]}
     return chief_skeptic_pass(reasoning)
 
 
