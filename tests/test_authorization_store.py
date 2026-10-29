@@ -4,6 +4,7 @@ import os
 import uuid
 
 import psycopg
+from psycopg import sql
 import pytest
 
 from critical_consensus.authorization_store import (
@@ -18,13 +19,17 @@ pytestmark = pytest.mark.skipif(not DATABASE_URL, reason="TEST_DATABASE_URL is n
 @pytest.fixture
 def store():
     assert DATABASE_URL is not None
+    schema_name = f"test_cc_{uuid.uuid4().hex}"
+
+    with psycopg.connect(DATABASE_URL) as admin:
+        admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
 
     def connect():
-        return psycopg.connect(DATABASE_URL)
+        connection = psycopg.connect(DATABASE_URL)
+        connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name)))
+        return connection
 
     with connect() as connection:
-        connection.execute("DROP TABLE IF EXISTS user_decisions")
-        connection.execute("DROP TABLE IF EXISTS permissions")
         connection.execute(
             """
             CREATE TABLE permissions (
@@ -38,9 +43,8 @@ def store():
     result = PostgresDecisionStore(connect)
     result.ensure_schema()
     yield result
-    with connect() as connection:
-        connection.execute("DROP TABLE IF EXISTS user_decisions")
-        connection.execute("DROP TABLE IF EXISTS permissions")
+    with psycopg.connect(DATABASE_URL) as admin:
+        admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema_name)))
 
 
 def seed_permission(store, *, mode="demo", status="REQUIRE_HUMAN", expires_at=None):
@@ -120,9 +124,14 @@ def test_store_refuses_expired_permission_and_duplicate_decision_id(store):
     decision = make_decision(permission_id, now)
     receipt = make_receipt(now)
     assert store.register_verified_decision(decision, receipt, now=now)["registered"] is True
-    duplicate = store.register_verified_decision(decision, receipt, now=now)
-    assert duplicate["registered"] is False
-    assert "ALREADY_REGISTERED" in duplicate["blockers"][0]
+    duplicate_id = store.register_verified_decision(decision, receipt, now=now)
+    assert duplicate_id["registered"] is False
+    assert "ALREADY_REGISTERED" in duplicate_id["blockers"][0]
+
+    second_decision = make_decision(permission_id, now)
+    duplicate_permission = store.register_verified_decision(second_decision, make_receipt(now), now=now)
+    assert duplicate_permission["registered"] is False
+    assert "ALREADY_REGISTERED" in duplicate_permission["blockers"][0]
 
 
 def test_live_approval_requires_verified_second_factor_and_signature(store):

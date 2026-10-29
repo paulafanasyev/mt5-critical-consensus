@@ -38,9 +38,9 @@ CREATE TABLE IF NOT EXISTS user_decisions (
     CHECK (expires_at > decision_timestamp)
 )
 """
-_CREATE_INDEX = """
-CREATE INDEX IF NOT EXISTS idx_user_decisions_permission_expiry
-ON user_decisions (permission_id, expires_at)
+_CREATE_PERMISSION_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_user_decisions_permission
+ON user_decisions (permission_id)
 """
 
 
@@ -136,7 +136,7 @@ class PostgresDecisionStore:
         try:
             with self._connect() as connection:
                 connection.execute(_CREATE_TABLE)
-                connection.execute(_CREATE_INDEX)
+                connection.execute(_CREATE_PERMISSION_INDEX)
         except Exception as exc:
             raise DecisionStoreError("authorization storage is unavailable") from exc
 
@@ -206,7 +206,7 @@ class PostgresDecisionStore:
                         expires_at, payload_hash, verifier_id, verification_method,
                         verification_ref, verified_at
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (decision_id) DO NOTHING
+                    ON CONFLICT DO NOTHING
                     RETURNING decision_id
                     """,
                     (decision_id, permission_id, user_id, decision["decision"], mode,
@@ -214,7 +214,7 @@ class PostgresDecisionStore:
                      receipt.verifier_id.strip(), receipt.method, receipt.receipt_id.strip(), verified_at),
                 ).fetchone()
                 if result is None:
-                    return {"registered": False, "blockers": ["DECISION_ID_ALREADY_REGISTERED"], "trade_allowed": False}
+                    return {"registered": False, "blockers": ["DECISION_OR_PERMISSION_ALREADY_REGISTERED"], "trade_allowed": False}
                 return {"registered": True, "decision_id": decision_id, "expires_at": expires_at.isoformat(),
                         "blockers": [], "trade_allowed": False}
         except DecisionStoreError:

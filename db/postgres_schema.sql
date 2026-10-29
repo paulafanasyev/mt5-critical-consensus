@@ -119,5 +119,6 @@ CREATE TABLE IF NOT EXISTS user_decisions (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   CHECK (expires_at > decision_timestamp)
 );
-CREATE INDEX IF NOT EXISTS idx_user_decisions_permission_expiry
-  ON user_decisions (permission_id, expires_at);
+-- A permission can receive only one registered human decision; a new review needs a new permission.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_user_decisions_permission
+  ON user_decisions (permission_id);
