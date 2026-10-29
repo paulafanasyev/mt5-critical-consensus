@@ -13,7 +13,8 @@ from pydantic import BaseModel, Field
 
 from .audit import canonical_hash
 from .contracts import validate_contract
-from .gates import certainty_gate, chief_skeptic_pass, permission_gate
+from .gates import certainty_gate, permission_gate
+from .strict import chief_skeptic_pass
 
 ROOT = Path(os.getenv("POLICY_DIR", str(Path(__file__).resolve().parents[2] / "config")))
 CHIEF_MAX_AGE_SECONDS = 300
@@ -111,8 +112,6 @@ def check_permission(body: GenericPayload) -> dict[str, Any]:
 
 @app.post("/v1/authorization/check", dependencies=[Depends(require_bridge_key)])
 def check_authorization() -> None:
-    # No durable permission store or cryptographic 2FA/signature verifier exists in this scaffold.
-    # Never treat a client-supplied `permission_result` object as proof that permission was granted.
     raise HTTPException(status_code=status.HTTP_423_LOCKED,
                         detail="Authorization endpoint disabled: server-side permission state and real 2FA/signature verification are not implemented")
 
