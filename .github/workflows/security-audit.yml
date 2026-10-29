@@ -15,7 +15,9 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: python -m pip install --upgrade pip pip-audit
+      - run: python -m pip install --upgrade pip pip-audit bandit
       - run: pip install -e '.[dev]'
       - name: Audit installed dependencies against known advisories
         run: pip-audit --skip-editable
+      - name: Scan Python source with Bandit
+        run: bandit -r src -ll
