@@ -111,8 +111,7 @@ def make_bundle():
 
 
 def test_pipeline_reaches_human_gate_but_does_not_create_order():
-    bundle = make_bundle()
-    root = Path(__file__).resolve().parents[1]
+    bundle = make_bundle(); root = Path(__file__).resolve().parents[1]
     for schema_name, value in (("chief_reasoning.schema.json", bundle["chief_reasoning"]),
                                ("agent_verdict_v2.schema.json", bundle["verdicts"][0]),
                                ("peer_review.schema.json", bundle["peer_reviews"][0]),
@@ -124,16 +123,13 @@ def test_pipeline_reaches_human_gate_but_does_not_create_order():
                                compliance_status="PASS", risk_flags=[])
     assert not list(Draft202012Validator(permission_schema).iter_errors(permission_contract))
     result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
-    assert result["status"] == "REQUIRE_HUMAN"
-    assert result["trade_allowed"] is False
+    assert result["status"] == "REQUIRE_HUMAN" and result["trade_allowed"] is False
     assert result["details"]["certainty"]["status"] == "PASS"
-    assert result["details"]["chief"]["verdict"] == "CONFIRM"
-    assert "order_command" not in result
+    assert result["details"]["chief"]["verdict"] == "CONFIRM" and "order_command" not in result
     packet = result["details"]["human_review_packet"]
     assert len(packet["peer_reviews"]) == 8 and len(packet["dissenting_opinions"]) == 1
     assert packet["tail_risk_probability"] == 0.01
-    assert result["audit_chain_valid"] is True
-    assert verify_audit_chain(result["audit_events"])["valid"] is True
+    assert result["audit_chain_valid"] is True and verify_audit_chain(result["audit_events"])["valid"] is True
 
 
 def test_pipeline_does_not_trust_caller_supplied_reviewer_count():
@@ -151,12 +147,11 @@ def test_pipeline_open_challenge_blocks_certainty_gate():
         "challenge_type": "LOGIC_GAP", "status": "OPEN", "argument": "Check the calculation",
         "evidence_refs": ["calc-contradiction"], "rounds": [], "created_at": NOW.isoformat()}]
     result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
-    assert result["status"] == "GATHER_MORE"
-    assert any("OPEN_CHALLENGES_PRESENT" in x for x in result["blockers"])
+    assert result["status"] == "GATHER_MORE" and any("OPEN_CHALLENGES_PRESENT" in x for x in result["blockers"])
 
 
 def test_pipeline_rejects_tampered_chief_reasoning_hash():
-    bundle = make_bundle(); bundle["chief_reasoning"]["reasoning_hash"] = "sha256:forged-value-which-is-long-enough"
+    bundle = make_bundle(); bundle["chief_reasoning"]["reasoning_hash"] = "sha256:" + "0" * 64
     result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
     assert result["status"] == "HOLD" and result["blockers"] == ["CHIEF_REASONING_HASH_MISMATCH"]
 
@@ -170,19 +165,16 @@ def test_pipeline_live_mode_denied_by_policy():
 def test_pipeline_valid_human_approval_is_only_authorized_once():
     bundle = make_bundle()
     bundle["user_decision"] = {"decision_id": "decision-1", "decision": "APPROVE", "user_id": "operator-1",
-        "reason": "Reviewed dissent and tail risk", "permission_id": "perm-1",
-        "timestamp": NOW.isoformat(), "ttl_seconds": 300}
+        "reason": "Reviewed dissent and tail risk", "permission_id": "perm-1", "timestamp": NOW.isoformat(), "ttl_seconds": 300}
     result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
-    assert result["status"] == "AUTHORIZED_ONCE"
-    assert result["details"]["authorization"]["authorized"] is True
+    assert result["status"] == "AUTHORIZED_ONCE" and result["details"]["authorization"]["authorized"] is True
     assert result["trade_allowed"] is False and "order_command" not in result
 
 
 def test_pipeline_missing_challenge_ledger_fails_closed():
     bundle = make_bundle(); bundle.pop("challenge_records")
     result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
-    assert result["status"] == "GATHER_MORE"
-    assert any("CHALLENGE_LEDGER_MISSING" in x for x in result["blockers"])
+    assert result["status"] == "GATHER_MORE" and any("CHALLENGE_LEDGER_MISSING" in x for x in result["blockers"])
     assert result["audit_chain_valid"] is True
 
 
@@ -225,8 +217,7 @@ def test_verdict_for_another_signal_is_rejected_before_consensus():
     bundle = make_bundle(); bundle["verdicts"][0]["signal_id"] = "different-signal"
     result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
     assert result["status"] == "GATHER_MORE" and result["trade_allowed"] is False
-    assert "VERDICT_0:VERDICT_SIGNAL_ID_MISMATCH" in result["blockers"]
-    assert "certainty" not in result["details"]
+    assert "VERDICT_0:VERDICT_SIGNAL_ID_MISMATCH" in result["blockers"] and "certainty" not in result["details"]
 
 
 def test_expired_verdict_is_rejected_before_consensus():
