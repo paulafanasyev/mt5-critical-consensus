@@ -1,0 +1,30 @@
+version: 1
+permission_matrix:
+  instruments: [EURUSD, XAUUSD]
+  max_size_per_trade: 0.20
+  max_positions: 5
+  max_correlated_positions: 2
+  max_risk_per_trade_fraction: 0.005
+  daily_loss_limit_fraction: 0.02
+  max_drawdown_fraction: 0.10
+  allowed_directions: [BUY, SELL]
+  allowed_time_utc:
+    start: "07:00"
+    end: "19:00"
+  rollover_block_utc:
+    start: "20:55"
+    end: "21:10"
+  blocked_around_news: true
+  news_block_minutes_before: 15
+  news_block_minutes_after: 30
+  live_requires_signature: true
+  live_enabled: false
+  demo_enabled: true
+  blocked_flags: [sanctions, MNPI, mnpi_suspect, technical_halt, liquidity, kill_switch]
+  min_expected_rr: 1.5
+  expected_rr_tolerance_fraction: 0.10
+  require_stop_loss: true
+  require_take_profit: true
+  max_command_ttl_seconds: 600
+  require_user_approval_for_demo: true
+  require_user_approval_for_live: true
