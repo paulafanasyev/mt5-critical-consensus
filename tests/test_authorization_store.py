@@ -259,7 +259,11 @@ def test_existing_permission_status_constraint_migrates_for_consumed_state(store
         )
 
     migration_path = Path(__file__).resolve().parents[1] / "db" / "migrations" / "20261029_permission_decision_consumed.sql"
-    statements = migration_path.read_text(encoding="utf-8").split(";")
+    migration_sql = "\n".join(
+        line for line in migration_path.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("--")
+    )
+    statements = migration_sql.split(";")
     with store._connect() as connection:
         for statement in statements:
             if statement.strip():
