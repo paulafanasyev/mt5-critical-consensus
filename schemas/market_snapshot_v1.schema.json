@@ -16,13 +16,21 @@
     "received_time"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"type": "integer", "const": 1},
     "snapshot_id": {"type": "string", "minLength": 1},
     "source_id": {"type": "string", "minLength": 1},
     "symbol": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,32}$"},
     "bid": {"type": "number", "exclusiveMinimum": 0},
     "ask": {"type": "number", "exclusiveMinimum": 0},
-    "event_time": {"type": "string", "format": "date-time"},
-    "received_time": {"type": "string", "format": "date-time"}
+    "event_time": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "received_time": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    }
   }
 }
