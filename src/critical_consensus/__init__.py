@@ -9,12 +9,12 @@ from . import gates as _gates
 
 __version__ = "0.2.0"
 
-# Keep the historic gates-module import path while adding a strict public boundary.
 _unchecked_chief_skeptic_pass = _gates.chief_skeptic_pass
 
 
-def _strict_chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probability: float = 0.05,
-                               now: datetime | None = None) -> dict[str, Any]:
+def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probability: float = 0.05,
+                       now: datetime | None = None) -> dict[str, Any]:
+    """Public strict Chief gate: contract validity and freshness are mandatory."""
     result = _unchecked_chief_skeptic_pass(reasoning, max_tail_risk_probability=max_tail_risk_probability, now=now)
     blockers = list(result.get("blockers", []))
     valid, _ = validate_contract("chief_reasoning.schema.json", reasoning)
@@ -45,4 +45,22 @@ def _strict_chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_pr
     return result
 
 
-_gates.chief_skeptic_pass = _strict_chief_skeptic_pass
+_gates.chief_skeptic_pass = chief_skeptic_pass
+
+from . import pipeline as _pipeline  # noqa: E402
+
+_unchecked_evaluate_signal_bundle = _pipeline.evaluate_signal_bundle
+
+
+def evaluate_signal_bundle(bundle: Mapping[str, Any], certainty_policy: Mapping[str, Any],
+                           permission_matrix: Mapping[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+    """Public pipeline boundary; malformed inputs must never escape as an exception."""
+    try:
+        return _unchecked_evaluate_signal_bundle(bundle, certainty_policy, permission_matrix, now=now)
+    except (TypeError, ValueError, KeyError, OverflowError, AttributeError):
+        return {"status": "GATHER_MORE", "trade_allowed": False,
+                "blockers": ["INVALID_SIGNAL_BUNDLE"], "audit_events": [], "details": {}}
+
+
+_pipeline.evaluate_signal_bundle = evaluate_signal_bundle
+__all__ = ["__version__", "chief_skeptic_pass", "evaluate_signal_bundle"]
