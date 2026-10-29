@@ -111,7 +111,7 @@ def check_permission(body: GenericPayload) -> dict[str, Any]:
     return permission_gate(body.payload, _yaml("permission_matrix.yaml"))
 
 
-@app.post("/v1/authorization/check", dependencies=[Depends(require_bridge_key)])
+@app.post("/v1/authorization/check", status_code=status.HTTP_423_LOCKED, dependencies=[Depends(require_bridge_key)])
 def check_authorization() -> None:
     raise HTTPException(status_code=status.HTTP_423_LOCKED,
                         detail="Authorization endpoint disabled: server-side permission state and real 2FA/signature verification are not implemented")
@@ -122,7 +122,7 @@ def next_execution_command():
     return None
 
 
-@app.post("/v1/execution/submit", dependencies=[Depends(require_bridge_key)])
+@app.post("/v1/execution/submit", status_code=status.HTTP_423_LOCKED, dependencies=[Depends(require_bridge_key)])
 def submit_execution() -> None:
     raise HTTPException(status_code=status.HTTP_423_LOCKED,
                         detail="Execution disabled in reference scaffold; no order was sent")
