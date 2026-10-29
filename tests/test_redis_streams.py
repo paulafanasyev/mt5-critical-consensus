@@ -223,7 +223,8 @@ async def test_reclaim_pending_messages_rejects_invalid_count(count):
 @pytest.mark.parametrize("stream,group", [
     ("signals:v1", "workers"),
     ("cc:signals:v1", ""),
-    ("cc:signals:v1", "bad\\ngroup"),
+    ("cc:signals:v1", "bad\ngroup"),
+    ("cc:signals:v1", "bad\rgroup"),
     ("cc:signals:v1", "g" * 129),
 ])
 async def test_consumer_group_creation_rejects_invalid_stream_or_group(stream, group):
