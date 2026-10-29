@@ -156,6 +156,11 @@ def test_rejected_human_decision_is_consumed_but_never_authorizes(store):
     assert result["status"] == "CONSUMED_REJECT"
     assert result["trade_allowed"] is False
     assert result["blockers"] == ["USER_REJECTED"]
+    with store._connect() as connection:
+        state = connection.execute(
+            "SELECT status FROM permissions WHERE permission_id::text = %s", (permission_id,)
+        ).fetchone()
+    assert state == ("DECISION_CONSUMED",)
 
 
 def test_concurrent_consume_has_exactly_one_winner(store):
@@ -171,6 +176,11 @@ def test_concurrent_consume_has_exactly_one_winner(store):
         outcomes = list(pool.map(lambda _: consume(), range(8)))
     assert outcomes.count(True) == 1
     assert outcomes.count(False) == 7
+    with store._connect() as connection:
+        state = connection.execute(
+            "SELECT status FROM permissions WHERE permission_id::text = %s", (permission_id,)
+        ).fetchone()
+    assert state == ("DECISION_CONSUMED",)
 
 
 def test_store_fails_closed_for_unverified_receipt_and_ttl_outside_cap(store):
@@ -184,3 +194,38 @@ def test_store_fails_closed_for_unverified_receipt_and_ttl_outside_cap(store):
     result = store.register_verified_decision(decision, {"verified": True}, now=now)
     assert result["registered"] is False
     assert "RECEIPT_REQUIRED" in result["blockers"][0]
+
+
+def test_consumed_approval_closes_permission_without_granting_trade(store):
+    permission_id, now = seed_permission(store)
+    decision = make_decision(permission_id, now)
+    assert store.register_verified_decision(decision, make_receipt(now), now=now)["registered"] is True
+
+    result = store.consume_decision(
+        {"status": "REQUIRE_HUMAN", "permission_id": permission_id}, decision,
+        now=now + timedelta(seconds=1),
+    )
+    assert result["status"] == "CONSUMED_APPROVE"
+    assert result["trade_allowed"] is False
+    with store._connect() as connection:
+        state = connection.execute(
+            "SELECT status FROM permissions WHERE permission_id::text = %s", (permission_id,)
+        ).fetchone()
+    assert state == ("DECISION_CONSUMED",)
+
+
+def test_revoked_permission_cannot_consume_registered_decision(store):
+    permission_id, now = seed_permission(store)
+    decision = make_decision(permission_id, now)
+    assert store.register_verified_decision(decision, make_receipt(now), now=now)["registered"] is True
+    with store._connect() as connection:
+        connection.execute("UPDATE permissions SET status = 'DENY' WHERE permission_id::text = %s",
+                           (permission_id,))
+
+    result = store.consume_decision(
+        {"status": "REQUIRE_HUMAN", "permission_id": permission_id}, decision,
+        now=now + timedelta(seconds=1),
+    )
+    assert result["consumed"] is False
+    assert result["status"] == "DENY"
+    assert "PERMISSION_NOT_PENDING_HUMAN_APPROVAL" in result["blockers"]

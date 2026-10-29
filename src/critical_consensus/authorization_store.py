@@ -245,6 +245,27 @@ class PostgresDecisionStore:
             return {"consumed": False, "status": "DENY", "blockers": ["PERMISSION_ID_MISMATCH"], "trade_allowed": False}
         try:
             with self._connect() as connection:
+                # Lock the authoritative permission row first. A concurrent revocation or
+                # expiry must serialize with consumption rather than race the decision update.
+                permission_row = connection.execute(
+                    "SELECT status, mode, expires_at FROM permissions WHERE permission_id::text = %s FOR UPDATE",
+                    (permission_id,),
+                ).fetchone()
+                if permission_row is None:
+                    return {"consumed": False, "status": "DENY",
+                            "blockers": ["PERMISSION_NOT_FOUND"], "trade_allowed": False}
+                permission_status, permission_mode, permission_expiry = permission_row
+                if permission_status != "REQUIRE_HUMAN" or permission_mode not in {"demo", "live"}:
+                    return {"consumed": False, "status": "DENY",
+                            "blockers": ["PERMISSION_NOT_PENDING_HUMAN_APPROVAL"], "trade_allowed": False}
+                if (not isinstance(permission_expiry, datetime) or permission_expiry.tzinfo is None
+                        or permission_expiry.utcoffset() is None):
+                    return {"consumed": False, "status": "DENY",
+                            "blockers": ["PERMISSION_EXPIRY_INVALID"], "trade_allowed": False}
+                if permission_expiry.astimezone(timezone.utc) <= current:
+                    return {"consumed": False, "status": "DENY",
+                            "blockers": ["PERMISSION_EXPIRED"], "trade_allowed": False}
+
                 row = connection.execute(
                     """
                     UPDATE user_decisions AS d
@@ -274,6 +295,23 @@ class PostgresDecisionStore:
                     return {"consumed": False, "status": "DENY",
                             "blockers": ["DECISION_UNREGISTERED_EXPIRED_MISMATCHED_OR_REPLAYED"],
                             "trade_allowed": False}
+                # This is a consumed decision, not an authorization grant. Close the
+                # permission state for both APPROVE and REJECT until a separately audited
+                # authorization/execution boundary is implemented.
+                closed = connection.execute(
+                    """
+                    UPDATE permissions
+                    SET status = 'DECISION_CONSUMED'
+                    WHERE permission_id::text = %s
+                      AND status = 'REQUIRE_HUMAN'
+                      AND mode = %s
+                      AND expires_at > %s
+                    """,
+                    (permission_id, permission_mode, current),
+                )
+                if closed.rowcount != 1:
+                    # Raise to roll the transaction back, including consumed_at.
+                    raise DecisionStoreError("permission state changed during decision consumption")
                 status_value = "CONSUMED_APPROVE" if row[0] == "APPROVE" else "CONSUMED_REJECT"
                 blockers = [] if row[0] == "APPROVE" else ["USER_REJECTED"]
                 return {"consumed": True, "status": status_value, "decision_id": decision_id,

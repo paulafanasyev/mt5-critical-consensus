@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS permissions (
   permission_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   signal_id UUID NOT NULL,
   mode TEXT NOT NULL CHECK (mode IN ('demo','live')),
-  status TEXT NOT NULL CHECK (status IN ('DENY','REQUIRE_HUMAN','ALLOW_ONCE','EXPIRED')),
+  status TEXT NOT NULL CHECK (status IN ('DENY','REQUIRE_HUMAN','ALLOW_ONCE','EXPIRED','DECISION_CONSUMED')),
   request JSONB NOT NULL,
   decision JSONB,
   expires_at TIMESTAMPTZ NOT NULL,
