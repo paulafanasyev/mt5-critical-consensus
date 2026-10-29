@@ -20,7 +20,7 @@ STREAM_DLQ = "cc:dead-letter:v1"
 
 _REQUIRED_EVENT_FIELDS = {"event_id", "event_type", "schema_version", "created_at", "payload"}
 _RFC3339_RE = re.compile(
-    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
 )
 _MAX_EVENT_ID_LENGTH = 128
 _MAX_EVENT_TYPE_LENGTH = 128
