@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/critical-consensus/market_snapshot_v1.schema.json",
+  "title": "Read-only Market Snapshot V1",
+  "description": "Normalized quote observation for analysis and paper simulation only; not an order instruction.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "snapshot_id",
+    "source_id",
+    "symbol",
+    "bid",
+    "ask",
+    "event_time",
+    "received_time"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "snapshot_id": {"type": "string", "minLength": 1},
+    "source_id": {"type": "string", "minLength": 1},
+    "symbol": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,32}$"},
+    "bid": {"type": "number", "exclusiveMinimum": 0},
+    "ask": {"type": "number", "exclusiveMinimum": 0},
+    "event_time": {"type": "string", "format": "date-time"},
+    "received_time": {"type": "string", "format": "date-time"}
+  }
+}
