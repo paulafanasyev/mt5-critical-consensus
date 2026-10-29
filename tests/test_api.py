@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 from fastapi.testclient import TestClient
 
 from critical_consensus.api import app
@@ -75,3 +77,59 @@ def test_disabled_endpoints_document_locked_status_in_openapi():
         responses = spec["paths"][path]["post"]["responses"]
         assert "423" in responses
         assert "200" not in responses
+
+
+def _market_snapshot(**overrides):
+    now = datetime.now(timezone.utc)
+    snapshot = {
+        "schema_version": 1, "snapshot_id": "api-snapshot-1",
+        "source_id": "untrusted-caller-label", "symbol": "EURUSD",
+        "bid": 1.0840, "ask": 1.0842,
+        "event_time": (now - timedelta(seconds=1)).isoformat(),
+        "received_time": now.isoformat(),
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
+def test_market_snapshot_api_accepts_fresh_valid_quote_without_authorizing_trade(monkeypatch):
+    monkeypatch.setenv("MT5_BRIDGE_TOKEN", TOKEN)
+    response = client.post("/v1/market/snapshot/validate", headers={"X-Bridge-Key": TOKEN},
+                           json={"payload": _market_snapshot()})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "VALID_READ_ONLY_SNAPSHOT"
+    assert body["valid"] is True
+    assert body["trade_allowed"] is False
+    assert body["blockers"] == []
+    assert "order_command" not in body
+
+
+def test_market_snapshot_api_rejects_schema_invalid_payload(monkeypatch):
+    monkeypatch.setenv("MT5_BRIDGE_TOKEN", TOKEN)
+    response = client.post("/v1/market/snapshot/validate", headers={"X-Bridge-Key": TOKEN},
+                           json={"payload": {"symbol": "EURUSD", "bid": 1.0, "ask": 1.1}})
+    assert response.status_code == 200
+    assert response.json()["status"] == "REJECTED"
+    assert response.json()["trade_allowed"] is False
+    assert "MARKET_SNAPSHOT_SCHEMA_INVALID" in response.json()["blockers"]
+
+
+def test_market_snapshot_api_rejects_crossed_quotes_and_stale_event_time(monkeypatch):
+    monkeypatch.setenv("MT5_BRIDGE_TOKEN", TOKEN)
+    headers = {"X-Bridge-Key": TOKEN}
+    crossed = client.post("/v1/market/snapshot/validate", headers=headers,
+                          json={"payload": _market_snapshot(bid=1.2, ask=1.1)}).json()
+    stale = client.post("/v1/market/snapshot/validate", headers=headers,
+                         json={"payload": _market_snapshot(event_time=(datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat())}).json()
+    assert crossed["valid"] is False
+    assert "CROSSED_QUOTE" in crossed["blockers"]
+    assert stale["valid"] is False
+    assert "QUOTE_STALE" in stale["blockers"]
+    assert crossed["trade_allowed"] is False and stale["trade_allowed"] is False
+
+
+def test_market_snapshot_api_requires_bridge_key(monkeypatch):
+    monkeypatch.setenv("MT5_BRIDGE_TOKEN", TOKEN)
+    response = client.post("/v1/market/snapshot/validate", json={"payload": _market_snapshot()})
+    assert response.status_code == 401

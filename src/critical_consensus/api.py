@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from .audit import canonical_hash
 from .contracts import validate_contract
 from .gates import certainty_gate, permission_gate
+from .market_data import validate_market_snapshot
 from .strict import chief_skeptic_pass
 
 ROOT = Path(os.getenv("POLICY_DIR", str(Path(__file__).resolve().parents[2] / "config")))
@@ -123,6 +124,32 @@ def check_permission(body: GenericPayload) -> dict[str, Any]:
         return {"status": "DENY", "allowed": False, "trade_allowed": False,
                 "blockers": ["PERMISSION_REQUEST_SCHEMA_INVALID"]}
     return permission_gate(body.payload, _yaml("permission_matrix.yaml"))
+
+
+
+
+@app.post("/v1/market/snapshot/validate", dependencies=[Depends(require_bridge_key)])
+def validate_market_snapshot_endpoint(body: GenericPayload) -> dict[str, Any]:
+    """Validate a normalized quote snapshot only; never stores it or authorizes a trade."""
+    schema_valid, _ = validate_contract("market_snapshot_v1.schema.json", body.payload)
+    if not schema_valid:
+        return {"status": "REJECTED", "valid": False, "trade_allowed": False,
+                "blockers": ["MARKET_SNAPSHOT_SCHEMA_INVALID"]}
+
+    policy = _yaml("market_snapshot_policy.yaml")
+    validation = validate_market_snapshot(
+        body.payload,
+        max_age_seconds=policy.get("max_age_seconds"),
+        future_skew_seconds=policy.get("future_skew_seconds"),
+    )
+    is_valid = validation.get("valid") is True
+    return {
+        "status": "VALID_READ_ONLY_SNAPSHOT" if is_valid else "REJECTED",
+        "valid": is_valid,
+        "trade_allowed": False,
+        "blockers": list(validation.get("blockers", [])),
+        "validation": validation,
+    }
 
 
 @app.post("/v1/authorization/check", status_code=status.HTTP_423_LOCKED, dependencies=[Depends(require_bridge_key)])

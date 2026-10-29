@@ -1,0 +1,4 @@
+# Server-owned freshness policy for read-only market snapshots.
+# Source IDs are labels, not proof of feed authenticity.
+max_age_seconds: 5
+future_skew_seconds: 1

@@ -15,12 +15,14 @@
 - `src/critical_consensus/gates.py` — self-adversarial checks, peer-review validation, challenge loop, fail-closed certainty/chief/permission/authorization gates.
 - `src/critical_consensus/pipeline.py` — orchestration of existing agent outputs through Certainty → Chief → Permission → human approval; it never creates an order.
 - `src/critical_consensus/calibration.py` — Brier score, shrinkage penalty, weighted consensus; явные ограничения эвристики.
-- `src/critical_consensus/api.py` — FastAPI policy endpoints; authorization and order submission endpoints deliberately disabled until durable permission state and a real 2FA/signature verifier exist.
+- `src/critical_consensus/api.py` — FastAPI policy endpoints, including protected read-only market-snapshot validation; authorization and order submission remain deliberately disabled until a real 2FA/signature verifier and a separately audited execution boundary exist.
+- `src/critical_consensus/market_data.py`, `src/critical_consensus/mt5_readonly.py` — fail-closed snapshot checks and a quote-only adapter for an external MT5 host; its CI test uses a fake terminal client.
+- `src/critical_consensus/authorization_store.py` — PostgreSQL one-time decision registry with atomic consume/replay prevention; not connected to public authorization API and does not authorize trades.
 - `src/critical_consensus/redis_streams.py` — idempotent event publishing, consumer-group helpers, retry handling and DLQ (at-least-once; worker deployment is not included).
 - `schemas/` — JSON Schema Draft 2020-12 для 11 контрактов.
 - `config/` — deny-by-default policy thresholds и permissions.
 - `mql5/CriticalConsensusEA.mq5` — демонстрационный EA: demo account only, disabled by default, TTL/SL/TP/slippage/idempotency checks.
-- `db/postgres_schema.sql`, `neo4j/schema.cypher` — минимальные схемы хранения и графа.
+- `db/postgres_schema.sql`, `db/migrations/20261029_permission_decision_consumed.sql`, `neo4j/schema.cypher` — схемы хранения/графа и миграция статуса решения.
 - `tests/` — adversarial unit tests.
 - `.github/workflows/security-audit.yml` — checks installed Python dependencies for known advisories on push, pull request, and weekly schedule.
 - `docs/` — архитектура, формулы, пример trace и недельный roadmap.

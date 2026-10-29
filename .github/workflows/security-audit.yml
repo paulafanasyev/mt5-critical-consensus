@@ -1,6 +1,7 @@
 name: security-audit
 on:
   push:
+    branches: [main]
   pull_request:
   schedule:
     - cron: "23 5 * * 1"
