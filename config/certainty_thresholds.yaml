@@ -1,0 +1,28 @@
+version: 1
+near_certainty_threshold: 0.98
+consensus_score_threshold: 0.98
+min_reviewers_per_verdict: 2
+max_resolution_rounds: 3
+brier_threshold: 0.12
+min_calibration_sample_size: 30
+dissent_rate_floor: 0.10
+min_dissent_samples: 30
+groupthink_alarm_threshold: 0.10
+source_credibility_threshold: 0.75
+source_max_age_seconds: 900
+contradiction_lookback_hours: 6
+required_independent_sources_for_news_or_rumor: 2
+false_certainty_rate_max: 0.05
+min_false_certainty_samples: 30
+fail_action: GATHER_MORE
+deadlock_action: ESCALATE
+mandatory_agents:
+  - PlatformScoutAgent
+  - GlobalNewsAgent
+  - TechnicalAnalystAgent
+  - RiskManagerAgent
+  - ComplianceAgent
+  - ContradictionAgent
+  - DevilAdvocateAgent
+  - PortfolioAgent
+  - QuantModelAgent
