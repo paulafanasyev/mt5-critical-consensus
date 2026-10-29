@@ -828,8 +828,8 @@ def user_authorization_gate(permission_result: Mapping[str, Any], decision: Mapp
         if decision.get("signature_verified") is not True: blockers.append("LIVE_SIGNATURE_REQUIRED")
     if blockers:
         return {"status": "DENY", "authorized": False, "blockers": sorted(set(blockers)), "trade_allowed": False}
-    return {"status": "ALLOW_ONCE", "authorized": True, "blockers": [],
-            "user_id": decision.get("user_id"), "timestamp": decision.get("timestamp"),
-            "permission_id": decision.get("permission_id"), "trade_allowed": False,
-            "note": "One-time authorization metadata only; execution must revalidate signature, expiry, current price, SL/TP and idempotency."}
+    return {"status": "DENY", "authorized": False,
+            "blockers": ["DURABLE_REPLAY_PROTECTION_NOT_IMPLEMENTED"], "trade_allowed": False,
+            "decision_id": decision.get("decision_id"),
+            "note": "Approval metadata is structurally valid, but no persistent decision-idempotency store or replay protection exists; authorization is denied."}
 
