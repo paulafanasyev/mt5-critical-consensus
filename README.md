@@ -81,7 +81,7 @@ assert result["trade_allowed"] is False
 
 ## Проверка текущего каркаса
 
-- Последний локальный запуск: `pytest -q` — **77 тестов PASS** (синтетические тесты функций и API, не брокерные испытания). Тестируйте повторно после каждого изменения.
+- Локальный исходный архив: `pytest -q` — **77 тестов PASS**. Последний GitHub Actions run на `main` — **83 passed in 0.81s**, без предупреждений pytest: [workflow run](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40848990804). CI закреплён на `ubuntu-22.04`, использует `actions/checkout@v7`, `actions/setup-python@v7` и `httpx2` для TestClient. Это синтетические тесты функций/API, а не брокерные испытания.
 - Проверяются fail-closed gates, integrity binding между ChiefReasoning/consensus/source summary и PermissionRequest, выдача полного human review packet, hash chain, API key gate и Redis Streams helpers.
 - Проверка зелёных тестов доказывает поведение локальных функций на синтетических входах, но не проверяет брокер, MQL5-компиляцию, реальную очередь, рыночные данные или доходность.
 - ChiefReasoning hash вычисляется по каноническому JSON без поля `reasoning_hash`; изменение любого шага делает hash невалидным.
