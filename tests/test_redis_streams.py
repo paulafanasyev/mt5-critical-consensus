@@ -20,11 +20,14 @@ class FakeRedis:
 
     async def eval(self, script, numkeys, dedupe_key, stream, serialized, ttl):
         if dedupe_key in self.values:
-            return self.values[dedupe_key]
+            stream_id, old_serialized = self.values[dedupe_key]
+            if old_serialized != serialized:
+                raise RuntimeError("EVENT_ID_COLLISION: event_id reused with different content")
+            return stream_id
         self.counter += 1
         stream_id = f"{self.counter}-0"
         self.streams.setdefault(stream, []).append((stream_id, {"event": serialized}))
-        self.values[dedupe_key] = stream_id
+        self.values[dedupe_key] = (stream_id, serialized)
         return stream_id
 
     async def xgroup_create(self, stream, group, id="0-0", mkstream=True):
@@ -111,3 +114,38 @@ async def test_invalid_json_is_dead_lettered_and_acked():
     assert stats["invalid"] == 1
     assert stats["dead_lettered"] == 1
     assert redis.acks == [("cc:signals:v1", "workers", "12-0")]
+
+
+@pytest.mark.asyncio
+async def test_publish_event_rejects_reused_event_id_with_different_content():
+    redis = FakeRedis()
+    first_event = event("same-id")
+    await publish_event(redis, "cc:signals:v1", first_event)
+    altered = event("same-id")
+    altered["payload"] = {"signal_id": "sig-2"}
+    with pytest.raises(RuntimeError, match="EVENT_ID_COLLISION"):
+        await publish_event(redis, "cc:signals:v1", altered)
+    assert len(redis.streams["cc:signals:v1"]) == 1
+
+
+@pytest.mark.parametrize("field,value", [
+    ("event_id", 123),
+    ("event_id", {"id": "e-1"}),
+    ("event_type", ["SIGNAL"]),
+    ("created_at", 1793280000),
+    ("created_at", "2026-10-29 12:00:00+00:00"),
+    ("created_at", "2026-10-29T12:00:00"),
+])
+@pytest.mark.asyncio
+async def test_publish_event_rejects_coerced_or_non_rfc3339_fields(field, value):
+    malformed = event()
+    malformed[field] = value
+    with pytest.raises(ValueError):
+        await publish_event(FakeRedis(), "cc:signals:v1", malformed)
+
+
+@pytest.mark.asyncio
+async def test_publish_event_rejects_noninteger_or_oversized_dedupe_ttl():
+    for ttl in (True, 1.5, "3600", 0, 604801):
+        with pytest.raises(ValueError, match="dedupe_ttl_seconds"):
+            await publish_event(FakeRedis(), "cc:signals:v1", event(), dedupe_ttl_seconds=ttl)

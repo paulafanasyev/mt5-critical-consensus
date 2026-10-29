@@ -84,3 +84,10 @@ flowchart TB
 - `PostgresAuditStore` сохраняет hash-linked trace целиком одной транзакцией, проверяет её после записи и поддерживает идемпотентный повтор того же trace. Время события хранится одновременно в UTC timestamp и исходной строковой форме, поскольку именно строка включена в canonical hash.
 - Заголовок trace и отдельные события защищены от UPDATE/DELETE триггерами и правами для PUBLIC; в production роль приложения должна иметь минимальные права, а выгрузки следует защищать WORM/object-lock.
 - `evaluate_signal_bundle(..., audit_store=store)` теперь поддерживает явное внедрение такого хранилища. Если запись не подтверждена как сохранённая и проверенная, итог становится `DENY` с `AUDIT_PERSISTENCE_FAILED`. По умолчанию хранилище не создаётся автоматически: deployment должен передать настроенный адаптер и connection factory. Успешное сохранение не создаёт разрешение на торговлю.
+
+
+## Redis Streams envelope and dedupe
+
+- `publish_event` accepts strict string IDs/types and bounded RFC3339 timestamps; it does not coerce integers or objects to strings.
+- Dedupe records retain the canonical serialized event beside the stream ID. A repeated `event_id` with identical content returns the original stream ID; reusing it with different content raises `EVENT_ID_COLLISION` instead of silently hiding the changed event.
+- The publisher uses a bounded dedupe TTL of 1–604800 seconds. Redis remains at-least-once; consumers still need a durable idempotency inbox around side effects.
