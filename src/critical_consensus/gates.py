@@ -357,12 +357,17 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dic
     sources = list(raw_sources) if isinstance(raw_sources, Sequence) and not isinstance(raw_sources, (str, bytes)) else []
     sources_ok = bool(sources)
     seen_source_ids: set[str] = set()
+    duplicate_source_ids = False
     independence_groups: set[str] = set()
     for source in sources:
         if not isinstance(source, Mapping):
             sources_ok = False
             continue
-        source_id = str(source.get("source_id", "")).strip()
+        raw_source_id = source.get("source_id")
+        source_id = raw_source_id.strip() if isinstance(raw_source_id, str) else ""
+        if source_id and source_id in seen_source_ids:
+            duplicate_source_ids = True
+            sources_ok = False
         credibility = _finite_float(source.get("credibility"))
         age = _finite_float(source.get("age_seconds"))
         ttl = _finite_float(source.get("ttl_seconds"))
@@ -378,6 +383,8 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dic
     checks["key_sources_fresh_and_credible"] = sources_ok
     if not sources_ok:
         reasons.append("KEY_SOURCE_MISSING_STALE_LOW_CREDIBILITY_OR_MNPI_SUSPECT")
+    if duplicate_source_ids:
+        reasons.append("KEY_SOURCE_IDS_INVALID_OR_DUPLICATE")
     if payload.get("news_or_rumor") is True:
         min_independent_raw = _finite_float(thresholds.get("required_independent_sources_for_news_or_rumor", 2))
         min_independent = int(min_independent_raw) if min_independent_raw is not None and min_independent_raw >= 1 else 2
@@ -388,8 +395,15 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dic
 
     da = payload.get("devil_advocate_report")
     hypotheses = da.get("counter_hypotheses", []) if isinstance(da, Mapping) else []
-    valid_hypotheses = [h for h in hypotheses if isinstance(h, Mapping) and str(h.get("hypothesis", "")).strip()
-                        and isinstance(h.get("evidence_refs"), Sequence) and not isinstance(h.get("evidence_refs"), (str, bytes)) and len(h.get("evidence_refs")) > 0]
+    valid_hypotheses = [
+        h for h in hypotheses
+        if isinstance(h, Mapping)
+        and isinstance(h.get("hypothesis"), str) and h["hypothesis"].strip()
+        and isinstance(h.get("evidence_refs"), Sequence)
+        and not isinstance(h.get("evidence_refs"), (str, bytes))
+        and bool(h.get("evidence_refs"))
+        and all(isinstance(ref, str) and ref.strip() for ref in h["evidence_refs"])
+    ]
     da_ok = isinstance(da, Mapping) and da.get("status") == "PASS" and len(valid_hypotheses) >= 3
     checks["devil_advocate_has_three_evidence_backed_hypotheses"] = da_ok
     if not da_ok:
@@ -459,15 +473,16 @@ def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probabilit
     if not isinstance(reasoning, Mapping):
         return {"verdict": "HOLD", "passed": False, "blockers": ["INVALID_CHIEF_REASONING"], "trade_allowed": False}
     required = list("abcdefghi")
-    if not str(reasoning.get("reasoning_id", "")).strip():
-        blockers_identity = ["CHIEF_REASONING_ID_MISSING"]
-    else:
-        blockers_identity = []
-    if not str(reasoning.get("signal_id", "")).strip():
+    blockers_identity: list[str] = []
+    reasoning_id = reasoning.get("reasoning_id")
+    signal_id = reasoning.get("signal_id")
+    if not isinstance(reasoning_id, str) or not reasoning_id.strip():
+        blockers_identity.append("CHIEF_REASONING_ID_MISSING")
+    if not isinstance(signal_id, str) or not signal_id.strip():
         blockers_identity.append("CHIEF_SIGNAL_ID_MISSING")
     created_at = reasoning.get("created_at")
-    if not created_at:
-        blockers_identity.append("CHIEF_CREATED_AT_MISSING")
+    if not isinstance(created_at, str) or not created_at.strip():
+        blockers_identity.append("CHIEF_CREATED_AT_MISSING_OR_INVALID")
     else:
         try:
             chief_created_at = _parse_time(created_at)
@@ -485,9 +500,11 @@ def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probabilit
             probability = _finite_float(scenario.get("probability"))
             evidence = scenario.get("evidence_refs")
             evidence_ok = (isinstance(evidence, Sequence) and not isinstance(evidence, (str, bytes))
-                           and bool(evidence) and all(str(item).strip() for item in evidence))
-            if (str(scenario.get("scenario", "")).strip() and probability is not None
-                    and 0 <= probability <= 1 and str(scenario.get("impact", "")).strip() and evidence_ok):
+                           and bool(evidence) and all(isinstance(item, str) and item.strip() for item in evidence))
+            scenario_name = scenario.get("scenario")
+            impact = scenario.get("impact")
+            if (isinstance(scenario_name, str) and scenario_name.strip() and probability is not None
+                    and 0 <= probability <= 1 and isinstance(impact, str) and impact.strip() and evidence_ok):
                 valid_scenarios.append(scenario)
     if not valid_scenarios:
         blockers_identity.append("CHIEF_TAIL_RISK_SCENARIOS_MISSING_OR_INVALID")
@@ -501,8 +518,10 @@ def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probabilit
         if not isinstance(item, Mapping):
             continue
         evidence = item.get("evidence_refs")
-        has_evidence = isinstance(evidence, Sequence) and not isinstance(evidence, (str, bytes)) and bool(evidence) and all(str(x).strip() for x in evidence)
-        if item.get("passed") is not True or not str(item.get("detail", "")).strip() or not has_evidence:
+        has_evidence = (isinstance(evidence, Sequence) and not isinstance(evidence, (str, bytes))
+                        and bool(evidence) and all(isinstance(x, str) and x.strip() for x in evidence))
+        detail = item.get("detail")
+        if item.get("passed") is not True or not isinstance(detail, str) or not detail.strip() or not has_evidence:
             failed.append(step)
     blockers: list[str] = list(blockers_identity)
     raw_challenges = reasoning.get("open_challenges")
@@ -516,8 +535,12 @@ def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probabilit
     if max_tail_risk is None or not 0 <= max_tail_risk <= 1:
         blockers.append("INVALID_CHIEF_TAIL_RISK_POLICY")
         max_tail_risk = 0.05
-    reasons_against = list(dict.fromkeys(str(x).strip() for x in reasoning.get("reasons_against", []) if str(x).strip())) if isinstance(reasoning.get("reasons_against", []), Sequence) and not isinstance(reasoning.get("reasons_against", []), (str, bytes)) else []
-    if len(reasons_against) < 5:
+    raw_reasons_against = reasoning.get("reasons_against")
+    reasons_are_strings = (isinstance(raw_reasons_against, Sequence)
+                           and not isinstance(raw_reasons_against, (str, bytes))
+                           and all(isinstance(x, str) and x.strip() for x in raw_reasons_against))
+    reasons_against = list(dict.fromkeys(x.strip() for x in raw_reasons_against)) if reasons_are_strings else []
+    if not reasons_are_strings or len(reasons_against) < 5:
         blockers.append("CHIEF_REQUIRES_FIVE_DISTINCT_REASONS_AGAINST")
     if missing:
         blockers.append("MISSING_CHIEF_STEPS:" + ",".join(missing))
@@ -533,11 +556,15 @@ def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probabilit
         snapshot_records = [x for x in ledger_snapshot if isinstance(x, Mapping)]
         if len(snapshot_records) != len(ledger_snapshot):
             blockers.append("CHIEF_CHALLENGE_LEDGER_INVALID")
-        challenge_ids = sorted(str(x.get("challenge_id", "")).strip() for x in snapshot_records)
-        supplied_reviewed = sorted(str(x).strip() for x in reviewed_ids)
-        if not all(challenge_ids) or challenge_ids != supplied_reviewed or len(set(challenge_ids)) != len(challenge_ids):
+        challenge_ids_raw = [x.get("challenge_id") for x in snapshot_records]
+        reviewed_ids_valid = all(isinstance(x, str) and x.strip() for x in reviewed_ids)
+        challenge_ids_valid = all(isinstance(x, str) and x.strip() for x in challenge_ids_raw)
+        challenge_ids = sorted(x.strip() for x in challenge_ids_raw if isinstance(x, str))
+        supplied_reviewed = sorted(x.strip() for x in reviewed_ids if isinstance(x, str))
+        if (not challenge_ids_valid or not reviewed_ids_valid or challenge_ids != supplied_reviewed
+                or len(set(challenge_ids)) != len(challenge_ids)):
             blockers.append("CHIEF_DID_NOT_REVIEW_ALL_CHALLENGES")
-        if any(str(x.get("status", "OPEN")).upper() not in {"RESOLVED"} for x in snapshot_records):
+        if any(x.get("status") != "RESOLVED" for x in snapshot_records):
             blockers.append("CHIEF_CHALLENGE_LEDGER_CONTAINS_UNRESOLVED_CHALLENGE")
         if reasoning.get("challenge_ledger_hash") != canonical_hash(list(ledger_snapshot)):
             blockers.append("CHIEF_CHALLENGE_LEDGER_HASH_MISMATCH")
@@ -751,9 +778,17 @@ def user_authorization_gate(permission_result: Mapping[str, Any], decision: Mapp
     if not isinstance(permission_result, Mapping) or not isinstance(decision, Mapping):
         return {"status": "DENY", "authorized": False, "blockers": ["INVALID_AUTHORIZATION_PAYLOAD"], "trade_allowed": False}
     if permission_result.get("status") != "REQUIRE_HUMAN": blockers.append("PERMISSION_NOT_PENDING_HUMAN_APPROVAL")
-    if str(decision.get("decision", "")).upper() != "APPROVE": blockers.append("USER_DID_NOT_APPROVE")
-    if not str(decision.get("user_id", "")).strip(): blockers.append("USER_ID_MISSING")
-    if not str(decision.get("reason", "")).strip(): blockers.append("DECISION_REASON_MISSING")
+    decision_id = decision.get("decision_id")
+    if not isinstance(decision_id, str) or not decision_id.strip():
+        blockers.append("DECISION_ID_MISSING")
+    if decision.get("decision") != "APPROVE":
+        blockers.append("USER_DID_NOT_APPROVE")
+    if not isinstance(decision.get("user_id"), str) or not decision["user_id"].strip():
+        blockers.append("USER_ID_MISSING")
+    if not isinstance(decision.get("reason"), str) or not decision["reason"].strip():
+        blockers.append("DECISION_REASON_MISSING")
+    if not isinstance(decision.get("permission_id"), str) or not decision["permission_id"].strip():
+        blockers.append("PERMISSION_ID_MISMATCH")
     if not permission_result.get("permission_id") or decision.get("permission_id") != permission_result.get("permission_id"):
         blockers.append("PERMISSION_ID_MISMATCH")
     mode = str(permission_result.get("mode", "")).lower()
@@ -761,14 +796,18 @@ def user_authorization_gate(permission_result: Mapping[str, Any], decision: Mapp
         blockers.append("PERMISSION_MODE_MISSING_OR_INVALID")
     try:
         current = _current_utc(now)
-        decision_at = _parse_time(decision.get("timestamp", ""))
+        timestamp_value = decision.get("timestamp")
+        if not isinstance(timestamp_value, str) or not timestamp_value.strip():
+            raise ValueError("decision timestamp must be a string")
+        decision_at = _parse_time(timestamp_value)
         age = (current - decision_at).total_seconds()
-        ttl_raw = _finite_float(decision.get("ttl_seconds", max_ttl_seconds))
+        ttl_value = decision.get("ttl_seconds")
         if age < -max_future_skew_seconds: blockers.append("DECISION_TIMESTAMP_IN_FUTURE")
-        if ttl_raw is None or ttl_raw <= 0: blockers.append("INVALID_DECISION_TTL")
-        else:
-            ttl = min(max_ttl_seconds, ttl_raw)
-            if age > ttl: blockers.append("DECISION_EXPIRED")
+        if (isinstance(ttl_value, bool) or not isinstance(ttl_value, int)
+                or not 1 <= ttl_value <= min(max_ttl_seconds, 600)):
+            blockers.append("INVALID_DECISION_TTL")
+        elif age > ttl_value:
+            blockers.append("DECISION_EXPIRED")
         permission_expiry_raw = permission_result.get("expires_at")
         if not permission_expiry_raw:
             blockers.append("PERMISSION_EXPIRY_MISSING")
