@@ -1,8 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://example.invalid/critical-consensus/market_snapshot_v1.schema.json",
   "title": "Read-only Market Snapshot V1",
-  "description": "Normalized quote observation for analysis and paper simulation only; not an order instruction.",
+  "description": "Structural contract for a normalized quote observation used for analysis and paper simulation only. This schema is not a complete market-data integrity gate: consumers must also use validate_market_snapshot for finite-number checks, crossed-quote checks, clock ordering, and freshness policy.",
   "type": "object",
   "additionalProperties": false,
   "required": [

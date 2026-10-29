@@ -72,8 +72,10 @@ def validate_market_snapshot(
     if unknown_fields:
         blockers.append("UNKNOWN_FIELDS")
 
+    current = datetime.now(timezone.utc) if now is None else now
+    if not isinstance(current, datetime):
+        return {"valid": False, "blockers": ["CURRENT_TIME_INVALID"]}
     try:
-        current = datetime.now(timezone.utc) if now is None else now
         if current.tzinfo is None or current.utcoffset() is None:
             raise ValueError("timezone required")
         current = current.astimezone(timezone.utc)

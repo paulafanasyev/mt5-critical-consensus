@@ -44,3 +44,41 @@ def test_schema_and_runtime_both_reject_whitespace_only_identifiers():
         )
         assert result["valid"] is False
         assert f"{field.upper()}_MISSING" in result["blockers"]
+
+
+def test_schema_is_structural_and_runtime_owns_semantic_quote_checks():
+    crossed = valid_snapshot()
+    crossed["bid"], crossed["ask"] = crossed["ask"], crossed["bid"]
+    assert not list(VALIDATOR.iter_errors(crossed))
+    result = validate_market_snapshot(
+        crossed, now=NOW, max_age_seconds=5, future_skew_seconds=2
+    )
+    assert result["valid"] is False
+    assert "CROSSED_QUOTE" in result["blockers"]
+
+
+def test_runtime_rejects_non_datetime_now_and_boolean_freshness_policies():
+    snapshot = valid_snapshot()
+    bad_clock = validate_market_snapshot(
+        snapshot, now="2026-10-29T12:00:00Z", max_age_seconds=5, future_skew_seconds=2
+    )
+    bad_age = validate_market_snapshot(
+        snapshot, now=NOW, max_age_seconds=True, future_skew_seconds=2
+    )
+    bad_skew = validate_market_snapshot(
+        snapshot, now=NOW, max_age_seconds=5, future_skew_seconds=False
+    )
+    assert bad_clock["valid"] is False
+    assert "CURRENT_TIME_INVALID" in bad_clock["blockers"]
+    assert "MAX_AGE_POLICY_INVALID" in bad_age["blockers"]
+    assert "FUTURE_SKEW_POLICY_INVALID" in bad_skew["blockers"]
+
+
+def test_schema_version_numeric_integer_form_is_accepted_consistently():
+    snapshot = valid_snapshot()
+    snapshot["schema_version"] = 1.0
+    assert not list(VALIDATOR.iter_errors(snapshot))
+    result = validate_market_snapshot(
+        snapshot, now=NOW, max_age_seconds=5, future_skew_seconds=2
+    )
+    assert result["valid"] is True
