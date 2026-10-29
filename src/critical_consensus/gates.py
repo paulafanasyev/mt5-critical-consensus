@@ -777,6 +777,12 @@ def user_authorization_gate(permission_result: Mapping[str, Any], decision: Mapp
     blockers: list[str] = []
     if not isinstance(permission_result, Mapping) or not isinstance(decision, Mapping):
         return {"status": "DENY", "authorized": False, "blockers": ["INVALID_AUTHORIZATION_PAYLOAD"], "trade_allowed": False}
+    if (isinstance(max_ttl_seconds, bool) or not isinstance(max_ttl_seconds, int)
+            or not 1 <= max_ttl_seconds <= 600
+            or isinstance(max_future_skew_seconds, bool) or not isinstance(max_future_skew_seconds, int)
+            or not 0 <= max_future_skew_seconds <= 30):
+        return {"status": "DENY", "authorized": False,
+                "blockers": ["INVALID_AUTHORIZATION_POLICY"], "trade_allowed": False}
     if permission_result.get("status") != "REQUIRE_HUMAN": blockers.append("PERMISSION_NOT_PENDING_HUMAN_APPROVAL")
     decision_id = decision.get("decision_id")
     if not isinstance(decision_id, str) or not decision_id.strip():
