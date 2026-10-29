@@ -14,8 +14,10 @@ contradiction_lookback_hours: 6
 required_independent_sources_for_news_or_rumor: 2
 false_certainty_rate_max: 0.05
 min_false_certainty_samples: 30
+# A failed gate always returns GATHER_MORE unless a challenge deadlocks, then ESCALATE.
 fail_action: GATHER_MORE
 deadlock_action: ESCALATE
+
 mandatory_agents:
   - PlatformScoutAgent
   - GlobalNewsAgent

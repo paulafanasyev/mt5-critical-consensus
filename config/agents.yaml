@@ -16,4 +16,4 @@ optional_agents:
   - TraderRankingAgent
   - SourceRankingAgent
 # Applicability may be ABSTAIN only with a formal reason and policy-approved exclusion.
-# Every APPROVE requires at least two independent reviewers.
+# For every APPROVE, the orchestrator must attach at least two independent reviewers.
