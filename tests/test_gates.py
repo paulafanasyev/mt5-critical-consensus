@@ -182,7 +182,7 @@ def test_permission_gate_fails_closed_when_risk_snapshot_missing():
 def test_valid_demo_approval_is_one_time_allow_not_order_execution():
     now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
     permission = {"status": "REQUIRE_HUMAN", "permission_id": "p2", "mode": "demo", "expires_at": (now + timedelta(minutes=5)).isoformat()}
-    decision = {"decision": "APPROVE", "user_id": "operator-1", "reason": "reviewed dissent and tail risk",
+    decision = {"decision_id": "decision-p2", "decision": "APPROVE", "user_id": "operator-1", "reason": "reviewed dissent and tail risk",
                 "permission_id": "p2", "timestamp": now.isoformat(), "ttl_seconds": 300}
     result = user_authorization_gate(permission, decision, now=now)
     assert result["status"] == "ALLOW_ONCE"
