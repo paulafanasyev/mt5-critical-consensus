@@ -56,3 +56,11 @@ def test_authorization_endpoint_does_not_trust_client_supplied_permission(monkey
         "decision": {"decision": "APPROVE", "user_id": "u", "reason": "ok"}}})
     assert response.status_code == 423
     assert "server-side permission state" in response.json()["detail"]
+
+
+def test_disabled_endpoints_document_locked_status_in_openapi():
+    spec = client.get("/openapi.json").json()
+    for path in ("/v1/authorization/check", "/v1/execution/submit"):
+        responses = spec["paths"][path]["post"]["responses"]
+        assert "423" in responses
+        assert "200" not in responses
