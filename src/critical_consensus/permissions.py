@@ -1,7 +1,8 @@
 """Explicit execution permission checks; live execution is disabled by default.
 
 This module evaluates policy metadata only; it never sends orders. A passing result
-must not be treated as proof that an execution adapter is safe to use.
+must not be treated as proof that an execution adapter is safe to use. In particular,
+``signed`` is caller-supplied metadata, not cryptographic signature verification.
 """
 from __future__ import annotations
 
@@ -50,12 +51,17 @@ def authorize_order(
     """Check a proposed intent; never dispatch or create an order.
 
     Price and volume fields must be finite real numbers. Stop loss and take profit
-    must bracket an explicit expected entry price in the correct direction.
+    must bracket an explicit expected entry price in the correct direction. Requiring
+    expected_price is a deliberate behavior tightening versus older callers that only
+    supplied SL/TP. Do not use this helper as an execution or signature-verification API.
     """
+    if not isinstance(intent, OrderIntent):
+        return PermissionResult(False, ("order intent is invalid",))
+
     reasons: list[str] = []
     if not isinstance(intent.symbol, str) or intent.symbol not in allowed_symbols:
         reasons.append("symbol is not allow-listed")
-    if intent.direction not in {"BUY", "SELL"}:
+    if not isinstance(intent.direction, str) or intent.direction not in {"BUY", "SELL"}:
         reasons.append("direction must be BUY or SELL")
 
     volume = _finite_number(intent.volume)
