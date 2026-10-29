@@ -1,0 +1,19 @@
+version: 1
+mandatory_agents:
+  - PlatformScoutAgent
+  - GlobalNewsAgent
+  - TechnicalAnalystAgent
+  - RiskManagerAgent
+  - ComplianceAgent
+  - ContradictionAgent
+  - DevilAdvocateAgent
+  - PortfolioAgent
+  - QuantModelAgent
+optional_agents:
+  - OnChainAgent
+  - MacroAgent
+  - AlternativeDataAgent
+  - TraderRankingAgent
+  - SourceRankingAgent
+# Applicability may be ABSTAIN only with a formal reason and policy-approved exclusion.
+# Every APPROVE requires at least two independent reviewers.
