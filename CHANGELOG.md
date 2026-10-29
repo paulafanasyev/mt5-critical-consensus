@@ -9,7 +9,7 @@
 - Disabled HTTP authorization evaluation until a server-side permission store and real cryptographic 2FA/signature verification exist. Order submission remains disabled.
 - Added Redis Streams idempotent publish/retry/DLQ helpers and PostgreSQL inbox schema; neither a worker service nor a production persistence adapter is deployed.
 - Tightened local Compose secrets: no known default database passwords; unique local credentials must be configured explicitly.
-- Verification in this environment: 77 pytest tests PASS, 11 JSON Schemas valid, 3 policy YAML files valid, and Docker Compose YAML parses. No MT5 terminal, MetaEditor, Docker runtime or PostgreSQL client was available for integration verification.
+- Verification: local source archive — 77 pytest tests PASS; GitHub Actions `main` — 83 tests PASS in 0.81s on Python 3.12 (`ubuntu-22.04`), current workflow run: https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40848990804. The 11 JSON Schema files are syntactically valid. No MT5 terminal, MetaEditor, Docker runtime or PostgreSQL client was available for integration verification.
 
 ## Scope note
 
