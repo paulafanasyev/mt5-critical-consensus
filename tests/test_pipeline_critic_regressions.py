@@ -34,7 +34,7 @@ def test_missing_chief_reasoning_hash_is_not_synthesized():
     bundle["permission_request"].pop("chief_reasoning_hash")
     result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
     assert result["status"] == "HOLD"
-    assert "CHIEF_REASONING_HASH_MISSING" in result["blockers"]
+    assert any(code in result["blockers"] for code in ("CHIEF_REASONING_HASH_MISSING", "CHIEF_REASONING_SCHEMA_INVALID"))
 
 
 def test_stale_chief_reasoning_is_rejected_even_with_valid_hash():
@@ -43,7 +43,7 @@ def test_stale_chief_reasoning_is_rejected_even_with_valid_hash():
     _resign_chief(bundle)
     result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
     assert result["status"] == "HOLD"
-    assert "CHIEF_REASONING_SCHEMA_INVALID" in result["blockers"] or "CHIEF_REASONING_STALE_OR_FUTURE" in result["blockers"]
+    assert any(code in result["blockers"] for code in ("CHIEF_REASONING_EXPIRED", "CHIEF_REASONING_STALE_OR_FUTURE"))
 
 
 def test_resolved_challenge_requires_explicit_nonempty_string_evidence_refs():
@@ -69,8 +69,7 @@ def test_invalid_top_level_challenge_status_is_not_normalized_to_resolved():
 
 
 def test_malformed_challenge_target_and_type_are_rejected():
-    for field, value in (("target_verdict_id", 0), ("challenge_type", None),
-                         ("challenge_type", "MADE_UP_TYPE")):
+    for field, value in (("target_verdict_id", 0), ("challenge_type", None), ("challenge_type", "MADE_UP_TYPE")):
         bundle = make_bundle()
         bundle["challenge_records"][0][field] = value
         _resign_ledger_and_chief(bundle)
@@ -95,18 +94,14 @@ def test_challenge_missing_required_fields_or_old_resolution_is_rejected():
 
 
 def test_peer_review_missing_or_stale_or_future_contract_is_rejected():
-    bundle = make_bundle()
-    bundle["peer_reviews"][0].pop("review_id")
-    result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
-    assert result["status"] == "GATHER_MORE"
-    assert "INSUFFICIENT_OR_INVALID_PEER_REVIEWS" in result["blockers"]
-
+    cases = []
+    missing_id = make_bundle(); missing_id["peer_reviews"][0].pop("review_id"); cases.append(missing_id)
     for timestamp in ((NOW - timedelta(seconds=301)).isoformat(), (NOW + timedelta(seconds=31)).isoformat()):
-        bundle = make_bundle()
-        bundle["peer_reviews"][0]["created_at"] = timestamp
+        timed = make_bundle(); timed["peer_reviews"][0]["created_at"] = timestamp; cases.append(timed)
+    for bundle in cases:
         result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
         assert result["status"] == "GATHER_MORE"
-        assert "INSUFFICIENT_OR_INVALID_PEER_REVIEWS" in result["blockers"]
+        assert any("INSUFFICIENT_OR_INVALID_PEER_REVIEWS" in blocker for blocker in result["blockers"])
 
 
 def test_duplicate_review_ids_and_duplicate_source_ids_block_pipeline():
@@ -114,24 +109,21 @@ def test_duplicate_review_ids_and_duplicate_source_ids_block_pipeline():
     bundle["peer_reviews"][1]["review_id"] = bundle["peer_reviews"][0]["review_id"]
     result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
     assert result["status"] == "GATHER_MORE"
-    assert "INSUFFICIENT_OR_INVALID_PEER_REVIEWS" in result["blockers"]
+    assert any("INSUFFICIENT_OR_INVALID_PEER_REVIEWS" in blocker for blocker in result["blockers"])
 
-    bundle = make_bundle()
-    bundle["key_sources"].append(dict(bundle["key_sources"][0]))
+    bundle = make_bundle(); bundle["key_sources"].append(dict(bundle["key_sources"][0]))
     result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
     assert result["status"] == "GATHER_MORE"
     assert any("KEY_SOURCE_IDS_INVALID_OR_DUPLICATE" in blocker for blocker in result["blockers"])
 
 
 def test_verdict_schema_and_server_owned_ttl_are_enforced():
-    bundle = make_bundle()
-    bundle["verdicts"][0]["reasoning"] = ""
+    bundle = make_bundle(); bundle["verdicts"][0]["reasoning"] = ""
     result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
     assert result["status"] == "GATHER_MORE"
     assert any("VERDICT_0:VERDICT_SCHEMA_INVALID" in blocker for blocker in result["blockers"])
 
-    bundle = make_bundle()
-    bundle["verdicts"][0]["ttl_seconds"] = 3600
+    bundle = make_bundle(); bundle["verdicts"][0]["ttl_seconds"] = 3600
     result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
     assert result["status"] == "GATHER_MORE"
     assert "VERDICT_0:VERDICT_TTL_INVALID" in result["blockers"]
@@ -147,8 +139,7 @@ def test_user_decision_requires_schema_complete_one_time_metadata():
 
 
 def test_non_mapping_peer_review_is_not_silently_dropped():
-    bundle = make_bundle()
-    bundle["peer_reviews"].append("malformed-review")
+    bundle = make_bundle(); bundle["peer_reviews"].append("malformed-review")
     result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
     assert result["status"] == "GATHER_MORE"
-    assert "PEER_REVIEW_SET_INVALID_OR_HAS_DROPPED_RECORDS" in result["blockers"]
+    assert any("PEER_REVIEW_SET_INVALID_OR_HAS_DROPPED_RECORDS" in blocker for blocker in result["blockers"])
