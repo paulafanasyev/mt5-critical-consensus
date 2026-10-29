@@ -121,6 +121,7 @@ def evaluate_signal_bundle(bundle: Mapping[str, Any], certainty_policy: Mapping[
         previous_hash = event["event_hash"]
 
     def finish(status: str, blockers: list[str], **details: Any) -> dict[str, Any]:
+        nonlocal previous_hash
         result_status = status
         result_blockers = sorted(set(blockers))
         emit("PIPELINE_RESULT", {"signal_id": signal_id or "unknown", "status": result_status,
