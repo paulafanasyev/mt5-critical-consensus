@@ -3,7 +3,7 @@
   "functions": {
     "src/critical_consensus/api.py": {
       "maxDuration": 30,
-      "includeFiles": "config/**/*.yaml"
+      "includeFiles": "{config/**/*.yaml,schemas/**/*.json}"
     }
   }
 }
