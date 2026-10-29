@@ -96,3 +96,28 @@ FOR EACH ROW EXECUTE FUNCTION reject_audit_events_mutation();
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_events_hash ON audit_events(event_hash);
 REVOKE UPDATE, DELETE, TRUNCATE ON audit_events FROM PUBLIC;
+
+
+-- One-time human decision registry. Decisions are inserted by trusted server-side
+-- authentication code only after verified identity/MFA/signature checks.
+-- Permission IDs are stored as text to match the external payload; queries bind them
+-- back to the authoritative permissions table through permission_id::text.
+CREATE TABLE IF NOT EXISTS user_decisions (
+  decision_id TEXT PRIMARY KEY CHECK (btrim(decision_id) <> ''),
+  permission_id TEXT NOT NULL CHECK (btrim(permission_id) <> ''),
+  user_id TEXT NOT NULL CHECK (btrim(user_id) <> ''),
+  decision TEXT NOT NULL CHECK (decision IN ('APPROVE','REJECT')),
+  mode TEXT NOT NULL CHECK (mode IN ('demo','live')),
+  decision_timestamp TIMESTAMPTZ NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  payload_hash TEXT NOT NULL,
+  verifier_id TEXT NOT NULL,
+  verification_method TEXT NOT NULL,
+  verification_ref TEXT NOT NULL,
+  verified_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (expires_at > decision_timestamp)
+);
+CREATE INDEX IF NOT EXISTS idx_user_decisions_permission_expiry
+  ON user_decisions (permission_id, expires_at);

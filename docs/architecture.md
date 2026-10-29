@@ -70,3 +70,10 @@ flowchart TB
 1. Первая итерация: данные read-only, demo/paper, 3–4 агента, ручной approve на каждый ордер.
 2. Никакого live, пока не проверены контракты, брокерские ограничения, отказоустойчивость, forward-тесты и юридические условия.
 3. Перенос bridge на отдельный Windows VPS; агенты/очереди/БД — Linux. Слушать localhost, внешний доступ закрыть firewall/IP allowlist.
+
+
+## Новые safety adapters (интеграционный этап)
+
+- `PostgresDecisionStore` реализует серверный реестр одноразовых решений с атомарным потреблением и ограничением TTL. Это только хранилище: оно не доказывает личность и пока не подключено к `user_authorization_gate` или публичному API.
+- `MT5ReadOnlyAdapter` читает allow-listed ticks через `symbol_info_tick` и прогоняет снимки через валидатор freshness/spread. Он не вызывает `order_send`; CI покрывает адаптер поддельным клиентом, но не реальный MT5 terminal.
+- Веб-авторизация остаётся отключённой (HTTP 423), а торговля запрещена. Для завершения нужны реальный проверенный auth/MFA/signature provider, серверный permission issuance flow, подключение decision store к проверенному server-side boundary, отдельный read-only Windows demo smoke test и независимый аудит до изменения любого execution пути.
