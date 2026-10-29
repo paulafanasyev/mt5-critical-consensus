@@ -9,7 +9,8 @@
 - Disabled HTTP authorization evaluation until a server-side permission store and real cryptographic 2FA/signature verification exist. Order submission remains disabled.
 - Added Redis Streams idempotent publish/retry/DLQ helpers and PostgreSQL inbox schema; neither a worker service nor a production persistence adapter is deployed.
 - Tightened local Compose secrets: no known default database passwords; unique local credentials must be configured explicitly.
-- Verification: local source archive — 77 pytest tests PASS; GitHub Actions `main` — 84 tests PASS in 0.88s on Python 3.12 (`ubuntu-22.04`), current workflow run: https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40849397176. The 11 JSON Schema files are syntactically valid. No MT5 terminal, MetaEditor, Docker runtime or PostgreSQL client was available for integration verification.
+- Added scheduled `pip-audit` workflow. It found `PYSEC-2026-1845` in pytest 8.4.2; the dev dependency now requires pytest >=9.0.3. The audit subsequently passed.
+- Verification: local source archive — 77 pytest tests PASS; GitHub Actions `main` — 84 tests PASS on Python 3.12 (`ubuntu-22.04`); dependency audit passed after upgrading pytest to >=9.0.3. See current workflows: https://github.com/paulafanasyev/mt5-critical-consensus/actions. The 11 JSON Schema files are syntactically valid. No MT5 terminal, MetaEditor, Docker runtime or PostgreSQL client was available for integration verification.
 
 ## Scope note
 

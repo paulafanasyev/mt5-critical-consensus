@@ -22,6 +22,7 @@
 - `mql5/CriticalConsensusEA.mq5` — демонстрационный EA: demo account only, disabled by default, TTL/SL/TP/slippage/idempotency checks.
 - `db/postgres_schema.sql`, `neo4j/schema.cypher` — минимальные схемы хранения и графа.
 - `tests/` — adversarial unit tests.
+- `.github/workflows/security-audit.yml` — checks installed Python dependencies for known advisories on push, pull request, and weekly schedule.
 - `docs/` — архитектура, формулы, пример trace и недельный roadmap.
 
 ## Быстрый запуск (Linux, Python 3.11+)
@@ -81,7 +82,7 @@ assert result["trade_allowed"] is False
 
 ## Проверка текущего каркаса
 
-- Локальный исходный архив: `pytest -q` — **77 тестов PASS**. Последний GitHub Actions run на `main` — **84 passed in 0.88s**, без предупреждений pytest: [workflow run](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40849397176). CI закреплён на `ubuntu-22.04`, использует `actions/checkout@v7`, `actions/setup-python@v7` и `httpx2` для TestClient. Это синтетические тесты функций/API, а не брокерные испытания.
+- Локальный исходный архив: `pytest -q` — **77 тестов PASS**. Последний GitHub Actions run на `main` — **84 passed** на Python 3.12; текущий проход зависит от CI после настройки pytest-asyncio: [workflow runs](https://github.com/paulafanasyev/mt5-critical-consensus/actions). CI закреплён на `ubuntu-22.04`, использует `actions/checkout@v7`, `actions/setup-python@v7` и `httpx2` для TestClient. Это синтетические тесты функций/API, а не брокерные испытания.
 - Проверяются fail-closed gates, integrity binding между ChiefReasoning/consensus/source summary и PermissionRequest, выдача полного human review packet, hash chain, API key gate и Redis Streams helpers.
 - Проверка зелёных тестов доказывает поведение локальных функций на синтетических входах, но не проверяет брокер, MQL5-компиляцию, реальную очередь, рыночные данные или доходность.
 - ChiefReasoning hash вычисляется по каноническому JSON без поля `reasoning_hash`; изменение любого шага делает hash невалидным.
