@@ -214,3 +214,76 @@ def test_verdict_at_exact_ttl_boundary_is_accepted():
     result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
     assert result["status"] == "REQUIRE_HUMAN" and result["details"]["certainty"]["status"] == "PASS"
     assert result["trade_allowed"] is False and "order_command" not in result
+
+
+class _SuccessfulAuditStore:
+    def __init__(self):
+        self.calls = 0
+        self.events = None
+
+    def persist_trace(self, events):
+        self.calls += 1
+        copied = [dict(event) for event in events]
+        assert verify_audit_chain(copied)["valid"] is True
+        self.events = copied
+        return {
+            "persisted": True,
+            "verified": True,
+            "already_present": False,
+            "event_count": len(copied),
+            "trade_allowed": False,
+        }
+
+
+class _FailedAuditStore:
+    def __init__(self, *, raises=False):
+        self.raises = raises
+
+    def persist_trace(self, events):
+        if self.raises:
+            raise RuntimeError("synthetic database outage")
+        return {
+            "persisted": False,
+            "verified": False,
+            "blockers": ["AUDIT_TRACE_STORE_UNAVAILABLE"],
+            "trade_allowed": False,
+        }
+
+
+def test_pipeline_persists_complete_trace_when_audit_store_is_injected():
+    store = _SuccessfulAuditStore()
+    result = evaluate_signal_bundle(
+        make_bundle(), CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW, audit_store=store
+    )
+    assert result["status"] == "REQUIRE_HUMAN"
+    assert result["trade_allowed"] is False
+    assert store.calls == 1
+    assert store.events == result["audit_events"]
+    assert result["audit_persistence"]["persisted"] is True
+    assert result["audit_persistence"]["verified"] is True
+    assert result["audit_chain_valid"] is True
+
+
+def test_pipeline_fails_closed_when_audit_store_returns_failure():
+    result = evaluate_signal_bundle(
+        make_bundle(), CERTAINTY_POLICY, PERMISSION_MATRIX,
+        now=NOW, audit_store=_FailedAuditStore(),
+    )
+    assert result["status"] == "DENY"
+    assert result["trade_allowed"] is False
+    assert "AUDIT_PERSISTENCE_FAILED" in result["blockers"]
+    assert result["audit_persistence"]["persisted"] is False
+    assert result["audit_events"][-1]["event_type"] == "AUDIT_PERSISTENCE_FAILURE"
+    assert result["audit_events"][-1]["payload"]["status"] == "DENY"
+    assert verify_audit_chain(result["audit_events"])["valid"] is True
+
+
+def test_pipeline_fails_closed_when_audit_store_raises():
+    result = evaluate_signal_bundle(
+        make_bundle(), CERTAINTY_POLICY, PERMISSION_MATRIX,
+        now=NOW, audit_store=_FailedAuditStore(raises=True),
+    )
+    assert result["status"] == "DENY"
+    assert result["trade_allowed"] is False
+    assert "AUDIT_PERSISTENCE_FAILED" in result["blockers"]
+    assert "AUDIT_STORE_UNAVAILABLE" in result["audit_persistence"]["blockers"]

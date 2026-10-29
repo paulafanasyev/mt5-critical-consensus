@@ -88,11 +88,14 @@ def _validate_verdict_metadata(verdict: Mapping[str, Any], signal_id: str, curre
 
 
 def evaluate_signal_bundle(bundle: Mapping[str, Any], certainty_policy: Mapping[str, Any],
-                           permission_matrix: Mapping[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+                           permission_matrix: Mapping[str, Any], *, now: datetime | None = None,
+                           audit_store: Any | None = None) -> dict[str, Any]:
     """Evaluate certainty → ChiefAgent → Permission → user authorization, fail-closed.
 
     No OrderCommand is returned and ``trade_allowed`` is always false. Peer reviews
     must come from a trusted internal review service, not directly from bridge callers.
+    When an audit_store is supplied, every completed pipeline trace is durably persisted.
+    Missing or failed persistence changes the returned status to DENY; it never enables execution.
     """
     if not isinstance(bundle, Mapping):
         return {"status": "GATHER_MORE", "trade_allowed": False,
@@ -118,13 +121,49 @@ def evaluate_signal_bundle(bundle: Mapping[str, Any], certainty_policy: Mapping[
         previous_hash = event["event_hash"]
 
     def finish(status: str, blockers: list[str], **details: Any) -> dict[str, Any]:
-        emit("PIPELINE_RESULT", {"signal_id": signal_id or "unknown", "status": status,
-                                 "blockers": sorted(set(blockers)), "detail_hash": canonical_hash(details)})
+        result_status = status
+        result_blockers = sorted(set(blockers))
+        emit("PIPELINE_RESULT", {"signal_id": signal_id or "unknown", "status": result_status,
+                                 "blockers": result_blockers, "detail_hash": canonical_hash(details)})
+        audit_persistence: dict[str, Any] | None = None
+        if audit_store is not None:
+            try:
+                receipt = audit_store.persist_trace(trace)
+                if isinstance(receipt, Mapping):
+                    audit_persistence = dict(receipt)
+                else:
+                    audit_persistence = {
+                        "persisted": False, "verified": False,
+                        "blockers": ["AUDIT_STORE_INVALID_RECEIPT"], "trade_allowed": False,
+                    }
+            except Exception as exc:
+                audit_persistence = {
+                    "persisted": False, "verified": False,
+                    "blockers": ["AUDIT_STORE_UNAVAILABLE"],
+                    "error_type": type(exc).__name__, "trade_allowed": False,
+                }
+            if (audit_persistence.get("persisted") is not True
+                    or audit_persistence.get("verified") is not True):
+                result_status = "DENY"
+                result_blockers = sorted(set(result_blockers + ["AUDIT_PERSISTENCE_FAILED"]))
+                store_blockers = audit_persistence.get("blockers", [])
+                if not isinstance(store_blockers, list):
+                    store_blockers = ["AUDIT_STORE_INVALID_BLOCKERS"]
+                safe_store_blockers = [
+                    item for item in store_blockers if isinstance(item, str) and item.strip()
+                ]
+                emit("AUDIT_PERSISTENCE_FAILURE", {
+                    "signal_id": signal_id or "unknown", "status": "DENY",
+                    "blockers": result_blockers, "store_blockers": safe_store_blockers,
+                })
         chain_check = verify_audit_chain(trace)
-        return {"signal_id": signal_id or "unknown", "status": status, "trade_allowed": False,
-                "blockers": sorted(set(blockers)), "details": details,
-                "audit_events": trace, "audit_chain_valid": chain_check.get("valid") is True,
-                "audit_chain_check": chain_check}
+        result = {"signal_id": signal_id or "unknown", "status": result_status, "trade_allowed": False,
+                  "blockers": result_blockers, "details": details,
+                  "audit_events": trace, "audit_chain_valid": chain_check.get("valid") is True,
+                  "audit_chain_check": chain_check}
+        if audit_store is not None:
+            result["audit_persistence"] = audit_persistence
+        return result
 
     emit("SIGNAL_RECEIVED", {"signal_id": signal_id or "unknown", "bundle_hash": canonical_hash(bundle)})
     raw_verdicts = bundle.get("verdicts")
