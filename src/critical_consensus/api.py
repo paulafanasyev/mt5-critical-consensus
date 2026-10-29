@@ -89,8 +89,7 @@ def review_chief(body: GenericPayload) -> dict[str, Any]:
     if not isinstance(supplied_hash, str) or not supplied_hash.strip():
         return {"verdict": "HOLD", "passed": False, "trade_allowed": False,
                 "blockers": ["CHIEF_REASONING_HASH_MISSING_OR_INVALID"]}
-    unsigned = dict(reasoning)
-    unsigned.pop("reasoning_hash", None)
+    unsigned = dict(reasoning); unsigned.pop("reasoning_hash", None)
     if supplied_hash != canonical_hash(unsigned):
         return {"verdict": "HOLD", "passed": False, "trade_allowed": False,
                 "blockers": ["CHIEF_REASONING_HASH_MISMATCH"]}
@@ -103,6 +102,10 @@ def review_chief(body: GenericPayload) -> dict[str, Any]:
 
 @app.post("/v1/permission/check", dependencies=[Depends(require_bridge_key)])
 def check_permission(body: GenericPayload) -> dict[str, Any]:
+    valid, _ = validate_contract("permission_request.schema.json", body.payload)
+    if not valid:
+        return {"status": "DENY", "allowed": False, "trade_allowed": False,
+                "blockers": ["PERMISSION_REQUEST_SCHEMA_INVALID"]}
     return permission_gate(body.payload, _yaml("permission_matrix.yaml"))
 
 
@@ -116,7 +119,6 @@ def check_authorization() -> None:
 
 @app.get("/v1/execution/next", status_code=204, dependencies=[Depends(require_bridge_key)])
 def next_execution_command():
-    # Intentionally no queue consumer; no order command can be fetched from this scaffold.
     return None
 
 
