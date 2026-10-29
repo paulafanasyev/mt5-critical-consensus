@@ -131,7 +131,8 @@ def test_pipeline_valid_human_approval_is_only_authorized_once():
         "user_id": "operator-1", "reason": "Reviewed dissent and tail risk", "permission_id": "perm-1",
         "timestamp": NOW.isoformat(), "ttl_seconds": 300}
     result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
-    assert result["status"] == "AUTHORIZED_ONCE" and result["details"]["authorization"]["authorized"] is True
+    assert result["status"] == "DENY" and result["details"]["authorization"]["authorized"] is False
+    assert "DURABLE_REPLAY_PROTECTION_NOT_IMPLEMENTED" in result["blockers"]
     assert result["trade_allowed"] is False and "order_command" not in result
 
 
