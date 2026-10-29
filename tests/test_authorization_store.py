@@ -100,7 +100,8 @@ def test_registered_decision_can_be_consumed_once_only(store):
     assert first["status"] == "CONSUMED_APPROVE"
     assert first["trade_allowed"] is False
     assert second["consumed"] is False
-    assert "REPLAYED" in second["blockers"][0]
+    assert second["status"] == "DENY"
+    assert "PERMISSION_NOT_PENDING_HUMAN_APPROVAL" in second["blockers"][0]
 
 
 def test_mismatched_payload_cannot_consume_registered_decision(store):
@@ -131,7 +132,7 @@ def test_store_refuses_expired_permission_and_duplicate_decision_id(store):
     assert "ALREADY_REGISTERED" in duplicate_id["blockers"][0]
 
     second_decision = make_decision(permission_id, now)
-    duplicate_permission = store.register_verified_decision(second_decision, make_receipt(now, decision), now=now)
+    duplicate_permission = store.register_verified_decision(second_decision, make_receipt(now, second_decision), now=now)
     assert duplicate_permission["registered"] is False
     assert "ALREADY_REGISTERED" in duplicate_permission["blockers"][0]
 
