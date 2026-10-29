@@ -32,7 +32,7 @@ flowchart TB
     PG -->|DENY| STOP[No order]
     PG -->|REQUIRE_HUMAN| UA[Human approval + live 2FA/signature]
     UA -->|reject/expired| STOP
-    UA -->|one-time allow| EX[Planned execution bridge / MQL5 EA — disabled in scaffold]
+    UA -->|approval metadata valid, replay guard absent| STOP
     EX --> RECON[Fill + positions reconciliation]
     RECON --> AUD[(Append-only audit + immutable object storage)]
     CG --> AUD
@@ -61,7 +61,7 @@ flowchart TB
 
 - Любое решение вычисляется как conjunction обязательных условий, не по большинству голосов.
 - `PASS` у CertaintyGate означает только передачу на ChiefAgent; `CONFIRM` ChiefAgent означает только разрешение перейти к PermissionGate.
-- PermissionGate возвращает `REQUIRE_HUMAN`; authorization формирует одноразовое разрешение, но не создаёт ордер.
+- PermissionGate возвращает `REQUIRE_HUMAN`; без durable permission state и persistent replay/idempotency store approval остаётся метаданными и завершается `DENY`. Одноразовое разрешение пока не реализовано.
 - Исполнительный мост перепроверяет TTL, client_order_id, slippage, SL/TP, состояние счёта и текущие позиции непосредственно перед операцией.
 - При неопределённом результате вызова брокера не выполняется слепой retry; запускается reconcile.
 
@@ -70,3 +70,30 @@ flowchart TB
 1. Первая итерация: данные read-only, demo/paper, 3–4 агента, ручной approve на каждый ордер.
 2. Никакого live, пока не проверены контракты, брокерские ограничения, отказоустойчивость, forward-тесты и юридические условия.
 3. Перенос bridge на отдельный Windows VPS; агенты/очереди/БД — Linux. Слушать localhost, внешний доступ закрыть firewall/IP allowlist.
+
+
+## Новые safety adapters (интеграционный этап)
+
+- `PostgresDecisionStore` реализует серверный реестр одноразовых решений с атомарным потреблением и ограничением TTL. Это только хранилище: оно не доказывает личность и пока не подключено к `user_authorization_gate` или публичному API.
+- `MT5ReadOnlyAdapter` читает allow-listed ticks через `symbol_info_tick` и прогоняет снимки через валидатор freshness/spread. Он не вызывает `order_send`; CI покрывает адаптер поддельным клиентом, но не реальный MT5 terminal.
+- Веб-авторизация остаётся отключённой (HTTP 423), а торговля запрещена. Для завершения нужны реальный проверенный auth/MFA/signature provider, серверный permission issuance flow, подключение decision store к проверенному server-side boundary, отдельный read-only Windows demo smoke test и независимый аудит до изменения любого execution пути.
+
+
+## Долговременный audit trace storage
+
+- `PostgresAuditStore` сохраняет hash-linked trace целиком одной транзакцией, проверяет её после записи и поддерживает идемпотентный повтор того же trace. Время события хранится одновременно в UTC timestamp и исходной строковой форме, поскольку именно строка включена в canonical hash.
+- Заголовок trace и отдельные события защищены от UPDATE/DELETE триггерами и правами для PUBLIC; в production роль приложения должна иметь минимальные права, а выгрузки следует защищать WORM/object-lock.
+- `evaluate_signal_bundle(..., audit_store=store)` теперь поддерживает явное внедрение такого хранилища. Если запись не подтверждена как сохранённая и проверенная, итог становится `DENY` с `AUDIT_PERSISTENCE_FAILED`. По умолчанию хранилище не создаётся автоматически: deployment должен передать настроенный адаптер и connection factory. Успешное сохранение не создаёт разрешение на торговлю.
+
+
+## Redis Streams envelope and dedupe
+
+- `publish_event` accepts strict string IDs/types and bounded RFC3339 timestamps; it does not coerce integers or objects to strings.
+- Dedupe records retain the canonical serialized event beside the stream ID. A repeated `event_id` with identical content returns the original stream ID; reusing it with different content raises `EVENT_ID_COLLISION` instead of silently hiding the changed event.
+- The publisher uses a bounded dedupe TTL of 1–604800 seconds. Redis remains at-least-once; consumers still need a durable idempotency inbox around side effects.
+
+
+- Redis Streams consumer arguments are now type-checked and bounded: `max_attempts` 1–100, read/reclaim batch count 1–1000, read block timeout 0–60000 ms, reclaim idle threshold 0–24 hours, and stream/group/consumer names have bounded string length. Booleans, floats and stringified numbers are rejected rather than implicitly accepted.
+
+
+- The stream consumer independently rejects messages over 1 MiB, duplicate JSON object keys, non-finite JSON constants, and parser exhaustion before calling handlers. Invalid input is written to the DLQ before the source entry is acknowledged; the original raw content is not copied into the DLQ, only its SHA-256 digest is retained.

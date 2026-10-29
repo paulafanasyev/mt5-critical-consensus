@@ -42,12 +42,18 @@ CREATE TABLE IF NOT EXISTS permissions (
   permission_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   signal_id UUID NOT NULL,
   mode TEXT NOT NULL CHECK (mode IN ('demo','live')),
-  status TEXT NOT NULL CHECK (status IN ('DENY','REQUIRE_HUMAN','ALLOW_ONCE','EXPIRED')),
+  status TEXT NOT NULL CHECK (status IN ('DENY','REQUIRE_HUMAN','ALLOW_ONCE','EXPIRED','DECISION_CONSUMED')),
   request JSONB NOT NULL,
   decision JSONB,
   expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Idempotent migration for databases created before the decision registry was added.
+ALTER TABLE permissions DROP CONSTRAINT IF EXISTS permissions_status_check;
+ALTER TABLE permissions
+  ADD CONSTRAINT permissions_status_check
+  CHECK (status IN ('DENY','REQUIRE_HUMAN','ALLOW_ONCE','EXPIRED','DECISION_CONSUMED'));
 
 CREATE TABLE IF NOT EXISTS order_commands (
   command_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -96,3 +102,75 @@ FOR EACH ROW EXECUTE FUNCTION reject_audit_events_mutation();
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_events_hash ON audit_events(event_hash);
 REVOKE UPDATE, DELETE, TRUNCATE ON audit_events FROM PUBLIC;
+
+
+-- One-time human decision registry. Decisions are inserted by trusted server-side
+-- authentication code only after verified identity/MFA/signature checks.
+-- Permission IDs are stored as text to match the external payload; queries bind them
+-- back to the authoritative permissions table through permission_id::text.
+CREATE TABLE IF NOT EXISTS user_decisions (
+  decision_id TEXT PRIMARY KEY CHECK (btrim(decision_id) <> ''),
+  permission_id TEXT NOT NULL CHECK (btrim(permission_id) <> ''),
+  user_id TEXT NOT NULL CHECK (btrim(user_id) <> ''),
+  decision TEXT NOT NULL CHECK (decision IN ('APPROVE','REJECT')),
+  mode TEXT NOT NULL CHECK (mode IN ('demo','live')),
+  decision_timestamp TIMESTAMPTZ NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  payload_hash TEXT NOT NULL,
+  verifier_id TEXT NOT NULL,
+  verification_method TEXT NOT NULL,
+  verification_ref TEXT NOT NULL,
+  verified_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (expires_at > decision_timestamp)
+);
+-- A permission can receive only one registered human decision; a new review needs a new permission.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_user_decisions_permission
+  ON user_decisions (permission_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_user_decisions_auth_receipt
+  ON user_decisions (verifier_id, verification_ref);
+
+
+-- Durable, independently verifiable audit traces. The event timestamp is stored both
+-- as TIMESTAMPTZ for querying and as exact text for canonical hash verification.
+CREATE TABLE IF NOT EXISTS audit_traces (
+  trace_id UUID PRIMARY KEY,
+  signal_id TEXT NOT NULL,
+  pipeline_status TEXT NOT NULL,
+  event_count INTEGER NOT NULL CHECK (event_count > 0),
+  chain_head TEXT NOT NULL,
+  events_hash TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS audit_trace_events (
+  trace_id UUID NOT NULL REFERENCES audit_traces(trace_id) ON DELETE RESTRICT,
+  event_index INTEGER NOT NULL CHECK (event_index >= 0),
+  event_type TEXT NOT NULL,
+  timestamp_text TEXT NOT NULL,
+  occurred_at TIMESTAMPTZ NOT NULL,
+  previous_hash TEXT,
+  event_hash TEXT NOT NULL,
+  payload JSONB NOT NULL,
+  PRIMARY KEY (trace_id, event_index),
+  UNIQUE (trace_id, event_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_audit_trace_events_hash
+  ON audit_trace_events(event_hash);
+
+CREATE OR REPLACE FUNCTION reject_audit_trace_mutation()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'audit trace storage is append-only; UPDATE/DELETE is prohibited';
+END;
+$$;
+DROP TRIGGER IF EXISTS audit_traces_no_update_delete ON audit_traces;
+CREATE TRIGGER audit_traces_no_update_delete
+BEFORE UPDATE OR DELETE ON audit_traces
+FOR EACH ROW EXECUTE FUNCTION reject_audit_trace_mutation();
+DROP TRIGGER IF EXISTS audit_trace_events_no_update_delete ON audit_trace_events;
+CREATE TRIGGER audit_trace_events_no_update_delete
+BEFORE UPDATE OR DELETE ON audit_trace_events
+FOR EACH ROW EXECUTE FUNCTION reject_audit_trace_mutation();
+REVOKE UPDATE, DELETE, TRUNCATE ON audit_traces FROM PUBLIC;
+REVOKE UPDATE, DELETE, TRUNCATE ON audit_trace_events FROM PUBLIC;

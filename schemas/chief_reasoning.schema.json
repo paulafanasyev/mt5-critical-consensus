@@ -2,35 +2,34 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://example.invalid/critical-consensus/chief_reasoning.schema.json",
   "title": "Chief Reasoning",
-  "description": "ChiefAgent must complete all steps a-i before CONFIRM.",
+  "description": "ChiefAgent must complete all steps a-i before CONFIRM and review the complete challenge ledger.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["reasoning_id","signal_id","verdict","reasons_against","steps","open_challenges","tail_risk_probability","tail_risk_scenarios","reasoning_hash","created_at","all_challenges_read","challenge_ledger_snapshot","challenge_ledger_hash","reviewed_challenge_ids"],
+  "required": ["reasoning_id", "signal_id", "verdict", "reasons_against", "steps", "open_challenges", "tail_risk_probability", "tail_risk_scenarios", "reasoning_hash", "created_at", "all_challenges_read", "challenge_ledger_snapshot", "challenge_ledger_hash", "reviewed_challenge_ids"],
   "properties": {
-    "reasoning_id": {"type": "string"},
-    "signal_id": {"type": "string"},
-    "verdict": {"enum": ["CONFIRM","HOLD","REJECT"]},
-    "steps": {"type": "object", "required": ["a","b","c","d","e","f","g","h","i"], "properties": {
-      "a": {"type":"object","required":["passed","detail","evidence_refs"],"properties":{"passed":{"type":"boolean"},"detail":{"type":"string"},"evidence_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}},"additionalProperties":false},
-      "b": {"type":"object","required":["passed","detail","evidence_refs"],"properties":{"passed":{"type":"boolean"},"detail":{"type":"string"},"evidence_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}},"additionalProperties":false},
-      "c": {"type":"object","required":["passed","detail","evidence_refs"],"properties":{"passed":{"type":"boolean"},"detail":{"type":"string"},"evidence_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}},"additionalProperties":false},
-      "d": {"type":"object","required":["passed","detail","evidence_refs"],"properties":{"passed":{"type":"boolean"},"detail":{"type":"string"},"evidence_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}},"additionalProperties":false},
-      "e": {"type":"object","required":["passed","detail","evidence_refs"],"properties":{"passed":{"type":"boolean"},"detail":{"type":"string"},"evidence_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}},"additionalProperties":false},
-      "f": {"type":"object","required":["passed","detail","evidence_refs"],"properties":{"passed":{"type":"boolean"},"detail":{"type":"string"},"evidence_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}},"additionalProperties":false},
-      "g": {"type":"object","required":["passed","detail","evidence_refs"],"properties":{"passed":{"type":"boolean"},"detail":{"type":"string"},"evidence_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}},"additionalProperties":false},
-      "h": {"type":"object","required":["passed","detail","evidence_refs"],"properties":{"passed":{"type":"boolean"},"detail":{"type":"string"},"evidence_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}},"additionalProperties":false},
-      "i": {"type":"object","required":["passed","detail","evidence_refs"],"properties":{"passed":{"type":"boolean"},"detail":{"type":"string"},"evidence_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}},"additionalProperties":false}
-    },"additionalProperties":false},
-    "open_challenges":{"type":"array"},
-    "tail_risk_probability":{"type":"number","minimum":0,"maximum":1},
-    "reasoning_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
-    "created_at":{"type":"string","format":"date-time"},
-    "resolved_challenge_refs":{"type":"array","items":{"type":"string"}},
-    "reasons_against":{"type":"array","minItems":5,"items":{"type":"string","minLength":1},"uniqueItems":true},
-    "all_challenges_read":{"type":"boolean","const":true},
-    "challenge_ledger_snapshot":{"type":"array","items":{"type":"object","required":["challenge_id"],"properties":{"challenge_id":{"type":"string","minLength":1},"status":{"enum":["OPEN","RESOLVED","ESCALATED"]},"target_verdict_id":{"type":"string"},"challenge_type":{"type":"string"},"evidence_refs":{"type":"array","items":{"type":"string"}},"resolution_evidence_refs":{"type":"array","items":{"type":"string"}}},"additionalProperties":true}},
-    "challenge_ledger_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
-    "reviewed_challenge_ids":{"type":"array","uniqueItems":true,"items":{"type":"string","minLength":1}},
-    "tail_risk_scenarios":{"type":"array","minItems":1,"items":{"type":"object","required":["scenario","probability","impact","evidence_refs"],"properties":{"scenario":{"type":"string","minLength":1},"probability":{"type":"number","minimum":0,"maximum":1},"impact":{"type":"string","minLength":1},"mitigation":{"type":"string"},"evidence_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}},"additionalProperties":false}}
+    "reasoning_id": {"type": "string", "minLength": 1, "pattern": "\\S"},
+    "signal_id": {"type": "string", "minLength": 1, "pattern": "\\S"},
+    "verdict": {"enum": ["CONFIRM", "HOLD", "REJECT"]},
+    "steps": {"type": "object", "required": ["a", "b", "c", "d", "e", "f", "g", "h", "i"], "properties": {
+      "a": {"$ref": "#/$defs/chief_step"}, "b": {"$ref": "#/$defs/chief_step"}, "c": {"$ref": "#/$defs/chief_step"},
+      "d": {"$ref": "#/$defs/chief_step"}, "e": {"$ref": "#/$defs/chief_step"}, "f": {"$ref": "#/$defs/chief_step"},
+      "g": {"$ref": "#/$defs/chief_step"}, "h": {"$ref": "#/$defs/chief_step"}, "i": {"$ref": "#/$defs/chief_step"}
+    }, "additionalProperties": false},
+    "open_challenges": {"type": "array", "items": {"$ref": "#/$defs/challenge_record"}},
+    "tail_risk_probability": {"type": "number", "minimum": 0, "maximum": 1},
+    "reasoning_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "resolved_challenge_refs": {"type": "array", "items": {"type": "string", "minLength": 1, "pattern": "\\S"}},
+    "reasons_against": {"type": "array", "minItems": 5, "items": {"type": "string", "minLength": 1, "pattern": "\\S"}, "uniqueItems": true},
+    "all_challenges_read": {"type": "boolean", "const": true},
+    "challenge_ledger_snapshot": {"type": "array", "items": {"$ref": "#/$defs/challenge_record"}},
+    "challenge_ledger_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "reviewed_challenge_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "pattern": "\\S"}},
+    "tail_risk_scenarios": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["scenario", "probability", "impact", "evidence_refs"], "properties": {"scenario": {"type": "string", "minLength": 1, "pattern": "\\S"}, "probability": {"type": "number", "minimum": 0, "maximum": 1}, "impact": {"type": "string", "minLength": 1, "pattern": "\\S"}, "mitigation": {"type": "string"}, "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "pattern": "\\S"}}}, "additionalProperties": false}}
+  },
+  "$defs": {
+    "chief_step": {"type": "object", "required": ["passed", "detail", "evidence_refs"], "properties": {"passed": {"type": "boolean"}, "detail": {"type": "string", "minLength": 1, "pattern": "\\S"}, "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "pattern": "\\S"}}}, "additionalProperties": false},
+    "challenge_round": {"type": "object", "required": ["round", "response", "evidence_refs"], "properties": {"round": {"type": "integer", "minimum": 1, "maximum": 3}, "response": {"type": "string", "minLength": 1, "pattern": "\\S"}, "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "pattern": "\\S"}}, "status": {"enum": ["OPEN", "RESOLVED", "ESCALATED"]}}, "additionalProperties": false},
+    "challenge_record": {"type": "object", "additionalProperties": false, "required": ["challenge_id", "target_verdict_id", "challenge_type", "status", "argument", "evidence_refs", "rounds", "created_at"], "properties": {"challenge_id": {"type": "string", "minLength": 1, "pattern": "\\S"}, "target_verdict_id": {"type": "string", "minLength": 1, "pattern": "\\S"}, "challenge_type": {"enum": ["DATA_CONTRADICTION", "SOURCE_WEAK", "STALE_DATA", "LOGIC_GAP", "REGIME_MISMATCH", "CORRELATION_RISK"]}, "status": {"enum": ["OPEN", "RESOLVED", "ESCALATED"]}, "argument": {"type": "string", "minLength": 1, "pattern": "\\S"}, "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "pattern": "\\S"}}, "rounds": {"type": "array", "maxItems": 3, "items": {"$ref": "#/$defs/challenge_round"}}, "created_at": {"type": "string", "format": "date-time"}, "resolved_at": {"type": "string", "format": "date-time"}, "resolution_evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "pattern": "\\S"}}}, "allOf": [{"if": {"properties": {"status": {"const": "RESOLVED"}}, "required": ["status"]}, "then": {"required": ["resolved_at", "resolution_evidence_refs"], "properties": {"rounds": {"minItems": 1}}}}]}
   }
 }

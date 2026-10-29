@@ -15,12 +15,15 @@
 - `src/critical_consensus/gates.py` — self-adversarial checks, peer-review validation, challenge loop, fail-closed certainty/chief/permission/authorization gates.
 - `src/critical_consensus/pipeline.py` — orchestration of existing agent outputs through Certainty → Chief → Permission → human approval; it never creates an order.
 - `src/critical_consensus/calibration.py` — Brier score, shrinkage penalty, weighted consensus; явные ограничения эвристики.
-- `src/critical_consensus/api.py` — FastAPI policy endpoints; authorization and order submission endpoints deliberately disabled until durable permission state and a real 2FA/signature verifier exist.
-- `src/critical_consensus/redis_streams.py` — idempotent event publishing, consumer-group helpers, retry handling and DLQ (at-least-once; worker deployment is not included).
+- `src/critical_consensus/api.py` — FastAPI policy endpoints, including protected read-only market-snapshot validation; authorization and order submission remain deliberately disabled until a real 2FA/signature verifier and a separately audited execution boundary exist.
+- `src/critical_consensus/market_data.py`, `src/critical_consensus/mt5_readonly.py` — fail-closed snapshot checks and a quote-only adapter for an external MT5 host; its CI test uses a fake terminal client.
+- `src/critical_consensus/authorization_store.py` — PostgreSQL one-time decision registry with atomic consume/replay prevention; not connected to public authorization API and does not authorize trades.
+- `src/critical_consensus/audit_store.py` — append-only PostgreSQL audit trace storage with post-write verification and idempotent retries. Pass it explicitly as `audit_store=` to `evaluate_signal_bundle`; persistence failure forces `DENY`.
+- `src/critical_consensus/redis_streams.py` — strict bounded event envelopes, content-bound idempotent publishing (`EVENT_ID_COLLISION` on reused IDs with different payloads), bounded consumer/reclaim parameters, strict JSON parsing and size limits at the consumer, retry handling and DLQ (at-least-once; worker deployment is not included).
 - `schemas/` — JSON Schema Draft 2020-12 для 11 контрактов.
 - `config/` — deny-by-default policy thresholds и permissions.
 - `mql5/CriticalConsensusEA.mq5` — демонстрационный EA: demo account only, disabled by default, TTL/SL/TP/slippage/idempotency checks.
-- `db/postgres_schema.sql`, `neo4j/schema.cypher` — минимальные схемы хранения и графа.
+- `db/postgres_schema.sql`, `db/migrations/20261029_permission_decision_consumed.sql`, `neo4j/schema.cypher` — схемы хранения/графа и миграция статуса решения.
 - `tests/` — adversarial unit tests.
 - `.github/workflows/security-audit.yml` — checks installed Python dependencies for known advisories on push, pull request, and weekly schedule.
 - `docs/` — архитектура, формулы, пример trace и недельный roadmap.
@@ -54,7 +57,7 @@ docker compose up -d
 
 ## Сквозной demo evaluation flow
 
-`evaluate_signal_bundle(...)` принимает уже сформированные verdicts, peer reviews, challenge ledger, source reports и ChiefReasoning. Он пересчитывает coverage peer-review, использует калибровочные метаданные для consensus, связывает PermissionRequest с хэшем ChiefReasoning, пересчитанным consensus и точными сводками источников, затем применяет certainty gate, ChiefAgent и PermissionGate. Если пользователь не передал решение, возвращается `REQUIRE_HUMAN` вместе с `human_review_packet`: все peer reviews, dissenting opinions, challenge ledger, ChiefReasoning, источники, риск-снимок и tail-risk. Валидное решение приводит только к `AUTHORIZED_ONCE`; команда ордера не создаётся.
+`evaluate_signal_bundle(...)` принимает уже сформированные verdicts, peer reviews, challenge ledger, source reports и ChiefReasoning. Он пересчитывает coverage peer-review, использует калибровочные метаданные для consensus, связывает PermissionRequest с хэшем ChiefReasoning, пересчитанным consensus и точными сводками источников, затем применяет certainty gate, ChiefAgent и PermissionGate. Если пользователь не передал решение, возвращается `REQUIRE_HUMAN` вместе с `human_review_packet`: все peer reviews, dissenting opinions, challenge ledger, ChiefReasoning, источники, риск-снимок и tail-risk. Даже валидные метаданные подтверждения не дают `AUTHORIZED_ONCE`: без постоянного хранилища `decision_id`, защиты от повторного воспроизведения и серверного состояния авторизации pipeline возвращает `DENY`. Команда ордера не создаётся.
 
 ```python
 from critical_consensus.pipeline import evaluate_signal_bundle
@@ -82,9 +85,21 @@ assert result["trade_allowed"] is False
 
 ## Проверка текущего каркаса
 
-- Локальная проверка исходников: `pytest -q` — **78 тестов PASS**. Последний проверенный GitHub Actions прогон: **84 passed in 0.81s**, Python 3.12, без pytest warnings: [тесты](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40849840096). Отдельный аудит зависимостей: [PASS](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40849840095), `pip-audit` сообщил `No known vulnerabilities found`; зафиксировано требование `pytest>=9.0.3` после исправления `PYSEC-2026-1845`. CI использует `ubuntu-22.04`, `actions/checkout@v7`, `actions/setup-python@v7` и `httpx2` для TestClient. Это синтетические тесты функций/API, а не брокерные испытания.
-- Проверяются fail-closed gates, integrity binding между ChiefReasoning/consensus/source summary и PermissionRequest, выдача полного human review packet, hash chain, API key gate и Redis Streams helpers.
-- Проверка зелёных тестов доказывает поведение локальных функций на синтетических входах, но не проверяет брокер, MQL5-компиляцию, реальную очередь, рыночные данные или доходность.
+### Актуальная интеграционная ветка
+
+- Ветка: `integration/safety-gates-merged`, интеграционный PR: [#7](https://github.com/paulafanasyev/mt5-critical-consensus/pull/7). Проверенный кодовый коммит: `54c59fe8effae4a83fc553f17480c6c83598dea5`.
+- GitHub Actions на последнем кодовом коммите `091211d7a9e8a70993bcaa1812868ab3941d6f98`: **220 passed in 2.84s** на Python 3.12 с PostgreSQL 16 service container. [Тесты](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40914754982). [Аудит безопасности](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40914755214): `pip-audit` — `No known vulnerabilities found`, Bandit — `No issues identified`.
+- [Аудит безопасности](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40908492260): `pip-audit` сообщил `No known vulnerabilities found`, Bandit — `No issues identified`.
+- Тесты покрывают защищённый `POST /v1/market/snapshot/validate`, strict policy gates, рыночные снимки, protective levels, одноразовую PostgreSQL-авторизацию без выдачи торгового разрешения, read-only MT5 adapter с fake-клиентом, append-only audit store и связку pipeline → PostgreSQL → повторная проверка trace.
+- `evaluate_signal_bundle(..., audit_store=store)` передаёт готовую hash-linked трассу в внедрённое хранилище. Если сохранение/проверка не подтверждены, итог становится `DENY` с `AUDIT_PERSISTENCE_FAILED`. DB store не создаётся автоматически — deployment должен передать настроенный PostgreSQL adapter.
+- PostgreSQL-реестр решений и audit store не подключены к публичному authorization endpoint автоматически. Реальный provider аутентификации/MFA/signature не реализован; запись или потребление решения не разрешает торговлю.
+- `/v1/authorization/check` и `/v1/execution/submit` остаются HTTP 423. `execution_enabled=false`, `live_enabled=false`; ордер не создаётся и не отправляется.
+- **NOT PROVEN / pending:** Vercel Preview текущей интеграционной ветки. Создание деплоя отклонено лимитом `api-deployments-free-per-day` (свыше 100 деплоев за сутки; Vercel предлагает повторить через 24 часа). Production не менялся и остаётся на `main` commit `1774971700fed478479ed657082f9300989505df`. Также не проверены запущенный Windows MT5 terminal/брокер, компиляция MQL5 в MetaEditor, подлинность рыночного feed, прибыльность и production readiness.
+### Исторический baseline ветки `main`
+
+Предыдущие замеры относятся к более раннему состоянию репозитория, а не к интеграционной ветке: локально 78 тестов и один CI-прогон с 84 тестами ([старый прогон](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40849840096), [старый аудит](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40849840095)). Не используйте эти числа как текущую оценку интегрированного кода.
+
+- Зелёные синтетические тесты проверяют поведение функций и интеграцию с тестовой PostgreSQL, но не доказывают работу брокера, реального MT5 terminal, production-хранилища или доходность.
 - ChiefReasoning hash вычисляется по каноническому JSON без поля `reasoning_hash`; изменение любого шага делает hash невалидным.
 
 ## Официальные точки интеграции
