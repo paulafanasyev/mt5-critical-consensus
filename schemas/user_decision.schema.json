@@ -5,51 +5,17 @@
   "description": "Explicit human decision. Live requires 2FA and signature verification.",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "decision_id",
-    "permission_id",
-    "user_id",
-    "decision",
-    "timestamp",
-    "reason",
-    "ttl_seconds"
-  ],
+  "required": ["decision_id", "permission_id", "user_id", "decision", "timestamp", "reason", "ttl_seconds"],
   "properties": {
-    "decision_id": {
-      "type": "string"
-    },
-    "permission_id": {
-      "type": "string"
-    },
-    "user_id": {
-      "type": "string"
-    },
-    "decision": {
-      "enum": [
-        "APPROVE",
-        "REJECT"
-      ]
-    },
-    "timestamp": {
-      "type": "string",
-      "format": "date-time"
-    },
-    "reason": {
-      "type": "string"
-    },
-    "ttl_seconds": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 600
-    },
-    "two_fa_verified": {
-      "type": "boolean"
-    },
-    "signature_verified": {
-      "type": "boolean"
-    },
-    "ip_hash": {
-      "type": "string"
-    }
+    "decision_id": {"type": "string", "minLength": 1, "pattern": "\\S"},
+    "permission_id": {"type": "string", "minLength": 1, "pattern": "\\S"},
+    "user_id": {"type": "string", "minLength": 1, "pattern": "\\S"},
+    "decision": {"enum": ["APPROVE", "REJECT"]},
+    "timestamp": {"type": "string", "format": "date-time"},
+    "reason": {"type": "string", "minLength": 1, "pattern": "\\S"},
+    "ttl_seconds": {"type": "integer", "minimum": 1, "maximum": 600},
+    "two_fa_verified": {"type": "boolean"},
+    "signature_verified": {"type": "boolean"},
+    "ip_hash": {"type": "string"}
   }
 }
