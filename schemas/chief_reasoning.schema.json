@@ -31,6 +31,6 @@
     "challenge_ledger_snapshot":{"type":"array","items":{"type":"object","required":["challenge_id"],"properties":{"challenge_id":{"type":"string","minLength":1},"status":{"enum":["OPEN","RESOLVED","ESCALATED"]},"target_verdict_id":{"type":"string"},"challenge_type":{"type":"string"},"evidence_refs":{"type":"array","items":{"type":"string"}},"resolution_evidence_refs":{"type":"array","items":{"type":"string"}}},"additionalProperties":true}},
     "challenge_ledger_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
     "reviewed_challenge_ids":{"type":"array","uniqueItems":true,"items":{"type":"string","minLength":1}},
-    "tail_risk_scenarios":{"type":"array","minItems":1,"items":{"type":"object","required":["scenario","probability","impact","evidence_refs"],"properties":{"scenario":{"type":"string","minLength":1},"probability":{"type":"number","minimum":0,"maximum":1},"impact":{"type":"string","minLength":1},"mitigation":{"type":"string"},"evidence_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}},"additionalProperties":false}
+    "tail_risk_scenarios":{"type":"array","minItems":1,"items":{"type":"object","required":["scenario","probability","impact","evidence_refs"],"properties":{"scenario":{"type":"string","minLength":1},"probability":{"type":"number","minimum":0,"maximum":1},"impact":{"type":"string","minLength":1},"mitigation":{"type":"string"},"evidence_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}},"additionalProperties":false}}
   }
 }
