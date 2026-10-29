@@ -32,7 +32,7 @@ flowchart TB
     PG -->|DENY| STOP[No order]
     PG -->|REQUIRE_HUMAN| UA[Human approval + live 2FA/signature]
     UA -->|reject/expired| STOP
-    UA -->|one-time allow| EX[Planned execution bridge / MQL5 EA — disabled in scaffold]
+    UA -->|approval metadata valid, replay guard absent| STOP
     EX --> RECON[Fill + positions reconciliation]
     RECON --> AUD[(Append-only audit + immutable object storage)]
     CG --> AUD
@@ -61,7 +61,7 @@ flowchart TB
 
 - Любое решение вычисляется как conjunction обязательных условий, не по большинству голосов.
 - `PASS` у CertaintyGate означает только передачу на ChiefAgent; `CONFIRM` ChiefAgent означает только разрешение перейти к PermissionGate.
-- PermissionGate возвращает `REQUIRE_HUMAN`; authorization формирует одноразовое разрешение, но не создаёт ордер.
+- PermissionGate возвращает `REQUIRE_HUMAN`; без durable permission state и persistent replay/idempotency store approval остаётся метаданными и завершается `DENY`. Одноразовое разрешение пока не реализовано.
 - Исполнительный мост перепроверяет TTL, client_order_id, slippage, SL/TP, состояние счёта и текущие позиции непосредственно перед операцией.
 - При неопределённом результате вызова брокера не выполняется слепой retry; запускается reconcile.
 
