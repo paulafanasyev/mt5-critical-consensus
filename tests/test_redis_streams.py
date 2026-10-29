@@ -149,3 +149,32 @@ async def test_publish_event_rejects_noninteger_or_oversized_dedupe_ttl():
     for ttl in (True, 1.5, "3600", 0, 604801):
         with pytest.raises(ValueError, match="dedupe_ttl_seconds"):
             await publish_event(FakeRedis(), "cc:signals:v1", event(), dedupe_ttl_seconds=ttl)
+
+
+@pytest.mark.parametrize("bad_payload", [
+    {"value": float("nan")},
+    {"value": float("inf")},
+    {"value": object()},
+])
+@pytest.mark.asyncio
+async def test_publish_event_rejects_non_json_payload_values(bad_payload):
+    malformed = event()
+    malformed["payload"] = bad_payload
+    with pytest.raises(ValueError, match="strict JSON"):
+        await publish_event(FakeRedis(), "cc:signals:v1", malformed)
+
+
+@pytest.mark.asyncio
+async def test_publish_event_rejects_oversized_envelope():
+    malformed = event()
+    malformed["payload"] = {"blob": "x" * 1_100_000}
+    with pytest.raises(ValueError, match="1048576-byte limit"):
+        await publish_event(FakeRedis(), "cc:signals:v1", malformed)
+
+
+@pytest.mark.asyncio
+async def test_publish_event_accepts_fractional_rfc3339_timestamp():
+    valid = event()
+    valid["created_at"] = "2026-10-29T12:00:00.123456Z"
+    result = await publish_event(FakeRedis(), "cc:signals:v1", valid)
+    assert result

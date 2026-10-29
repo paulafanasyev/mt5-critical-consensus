@@ -25,6 +25,7 @@ _RFC3339_RE = re.compile(
 _MAX_EVENT_ID_LENGTH = 128
 _MAX_EVENT_TYPE_LENGTH = 128
 _MAX_TIMESTAMP_LENGTH = 64
+MAX_EVENT_BYTES = 1_048_576
 
 _PUBLISH_LUA = """
 local existing = redis.call('GET', KEYS[1])
@@ -69,7 +70,7 @@ def _validate_event(event: Mapping[str, Any]) -> None:
         raise ValueError("payload must be an object")
     created_at = event.get("created_at")
     if not isinstance(created_at, str) or not created_at or len(created_at) > _MAX_TIMESTAMP_LENGTH or _RFC3339_RE.fullmatch(created_at) is None:
-        raise ValueError("created_at must be a bounded RFC3339 string")
+        raise ValueError("created_at must be a bounded RFC3339 timestamp including timezone")
     try:
         stamp = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
     except ValueError as exc:
@@ -78,16 +79,23 @@ def _validate_event(event: Mapping[str, Any]) -> None:
         raise ValueError("created_at must include a timezone")
 
 
-async def publish_event(redis_client, stream: str, event: Mapping[str, Any], *, dedupe_ttl_seconds: int = 2_592_000) -> str:
+async def publish_event(redis_client, stream: str, event: Mapping[str, Any], *, dedupe_ttl_seconds: int = 604_800) -> str:
     """Publish once per event_id within the dedupe TTL using one atomic Redis script."""
     if not isinstance(event, Mapping):
         raise ValueError("event must be an object")
     _validate_event(event)
-    if not stream or not stream.startswith("cc:"):
-        raise ValueError("stream must use the cc: namespace")
+    if not isinstance(stream, str) or not stream.startswith("cc:"):
+        raise ValueError("stream must be a string in the cc: namespace")
     if isinstance(dedupe_ttl_seconds, bool) or not isinstance(dedupe_ttl_seconds, int) or not 1 <= dedupe_ttl_seconds <= 7 * 24 * 60 * 60:
         raise ValueError("dedupe_ttl_seconds must be an integer in 1..604800")
-    serialized = json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    try:
+        serialized = json.dumps(
+            event, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        )
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise ValueError("event must contain strict JSON-compatible values") from exc
+    if len(serialized.encode("utf-8")) > MAX_EVENT_BYTES:
+        raise ValueError("event exceeds the 1048576-byte limit")
     dedupe_key = f"cc:published:{stream}:{event['event_id']}"
     result = await redis_client.eval(_PUBLISH_LUA, 2, dedupe_key, stream, serialized, dedupe_ttl_seconds)
     return str(_decode(result))
