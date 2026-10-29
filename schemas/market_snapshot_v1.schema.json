@@ -17,8 +17,8 @@
   ],
   "properties": {
     "schema_version": {"type": "integer", "const": 1},
-    "snapshot_id": {"type": "string", "minLength": 1},
-    "source_id": {"type": "string", "minLength": 1},
+    "snapshot_id": {"type": "string", "minLength": 1, "pattern": "\\S"},
+    "source_id": {"type": "string", "minLength": 1, "pattern": "\\S"},
     "symbol": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,32}$"},
     "bid": {"type": "number", "exclusiveMinimum": 0},
     "ask": {"type": "number", "exclusiveMinimum": 0},
