@@ -473,9 +473,6 @@ def evaluate_signal_bundle(bundle: Mapping[str, Any], certainty_policy: Mapping[
     emit("USER_AUTHORIZATION", {"signal_id": signal_id, "status": authorization.get("status"),
                                  "permission_id": authorization.get("permission_id"),
                                  "blockers": authorization.get("blockers", [])})
-    if authorization.get("authorized") is True:
-        return finish("AUTHORIZED_ONCE", [], certainty=certainty, chief=chief, permission=permission,
-                      authorization=authorization, human_review_packet=packet,
-                      message="One-time permission metadata validated; no order was created or sent.")
     return finish("DENY", list(authorization.get("blockers", [])), certainty=certainty,
-                  chief=chief, permission=permission, authorization=authorization, human_review_packet=packet)
+                  chief=chief, permission=permission, authorization=authorization, human_review_packet=packet,
+                  message="Approval metadata alone is insufficient: durable replay protection and server-side authorization state are not implemented.")
