@@ -275,6 +275,10 @@ def test_pipeline_fails_closed_when_audit_store_returns_failure():
     assert result["audit_persistence"]["persisted"] is False
     assert result["audit_events"][-1]["event_type"] == "AUDIT_PERSISTENCE_FAILURE"
     assert result["audit_events"][-1]["payload"]["status"] == "DENY"
+    pipeline_result = result["audit_events"][-2]
+    assert pipeline_result["event_type"] == "PIPELINE_RESULT"
+    assert pipeline_result["payload"]["status"] == "DENY"
+    assert "AUDIT_PERSISTENCE_FAILED" in pipeline_result["payload"]["blockers"]
     assert verify_audit_chain(result["audit_events"])["valid"] is True
 
 

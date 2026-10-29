@@ -146,6 +146,17 @@ def evaluate_signal_bundle(bundle: Mapping[str, Any], certainty_policy: Mapping[
                     or audit_persistence.get("verified") is not True):
                 result_status = "DENY"
                 result_blockers = sorted(set(result_blockers + ["AUDIT_PERSISTENCE_FAILED"]))
+                # The trace being returned must not retain a positive PIPELINE_RESULT
+                # after audit persistence fails. This denial trace remains verifiable,
+                # but it is explicitly not persisted because the store failed.
+                final_event = trace[-1]
+                final_payload = dict(final_event.get("payload", {}))
+                final_payload["status"] = "DENY"
+                final_payload["blockers"] = result_blockers
+                final_event["payload"] = final_payload
+                final_event.pop("event_hash", None)
+                final_event["event_hash"] = canonical_hash(final_event)
+                previous_hash = final_event["event_hash"]
                 store_blockers = audit_persistence.get("blockers", [])
                 if not isinstance(store_blockers, list):
                     store_blockers = ["AUDIT_STORE_INVALID_BLOCKERS"]
