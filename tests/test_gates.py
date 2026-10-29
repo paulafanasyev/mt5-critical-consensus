@@ -339,3 +339,16 @@ def test_certainty_gate_rejects_duplicate_source_ids():
     result = certainty_gate(payload, POLICY)
     assert result["status"] == "GATHER_MORE"
     assert "KEY_SOURCE_IDS_INVALID_OR_DUPLICATE" in result["blockers"]
+
+
+def test_user_authorization_rejects_invalid_server_ttl_policy():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    permission = {"status": "REQUIRE_HUMAN", "permission_id": "p4", "mode": "demo",
+                  "expires_at": (now + timedelta(minutes=5)).isoformat()}
+    decision = {"decision_id": "decision-p4", "decision": "APPROVE", "user_id": "operator-1",
+                "reason": "reviewed", "permission_id": "p4", "timestamp": now.isoformat(), "ttl_seconds": 300}
+    for kwargs in ({"max_ttl_seconds": 601}, {"max_ttl_seconds": True},
+                   {"max_future_skew_seconds": 31}, {"max_future_skew_seconds": -1}):
+        result = user_authorization_gate(permission, decision, now=now, **kwargs)
+        assert result["status"] == "DENY"
+        assert "INVALID_AUTHORIZATION_POLICY" in result["blockers"]
