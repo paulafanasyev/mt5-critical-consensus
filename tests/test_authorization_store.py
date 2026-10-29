@@ -7,6 +7,7 @@ import psycopg
 from psycopg import sql
 import pytest
 
+from critical_consensus.audit import canonical_hash
 from critical_consensus.authorization_store import (
     PostgresDecisionStore,
     VerifiedAuthReceipt,
@@ -74,12 +75,13 @@ def make_decision(permission_id, now, *, decision="APPROVE", ttl_seconds=120, **
     return payload
 
 
-def make_receipt(now, *, two_fa=False, signature=False):
+def make_receipt(now, decision, *, two_fa=False, signature=False):
     return VerifiedAuthReceipt(
         verifier_id="test-auth-provider",
         method="webauthn",
         receipt_id=f"receipt-{uuid.uuid4().hex}",
         verified_at=now.isoformat(),
+        decision_hash=canonical_hash(dict(decision)),
         two_fa_verified=two_fa,
         signature_verified=signature,
     )
@@ -88,7 +90,7 @@ def make_receipt(now, *, two_fa=False, signature=False):
 def test_registered_decision_can_be_consumed_once_only(store):
     permission_id, now = seed_permission(store)
     decision = make_decision(permission_id, now)
-    registration = store.register_verified_decision(decision, make_receipt(now), now=now)
+    registration = store.register_verified_decision(decision, make_receipt(now, decision), now=now)
     assert registration["registered"] is True
 
     permission = {"status": "REQUIRE_HUMAN", "permission_id": permission_id}
@@ -137,7 +139,7 @@ def test_store_refuses_expired_permission_and_duplicate_decision_id(store):
 def test_live_approval_requires_verified_second_factor_and_signature(store):
     permission_id, now = seed_permission(store, mode="live")
     decision = make_decision(permission_id, now, two_fa_verified=True, signature_verified=True)
-    no_proof = make_receipt(now, two_fa=False, signature=False)
+    no_proof = make_receipt(now, decision, two_fa=False, signature=False)
     result = store.register_verified_decision(decision, no_proof, now=now)
     assert result["registered"] is False
     assert "LIVE_2FA_OR_SIGNATURE_VERIFICATION_REQUIRED" in result["blockers"][0]
@@ -229,3 +231,18 @@ def test_revoked_permission_cannot_consume_registered_decision(store):
     assert result["consumed"] is False
     assert result["status"] == "DENY"
     assert "PERMISSION_NOT_PENDING_HUMAN_APPROVAL" in result["blockers"]
+
+
+def test_verified_receipt_is_bound_to_exact_decision_payload(store):
+    permission_id, now = seed_permission(store)
+    decision = make_decision(permission_id, now)
+    receipt = make_receipt(now, decision)
+    altered = dict(decision)
+    altered["reason"] = "tampered after verification"
+
+    rejected = store.register_verified_decision(altered, receipt, now=now)
+    assert rejected["registered"] is False
+    assert "VERIFIED_AUTH_DECISION_BINDING_MISMATCH" in rejected["blockers"]
+
+    accepted = store.register_verified_decision(decision, receipt, now=now)
+    assert accepted["registered"] is True

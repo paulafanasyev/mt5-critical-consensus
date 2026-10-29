@@ -117,8 +117,11 @@ CREATE TABLE IF NOT EXISTS user_decisions (
   verified_at TIMESTAMPTZ NOT NULL,
   consumed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CHECK (expires_at > decision_timestamp)
+  CHECK (expires_at > decision_timestamp),
+  CONSTRAINT uq_user_decisions_auth_receipt UNIQUE (verifier_id, verification_ref)
 );
 -- A permission can receive only one registered human decision; a new review needs a new permission.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_user_decisions_permission
   ON user_decisions (permission_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_user_decisions_auth_receipt
+  ON user_decisions (verifier_id, verification_ref);

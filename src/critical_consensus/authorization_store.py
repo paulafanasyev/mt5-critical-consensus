@@ -35,12 +35,17 @@ CREATE TABLE IF NOT EXISTS user_decisions (
     verified_at TIMESTAMPTZ NOT NULL,
     consumed_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CHECK (expires_at > decision_timestamp)
+    CHECK (expires_at > decision_timestamp),
+    CONSTRAINT uq_user_decisions_auth_receipt UNIQUE (verifier_id, verification_ref)
 )
 """
 _CREATE_PERMISSION_INDEX = """
 CREATE UNIQUE INDEX IF NOT EXISTS uq_user_decisions_permission
 ON user_decisions (permission_id)
+"""
+_CREATE_AUTH_RECEIPT_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_user_decisions_auth_receipt
+ON user_decisions (verifier_id, verification_ref)
 """
 
 
@@ -60,6 +65,7 @@ class VerifiedAuthReceipt:
     method: str
     receipt_id: str
     verified_at: str
+    decision_hash: str
     two_fa_verified: bool = False
     signature_verified: bool = False
 
@@ -137,6 +143,7 @@ class PostgresDecisionStore:
             with self._connect() as connection:
                 connection.execute(_CREATE_TABLE)
                 connection.execute(_CREATE_PERMISSION_INDEX)
+                connection.execute(_CREATE_AUTH_RECEIPT_INDEX)
         except Exception as exc:
             raise DecisionStoreError("authorization storage is unavailable") from exc
 
@@ -164,6 +171,9 @@ class PostgresDecisionStore:
                 return {"registered": False, "blockers": ["VERIFIED_AUTH_RECEIPT_INVALID"], "trade_allowed": False}
         if receipt.method not in _ALLOWED_METHODS:
             return {"registered": False, "blockers": ["VERIFICATION_METHOD_INVALID"], "trade_allowed": False}
+        expected_decision_hash = canonical_hash(dict(decision))
+        if not isinstance(receipt.decision_hash, str) or receipt.decision_hash != expected_decision_hash:
+            return {"registered": False, "blockers": ["VERIFIED_AUTH_DECISION_BINDING_MISMATCH"], "trade_allowed": False}
         if not isinstance(receipt.two_fa_verified, bool) or not isinstance(receipt.signature_verified, bool):
             return {"registered": False, "blockers": ["VERIFIED_AUTH_RECEIPT_INVALID"], "trade_allowed": False}
         verified_at = _parse_time(receipt.verified_at)
