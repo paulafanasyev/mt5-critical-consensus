@@ -11,12 +11,12 @@ def test_live_execution_is_disabled_by_default():
     assert "live execution is disabled by policy" in result.reasons
 
 
-def test_order_requires_finite_protective_levels_and_user_approval():
+def test_order_requires_stops_and_user_approval():
     intent = OrderIntent("EURUSD", "BUY", 0.1, None, None)
     result = authorize_order(intent)
     assert not result.allowed
-    assert "stop loss is required and must be finite" in result.reasons
-    assert "take profit is required and must be finite" in result.reasons
+    assert "stop loss is required" in result.reasons
+    assert "take profit is required" in result.reasons
     assert "expected entry price is required and must be finite and positive" in result.reasons
     assert "explicit user approval is required" in result.reasons
 

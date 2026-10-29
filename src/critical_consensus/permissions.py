@@ -73,9 +73,9 @@ def authorize_order(
     take = _finite_number(intent.take_profit)
     entry = _finite_number(intent.expected_price)
     if stop is None:
-        reasons.append("stop loss is required and must be finite")
+        reasons.append("stop loss is required")
     if take is None:
-        reasons.append("take profit is required and must be finite")
+        reasons.append("take profit is required")
     if entry is None or entry <= 0:
         reasons.append("expected entry price is required and must be finite and positive")
     if stop is not None and take is not None and entry is not None and entry > 0:
