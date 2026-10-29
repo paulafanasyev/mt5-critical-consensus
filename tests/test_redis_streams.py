@@ -6,6 +6,8 @@ from critical_consensus.redis_streams import (
     STREAM_DLQ,
     ensure_consumer_group,
     process_message_batch,
+    read_new_messages,
+    reclaim_pending_messages,
     publish_event,
 )
 
@@ -178,3 +180,62 @@ async def test_publish_event_accepts_fractional_rfc3339_timestamp():
     valid["created_at"] = "2026-10-29T12:00:00.123456Z"
     result = await publish_event(FakeRedis(), "cc:signals:v1", valid)
     assert result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_attempts", [True, 1.5, "3", 0, 101])
+async def test_process_message_batch_rejects_invalid_retry_bounds(max_attempts):
+    with pytest.raises(ValueError, match="max_attempts"):
+        await process_message_batch(FakeRedis(), "cc:signals:v1", "workers", [],
+                                    lambda _event: None, max_attempts=max_attempts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [True, 1.5, "10", 0, 1001])
+async def test_read_new_messages_rejects_invalid_count_before_redis_call(count):
+    with pytest.raises(ValueError, match="count"):
+        await read_new_messages(FakeRedis(), "cc:signals:v1", "workers", "consumer-1", count=count)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("block_ms", [True, 1.5, "100", -1, 60001])
+async def test_read_new_messages_rejects_invalid_block_timeout(block_ms):
+    with pytest.raises(ValueError, match="block_ms"):
+        await read_new_messages(FakeRedis(), "cc:signals:v1", "workers", "consumer-1", block_ms=block_ms)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("min_idle_ms", [True, 1.5, "30000", -1, 86400001])
+async def test_reclaim_pending_messages_rejects_invalid_idle_bound(min_idle_ms):
+    with pytest.raises(ValueError, match="min_idle_ms"):
+        await reclaim_pending_messages(FakeRedis(), "cc:signals:v1", "workers", "consumer-1",
+                                       min_idle_ms=min_idle_ms)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [True, 1.5, "10", 0, 1001])
+async def test_reclaim_pending_messages_rejects_invalid_count(count):
+    with pytest.raises(ValueError, match="count"):
+        await reclaim_pending_messages(FakeRedis(), "cc:signals:v1", "workers", "consumer-1", count=count)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream,group", [
+    ("signals:v1", "workers"),
+    ("cc:signals:v1", ""),
+    ("cc:signals:v1", "bad\\ngroup"),
+    ("cc:signals:v1", "g" * 129),
+])
+async def test_consumer_group_creation_rejects_invalid_stream_or_group(stream, group):
+    with pytest.raises(ValueError):
+        await ensure_consumer_group(FakeRedis(), stream, group)
+
+
+@pytest.mark.asyncio
+async def test_process_message_batch_rejects_oversized_batch_and_noncallable_handler():
+    with pytest.raises(ValueError, match="at most"):
+        await process_message_batch(FakeRedis(), "cc:signals:v1", "workers",
+                                    [None] * 1001, lambda _event: None)
+    with pytest.raises(ValueError, match="handler"):
+        await process_message_batch(FakeRedis(), "cc:signals:v1", "workers",
+                                    [], None)

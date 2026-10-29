@@ -91,3 +91,6 @@ flowchart TB
 - `publish_event` accepts strict string IDs/types and bounded RFC3339 timestamps; it does not coerce integers or objects to strings.
 - Dedupe records retain the canonical serialized event beside the stream ID. A repeated `event_id` with identical content returns the original stream ID; reusing it with different content raises `EVENT_ID_COLLISION` instead of silently hiding the changed event.
 - The publisher uses a bounded dedupe TTL of 1–604800 seconds. Redis remains at-least-once; consumers still need a durable idempotency inbox around side effects.
+
+
+- Redis Streams consumer arguments are now type-checked and bounded: `max_attempts` 1–100, read/reclaim batch count 1–1000, read block timeout 0–60000 ms, reclaim idle threshold 0–24 hours, and stream/group/consumer names have bounded string length. Booleans, floats and stringified numbers are rejected rather than implicitly accepted.

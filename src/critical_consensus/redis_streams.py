@@ -26,6 +26,14 @@ _MAX_EVENT_ID_LENGTH = 128
 _MAX_EVENT_TYPE_LENGTH = 128
 _MAX_TIMESTAMP_LENGTH = 64
 MAX_EVENT_BYTES = 1_048_576
+MAX_STREAM_NAME_LENGTH = 128
+MAX_CONSUMER_NAME_LENGTH = 128
+MAX_GROUP_NAME_LENGTH = 128
+MAX_STREAM_ID_LENGTH = 128
+MAX_BATCH_COUNT = 1_000
+MAX_BLOCK_MS = 60_000
+MAX_ATTEMPTS = 100
+MAX_MIN_IDLE_MS = 24 * 60 * 60 * 1_000
 
 _PUBLISH_LUA = """
 local existing = redis.call('GET', KEYS[1])
@@ -50,6 +58,26 @@ return stream_id
 def _decode(value: Any) -> Any:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
+    return value
+
+
+def _validate_stream_name(stream: Any) -> str:
+    if (not isinstance(stream, str) or not stream.startswith("cc:")
+            or len(stream) > MAX_STREAM_NAME_LENGTH or any(ch in stream for ch in "\\r\\n")):
+        raise ValueError("stream must be a bounded string in the cc: namespace")
+    return stream
+
+
+def _validate_identifier(value: Any, name: str, max_length: int = MAX_CONSUMER_NAME_LENGTH) -> str:
+    if (not isinstance(value, str) or not value.strip() or len(value) > max_length
+            or any(ch in value for ch in "\\r\\n")):
+        raise ValueError(f"{name} must be a non-empty bounded string")
+    return value
+
+
+def _validate_bounded_int(value: Any, name: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be an integer in {minimum}..{maximum}")
     return value
 
 
@@ -102,7 +130,10 @@ async def publish_event(redis_client, stream: str, event: Mapping[str, Any], *, 
 
 
 async def ensure_consumer_group(redis_client, stream: str, group: str, *, start_id: str = "0-0") -> None:
-    """Create a stream group once; only suppress Redis' already-exists response."""
+    """Create a validated stream group once; only suppress Redis' already-exists response."""
+    _validate_stream_name(stream)
+    _validate_identifier(group, "group", MAX_GROUP_NAME_LENGTH)
+    _validate_identifier(start_id, "start_id", MAX_STREAM_ID_LENGTH)
     try:
         await redis_client.xgroup_create(stream, group, id=start_id, mkstream=True)
     except Exception as exc:
@@ -161,8 +192,15 @@ async def process_message_batch(
     max_attempts: int = 3,
 ) -> dict[str, int]:
     """Process XREADGROUP/XAUTOCLAIM messages; unacked failures remain pending for retry."""
-    if max_attempts < 1:
-        raise ValueError("max_attempts must be >= 1")
+    _validate_stream_name(stream)
+    _validate_identifier(group, "group", MAX_GROUP_NAME_LENGTH)
+    _validate_bounded_int(max_attempts, "max_attempts", 1, MAX_ATTEMPTS)
+    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
+        raise ValueError("messages must be a sequence")
+    if len(messages) > MAX_BATCH_COUNT:
+        raise ValueError(f"messages must contain at most {MAX_BATCH_COUNT} entries")
+    if not callable(handler):
+        raise ValueError("handler must be callable")
     stats = {"processed": 0, "retried": 0, "dead_lettered": 0, "invalid": 0}
     for raw_message_id, fields in messages:
         message_id = str(_decode(raw_message_id))
@@ -196,9 +234,12 @@ async def process_message_batch(
 
 async def read_new_messages(redis_client, stream: str, group: str, consumer: str, *,
                             count: int = 10, block_ms: int = 1000) -> list[tuple[str, Mapping[Any, Any]]]:
-    """Read new events from a consumer group. Create the group first with ensure_consumer_group."""
-    if count < 1 or block_ms < 0:
-        raise ValueError("count must be positive and block_ms non-negative")
+    """Read bounded new events from a validated consumer group."""
+    _validate_stream_name(stream)
+    _validate_identifier(group, "group", MAX_GROUP_NAME_LENGTH)
+    _validate_identifier(consumer, "consumer", MAX_CONSUMER_NAME_LENGTH)
+    _validate_bounded_int(count, "count", 1, MAX_BATCH_COUNT)
+    _validate_bounded_int(block_ms, "block_ms", 0, MAX_BLOCK_MS)
     records = await redis_client.xreadgroup(group, consumer, {stream: ">"}, count=count, block=block_ms)
     output: list[tuple[str, Mapping[Any, Any]]] = []
     for _stream_name, messages in records or []:
@@ -209,9 +250,13 @@ async def read_new_messages(redis_client, stream: str, group: str, consumer: str
 async def reclaim_pending_messages(redis_client, stream: str, group: str, consumer: str, *,
                                    min_idle_ms: int = 30_000, start_id: str = "0-0",
                                    count: int = 10) -> tuple[str, list[tuple[str, Mapping[Any, Any]]]]:
-    """Claim idle pending entries after a worker crash, so bounded retries can continue."""
-    if min_idle_ms < 0 or count < 1:
-        raise ValueError("min_idle_ms must be non-negative and count positive")
+    """Claim a bounded number of idle pending entries after a worker crash."""
+    _validate_stream_name(stream)
+    _validate_identifier(group, "group", MAX_GROUP_NAME_LENGTH)
+    _validate_identifier(consumer, "consumer", MAX_CONSUMER_NAME_LENGTH)
+    _validate_bounded_int(min_idle_ms, "min_idle_ms", 0, MAX_MIN_IDLE_MS)
+    _validate_bounded_int(count, "count", 1, MAX_BATCH_COUNT)
+    _validate_identifier(start_id, "start_id", MAX_STREAM_ID_LENGTH)
     result = await redis_client.xautoclaim(stream, group, consumer, min_idle_ms, start_id, count=count)
     if not isinstance(result, (tuple, list)) or len(result) < 2:
         raise RuntimeError("unexpected XAUTOCLAIM response")
