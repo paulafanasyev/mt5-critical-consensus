@@ -1,1 +1,59 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://example.invalid/critical-consensus/intel_report.schema.json","title":"Intel Report","description":"Raw normalized intelligence report with provenance and legal classification.","type":"object","additionalProperties":false,"required":["report_id","schema_version","instrument","observed_at","source_refs","facts","legal_tag","payload_hash"],"properties":{"report_id":{"type":"string"},"schema_version":{"type":"integer"},"instrument":{"type":"string"},"observed_at":{"type":"string","format":"date-time"},"source_refs":{"type":"array","items":{"type":"string"}},"facts":{"type":"array"},"legal_tag":{"enum":["LEGAL","PUBLIC-RUMOR","MNPI-SUSPECT","UNKNOWN"]},"payload_hash":{"type":"string"},"ttl_seconds":{"type":"integer"},"market_context":{"type":"object"}}}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/critical-consensus/intel_report.schema.json",
+  "title": "Intel Report",
+  "description": "Raw normalized intelligence report with provenance and legal classification.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "report_id",
+    "schema_version",
+    "instrument",
+    "observed_at",
+    "source_refs",
+    "facts",
+    "legal_tag",
+    "payload_hash"
+  ],
+  "properties": {
+    "report_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer"
+    },
+    "instrument": {
+      "type": "string"
+    },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "facts": {
+      "type": "array"
+    },
+    "legal_tag": {
+      "enum": [
+        "LEGAL",
+        "PUBLIC-RUMOR",
+        "MNPI-SUSPECT",
+        "UNKNOWN"
+      ]
+    },
+    "payload_hash": {
+      "type": "string"
+    },
+    "ttl_seconds": {
+      "type": "integer"
+    },
+    "market_context": {
+      "type": "object"
+    }
+  }
+}

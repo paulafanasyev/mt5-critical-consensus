@@ -5,23 +5,147 @@
   "description": "Agent verdict with calibration evidence and reproducibility metadata.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["verdict_id","signal_id","agent_id","verdict","confidence","reasoning","pros","cons","evidence_refs","ttl_seconds","input_hash","calibration_meta","created_at"],
+  "required": [
+    "verdict_id",
+    "signal_id",
+    "agent_id",
+    "verdict",
+    "confidence",
+    "reasoning",
+    "pros",
+    "cons",
+    "evidence_refs",
+    "ttl_seconds",
+    "input_hash",
+    "calibration_meta",
+    "created_at"
+  ],
   "properties": {
-    "verdict_id": {"type": "string", "minLength": 1},
-    "signal_id": {"type": "string", "minLength": 1},
-    "agent_id": {"type": "string", "minLength": 1},
-    "verdict": {"enum": ["APPROVE","ABSTAIN","REJECT","VETO","HOLD"]},
-    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-    "reasoning": {"type": "string", "minLength": 1},
-    "pros": {"type": "array"},
-    "cons": {"type": "array"},
-    "evidence_refs": {"type": "array", "items": {"type": "string"}},
-    "ttl_seconds": {"type": "integer", "minimum": 1},
-    "input_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-    "created_at": {"type": "string", "format": "date-time"},
-    "abstain_reason": {"type": "string"},
-    "reviewer_count": {"type": "integer", "minimum": 0},
-    "calibration_meta": {"type": "object", "required": ["brier_score","sample_size","method_version","calibration_status"], "properties": {"brier_score": {"type": "number", "minimum": 0, "maximum": 1}, "sample_size": {"type": "integer", "minimum": 0}, "method_version": {"type": "string"}, "high_confidence_accuracy": {"type": ["number","null"], "minimum": 0, "maximum": 1}, "calibration_status": {"enum": ["CALIBRATED","INSUFFICIENT_SAMPLE","UNVERIFIED","DRIFTED"]}}, "additionalProperties": false}
+    "verdict_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "signal_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "agent_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "verdict": {
+      "enum": [
+        "APPROVE",
+        "ABSTAIN",
+        "REJECT",
+        "VETO",
+        "HOLD"
+      ]
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "reasoning": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pros": {
+      "type": "array"
+    },
+    "cons": {
+      "type": "array"
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "ttl_seconds": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "input_hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "abstain_reason": {
+      "type": "string"
+    },
+    "reviewer_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "calibration_meta": {
+      "type": "object",
+      "required": [
+        "brier_score",
+        "sample_size",
+        "method_version",
+        "calibration_status"
+      ],
+      "properties": {
+        "brier_score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "sample_size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "method_version": {
+          "type": "string"
+        },
+        "high_confidence_accuracy": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "calibration_status": {
+          "enum": [
+            "CALIBRATED",
+            "INSUFFICIENT_SAMPLE",
+            "UNVERIFIED",
+            "DRIFTED"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
   },
-  "allOf": [{"if": {"properties": {"verdict": {"const": "ABSTAIN"}}, "required": ["verdict"]}, "then": {"required": ["abstain_reason"], "properties": {"abstain_reason": {"type": "string", "minLength": 1}}}}]
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "verdict": {
+            "const": "ABSTAIN"
+          }
+        },
+        "required": [
+          "verdict"
+        ]
+      },
+      "then": {
+        "required": [
+          "abstain_reason"
+        ],
+        "properties": {
+          "abstain_reason": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  ]
 }

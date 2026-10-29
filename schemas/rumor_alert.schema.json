@@ -1,1 +1,71 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://example.invalid/critical-consensus/rumor_alert.schema.json","title":"Rumor Alert","description":"Public-rumor record; MNPI-SUSPECT must be blocked by Compliance.","type":"object","additionalProperties":false,"required":["rumor_id","observed_at","source_refs","legal_tag","credibility","status"],"properties":{"rumor_id":{"type":"string"},"observed_at":{"type":"string","format":"date-time"},"source_refs":{"type":"array","items":{"type":"string"}},"legal_tag":{"enum":["PUBLIC-RUMOR","MNPI-SUSPECT","LEGAL","UNKNOWN"]},"credibility":{"type":"number","minimum":0,"maximum":1},"status":{"enum":["NEW","UNDER_REVIEW","BLOCKED","REFUTED","CORROBORATED"]},"claim":{"type":"string"},"independence_groups":{"type":"array","items":{"type":"string"}},"evidence_refs":{"type":"array","items":{"type":"string"}},"reason":{"type":"string"}}}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/critical-consensus/rumor_alert.schema.json",
+  "title": "Rumor Alert",
+  "description": "Public-rumor record; MNPI-SUSPECT must be blocked by Compliance.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "rumor_id",
+    "observed_at",
+    "source_refs",
+    "legal_tag",
+    "credibility",
+    "status"
+  ],
+  "properties": {
+    "rumor_id": {
+      "type": "string"
+    },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "legal_tag": {
+      "enum": [
+        "PUBLIC-RUMOR",
+        "MNPI-SUSPECT",
+        "LEGAL",
+        "UNKNOWN"
+      ]
+    },
+    "credibility": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "status": {
+      "enum": [
+        "NEW",
+        "UNDER_REVIEW",
+        "BLOCKED",
+        "REFUTED",
+        "CORROBORATED"
+      ]
+    },
+    "claim": {
+      "type": "string"
+    },
+    "independence_groups": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "reason": {
+      "type": "string"
+    }
+  }
+}

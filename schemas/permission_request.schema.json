@@ -1,1 +1,188 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://example.invalid/critical-consensus/permission_request.schema.json","title":"Permission Request","description":"Permission request passed only after analysis/gates; not an order.","type":"object","additionalProperties":false,"required":["permission_id","signal_id","instrument","direction","size","sl_tp","expected_rr","consensus_score","chief_reasoning_hash","tail_risk_summary","sources","mode","expires_at","risk_snapshot","within_high_impact_news_window","chief_verdict","certainty_status","compliance_status","risk_flags","expected_price"],"properties":{"permission_id":{"type":"string"},"signal_id":{"type":"string"},"instrument":{"type":"string"},"direction":{"enum":["BUY","SELL"]},"size":{"type":"number","exclusiveMinimum":0},"sl_tp":{"type":"object","required":["sl","tp"],"properties":{"sl":{"type":"number"},"tp":{"type":"number"}},"additionalProperties":false},"expected_rr":{"type":"number","exclusiveMinimum":0},"consensus_score":{"type":"number","minimum":0,"maximum":1},"chief_reasoning_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"tail_risk_summary":{"type":"string"},"sources":{"type":"array","items":{"type":"object","required":["id","credibility","age_seconds"],"properties":{"id":{"type":"string"},"credibility":{"type":"number","minimum":0,"maximum":1},"age_seconds":{"type":"number","minimum":0}},"additionalProperties":true}},"mode":{"enum":["demo","live"]},"expires_at":{"type":"string","format":"date-time"},"expected_price":{"type":"number","exclusiveMinimum":0},"risk_flags":{"type":"array","items":{"type":"string"}},"risk_snapshot":{"type":"object","required":["risk_fraction","daily_loss_fraction","drawdown_fraction","open_positions","correlated_open_positions"],"properties":{"risk_fraction":{"type":"number","minimum":0,"maximum":1},"daily_loss_fraction":{"type":"number","minimum":0,"maximum":1},"drawdown_fraction":{"type":"number","minimum":0,"maximum":1},"open_positions":{"type":"integer","minimum":0},"correlated_open_positions":{"type":"integer","minimum":0}},"additionalProperties":false},"within_high_impact_news_window":{"type":"boolean"},"chief_verdict":{"enum":["CONFIRM","HOLD","REJECT"]},"certainty_status":{"enum":["PASS","GATHER_MORE","ESCALATE"]},"compliance_status":{"enum":["PASS","FAIL"]}}}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/critical-consensus/permission_request.schema.json",
+  "title": "Permission Request",
+  "description": "Permission request passed only after analysis/gates; not an order.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "permission_id",
+    "signal_id",
+    "instrument",
+    "direction",
+    "size",
+    "sl_tp",
+    "expected_rr",
+    "consensus_score",
+    "chief_reasoning_hash",
+    "tail_risk_summary",
+    "sources",
+    "mode",
+    "expires_at",
+    "risk_snapshot",
+    "within_high_impact_news_window",
+    "chief_verdict",
+    "certainty_status",
+    "compliance_status",
+    "risk_flags",
+    "expected_price"
+  ],
+  "properties": {
+    "permission_id": {
+      "type": "string"
+    },
+    "signal_id": {
+      "type": "string"
+    },
+    "instrument": {
+      "type": "string"
+    },
+    "direction": {
+      "enum": [
+        "BUY",
+        "SELL"
+      ]
+    },
+    "size": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "sl_tp": {
+      "type": "object",
+      "required": [
+        "sl",
+        "tp"
+      ],
+      "properties": {
+        "sl": {
+          "type": "number"
+        },
+        "tp": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": false
+    },
+    "expected_rr": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "consensus_score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "chief_reasoning_hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "tail_risk_summary": {
+      "type": "string"
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "credibility",
+          "age_seconds"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "credibility": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "age_seconds": {
+            "type": "number",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "mode": {
+      "enum": [
+        "demo",
+        "live"
+      ]
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expected_price": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "risk_flags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "risk_snapshot": {
+      "type": "object",
+      "required": [
+        "risk_fraction",
+        "daily_loss_fraction",
+        "drawdown_fraction",
+        "open_positions",
+        "correlated_open_positions"
+      ],
+      "properties": {
+        "risk_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "daily_loss_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "drawdown_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "open_positions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "correlated_open_positions": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "within_high_impact_news_window": {
+      "type": "boolean"
+    },
+    "chief_verdict": {
+      "enum": [
+        "CONFIRM",
+        "HOLD",
+        "REJECT"
+      ]
+    },
+    "certainty_status": {
+      "enum": [
+        "PASS",
+        "GATHER_MORE",
+        "ESCALATE"
+      ]
+    },
+    "compliance_status": {
+      "enum": [
+        "PASS",
+        "FAIL"
+      ]
+    }
+  }
+}
