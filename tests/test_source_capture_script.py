@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -42,7 +43,7 @@ def test_capture_manifest_adds_content_type_before_provenance_validation(tmp_pat
         "sources": [{
             "publisher_id": "official-a",
             "url": "https://official-a.example/releases/rate-decision",
-            "published_at": "2026-10-30T01:58:00Z",
+            "published_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
             "publication_time_attestation": "operator_attested",
         }],
     }), encoding="utf-8")
@@ -64,7 +65,7 @@ def test_capture_manifest_rejects_unapproved_query_and_non_operator_date_basis(t
     base = {
         "publisher_id": "official-a",
         "url": "https://official-a.example/releases/rate-decision?token=abc",
-        "published_at": "2026-10-30T01:58:00Z",
+        "published_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
         "publication_time_attestation": "operator_attested",
     }
     manifest_path.write_text(json.dumps({"sources": [base]}), encoding="utf-8")
