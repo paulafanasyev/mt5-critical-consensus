@@ -183,7 +183,8 @@ def validate_source_capture(
     except (TypeError, ValueError, OverflowError):
         content_bytes = 0
     max_content_value = _number(registry.get("max_content_bytes", 512_000))
-    if (max_content_value is None or max_content_value < 1 or not max_content_value.is_integer()):
+    if (max_content_value is None or max_content_value < 1
+            or max_content_value > 512_000 or not max_content_value.is_integer()):
         blockers.append("SOURCE_MAX_CONTENT_POLICY_INVALID")
         max_content = 512_000
     else:
