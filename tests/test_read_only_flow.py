@@ -4,6 +4,7 @@ import pytest
 
 from critical_consensus.agent_runtime import AgentSpec, collect_agent_verdicts
 from critical_consensus.market_data import MarketBar, build_market_snapshot
+from critical_consensus.audit import canonical_hash
 
 
 @pytest.mark.asyncio
@@ -23,7 +24,7 @@ async def test_market_snapshot_to_agent_collection_never_authorizes_trade():
             assert input_snapshot["market_snapshot"]["symbol"] == "EURUSD"
             return {
                 "agent_id": agent_id, "signal_id": signal_id, "verdict_id": f"v-{agent_id}",
-                "input_hash": "sha256:" + "b" * 64, "confidence": 0.7,
+                "input_hash": canonical_hash(input_snapshot), "confidence": 0.7,
                 "verdict": "ABSTAIN", "ttl_seconds": 300,
                 "created_at": datetime(2026, 10, 2, 0, 0, tzinfo=timezone.utc).isoformat(),
                 "evidence_refs": ["market-snapshot:snapshot-test-001"],
