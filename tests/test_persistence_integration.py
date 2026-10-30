@@ -175,3 +175,42 @@ def test_publisher_source_capture_is_immutable_and_retrieved_by_exact_id():
     tampered = dict(record, captured_content=b'{"tampered":true}')
     with pytest.raises(ValueError, match="failed publisher provenance|do not match"):
         repo.record_source_evidence(tampered, registry=registry)
+
+def test_persist_event_once_rejects_lossy_or_non_json_values_before_database_access():
+    def unexpected_connect(_dsn):
+        raise AssertionError("invalid event must be rejected before database access")
+
+    repo = PostgresRepository("postgresql://unused/unused", connect_fn=unexpected_connect)
+    valid = {
+        "event_id": "strict-" + uuid.uuid4().hex,
+        "event_type": "STRICT_EVENT",
+        "schema_version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "payload": {"safe": True},
+    }
+    cyclic = []
+    cyclic.append(cyclic)
+    too_deep = {}
+    cursor = too_deep
+    for _ in range(34):
+        cursor["next"] = {}
+        cursor = cursor["next"]
+    invalid_events = [
+        {**valid, "event_id": 17},
+        {**valid, "event_type": 17},
+        {**valid, "schema_version": True},
+        {**valid, "created_at": "2026-10-30T12:00:00"},
+        {**valid, "payload": ["not", "an", "object"]},
+        {**valid, "payload": {"confidence": float("nan")}},
+        {**valid, "payload": {"metadata": {1: "numeric key"}}},
+        {**valid, "payload": {"created": datetime.now(timezone.utc)}},
+        {**valid, "payload": {"cycle": cyclic}},
+        {**valid, "payload": too_deep},
+        {**valid, "payload": {"large": "x" * 256_001}},
+    ]
+    for invalid in invalid_events:
+        with pytest.raises(ValueError):
+            repo.persist_event_once(invalid, consumer_name="strict-test")
+    with pytest.raises(ValueError, match="consumer_name"):
+        repo.persist_event_once(valid, consumer_name=17)
+
