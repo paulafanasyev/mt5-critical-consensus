@@ -145,12 +145,21 @@ def validate_source_capture(
     digest = str(record.get("content_sha256", ""))
     if _SHA256_RE.fullmatch(digest) is None:
         blockers.append("SOURCE_CONTENT_HASH_INVALID")
+    captured_content = record.get("captured_content")
+    if not isinstance(captured_content, (bytes, bytearray, memoryview)) or not captured_content:
+        blockers.append("SOURCE_CAPTURED_BYTES_MISSING")
+        actual_bytes = b""
+    else:
+        actual_bytes = bytes(captured_content)
+    actual_digest = "sha256:" + hashlib.sha256(actual_bytes).hexdigest() if actual_bytes else ""
+    if actual_digest != digest:
+        blockers.append("SOURCE_CAPTURED_CONTENT_HASH_MISMATCH")
     try:
         content_bytes = int(record.get("content_bytes"))
     except (TypeError, ValueError, OverflowError):
         content_bytes = 0
     max_content = int(registry.get("max_content_bytes", 512_000))
-    if content_bytes < 1 or content_bytes > max_content:
+    if content_bytes < 1 or content_bytes > max_content or content_bytes != len(actual_bytes):
         blockers.append("SOURCE_CAPTURE_SIZE_INVALID")
     if str(record.get("capture_method", "")) != "https_fetch":
         blockers.append("SOURCE_CAPTURE_METHOD_NOT_VERIFIED")
