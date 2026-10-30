@@ -12,7 +12,7 @@ from redis.asyncio import Redis
 
 from critical_consensus.persistence import PostgresRepository
 from critical_consensus.redis_streams import (
-    ensure_consumer_group, process_message_batch, publish_event, read_new_messages,
+    STREAM_DLQ, ensure_consumer_group, process_message_batch, publish_event, read_new_messages,
     reclaim_and_process_batch,
 )
 
@@ -102,3 +102,71 @@ async def test_worker_reclaims_abandoned_pending_event_after_consumer_crash():
         attempt_keys = await redis.keys(f"cc:attempts:{stream}:{group}:*")
         await redis.delete(stream, *attempt_keys)
         await redis.aclose()
+
+@pytest.mark.asyncio
+async def test_redis_dead_letter_script_is_idempotent_and_acknowledges_replay():
+    redis = Redis.from_url(os.environ["TEST_REDIS_URL"], decode_responses=True)
+    stream = "cc:dead-letter-integration:" + uuid.uuid4().hex
+    group = "dead-letter-group"
+    consumer = "dead-letter-consumer"
+    event_id = "dead-letter-" + uuid.uuid4().hex
+    event = {
+        "event_id": event_id,
+        "event_type": "READ_ONLY_DEAD_LETTER_TEST",
+        "schema_version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "payload": {"trade_allowed": False},
+    }
+    message_id = None
+    dlq_ids = []
+    dedupe_key = None
+    attempt_key = None
+    try:
+        await redis.ping()
+        await redis.xadd(stream, {"event": json.dumps(event, sort_keys=True, separators=(",", ":"))})
+        await ensure_consumer_group(redis, stream, group, start_id="0-0")
+        messages = await read_new_messages(redis, stream, group, consumer, count=5, block_ms=1000)
+        assert len(messages) == 1
+        message_id = messages[0][0]
+        dedupe_key = f"cc:dead-lettered:{stream}:{group}:{message_id}"
+        attempt_key = f"cc:attempts:{stream}:{group}:{message_id}"
+
+        async def rejected_handler(_message):
+            raise RuntimeError("integration failure")
+
+        first = await process_message_batch(
+            redis, stream, group, messages, rejected_handler, max_attempts=1,
+        )
+        assert first == {"processed": 0, "retried": 0, "dead_lettered": 1, "invalid": 0}
+        assert int((await redis.xpending(stream, group))["pending"]) == 0
+
+        rows = await redis.xrange(STREAM_DLQ, min="-", max="+")
+        matching = [
+            (row_id, json.loads(fields["dead_letter"]))
+            for row_id, fields in rows
+            if json.loads(fields["dead_letter"]).get("source_stream") == stream
+            and json.loads(fields["dead_letter"]).get("source_message_id") == message_id
+        ]
+        assert len(matching) == 1
+        dlq_ids = [matching[0][0]]
+
+        replay = await process_message_batch(
+            redis, stream, group, messages, rejected_handler, max_attempts=1,
+        )
+        assert replay == {"processed": 0, "retried": 0, "dead_lettered": 1, "invalid": 0}
+        assert int((await redis.xpending(stream, group))["pending"]) == 0
+        rows_after_replay = await redis.xrange(STREAM_DLQ, min="-", max="+")
+        matching_after_replay = [
+            row_id for row_id, fields in rows_after_replay
+            if json.loads(fields["dead_letter"]).get("source_stream") == stream
+            and json.loads(fields["dead_letter"]).get("source_message_id") == message_id
+        ]
+        assert matching_after_replay == dlq_ids
+    finally:
+        cleanup_keys = [key for key in (stream, dedupe_key, attempt_key) if key]
+        if cleanup_keys:
+            await redis.delete(*cleanup_keys)
+        if dlq_ids:
+            await redis.xdel(STREAM_DLQ, *dlq_ids)
+        await redis.aclose()
+
