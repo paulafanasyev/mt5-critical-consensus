@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 
 def canonical_hash(payload: Mapping[str, Any]) -> str:
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str).encode("utf-8")
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False, default=str).encode("utf-8")
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
