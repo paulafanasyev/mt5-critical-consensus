@@ -126,6 +126,22 @@ python scripts/evaluate_signal_bundle.py .\trusted-decision-bundle.json --output
 
 The bundle must include the exact immutable `signal_input` object, its `signal_input_hash`, the nine policy-mandatory agent verdicts, two validated peer reviews per verdict, a registered/resolved challenge ledger, at least three evidence-backed counter-hypotheses, fresh credible source records, verified historical dissent/false-certainty metrics, all nine Chief reasoning steps, tail-risk scenarios and a permission request bound to the Chief reasoning hash. The pipeline independently checks each verdict's input hash against the same signal snapshot. Missing data remains `GATHER_MORE`, a challenge deadlock escalates, and failed Chief/Permission checks remain HOLD/DENY.
 
+The nine Chief steps have fixed semantic identifiers; the schema and runtime gate reject generic or swapped labels:
+
+| Step | Required check |
+|---|---|
+| a | `ADVERSARIAL_PASS` — attempt to disprove the proposed trade |
+| b | `CONTRADICTION_CHECK` — reconcile contradictions and conflicting evidence |
+| c | `SOURCE_AUDIT` — inspect source quality, freshness and provenance |
+| d | `TAIL_RISK_CHECK` — assess low-probability/high-impact loss |
+| e | `RED_TEAM_SELF_REVIEW` — challenge the Chief's own reasoning |
+| f | `FULL_CHALLENGE_LEDGER_REVIEW` — read every OPEN/RESOLVED objection, including Devil's Advocate challenges |
+| g | `GROUPTHINK_CHECK` — inspect dissent and correlated agreement |
+| h | `SIMILAR_REGIME_CALIBRATION` — compare calibration in similar market regimes |
+| i | `ERROR_PROBABILITY_SCENARIO` — formulate an explicit error-probability scenario |
+
+Each step also needs `passed=true`, a non-empty explanation and at least one evidence reference. These references must belong to the signal's declared evidence registry. A syntactically valid reference list is not, by itself, proof that the referenced artifact was independently captured; persisted source provenance is checked separately when `--persist` is used.
+
 The CLI will not accept or process a supplied `user_decision`; it only evaluates the policy path and emits a human-review packet. `--persist` first reads the persisted kill-switch state and latest MT5 risk snapshot for the requested instrument, and requires the switch to be explicitly inactive plus a fresh demo snapshot whose request hash exactly matches instrument/direction/size/expected price/SL/TP. Missing, stale, denied or mismatched risk evidence makes the result `DENY`; the current MT5 collector leaves the news-window status unknown until a trusted calendar adapter is connected, so the persisted-risk path remains blocked on that missing evidence. On a valid risk check, `--persist` stores verified hash-chain events and the resulting decision in append-only PostgreSQL tables. It does not submit, queue, authorize or create an order. A `REQUIRE_HUMAN` result means only that the packet is ready for a separately authenticated operator review.
 
 Do not fill missing fields with synthetic scores, fabricated source credibility, guessed reviewer records or hand-entered calibration labels. Synthetic fixtures are allowed only inside tests and must remain explicitly marked as test data.
