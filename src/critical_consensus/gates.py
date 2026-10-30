@@ -2,6 +2,7 @@
 from __future__ import annotations
 from datetime import datetime, timezone
 import math
+import re
 import uuid
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
@@ -509,6 +510,9 @@ def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probabilit
         blockers_identity = []
     if not str(reasoning.get("signal_id", "")).strip():
         blockers_identity.append("CHIEF_SIGNAL_ID_MISSING")
+    signal_input_hash = reasoning.get("signal_input_hash")
+    if not isinstance(signal_input_hash, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", signal_input_hash) is None:
+        blockers_identity.append("CHIEF_SIGNAL_INPUT_HASH_MISSING_OR_INVALID")
     created_at = reasoning.get("created_at")
     if not created_at:
         blockers_identity.append("CHIEF_CREATED_AT_MISSING")
