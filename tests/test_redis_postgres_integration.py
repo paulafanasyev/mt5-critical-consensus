@@ -43,6 +43,9 @@ async def test_redis_event_is_committed_before_ack_and_replay_is_idempotent():
         first_id = await publish_event(redis, stream, event)
         second_id = await publish_event(redis, stream, event)
         assert first_id == second_id
+        conflicting_event = {**event, "payload": {"symbol": "GBPUSD", "trade_allowed": False}}
+        with pytest.raises(Exception, match="EVENT_ID_PAYLOAD_CONFLICT"):
+            await publish_event(redis, stream, conflicting_event)
         await ensure_consumer_group(redis, stream, group, start_id="0-0")
         messages = await read_new_messages(redis, stream, group, consumer, count=5, block_ms=1000)
         assert len(messages) == 1
