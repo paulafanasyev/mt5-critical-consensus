@@ -63,7 +63,7 @@ After adding an approved publisher profile, create a manifest containing the pub
       "publisher_id": "OPERATOR_REVIEWED_ID",
       "url": "https://approved.example/path/to/specific-resource",
       "published_at": "2026-10-30T01:30:00Z",
-      "publication_time_attestation": "publisher_api_field"
+      "publication_time_attestation": "operator_attested"
     }
   ]
 }
