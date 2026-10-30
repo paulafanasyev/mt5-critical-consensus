@@ -198,7 +198,7 @@ class PostgresRepository:
             # retrieved_at differs. Preserve the first archived retrieval timestamp.
             equal = (
                 actual[0] == expected[0] and actual[1] == expected[1] and actual[2] == expected[2]
-                and actual[3] == expected[3] and actual[5] == expected[6]
+                and actual[3] == expected[3] and actual[5] == expected[5]
                 and math.isclose(float(actual[6]), float(expected[7]), rel_tol=0, abs_tol=1e-12)
                 and int(actual[7]) == int(expected[8]) and actual[8] == expected[9]
                 and int(actual[9]) == int(expected[10]) and bytes(actual[10]) == expected[11]
