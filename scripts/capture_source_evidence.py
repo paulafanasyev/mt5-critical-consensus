@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 import yaml
 
@@ -38,8 +38,15 @@ def _safe_url(url: str, profile: dict) -> str:
             or parsed.fragment or parsed.port not in (None, 443) or is_ip_literal
             or not _host_allowed(host, profile.get("domains", []))):
         raise ValueError("source URL is not an allowlisted HTTPS publisher URL")
-    if re.search(r"(?:^|[&;])(token|api[_-]?key|password|secret|signature|authorization)=", parsed.query, re.I):
-        raise ValueError("source URL query appears to contain a credential")
+    allowed_query_parameters = profile.get("allowed_query_parameters", [])
+    if not isinstance(allowed_query_parameters, list) or any(not isinstance(key, str) for key in allowed_query_parameters):
+        raise ValueError("publisher allowed_query_parameters policy is invalid")
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    forbidden_names = {"token", "access_token", "api_key", "apikey", "password", "secret",
+                       "signature", "authorization", "client_secret"}
+    if (any(name.lower() in forbidden_names for name, _ in query_pairs)
+            or any(name not in allowed_query_parameters for name, _ in query_pairs)):
+        raise ValueError("source URL has an unapproved or credential-like query parameter")
     if not parsed.path or parsed.path == "/":
         raise ValueError("source URL must identify a specific publisher resource")
     return host
@@ -102,7 +109,8 @@ def capture_manifest(manifest_path: Path, registry_path: Path, *, timeout: float
         published_at = item.get("published_at")
         attestation = str(item.get("publication_time_attestation", "")).strip()
         allowed_attestations = profile.get("allowed_publication_time_attestations", [])
-        if attestation != "operator_attested" or attestation not in allowed_attestations:
+        if (not isinstance(allowed_attestations, list)
+                or attestation != "operator_attested" or attestation not in allowed_attestations):
             raise ValueError(f"source entry {index} has no allowed publication-time attestation")
         body, content_type = _fetch(url, max_bytes=max_bytes, timeout=timeout)
         digest = "sha256:" + hashlib.sha256(body).hexdigest()
