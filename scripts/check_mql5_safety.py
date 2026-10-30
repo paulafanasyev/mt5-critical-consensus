@@ -40,6 +40,11 @@ def main() -> int:
         "strict JSON boolean parser is present": r"JsonBooleanValue",
         "boolean token must end at a JSON delimiter": r"return\s+tail==','\s*\|\|\s*tail=='}'",
         "live-path remains blocked": r"if\s*\(!EnableDemoExecution\s*\|\|\s*AllowLiveExecution\)",
+        "required command audit identifiers are non-empty": r"permission_id==\"\".*signal_id==\"\".*user_decision_id==\"\".*payload_hash==\"\".*created_at==\"\"",
+        "command numeric inputs reject NaN and infinity": r"!MathIsValidNumber\(volume\).*?!MathIsValidNumber\(expires_at_value\).*?!MathIsValidNumber\(MaxVolume\)",
+        "command expiry is integer and has a maximum five-minute TTL": r"MathFloor\(expires_at_value\).*?current_time\s*\+\s*300\.0",
+        "live quote and point values must be finite": r"!MathIsValidNumber\(tick\.bid\).*?!MathIsValidNumber\(tick\.ask\).*?!MathIsValidNumber\(point\)",
+        "broker volume metadata and derived lot step must be finite": r"!MathIsValidNumber\(step\).*?!MathIsValidNumber\(minvol\).*?!MathIsValidNumber\(maxvol\).*?!MathIsValidNumber\(volume_steps\)",
     }
     failures = [name for name, pattern in required.items() if re.search(pattern, source) is None]
     if failures:
