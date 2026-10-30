@@ -165,6 +165,31 @@ async def process_message_batch(
     return stats
 
 
+async def reclaim_and_process_batch(
+    redis_client,
+    stream: str,
+    group: str,
+    consumer: str,
+    handler: Callable[[Mapping[str, Any]], Awaitable[None]],
+    *,
+    start_id: str = "0-0",
+    min_idle_ms: int = 30_000,
+    count: int = 10,
+    max_attempts: int = 3,
+) -> tuple[str, dict[str, int]]:
+    """Reclaim abandoned pending entries, persist them, then ACK through the common batch path."""
+    next_id, messages = await reclaim_pending_messages(
+        redis_client, stream, group, consumer,
+        min_idle_ms=min_idle_ms, start_id=start_id, count=count,
+    )
+    if not messages:
+        return next_id, {"processed": 0, "retried": 0, "dead_lettered": 0, "invalid": 0}
+    stats = await process_message_batch(
+        redis_client, stream, group, messages, handler, max_attempts=max_attempts,
+    )
+    return next_id, stats
+
+
 async def read_new_messages(redis_client, stream: str, group: str, consumer: str, *,
                             count: int = 10, block_ms: int = 1000) -> list[tuple[str, Mapping[Any, Any]]]:
     """Read new events from a consumer group. Create the group first with ensure_consumer_group."""
