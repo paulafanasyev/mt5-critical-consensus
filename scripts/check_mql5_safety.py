@@ -18,6 +18,8 @@ def main() -> int:
         "command expiry validation": r"expires_at\s*<=\s*\(long\)TimeGMT\(\)",
         "protective stop-loss and take-profit validation": r"sl\s*<=\s*0\s*\|\|\s*tp\s*<=\s*0",
         "slippage guard": r"MaxSlippagePoints",
+        "live spread cap": r"MaxSpreadPoints",
+        "spread must be checked before order construction": r"\(tick\.ask\s*-\s*tick\.bid\)\s*/\s*point\s*>\s*MaxSpreadPoints",
         "broker preflight": r"OrderCheck\s*\(",
         "localhost bridge default": r"http://127\.0\.0\.1:8000/v1/execution/next",
         "duplicate order guard": r"DUPLICATE BLOCKED",
