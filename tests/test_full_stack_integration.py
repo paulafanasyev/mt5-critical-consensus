@@ -53,7 +53,8 @@ async def test_market_history_agents_forecast_calibration_audit_and_kill_switch(
         return AgentSpec(agent_id, group, run)
 
     collected = await collect_agent_verdicts(
-        {"signal_id": signal_id, "market_snapshot": snapshot},
+        {"signal_id": signal_id, "market_snapshot": snapshot,
+         "available_evidence_refs": ["market-bars:" + signal_id]},
         [AgentSpec("analysis-a", "provider-a", agent("analysis-a", "provider-a").run, role="analyst"),
          AgentSpec("critic-b", "provider-b", agent("critic-b", "provider-b").run, role="critic"),
          AgentSpec("chief-c", "provider-c", agent("chief-c", "provider-c").run, role="chief_review"),
