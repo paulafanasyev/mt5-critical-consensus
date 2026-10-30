@@ -149,3 +149,34 @@ def test_challenge_resolver_receives_only_challenge_cited_documents(monkeypatch)
     assert captured["prompt"]["untrusted_source_documents"] == [
         {"source_id": "source-b", "text": "unrelated evidence"}
     ]
+
+
+@pytest.mark.asyncio
+async def test_provider_call_timeout_does_not_wait_for_blocking_thread_shutdown(monkeypatch):
+    import asyncio
+    import time
+
+    agent = OpenAICompatibleAgent(
+        agent_id="slow-agent", model="test-model", api_key="test-secret",
+    )
+
+    def slow_sync_call(_signal):
+        time.sleep(0.3)
+        return {"verdict": "ABSTAIN"}
+
+    monkeypatch.setattr(agent, "_call_sync", slow_sync_call)
+    started = time.monotonic()
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(agent({"signal_id": "timeout"}), timeout=0.02)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.15
+    assert _provider_slots_available_for_test() is True
+    time.sleep(0.32)
+
+
+def _provider_slots_available_for_test():
+    from critical_consensus.providers import _PROVIDER_CALL_SLOTS
+    acquired = _PROVIDER_CALL_SLOTS.acquire(blocking=False)
+    if acquired:
+        _PROVIDER_CALL_SLOTS.release()
+    return acquired
