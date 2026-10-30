@@ -336,6 +336,7 @@ def _persisted_demo_risk_evidence(bundle, *, kill_switch_active=False, binding_o
         "equity_high_watermark": 10000.0, "risk_fraction": 0.003,
         "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0,
         "open_positions": 1, "correlated_open_positions": 0,
+        "spread_points": 10.0, "max_spread_points": 20,
         "request_binding_sha256": binding_override or risk_request_binding_hash(request),
         "within_high_impact_news_window": False,
     }
