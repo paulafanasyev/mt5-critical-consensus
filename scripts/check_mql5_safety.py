@@ -23,12 +23,12 @@ def main() -> int:
         "broker preflight": r"OrderCheck\s*\(",
         "localhost bridge default": r"http://127\.0\.0\.1:8000/v1/execution/next",
         "duplicate order guard": r"DUPLICATE BLOCKED",
-        "atomic account execution mutex": r"GlobalVariableSetOnCondition\\s*\\(",
-        "temporary mutex creation": r"GlobalVariableTemp\\s*\\(",
-        "persistent marker flushed before send": r"GlobalVariablesFlush\\s*\\(\\)",
-        "order key bound to account login": r"AccountInfoInteger\\(ACCOUNT_LOGIN\\)",
-        "order key rejects values that could be truncated": r"StringLen\\(order_id\\)\\s*>\\s*38",
-        "persistent marker write failure is checked": r"marker_written\\s*==\\s*0",
+        "atomic account execution mutex": r"GlobalVariableSetOnCondition\s*\(",
+        "temporary mutex creation": r"GlobalVariableTemp\s*\(",
+        "persistent marker flushed before send": r"GlobalVariablesFlush\s*\(\)",
+        "order key bound to account login": r"AccountInfoInteger\(ACCOUNT_LOGIN\)",
+        "order key rejects values that could be truncated": r"StringLen\(order_id\)\s*>\s*38",
+        "persistent marker write failure is checked": r"marker_written\s*==\s*0",
         "idempotency expiry limitation documented": r"four weeks of inactivity",
         "server ledger requirement documented": r"PostgreSQL idempotency ledger",
         "kill-switch endpoint configured": r"KillSwitchUrl",
@@ -72,7 +72,7 @@ def main() -> int:
     duplicate = execute_body.find("if(GlobalVariableCheck(global_key))")
     attempt = execute_body.find("GlobalVariableSet(global_key")
     flush = execute_body.find("GlobalVariablesFlush()")
-    release = execute_body.find("ReleaseExecutionLock(lock_key, lock_lease)", attempt)
+    release = execute_body.find("ReleaseExecutionLock(lock_key, lock_lease)", flush)
     send = execute_body.find("OrderSend(request, result)")
     if min(preflight, recheck, lock, duplicate, attempt, flush, release, send) < 0:
         print("FAIL: one or more order attempt controls are missing")
