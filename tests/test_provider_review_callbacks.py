@@ -68,7 +68,7 @@ def test_provider_challenge_resolver_requires_allowlisted_resolution_evidence(mo
         },
     )
     result = resolver({"challenge_id": "ch-1", "target_verdict_id": "v-1",
-                       "evidence_refs": ["ev-1"]}, 1)
+                       "evidence_refs": ["ev-1", "ev-2"]}, 1)
     assert result["resolved"] is True
     assert result["evidence_refs"] == ["ev-2"]
     assert "Published source calculation: 1.25." in captured["user_prompt"]
