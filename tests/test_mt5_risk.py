@@ -268,3 +268,16 @@ def test_latest_risk_snapshot_rejects_non_object_json_payload():
 
     with pytest.raises(RuntimeError, match="not a JSON object"):
         _risk_snapshot_repository(row).get_latest_mt5_risk_snapshot("EURUSD")
+
+def test_collector_rejects_quote_age_policy_above_server_enforced_maximum(monkeypatch):
+    fake = FakeMT5()
+    monkeypatch.setitem(__import__("sys").modules, "MetaTrader5", fake)
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
+        proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        max_quote_age_seconds=16,
+    )
+    assert result["status"] == "DENY"
+    assert "MAX_QUOTE_AGE_POLICY_INVALID" in result["blockers"]
+    assert not fake.shutdown_called
+
