@@ -146,3 +146,49 @@ def test_generic_https_capture_only_accepts_operator_attested_publication_time()
     result = validate_source_capture(item, policy, now=NOW)
     assert result["status"] == "DENY"
     assert "SOURCE_PUBLICATION_TIME_ATTESTATION_NOT_ALLOWED" in result["blockers"]
+
+
+def test_publisher_json_timestamp_is_recomputed_from_exact_captured_bytes():
+    published = (NOW - timedelta(minutes=1)).isoformat()
+    body = (
+        '{"metadata":{"published_at":"' + published + '"},'
+        '"headline":"official statement","body":"policy decision"}'
+    ).encode("utf-8")
+    item = record(body=body, published_at=published)
+    policy = registry()
+    profile = policy["publishers"]["central-bank-a"]
+    profile["published_at_json_pointer"] = "/metadata/published_at"
+    profile["allowed_publication_time_attestations"] = ["publisher_json_pointer"]
+    item["publication_time_attestation"] = "publisher_json_pointer"
+    item["publication_time_field"] = "/metadata/published_at"
+    item["source_id"] = source_id_for_capture(
+        item["publisher_id"], item["source_url"], item["content_sha256"],
+        registry_version="1", published_at=published,
+        publication_time_attestation="publisher_json_pointer",
+        publication_time_field="/metadata/published_at",
+    )
+    assert validate_source_capture(item, policy, now=NOW)["status"] == "PASS"
+
+    tampered_body = body.replace(published.encode("utf-8"), b"2026-10-29T01:00:00Z")
+    tampered = dict(item)
+    tampered["captured_content"] = tampered_body
+    tampered["content_bytes"] = len(tampered_body)
+    tampered["content_sha256"] = "sha256:" + hashlib.sha256(tampered_body).hexdigest()
+    tampered["source_id"] = source_id_for_capture(
+        tampered["publisher_id"], tampered["source_url"], tampered["content_sha256"],
+        registry_version="1", published_at=published,
+        publication_time_attestation="publisher_json_pointer",
+        publication_time_field="/metadata/published_at",
+    )
+    result = validate_source_capture(tampered, policy, now=NOW)
+    assert result["status"] == "DENY"
+    assert "SOURCE_PUBLISHER_JSON_TIMESTAMP_MISMATCH" in result["blockers"]
+
+
+def test_publisher_json_timestamp_requires_configured_pointer_and_exact_field():
+    item = record()
+    item["publication_time_attestation"] = "publisher_json_pointer"
+    item["publication_time_field"] = "/metadata/published_at"
+    result = validate_source_capture(item, registry(), now=NOW)
+    assert result["status"] == "DENY"
+    assert "SOURCE_PUBLISHER_JSON_TIMESTAMP_POLICY_MISMATCH" in result["blockers"]
