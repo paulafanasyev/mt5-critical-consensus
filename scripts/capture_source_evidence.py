@@ -21,11 +21,6 @@ from critical_consensus.source_provenance import (
 )
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, request, fp, code, msg, headers, new_url):
-        return None
-
-
 def _safe_url(url: str, profile: dict) -> str:
     parsed = urlsplit(url)
     host = (parsed.hostname or "").lower().rstrip(".")
