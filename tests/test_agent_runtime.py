@@ -54,4 +54,26 @@ async def test_expired_verdict_is_rejected():
 async def test_duplicate_agent_ids_block_registry():
     agents = [AgentSpec("a", "g1", provider("a")), AgentSpec("a", "g2", provider("a"))]
     result = await collect_agent_verdicts({"signal_id": "s1"}, agents, now=NOW)
-    assert result["blockers"] == ["DUPLICATE_AGENT_ID"]
+    assert result["blockers"] == ["DUPLICATE_AGENT_ID"]\n
+@pytest.mark.asyncio
+async def test_required_roles_analyst_critic_chief_and_risk_must_all_be_present():
+    agents = [
+        AgentSpec("a1", "g1", provider("a1"), role="analyst"),
+        AgentSpec("a2", "g2", provider("a2"), role="analyst"),
+        AgentSpec("a3", "g3", provider("a3"), role="risk_review"),
+    ]
+    result = await collect_agent_verdicts(
+        {"signal_id": "s1"}, agents, now=NOW,
+        required_roles=("analyst", "critic", "chief_review", "risk_review"),
+    )
+    assert result["status"] == "GATHER_MORE"
+    assert result["missing_roles"] == ["chief_review", "critic"]
+    assert result["trade_allowed"] is False
+
+
+@pytest.mark.asyncio
+async def test_agent_role_is_trusted_registry_metadata_not_provider_claim():
+    agents = [AgentSpec("a1", "g1", provider("a1"), role="critic")]
+    result = await collect_agent_verdicts({"signal_id": "s1"}, agents, now=NOW)
+    assert result["verdicts"][0]["role"] == "critic"
+    assert result["verdicts"][0]["confidence_kind"] == "UNCALIBRATED_SUBJECTIVE"
