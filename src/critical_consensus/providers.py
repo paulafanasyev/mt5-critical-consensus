@@ -94,7 +94,8 @@ class OpenAICompatibleAgent:
                      "Accept": "application/json"},
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            # B310: endpoint scheme/host is allow-listed in __init__; this is the intended HTTP transport.
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:  # nosec B310
                 response_body = response.read(256_001)
         except urllib.error.HTTPError as exc:
             raise RuntimeError(f"provider_http_error:{exc.code}") from None
