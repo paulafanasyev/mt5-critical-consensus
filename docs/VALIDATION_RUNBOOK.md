@@ -7,7 +7,7 @@ Status as of this change: infrastructure and tests are being added; production r
 On the Windows host that already has MetaTrader 5 installed and logged in:
 
 ```powershell
-python -m pip install -e ".[data]"
+python -m pip install -e ".[data]" MetaTrader5
 $env:DATABASE_URL = "postgresql://USER:PASSWORD@127.0.0.1:5432/mt5cc"
 python scripts/import_mt5_history.py --live-terminal --symbol EURUSD --timeframe H1 --from-utc 2026-10-01T00:00:00Z --to-utc 2026-10-30T00:00:00Z
 ```
@@ -32,6 +32,16 @@ python scripts/run_worker.py
 The worker is a durable event writer for `cc:signals:v1`, not a trade executor. It acknowledges Redis entries only after the PostgreSQL transaction succeeds. The `processed_events` inbox protects replays; the same event ID with a different payload is rejected. Market bars and emitted forecast probabilities cannot be silently edited. Apply migrations with a dedicated database role and restrict production DB privileges; the sample integration role used by CI is intentionally more permissive than production should be.
 
 ## 3. Agent consensus
+
+For a controlled provider test, define provider metadata with environment variable names only; API secrets themselves belong in the environment/secret manager. For example:
+
+```powershell
+$env:OPENAI_API_KEY = "set-in-your-secret-manager"
+$env:MT5_AGENT_PROVIDERS = '[{"agent_id":"technical-a","independence_group":"vendor-a","model":"YOUR_MODEL","api_key_env":"OPENAI_API_KEY","base_url":"https://api.openai.com/v1"},{"agent_id":"technical-b","independence_group":"vendor-b","model":"YOUR_OTHER_MODEL","api_key_env":"OTHER_PROVIDER_KEY","base_url":"https://api.example.com/v1"},{"agent_id":"risk-review","independence_group":"vendor-c","model":"YOUR_RISK_MODEL","api_key_env":"RISK_PROVIDER_KEY","base_url":"https://api.example.net/v1"}]'
+python scripts/run_agent_analysis.py --symbol EURUSD --timeframe H1 --bars 200
+```
+
+The example is a template, not a valid provider configuration until model names and keys exist. The runner reads recent bars from PostgreSQL, builds a deterministic read-only snapshot, requests JSON from the configured OpenAI-compatible endpoints, constrains cited evidence to the supplied snapshot reference, and writes an audit event. It returns `GATHER_MORE` if provider settings, evidence, freshness or the required number of agents/groups are not satisfied. The same vendor, training corpus, model family or source data across providers can still create correlated errors; group labels do not prove independence.
 
 Register actual model/provider callables using `AgentSpec` and `collect_agent_verdicts`. Set the required number of distinct providers and independent groups explicitly. A provider must return signal-bound verdict ID, agent ID, SHA-256 input binding, UTC creation time, positive TTL and evidence references. Errors, timeouts and invalid output cause `GATHER_MORE`.
 
