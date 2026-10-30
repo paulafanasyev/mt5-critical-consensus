@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import uuid
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from critical_consensus.market_data import MarketBar
 from critical_consensus.persistence import PostgresRepository
 from critical_consensus.audit import make_audit_event, canonical_hash
+from critical_consensus.source_provenance import source_id_for_capture
 
 
 pytestmark = pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="TEST_DATABASE_URL not configured")
@@ -126,3 +128,44 @@ def test_pipeline_result_persistence_rejects_missing_or_forged_signal_hash():
               "audit_events": [event], "audit_chain_valid": True}
     with pytest.raises(ValueError, match="signal_input_sha256"):
         repo.persist_pipeline_result(result, signal_input_sha256="sha256:bad")
+
+
+def test_publisher_source_capture_is_immutable_and_retrieved_by_exact_id():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    now = datetime.now(timezone.utc)
+    body = b'{"title":"policy statement","body":"rate unchanged"}'
+    digest = "sha256:" + hashlib.sha256(body).hexdigest()
+    url = "https://publisher-a.example/releases/one"
+    registry = {
+        "version": "1", "max_clock_skew_seconds": 60, "max_capture_age_seconds": 300,
+        "max_source_age_seconds": 900, "min_independent_publishers": 2,
+        "max_content_bytes": 512000,
+        "publishers": {"publisher-a": {
+            "domains": ["publisher-a.example"], "independence_group": "publisher-a",
+            "credibility": 0.95, "ttl_seconds": 900,
+            "allowed_publication_time_attestations": ["publisher_api_field"],
+        }},
+    }
+    record = {
+        "source_id": source_id_for_capture("publisher-a", url, digest),
+        "publisher_id": "publisher-a", "publisher_domain": "publisher-a.example",
+        "source_url": url, "published_at": (now - timedelta(minutes=1)).isoformat(),
+        "retrieved_at": (now - timedelta(seconds=1)).isoformat(),
+        "independence_group": "publisher-a", "credibility": 0.95, "ttl_seconds": 900,
+        "content_sha256": digest, "content_bytes": len(body), "captured_content": body,
+        "publication_time_attestation": "publisher_api_field",
+        "capture_method": "https_fetch", "registry_version": "1",
+    }
+    first = repo.record_source_evidence(record, registry=registry)
+    duplicate = repo.record_source_evidence(record, registry=registry)
+    assert first["inserted"] is True
+    assert duplicate["inserted"] is False
+    loaded = repo.get_source_evidence([record["source_id"]])
+    assert len(loaded) == 1
+    assert loaded[0]["captured_content"] == body
+    assert loaded[0]["content_sha256"] == digest
+
+    tampered = dict(record, captured_content=b'{"tampered":true}')
+    with pytest.raises(ValueError, match="failed publisher provenance|do not match"):
+        repo.record_source_evidence(tampered, registry=registry)
