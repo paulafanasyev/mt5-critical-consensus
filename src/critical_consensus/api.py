@@ -15,6 +15,8 @@ from .gates import (
     chief_skeptic_pass,
     permission_gate,
 )
+from .persistence import PostgresRepository
+from .risk_controls import risk_controlled_permission
 
 ROOT = Path(os.getenv("POLICY_DIR", str(Path(__file__).resolve().parents[2] / "config")))
 
@@ -54,6 +56,12 @@ class GenericPayload(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class KillSwitchPayload(BaseModel):
+    active: bool
+    actor_id: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=1000)
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     """Non-sensitive liveness endpoint; reports the execution state, never credentials."""
@@ -79,6 +87,60 @@ def review_chief(body: GenericPayload) -> dict[str, Any]:
 @app.post("/v1/permission/check", dependencies=[Depends(require_bridge_key)])
 def check_permission(body: GenericPayload) -> dict[str, Any]:
     return permission_gate(body.payload, _yaml("permission_matrix.yaml"))
+
+
+@app.get("/v1/risk/kill-switch", dependencies=[Depends(require_bridge_key)])
+def get_kill_switch() -> dict[str, Any]:
+    """Return persisted emergency-stop state; unavailable DB is never treated as disabled."""
+    try:
+        return PostgresRepository().get_kill_switch_state()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Persisted kill-switch state unavailable; fail closed") from exc
+
+
+@app.post("/v1/risk/kill-switch", dependencies=[Depends(require_bridge_key)])
+def update_kill_switch(
+    body: KillSwitchPayload,
+    x_kill_switch_admin: str | None = Header(default=None, alias="X-Kill-Switch-Admin"),
+) -> dict[str, Any]:
+    """Activate the emergency stop with bridge auth; disabling additionally requires a separate admin secret."""
+    if not body.active:
+        expected = os.getenv("MT5_KILL_SWITCH_ADMIN_TOKEN", "")
+        if len(expected) < 32:
+            raise HTTPException(status_code=503, detail="Separate kill-switch admin token is not configured; switch cannot be disabled")
+        if not x_kill_switch_admin or not hmac.compare_digest(
+            x_kill_switch_admin.encode("utf-8"), expected.encode("utf-8")
+        ):
+            raise HTTPException(status_code=403, detail="Separate kill-switch administrator authentication required")
+    try:
+        return PostgresRepository().set_kill_switch(
+            active=body.active, actor_id=body.actor_id, reason=body.reason
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Kill-switch persistence failed; fail closed") from exc
+
+
+@app.post("/v1/risk/permission/check", dependencies=[Depends(require_bridge_key)])
+def check_risk_controlled_permission(body: GenericPayload) -> dict[str, Any]:
+    """Policy check with persisted global kill-switch and fresh terminal risk snapshot."""
+    request_payload = body.payload.get("permission_request", body.payload)
+    if not isinstance(request_payload, dict):
+        return {"status": "DENY", "allowed": False, "trade_allowed": False,
+                "blockers": ["INVALID_PERMISSION_REQUEST"]}
+    symbol = str(request_payload.get("instrument", "")).strip().upper()
+    if not symbol:
+        return {"status": "DENY", "allowed": False, "trade_allowed": False,
+                "blockers": ["INSTRUMENT_MISSING"]}
+    try:
+        repo = PostgresRepository()
+        kill_switch = repo.get_kill_switch_state()
+        snapshot = repo.get_latest_mt5_risk_snapshot(symbol)
+        return risk_controlled_permission(
+            request_payload, _yaml("permission_matrix.yaml"),
+            kill_switch_state=kill_switch, snapshot=snapshot,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Risk controls unavailable; request denied") from exc
 
 
 @app.post("/v1/authorization/check", dependencies=[Depends(require_bridge_key)])
