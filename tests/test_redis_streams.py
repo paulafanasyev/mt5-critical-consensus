@@ -212,3 +212,31 @@ async def test_retry_counter_ttl_is_set_atomically_with_increment():
     assert stats["retried"] == 1
     assert redis.values[attempt_key] == 1
     assert redis.expiries[attempt_key] == 7 * 24 * 60 * 60
+
+
+@pytest.mark.asyncio
+async def test_publish_event_rejects_nested_non_string_json_object_keys():
+    bad = event()
+    bad["payload"] = {"metadata": {1: "numeric", "1": "string"}}
+    with pytest.raises(ValueError, match="finite JSON"):
+        await publish_event(FakeRedis(), "cc:signals:v1", bad)
+
+
+@pytest.mark.asyncio
+async def test_publish_event_rejects_cyclic_or_excessively_nested_values():
+    bad = event()
+    cyclic = []
+    cyclic.append(cyclic)
+    bad["payload"] = {"cycle": cyclic}
+    with pytest.raises(ValueError, match="finite JSON"):
+        await publish_event(FakeRedis(), "cc:signals:v1", bad)
+
+    deep = event()
+    value = {}
+    cursor = value
+    for index in range(40):
+        cursor["next"] = {}
+        cursor = cursor["next"]
+    deep["payload"] = value
+    with pytest.raises(ValueError, match="finite JSON"):
+        await publish_event(FakeRedis(), "cc:signals:v1", deep)
