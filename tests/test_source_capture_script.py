@@ -183,3 +183,34 @@ def test_fetch_rejects_redirect_without_following_location(monkeypatch):
     assert calls["closed"] is True
     assert calls["connection_closed"] is True
     assert calls["method"] == "GET"
+
+
+def test_fetch_rejects_unbounded_or_invalid_response_size_policy():
+    for invalid in (0, -1, 512001, True, 1.5):
+        try:
+            CAPTURE._fetch(
+                "https://official-a.example/releases/item",
+                max_bytes=invalid, timeout=3,
+            )
+            assert False, "invalid max_bytes must be rejected before DNS or network calls"
+        except ValueError as exc:
+            assert "max_bytes" in str(exc)
+
+
+def test_capture_manifest_rejects_registry_size_limit_above_database_cap(tmp_path):
+    registry = policy()
+    registry["max_content_bytes"] = 512001
+    registry_path = tmp_path / "registry.yaml"
+    manifest_path = tmp_path / "manifest.json"
+    registry_path.write_text(yaml.safe_dump(registry), encoding="utf-8")
+    manifest_path.write_text(json.dumps({"sources": [{
+        "publisher_id": "official-a",
+        "url": "https://official-a.example/releases/rate-decision",
+        "published_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+        "publication_time_attestation": "operator_attested",
+    }]}), encoding="utf-8")
+    try:
+        CAPTURE.capture_manifest(manifest_path, registry_path)
+        assert False, "oversized registry cap should be rejected before any fetch"
+    except ValueError as exc:
+        assert "max_content_bytes" in str(exc)
