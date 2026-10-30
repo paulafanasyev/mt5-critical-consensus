@@ -16,13 +16,13 @@
 - `src/critical_consensus/pipeline.py` — orchestration of existing agent outputs through Certainty → Chief → Permission → human approval; it never creates an order.
 - `src/critical_consensus/calibration.py` — Brier score, shrinkage penalty, weighted consensus; явные ограничения эвристики.
 - `src/critical_consensus/api.py` — FastAPI policy endpoints; authorization and order submission endpoints deliberately disabled until durable permission state and a real 2FA/signature verifier exist.
-- `src/critical_consensus/redis_streams.py` — idempotent event publishing, consumer-group helpers, retry handling and DLQ (at-least-once; worker deployment is not included).
+- `src/critical_consensus/redis_streams.py` — idempotent event publishing, consumer groups, retry/DLQ and pending-message recovery; `scripts/run_worker.py` durably writes events to PostgreSQL before ACK. This worker archives events; it does not run agent analysis or dispatch orders.
 - `schemas/` — JSON Schema Draft 2020-12 для 11 контрактов.
 - `config/` — deny-by-default policy thresholds и permissions.
 - `mql5/CriticalConsensusEA.mq5` — демонстрационный EA: demo account only, disabled by default, TTL/SL/TP/slippage/idempotency checks.
-- `db/postgres_schema.sql`, `neo4j/schema.cypher` — минимальные схемы хранения и графа.
+- `db/postgres_schema.sql` + `db/migrations/` — базовые схемы и append-only market bars, pre-outcome forecasts, resolved labels and calibration reports; `neo4j/schema.cypher` — схема графа.
 - `tests/` — adversarial unit tests.
-- `.github/workflows/security-audit.yml` — checks installed Python dependencies for known advisories on push, pull request, and weekly schedule.
+- `.github/workflows/security-audit.yml` and `.github/workflows/validation-suite.yml` — dependency/source security scans, unit contracts and PostgreSQL/Redis integration checks.
 - `docs/` — архитектура, формулы, пример trace и недельный roadmap.
 
 ## Быстрый запуск (Linux, Python 3.11+)
@@ -82,7 +82,7 @@ assert result["trade_allowed"] is False
 
 ## Проверка текущего каркаса
 
-- Локальная проверка исходников: `pytest -q` — **78 тестов PASS**. Последний проверенный GitHub Actions прогон: **84 passed in 0.81s**, Python 3.12, без pytest warnings: [тесты](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40849840096). Отдельный аудит зависимостей: [PASS](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40849840095), `pip-audit` сообщил `No known vulnerabilities found`; зафиксировано требование `pytest>=9.0.3` после исправления `PYSEC-2026-1845`. CI использует `ubuntu-22.04`, `actions/checkout@v7`, `actions/setup-python@v7` и `httpx2` для TestClient. Это синтетические тесты функций/API, а не брокерные испытания.
+- До этого расширения локальная проверка исходников: `pytest -q` — **78 тестов PASS**; последний известный GitHub Actions прогон: **84 passed in 0.81s**, Python 3.12: [тесты](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40849840096). Исторический аудит зависимостей: [PASS](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40849840095). Для новых ingestion/storage/calibration изменений добавлен отдельный `validation-suite.yml`; его результаты должны быть подтверждены по конкретному PR/run, а не наследуются от старого CI. Эти проверки не заменяют broker/demo испытания.
 - Проверяются fail-closed gates, integrity binding между ChiefReasoning/consensus/source summary и PermissionRequest, выдача полного human review packet, hash chain, API key gate и Redis Streams helpers.
 - Проверка зелёных тестов доказывает поведение локальных функций на синтетических входах, но не проверяет брокер, MQL5-компиляцию, реальную очередь, рыночные данные или доходность.
 - ChiefReasoning hash вычисляется по каноническому JSON без поля `reasoning_hash`; изменение любого шага делает hash невалидным.
