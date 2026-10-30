@@ -47,7 +47,7 @@ def test_read_only_demo_risk_snapshot(monkeypatch):
     )
     assert result["status"] == "PASS"
     assert result["account_mode"] == "demo"
-    assert result["daily_pnl"] == 9.0
+    assert result["daily_pnl"] == 9.0\n    assert result["daily_loss_fraction"] == 0.0
     assert result["open_positions"] == 1
     assert result["correlated_open_positions"] == 1
     assert result["trade_allowed"] is False
@@ -83,4 +83,17 @@ def test_missing_equity_baselines_blocks_before_mt5_initializes(monkeypatch):
     )
     assert result["status"] == "DENY"
     assert "DAY_START_EQUITY_MISSING_OR_INVALID" in result["blockers"]
-    assert not fake.shutdown_called
+    assert not fake.shutdown_called\n
+def test_daily_loss_uses_equity_change_and_includes_open_position_loss(monkeypatch):
+    fake = FakeMT5()
+    fake.info.equity = 9500.0
+    fake.deals = [SimpleNamespace(profit=100.0, commission=0.0, swap=0.0, fee=0.0)]
+    monkeypatch.setitem(__import__("sys").modules, "MetaTrader5", fake)
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
+        proposed_risk_fraction=0.002, symbol_groups={"EURUSD": "fx-major"},
+        now=datetime(2026, 10, 30, 1, 0, tzinfo=timezone.utc),
+    )
+    # Realised P/L is positive in the fixture but equity is down 5%; the drawdown guard wins.
+    assert result["daily_pnl"] == 100.0
+    assert result["daily_loss_fraction"] == 0.05
