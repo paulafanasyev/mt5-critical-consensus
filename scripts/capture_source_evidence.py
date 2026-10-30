@@ -204,7 +204,7 @@ def capture_manifest(manifest_path: Path, registry_path: Path, *, timeout: float
             published_at = item.get("published_at")
             attestation = str(item.get("publication_time_attestation", "")).strip()
             if attestation != "operator_attested":
-                raise ValueError(f"source entry {index} requires operator_attested publication time")
+                raise ValueError(f"source entry {index} requires operator_attested publication-time attestation")
         allowed_attestations = profile.get("allowed_publication_time_attestations", [])
         if not isinstance(allowed_attestations, list) or attestation not in allowed_attestations:
             raise ValueError(f"source entry {index} has no allowed publication-time attestation")
