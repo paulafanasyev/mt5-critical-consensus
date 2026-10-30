@@ -21,6 +21,8 @@ def main() -> int:
         "broker preflight": r"OrderCheck\s*\(",
         "localhost bridge default": r"http://127\.0\.0\.1:8000/v1/execution/next",
         "duplicate order guard": r"DUPLICATE BLOCKED",
+        "kill-switch endpoint configured": r"input\\s+string\\s+KillSwitchUrl\\s*=\\s*\\"http://127\\.0\\.0\\.1:8000/v1/risk/kill-switch\\";",
+        "kill-switch response must explicitly be false": r"JsonFalse\\(response, \\"kill_switch_active\\"\\)",
         "live-path remains blocked": r"if\s*\(!EnableDemoExecution\s*\|\|\s*AllowLiveExecution\)",
     }
     failures = [name for name, pattern in required.items() if re.search(pattern, source) is None]
@@ -34,7 +36,18 @@ def main() -> int:
     if source.index("OrderCheck(request, check)") > source.index("OrderSend(request, result)"):
         print("FAIL: OrderSend appears before OrderCheck")
         return 1
-    print(f"PASS: {len(required) + 2} static EA safety invariants verified.")
+    timer = re.search(r"void\\s+OnTimer\\s*\\(\\s*\\)\\s*\\{(?P<body>.*?)\\n\\}", source, re.S)
+    if timer is None:
+        print("FAIL: OnTimer function missing")
+        return 1
+    body = timer.group("body")
+    if "if(!CheckKillSwitch()) return;" not in body:
+        print("FAIL: kill switch is not checked before command polling")
+        return 1
+    if body.index("if(!CheckKillSwitch()) return;") > body.index("if(!FetchCommand(body)) return;"):
+        print("FAIL: command polling appears before the kill-switch check")
+        return 1
+    print(f"PASS: {len(required) + 4} static EA safety invariants verified.")
     print("LIMIT: MQL5 compilation and terminal/demo-account execution are NOT PROVEN by static checks.")
     return 0
 
