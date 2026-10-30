@@ -218,6 +218,37 @@ def _bootstrap_mean_ci(values: Sequence[float], *, iterations: int = 2000, seed:
             "bootstrap_samples": iterations, "seed": seed}
 
 
+def _validate_forecasts(rows: Sequence[Forecast]) -> None:
+    """Reject malformed in-memory rows just as strictly as CSV-loaded forecasts."""
+    seen: set[tuple[str, str]] = set()
+    for index, row in enumerate(rows, start=1):
+        if not isinstance(row, Forecast):
+            raise ValueError(f"forecast {index}: expected Forecast instance")
+        if (not isinstance(row.model_id, str) or not row.model_id.strip()
+                or not isinstance(row.signal_id, str) or not row.signal_id.strip()):
+            raise ValueError(f"forecast {index}: model_id and signal_id are required")
+        key = (row.model_id, row.signal_id)
+        if key in seen:
+            raise ValueError(f"forecast {index}: duplicate model_id/signal_id forecast")
+        seen.add(key)
+        for field, stamp in (("issued_at", row.issued_at), ("resolved_at", row.resolved_at)):
+            if (not isinstance(stamp, datetime) or stamp.tzinfo is None
+                    or stamp.utcoffset() is None):
+                raise ValueError(f"forecast {index}: {field} must include a timezone")
+        if row.resolved_at <= row.issued_at:
+            raise ValueError(f"forecast {index}: resolved_at must be later than issued_at")
+        if isinstance(row.probability, bool):
+            raise ValueError(f"forecast {index}: probability must be numeric")
+        try:
+            probability = float(row.probability)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"forecast {index}: probability must be numeric") from exc
+        if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+            raise ValueError(f"forecast {index}: probability must be finite and in [0,1]")
+        if isinstance(row.outcome, bool) or not isinstance(row.outcome, int) or row.outcome not in (0, 1):
+            raise ValueError(f"forecast {index}: outcome must be integer 0 or 1")
+
+
 def evaluate_walk_forward(
     forecasts: Iterable[Forecast], *, min_train_samples: int = 30,
     min_class_samples: int = 5, refit_interval: int = 25,
@@ -226,6 +257,7 @@ def evaluate_walk_forward(
     rows = list(forecasts)
     if not rows:
         raise ValueError("at least one forecast is required")
+    _validate_forecasts(rows)
     if min_train_samples < 2 * min_class_samples or min_class_samples < 1 or refit_interval < 1:
         raise ValueError("invalid minimum sample size or refit interval")
     rows.sort(key=lambda item: (item.issued_at, item.model_id, item.signal_id))
