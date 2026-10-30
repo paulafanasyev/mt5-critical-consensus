@@ -25,6 +25,7 @@ def main() -> int:
     parser.add_argument("--symbol-groups", type=Path, required=True,
                         help="JSON object mapping every tradable/open-position symbol to an exposure group")
     parser.add_argument("--max-slippage-points", type=int, default=20)
+    parser.add_argument("--max-spread-points", type=int, default=20)
     parser.add_argument("--max-quote-age-seconds", type=int, default=15)
     parser.add_argument("--terminal-path", help="optional MT5 terminal executable path")
     args = parser.parse_args()
@@ -49,6 +50,7 @@ def main() -> int:
         equity_high_watermark=args.equity_high_watermark,
         proposed_request=proposed_request, symbol_groups=groups,
         terminal_path=args.terminal_path, max_slippage_points=args.max_slippage_points,
+        max_spread_points=args.max_spread_points,
         max_quote_age_seconds=args.max_quote_age_seconds,
     )
     persisted = repo.record_mt5_risk_snapshot(snapshot)
