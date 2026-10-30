@@ -41,13 +41,14 @@ PERMISSION_MATRIX = {
 def make_bundle():
     agents = ["PlatformScoutAgent", "TechnicalAnalystAgent", "RiskManagerAgent", "ComplianceAgent"]
     signal_input = {"signal_id": "sig-100", "instrument": "EURUSD",
-                    "market_snapshot_hash": "sha256:" + "c" * 64}
+                    "market_snapshot_hash": "sha256:" + "c" * 64,
+                    "available_evidence_refs": ["market-bars:EURUSD:H1","s1","s2","review-evidence-0-0","review-evidence-0-1","review-evidence-1-0","review-evidence-1-1","review-evidence-2-0","review-evidence-2-1","review-evidence-3-0","review-evidence-3-1","resolved-calculation-1","e1","e2","e3","stress-model-1","chief-a","chief-b","chief-c","chief-d","chief-e","chief-f","chief-g","chief-h","chief-i"]}
     signal_input_hash = canonical_hash(signal_input)
     verdicts = [
         {"verdict_id": f"v-{i}", "signal_id": "sig-100", "agent_id": agent,
          "verdict": "APPROVE", "confidence": 0.99,
          "reviewer_count": 999, "created_at": NOW.isoformat(), "ttl_seconds": 300,
-         "input_hash": signal_input_hash,
+         "input_hash": signal_input_hash, "evidence_refs": ["market-bars:EURUSD:H1"],
          "calibration_meta": {"brier_score": 0.05, "sample_size": 100,
                                "calibration_status": "CALIBRATED"}}
         for i, agent in enumerate(agents)
@@ -147,7 +148,7 @@ def test_pipeline_open_challenge_blocks_certainty_gate():
     bundle = make_bundle()
     bundle["peer_reviews"][0] = {"target_verdict_id": "v-0", "reviewer_alias": "reviewer-1",
         "stance": "CHALLENGE", "challenge_type": "LOGIC_GAP", "argument": "The calculation is inconsistent",
-        "evidence_refs": ["calc-contradiction"], "status": "VALIDATED"}
+        "evidence_refs": ["review-evidence-0-0"], "status": "VALIDATED"}
     bundle["challenge_records"] = [{"challenge_id": "ch-1", "target_verdict_id": "v-0", "challenge_type": "LOGIC_GAP",
                                      "status": "OPEN", "evidence_refs": ["calc-contradiction"]}]
     result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
