@@ -98,7 +98,8 @@ def _validate_result(
 async def collect_agent_verdicts(
     signal: Mapping[str, Any], agents: Sequence[AgentSpec], *,
     timeout_seconds: float = 15.0, minimum_agents: int = 3, minimum_independence_groups: int = 3,
-    required_roles: Sequence[str] = (), now: datetime | None = None,
+    required_roles: Sequence[str] = (), required_agent_ids: Sequence[str] = (),
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Collect verdicts concurrently and fail closed on timeouts, malformed output or insufficient coverage."""
     current = now or datetime.now(timezone.utc)
@@ -123,9 +124,26 @@ async def collect_agent_verdicts(
             or any(str(role).strip().lower() not in AgentSpec.ALLOWED_ROLES for role in required_roles)):
         return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["REQUIRED_AGENT_ROLES_POLICY_INVALID"], "trade_allowed": False}
     required_role_set = {str(role).strip().lower() for role in required_roles}
+    if (not isinstance(required_agent_ids, Sequence) or isinstance(required_agent_ids, (str, bytes))
+            or any(not str(agent_id).strip() for agent_id in required_agent_ids)):
+        return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["REQUIRED_AGENT_ID_POLICY_INVALID"], "trade_allowed": False}
+    required_agent_set = {str(agent_id).strip() for agent_id in required_agent_ids}
+    if len(required_agent_set) != len(required_agent_ids):
+        return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["DUPLICATE_REQUIRED_AGENT_ID"], "trade_allowed": False}
     ids = [agent.agent_id for agent in agents]
     if len(set(ids)) != len(ids):
         return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["DUPLICATE_AGENT_ID"], "trade_allowed": False}
+    missing_agent_ids = sorted(required_agent_set - set(ids))
+    if missing_agent_ids:
+        return {
+            "signal_id": signal_id, "status": "GATHER_MORE", "verdicts": [],
+            "agent_errors": [{"agent_id": agent_id, "code": "MANDATORY_AGENT_NOT_CONFIGURED"}
+                             for agent_id in missing_agent_ids],
+            "valid_agent_count": 0, "declared_independence_group_count": 0,
+            "missing_agent_ids": missing_agent_ids, "missing_roles": [],
+            "blockers": ["MISSING_MANDATORY_AGENTS:" + ",".join(missing_agent_ids)],
+            "trade_allowed": False,
+        }
 
     if minimum_independence_groups > 1:
         missing_identity = [agent.agent_id for agent in agents if not agent.provider_identity]
@@ -215,6 +233,8 @@ async def collect_agent_verdicts(
         "agent_roles": {role: sum(1 for verdict in verdicts if verdict.get("role") == role)
                         for role in sorted(AgentSpec.ALLOWED_ROLES)},
         "required_roles": sorted(required_role_set),
+        "required_agent_ids": sorted(required_agent_set),
+        "missing_agent_ids": [],
         "missing_roles": missing_roles,
         "provider_origin_count": len({agent.provider_origin for agent in agents if agent.provider_origin}),
         "provider_identity_count": len({agent.provider_identity for agent in agents if agent.provider_identity}),
