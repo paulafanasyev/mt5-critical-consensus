@@ -96,6 +96,9 @@ def test_every_schema_required_order_command_key_is_known_to_the_ea():
     source = _ea_source()
     missing = [key for key in required if f'"{key}"' not in source]
     assert missing == [], f"EA is unaware of required OrderCommand keys: {missing}"
+    match = re.search(r"string\s+required_keys\[\]\s*=\s*\{(?P<body>[^}]*)\}", source)
+    assert match is not None
+    assert re.findall(r'"([^"]+)"', match.group("body")) == required
 
 
 def test_ea_validates_a_full_command_object_before_extracting_fields():
@@ -148,3 +151,113 @@ def test_ea_blocks_live_and_unsafe_broker_states_before_send():
     assert 'JsonTrue("user_approved")' in source
     assert 'decision != "APPROVE" || !user_approved' in source
     assert "if(expires_raw <= 0 || MathFloor(expires_raw) != expires_raw)" in source
+
+
+def test_ea_pins_exact_limits_for_size_slippage_ttl_and_filling():
+    source = _ea_source()
+    assert "AccountInfoInteger(ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO" in source
+    assert "volume <= 0 || volume > MaxVolume" in source
+    assert "MathAbs(live_price - expected_price) > MaxSlippagePoints * point" in source
+    assert "expires_raw > now_epoch + MaxCommandTtlSeconds" in source
+    assert "if(expires_raw <= now_epoch)" in source
+    assert "if((filling & (long)SYMBOL_FILLING_FOK) != 0)       request.type_filling = ORDER_FILLING_FOK;" in source
+    assert "else if((filling & (long)SYMBOL_FILLING_IOC) != 0)  request.type_filling = ORDER_FILLING_IOC;" in source
+    assert "MathAbs(live_price - sl) < stops * point || MathAbs(tp - live_price) < stops * point" in source
+    assert "if(KeyInList(key))" in source
+    assert 'if(host != "127.0.0.1" && host != "localhost")' in source
+
+
+def test_checker_strips_comments_so_a_commented_guard_cannot_pass():
+    source = _ea_source()
+    spoofed = source.replace(
+        '   if(!OrderCheck(request, check))\n'
+        '   { Print("BLOCKED: OrderCheck failed; retcode=",check.retcode," ",check.comment); return false; }\n',
+        '   // if(!OrderCheck(request, check))\n'
+        '   // { Print("BLOCKED: OrderCheck failed; retcode=",check.retcode," ",check.comment); return false; }\n'
+        "   OrderCheck(request, check);\n",
+        1,
+    )
+    assert spoofed != source
+    failures, _ = _checker().check_source(spoofed)
+    assert "broker preflight failure branch" in failures
+    assert "broker preflight result ignored" in failures
+
+
+def test_checker_rejects_each_pinned_predicate_inversion_independently():
+    checker = _checker()
+    source = _ea_source()
+    inversions = {
+        "demo": ("ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO", "ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO"),
+        "volume": ("volume <= 0 || volume > MaxVolume", "volume <= 0"),
+        "slippage": ("MaxSlippagePoints * point", "MaxSlippagePoints * 50 * point"),
+        "ttl": ("now_epoch + MaxCommandTtlSeconds", "now_epoch + MaxCommandTtlSeconds * 1000"),
+        "expiry": ("if(expires_raw <= now_epoch)", "if(expires_raw <= now_epoch - 86400)"),
+        "stops": ("MathAbs(live_price - sl) < stops * point", "false"),
+    }
+    for label, (old, new) in inversions.items():
+        weakened = source.replace(old, new, 1)
+        assert weakened != source, label
+        failures, _ = checker.check_source(weakened)
+        assert failures, f"checker accepted the {label} weakening"
+
+
+def _canonical_command() -> dict:
+    return {
+        "command_id": "cmd-1",
+        "client_order_id": "ord-1",
+        "permission_id": "perm-1",
+        "signal_id": "sig-1",
+        "instrument": "EURUSD",
+        "direction": "BUY",
+        "size": 0.10,
+        "expected_price": 1.10000,
+        "sl": 1.09900,
+        "tp": 1.10200,
+        "mode": "demo",
+        "user_decision_id": "dec-1",
+        "user_decision": "APPROVE",
+        "user_approved": True,
+        "expires_at_epoch": 1767225600,
+        "payload_hash": "sha256:0f1e2d",
+        "created_at": "2026-10-30T12:00:00Z",
+    }
+
+
+def test_reference_flat_object_model_accepts_bridge_encoded_commands():
+    checker = _checker()
+    command = _canonical_command()
+    assert set(command) == set(json.loads(
+        (_root() / "schemas" / "order_command.schema.json").read_text(encoding="utf-8")
+    )["required"])
+    for payload in (json.dumps(command, separators=(",", ":")),
+                    json.dumps(command, sort_keys=True, indent=2),
+                    json.dumps({**command, "auth_signature_ref": "sig-ref"})):
+        ok, error = checker.validate_flat_object_model(payload)
+        assert ok, (error, payload)
+
+
+def test_reference_flat_object_model_matches_shared_fixtures():
+    checker = _checker()
+    cases = json.loads(
+        (_root() / "config" / "mql5_flat_object_cases.json").read_text(encoding="utf-8")
+    )
+    names = {case["name"] for case in cases["reject"]}
+    for required in ("duplicate key", "escaped quote in value", "control character in value",
+                     "nested object value", "array value", "trailing comma", "leading zero"):
+        assert required in names
+    for case in cases["accept"]:
+        ok, error = checker.validate_flat_object_model(case["json"])
+        assert ok, (case["name"], error)
+    for case in cases["reject"]:
+        ok, error = checker.validate_flat_object_model(case["json"])
+        assert not ok, case["name"]
+        assert case["reason"] in error, (case["name"], error)
+    assert checker.model_cases() == []
+
+
+def test_production_checker_and_self_test_cover_the_new_predicates():
+    checker = _checker()
+    assert checker.check_source(_ea_source())[0] == []
+    assert checker.self_test(_ea_source()) == []
+    assert len(checker.MUTATIONS) >= 30
+

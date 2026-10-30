@@ -100,7 +100,7 @@ assert result["trade_allowed"] is False
 
 ## Проверка текущего каркаса
 
-- Локальная проверка ветки `harden/10of10` на Python 3.12 (Windows): `pytest -q` — **225 passed, 10 skipped**; `python scripts/check_mql5_safety.py` — **116 static invariants verified, 14 mutations rejected** (компиляция EA и demo-исполнение по-прежнему NOT PROVEN). Все пропуски требуют `TEST_DATABASE_URL` и/или `TEST_REDIS_URL` и здесь не запускались. Результаты GitHub Actions относятся к предыдущим коммитам и для этой ветки должны быть подтверждены отдельным run после push; они не наследуются автоматически.
+- Локальная проверка ветки `harden/10of10` на Python 3.12 (Windows): `pytest -q` — **251 passed, 10 skipped**; `python scripts/check_mql5_safety.py` — **219 static invariants verified, 34 mutations rejected** (компиляция EA и demo-исполнение по-прежнему NOT PROVEN). Все пропуски требуют `TEST_DATABASE_URL` и/или `TEST_REDIS_URL` и здесь не запускались. Результаты GitHub Actions относятся к предыдущим коммитам и для этой ветки должны быть подтверждены отдельным run после push; они не наследуются автоматически.
 - Проверяются fail-closed gates, HMAC evidence/governance envelopes, одноразовые authorization nonce, integrity binding между ChiefReasoning/consensus/source summary и PermissionRequest, выдача полного human review packet, hash chain, API key gate, строгая каноническая сериализация и Redis Streams helpers.
 - Проверка зелёных тестов доказывает поведение локальных функций на синтетических входах, но не проверяет брокер, MQL5-компиляцию, реальную очередь, рыночные данные или доходность.
 - ChiefReasoning hash вычисляется по каноническому JSON без поля `reasoning_hash`; изменение любого шага делает hash невалидным.

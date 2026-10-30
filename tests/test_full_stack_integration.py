@@ -100,6 +100,8 @@ async def test_market_history_agents_forecast_calibration_audit_and_kill_switch(
         "blockers": ["MT5_TERMINAL_NOT_CONNECTED_IN_CI"],
     }
     repo.record_mt5_risk_snapshot(persisted_snapshot)
+    # Make the assertion independent of test order: the switch may be disabled elsewhere.
+    repo.set_kill_switch(active=True, actor_id="ci-e2e", reason="assert emergency stop blocks")
     blocked = risk_controlled_permission(
         {"instrument": symbol, "mode": "demo"}, {"permission_matrix": {}},
         kill_switch_state=repo.get_kill_switch_state(),

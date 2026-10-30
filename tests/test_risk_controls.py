@@ -139,3 +139,62 @@ def test_snapshot_rejects_peak_below_equity_and_empty_group():
     snapshot = good_snapshot()
     snapshot["symbol_group"] = "   "
     assert "SYMBOL_CORRELATION_GROUP_UNKNOWN" in risk_snapshot_gate(snapshot, now=NOW)["blockers"]
+
+
+def test_daily_loss_fraction_is_recomputed_from_the_day_start_baseline():
+    snapshot = good_snapshot()
+    snapshot["account_equity"] = 9900.0
+    snapshot["day_start_equity"] = 10000.0
+    snapshot["drawdown_fraction"] = 0.0294
+    snapshot["daily_loss_fraction"] = 0.0  # forged: real loss is 1%
+    snapshot["risk_value_account_currency"] = 20.0
+    assert "DAILY_LOSS_DOES_NOT_MATCH_EQUITY" in risk_snapshot_matches_order(good_request(), snapshot)
+
+
+def test_tick_spec_must_be_present_positive_and_use_the_loss_value():
+    for field in ("risk_tick_size", "risk_tick_value_loss"):
+        for value in (None, 0, -1.0):
+            snapshot = good_snapshot()
+            snapshot[field] = value
+            assert "RISK_SNAPSHOT_TICK_SPEC_MISSING_OR_INVALID" in risk_snapshot_matches_order(
+                good_request(), snapshot), (field, value)
+    # A profit tick value is not a loss tick value: a smaller one understates money at risk.
+    snapshot = good_snapshot()
+    snapshot["risk_tick_value_loss"] = 10.0
+    assert "RISK_VALUE_DOES_NOT_MATCH_ORDER" in risk_snapshot_matches_order(good_request(), snapshot)
+
+
+def test_risk_controlled_permission_reaches_human_review_only_when_every_gate_agrees():
+    now = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
+    request = good_request()
+    request.update({
+        "permission_id": "perm-1", "expected_rr": 1.9,
+        "chief_verdict": "CONFIRM", "certainty_status": "PASS", "compliance_status": "PASS",
+        "risk_flags": [], "expires_at": (now + timedelta(minutes=5)).isoformat(),
+        "within_high_impact_news_window": False,
+    })
+    snapshot = good_snapshot()
+    snapshot["observed_at"] = now.isoformat()
+    snapshot["request_binding_sha256"] = risk_request_binding_hash(request)
+    snapshot["within_high_impact_news_window"] = False
+    matrix = {"permission_matrix": {
+        "instruments": ["EURUSD"], "max_size_per_trade": 0.2, "max_positions": 5,
+        "max_correlated_positions": 2, "max_risk_per_trade_fraction": 0.005,
+        "daily_loss_limit_fraction": 0.02, "max_drawdown_fraction": 0.10,
+        "allowed_directions": ["BUY", "SELL"],
+        "allowed_time_utc": {"start": "07:00", "end": "19:00"}, "rollover_block_utc": None,
+        "blocked_around_news": True, "blocked_flags": ["sanctions", "mnpi"],
+        "min_expected_rr": 1.5, "expected_rr_tolerance_fraction": 0.01,
+        "require_stop_loss": True, "require_take_profit": True,
+        "max_command_ttl_seconds": 600, "demo_enabled": True, "live_enabled": False,
+    }}
+    result = risk_controlled_permission(
+        request, matrix, kill_switch_state=good_state(active=False),
+        snapshot=snapshot, now=now,
+    )
+    assert result["status"] == "REQUIRE_HUMAN"
+    assert result["blockers"] == []
+    assert result["risk_reconciliation"]["status"] == "PASS"
+    # A positive policy result still never authorizes execution.
+    assert result["trade_allowed"] is False
+    assert result["allowed"] is False

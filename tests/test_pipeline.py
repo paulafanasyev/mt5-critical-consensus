@@ -753,3 +753,41 @@ def test_operator_approval_is_bound_to_the_exact_order_parameters():
     assert result["status"] == "DENY"
     assert "USER_DECISION_PERMISSION_HASH_MISMATCH" in result["blockers"]
     assert result["trade_allowed"] is False
+
+
+def test_chief_challenge_ledger_snapshot_must_match_the_bundle_ledger():
+    bundle = make_bundle()
+    forged = dict(bundle["challenge_records"][0], challenge_id="ch-forged")
+    bundle["chief_reasoning"]["challenge_ledger_snapshot"] = [forged]
+    bundle["chief_reasoning"]["reviewed_challenge_ids"] = ["ch-forged"]
+    bundle["chief_reasoning"]["challenge_ledger_hash"] = canonical_hash([forged])
+    bundle["chief_reasoning"]["reasoning_hash"] = canonical_hash(bundle["chief_reasoning"])
+    bundle["permission_request"]["chief_reasoning_hash"] = bundle["chief_reasoning"]["reasoning_hash"]
+    result = run_pipeline(bundle)
+    assert result["status"] == "HOLD"
+    assert "CHIEF_CHALLENGE_LEDGER_SNAPSHOT_MISMATCH" in result["blockers"]
+    assert result["trade_allowed"] is False
+
+
+def test_challenge_resolution_must_cite_evidence_not_already_in_the_challenge():
+    bundle = make_bundle()
+    bundle["challenge_records"][0]["resolution_evidence_refs"] = ["review-evidence-0-0"]
+    result = run_pipeline(bundle)
+    assert result["status"] == "GATHER_MORE"
+    assert any("CHALLENGE_RESOLUTION_MISSING_NEW_EVIDENCE" in blocker
+               for blocker in result["blockers"])
+    assert result["trade_allowed"] is False
+
+
+def test_operator_key_must_differ_from_the_governance_domain():
+    state, snapshot = _persisted_demo_risk_evidence(_approval_bundle())
+    for kwargs, blocker in (
+        ({"operator_key": GOVERNANCE_KEY}, "OPERATOR_KEY_NOT_DISTINCT"),
+        ({"expected_operator_issuer": GOVERNANCE_ISSUER}, "OPERATOR_ISSUER_NOT_DISTINCT"),
+    ):
+        result = run_pipeline(
+            _approval_bundle(), require_persisted_risk=True, kill_switch_state=state,
+            terminal_risk_snapshot=snapshot, authorization_store=InMemoryNonceStore(), **kwargs,
+        )
+        assert result["status"] == "DENY"
+        assert blocker in result["blockers"]

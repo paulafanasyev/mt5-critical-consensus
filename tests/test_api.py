@@ -54,13 +54,14 @@ def configure(monkeypatch, *, bridge=BRIDGE, evidence_issuer=EVIDENCE_ISSUER,
     monkeypatch.setenv("MT5_GOVERNANCE_ISSUER", governance_issuer)
 
 
-def test_health_is_available_but_never_enables_execution():
+def test_health_is_available_but_never_enables_execution(monkeypatch):
+    configure(monkeypatch)
     response = client.get("/health")
     assert response.status_code == 200
     body = response.json()
     assert body["execution_enabled"] is False
     assert body["live_enabled"] is False
-    assert body["authenticated_policy_endpoints"] is False
+    assert body["authenticated_policy_endpoints"] is True
 
 
 def test_health_reports_configured_authentication_without_secrets(monkeypatch):
@@ -285,3 +286,20 @@ def test_health_is_hermetic_when_no_secrets_are_configured(monkeypatch):
     assert body["authenticated_policy_endpoints"] is False
     assert body["evidence_verification_configured"] is False
     assert body["governance_verification_configured"] is False
+
+
+def test_execution_endpoints_can_never_return_or_accept_an_order(monkeypatch):
+    configure(monkeypatch)
+    headers = {"X-Bridge-Key": BRIDGE}
+    fetched = client.get("/v1/execution/next", headers=headers)
+    assert fetched.status_code == 204
+    assert fetched.content == b""
+    submitted = client.post("/v1/execution/submit", headers=headers, json={"payload": {}})
+    assert submitted.status_code == 423
+    assert "no order was sent" in submitted.json()["detail"]
+
+
+def test_execution_endpoints_require_bridge_auth(monkeypatch):
+    configure(monkeypatch)
+    assert client.get("/v1/execution/next").status_code == 401
+    assert client.post("/v1/execution/submit", json={}).status_code == 401
