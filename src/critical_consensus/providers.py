@@ -86,8 +86,8 @@ class OpenAICompatibleAgent:
         except ValueError:
             is_ip_literal = False
         loopback = normalized_host in {"127.0.0.1", "localhost", "::1"}
-        if is_ip_literal and not loopback:
-            raise ValueError("provider endpoint IP literals are not allowed")
+        if is_ip_literal and (parsed.scheme != "http" or not loopback):
+            raise ValueError("provider endpoint IP literals are allowed only for HTTP loopback development")
         if parsed.scheme == "https":
             if parsed_port not in (None, 443):
                 raise ValueError("HTTPS provider endpoint must use the default port 443")
@@ -172,7 +172,7 @@ class OpenAICompatibleAgent:
             if isinstance(ref, str) and str(ref).strip() in set(allowed)
         }
         if not referenced:
-            raise ValueError("peer review needs at least one cited evidence reference")
+            raise RuntimeError("provider_peer_review_invalid")
         payload = {
             "target_verdict": dict(target),
             "other_anonymized_verdicts": [dict(item) for item in peers],
