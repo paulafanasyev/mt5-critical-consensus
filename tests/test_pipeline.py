@@ -40,11 +40,14 @@ PERMISSION_MATRIX = {
 
 def make_bundle():
     agents = ["PlatformScoutAgent", "TechnicalAnalystAgent", "RiskManagerAgent", "ComplianceAgent"]
+    signal_input = {"signal_id": "sig-100", "instrument": "EURUSD",
+                    "market_snapshot_hash": "sha256:" + "c" * 64}
+    signal_input_hash = canonical_hash(signal_input)
     verdicts = [
         {"verdict_id": f"v-{i}", "signal_id": "sig-100", "agent_id": agent,
          "verdict": "APPROVE", "confidence": 0.99,
          "reviewer_count": 999, "created_at": NOW.isoformat(), "ttl_seconds": 300,
-         "input_hash": "sha256:" + "a" * 64,
+         "input_hash": signal_input_hash,
          "calibration_meta": {"brier_score": 0.05, "sample_size": 100,
                                "calibration_status": "CALIBRATED"}}
         for i, agent in enumerate(agents)
@@ -63,7 +66,8 @@ def make_bundle():
                           "resolution_evidence_refs": ["resolved-calculation-1"]}
     challenge_snapshot = [resolved_challenge]
     bundle = {
-        "signal_id": "sig-100", "verdicts": verdicts, "peer_reviews": reviews,
+        "signal_id": "sig-100", "signal_input": signal_input,
+        "signal_input_hash": signal_input_hash, "verdicts": verdicts, "peer_reviews": reviews,
         "open_challenges": [], "challenge_records": challenge_snapshot, "challenge_resolution_status": "RESOLVED",
         "contradictions_last_n_hours": 0,
         "key_sources": [
@@ -283,3 +287,22 @@ def test_verdict_at_exact_ttl_boundary_is_accepted():
     assert result["details"]["certainty"]["status"] == "PASS"
     assert result["trade_allowed"] is False
     assert "order_command" not in result
+
+
+def test_pipeline_rejects_tampered_signal_input_hash_before_consensus():
+    bundle = make_bundle()
+    bundle["signal_input_hash"] = "sha256:" + "0" * 64
+    result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
+    assert result["status"] == "GATHER_MORE"
+    assert result["blockers"] == ["SIGNAL_INPUT_HASH_MISMATCH"]
+    assert "certainty" not in result["details"]
+    assert result["audit_chain_valid"] is True
+
+
+def test_pipeline_binds_every_agent_verdict_to_the_same_input_snapshot():
+    bundle = make_bundle()
+    bundle["verdicts"][0]["input_hash"] = "sha256:" + "f" * 64
+    result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
+    assert result["status"] == "GATHER_MORE"
+    assert "VERDICT_0:VERDICT_INPUT_HASH_DOES_NOT_MATCH_SIGNAL_INPUT" in result["blockers"]
+    assert "certainty" not in result["details"]
