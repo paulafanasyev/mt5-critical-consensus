@@ -39,6 +39,31 @@ def _stamp(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _json_pointer_value(document: Any, pointer: str) -> Any:
+    """Resolve a strict RFC 6901 JSON Pointer; only object keys and array indices are supported."""
+    if not isinstance(pointer, str) or not pointer.startswith("/") or pointer == "/":
+        raise ValueError("published_at_json_pointer must be a non-root RFC 6901 pointer")
+    value = document
+    for raw_part in pointer[1:].split("/"):
+        if re.search(r"~(?![01])", raw_part):
+            raise ValueError("JSON Pointer contains an invalid escape")
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        if isinstance(value, Mapping):
+            if part not in value:
+                raise ValueError("JSON Pointer field is missing")
+            value = value[part]
+        elif isinstance(value, list):
+            if not part.isdigit() or (len(part) > 1 and part.startswith("0")):
+                raise ValueError("JSON Pointer array index is invalid")
+            index = int(part)
+            if index >= len(value):
+                raise ValueError("JSON Pointer array index is out of range")
+            value = value[index]
+        else:
+            raise ValueError("JSON Pointer traverses a non-container value")
+    return value
+
+
 def _host_allowed(host: str, domains: Sequence[str]) -> bool:
     host = host.lower().rstrip(".")
     if not isinstance(domains, Sequence) or isinstance(domains, (str, bytes)):
@@ -55,6 +80,7 @@ def _host_allowed(host: str, domains: Sequence[str]) -> bool:
 def source_id_for_capture(
     publisher_id: str, url: str, content_sha256: str, *,
     registry_version: str = "", published_at: str = "", publication_time_attestation: str = "",
+    publication_time_field: str = "",
 ) -> str:
     """Derive an immutable ID from publisher, bytes, policy version and date attestation."""
     published_stamp = _stamp(published_at)
@@ -62,7 +88,8 @@ def source_id_for_capture(
     payload = json.dumps(
         {"publisher_id": publisher_id, "url": url, "content_sha256": content_sha256,
          "registry_version": registry_version, "published_at": canonical_published_at,
-         "publication_time_attestation": publication_time_attestation},
+         "publication_time_attestation": publication_time_attestation,
+         "publication_time_field": publication_time_field},
         sort_keys=True, separators=(",", ":"), ensure_ascii=False,
     )
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -161,10 +188,31 @@ def validate_source_capture(
         age = None
 
     attestation = str(record.get("publication_time_attestation", "")).strip()
+    publication_time_field = str(record.get("publication_time_field", "")).strip()
     allowed_attestations = profile.get("allowed_publication_time_attestations", [])
     if (not isinstance(allowed_attestations, Sequence) or isinstance(allowed_attestations, (str, bytes))
-            or attestation != "operator_attested" or attestation not in allowed_attestations):
+            or attestation not in allowed_attestations):
         blockers.append("SOURCE_PUBLICATION_TIME_ATTESTATION_NOT_ALLOWED")
+
+    configured_pointer = profile.get("published_at_json_pointer")
+    if isinstance(configured_pointer, str) and configured_pointer.strip():
+        pointer = configured_pointer.strip()
+        if (attestation != "publisher_json_pointer" or publication_time_field != pointer
+                or content_type != "application/json"):
+            blockers.append("SOURCE_PUBLISHER_JSON_TIMESTAMP_POLICY_MISMATCH")
+        else:
+            try:
+                decoded_document = json.loads(actual_bytes.decode("utf-8-sig"))
+                raw_published_value = _json_pointer_value(decoded_document, pointer)
+                pointer_stamp = _stamp(raw_published_value)
+                if pointer_stamp is None or published is None or pointer_stamp != published:
+                    blockers.append("SOURCE_PUBLISHER_JSON_TIMESTAMP_MISMATCH")
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+                blockers.append("SOURCE_PUBLISHER_JSON_TIMESTAMP_INVALID")
+    else:
+        if attestation != "operator_attested" or publication_time_field:
+            blockers.append("SOURCE_PUBLICATION_TIME_ATTESTATION_NOT_ALLOWED")
+
 
     digest = str(record.get("content_sha256", ""))
     if _SHA256_RE.fullmatch(digest) is None:
@@ -208,6 +256,7 @@ def validate_source_capture(
         registry_version=str(registry.get("version", "")),
         published_at=published.isoformat() if published is not None else "",
         publication_time_attestation=attestation,
+        publication_time_field=publication_time_field,
     ) if _SHA256_RE.fullmatch(digest) else ""
     if not expected_source_id or str(record.get("source_id", "")) != expected_source_id:
         blockers.append("SOURCE_ID_CONTENT_BINDING_MISMATCH")
