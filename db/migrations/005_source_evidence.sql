@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS source_evidence (
   ttl_seconds INTEGER NOT NULL CHECK (ttl_seconds > 0),
   content_sha256 TEXT NOT NULL CHECK (content_sha256 ~ '^sha256:[0-9a-f]{64}$'),
   content_bytes INTEGER NOT NULL CHECK (content_bytes > 0 AND content_bytes <= 512000),
+  captured_content BYTEA NOT NULL CHECK (octet_length(captured_content) = content_bytes),
   publication_time_attestation TEXT NOT NULL,
   capture_method TEXT NOT NULL CHECK (capture_method = 'https_fetch'),
   registry_version TEXT NOT NULL,
