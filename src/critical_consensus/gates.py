@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 import math
 import threading
+import time
 import re
 import uuid
 from typing import Any, Awaitable, Callable, Mapping, Sequence
@@ -154,6 +155,7 @@ async def anonymized_peer_review(
     verdicts: Sequence[Mapping[str, Any]],
     reviewers: Sequence[tuple[str, Callable[[dict[str, Any], list[dict[str, Any]]], Awaitable[dict[str, Any]]]]],
     *, min_reviewers_per_verdict: int = 2, review_timeout_seconds: float = 30.0,
+    overall_timeout_seconds: float = 120.0,
 ) -> list[dict[str, Any]]:
     """Obtain anonymized peer reviews and reject malformed or evidence-free reviews."""
     output: list[dict[str, Any]] = []
@@ -163,6 +165,12 @@ async def anonymized_peer_review(
             or not math.isfinite(review_timeout_seconds) or review_timeout_seconds <= 0
             or review_timeout_seconds > 120):
         raise ValueError("review_timeout_seconds must be finite and in (0,120]")
+    if (not isinstance(overall_timeout_seconds, (int, float))
+            or isinstance(overall_timeout_seconds, bool)
+            or not math.isfinite(overall_timeout_seconds)
+            or overall_timeout_seconds <= 0 or overall_timeout_seconds > 600):
+        raise ValueError("overall_timeout_seconds must be finite and in (0,600]")
+    review_deadline = time.monotonic() + float(overall_timeout_seconds)
     if not verdicts or any(not isinstance(v, Mapping) for v in verdicts):
         return [{"status": "BLOCKED", "reason": "INVALID_OR_EMPTY_VERDICTS"}]
     if any(not isinstance(item, tuple) or len(item) != 2 or not str(item[0]).strip() or not callable(item[1]) for item in reviewers):
@@ -181,14 +189,23 @@ async def anonymized_peer_review(
             continue
         peers = [dict(v) for j, v in enumerate(public) if j != target_idx]
         for i, (_private_reviewer_id, review_fn) in enumerate(possible[:min_reviewers_per_verdict], start=1):
+            remaining = review_deadline - time.monotonic()
+            if remaining <= 0:
+                output.append({"target_verdict_id": target.get("verdict_id"), "status": "BLOCKED",
+                               "reason": "REVIEW_CYCLE_TIMEOUT", "reviewer_alias": f"reviewer-{i:02d}"})
+                break
+            overall_limited = remaining < float(review_timeout_seconds)
             try:
                 review = await asyncio.wait_for(
                     review_fn(dict(target), [dict(x) for x in peers]),
-                    timeout=review_timeout_seconds,
+                    timeout=min(float(review_timeout_seconds), remaining),
                 )
             except asyncio.TimeoutError:
                 output.append({"target_verdict_id": target.get("verdict_id"), "status": "BLOCKED",
-                               "reason": "REVIEWER_TIMEOUT", "reviewer_alias": f"reviewer-{i:02d}"})
+                               "reason": "REVIEW_CYCLE_TIMEOUT" if overall_limited else "REVIEWER_TIMEOUT",
+                               "reviewer_alias": f"reviewer-{i:02d}"})
+                if overall_limited:
+                    break
                 continue
             except Exception as exc:  # fail closed; do not include potentially sensitive exception text
                 output.append({"target_verdict_id": target.get("verdict_id"), "status": "BLOCKED",
@@ -225,7 +242,8 @@ async def anonymized_peer_review(
 def challenge_resolution_loop(challenges: Sequence[Mapping[str, Any]],
                               resolver: Callable[[dict[str, Any], int], Mapping[str, Any]],
                               *, max_rounds: int = 3,
-                              resolver_timeout_seconds: float = 30.0) -> dict[str, Any]:
+                              resolver_timeout_seconds: float = 30.0,
+                              overall_timeout_seconds: float = 120.0) -> dict[str, Any]:
     """Resolve challenges with bounded waits; timeouts leave the challenge open."""
     if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or max_rounds < 1 or max_rounds > 3:
         raise ValueError("max_rounds must be an integer from 1 to 3")
@@ -234,6 +252,12 @@ def challenge_resolution_loop(challenges: Sequence[Mapping[str, Any]],
             or not math.isfinite(resolver_timeout_seconds)
             or resolver_timeout_seconds <= 0 or resolver_timeout_seconds > 120):
         raise ValueError("resolver_timeout_seconds must be finite and in (0,120]")
+    if (isinstance(overall_timeout_seconds, bool)
+            or not isinstance(overall_timeout_seconds, (int, float))
+            or not math.isfinite(overall_timeout_seconds)
+            or overall_timeout_seconds <= 0 or overall_timeout_seconds > 600):
+        raise ValueError("overall_timeout_seconds must be finite and in (0,600]")
+    resolution_deadline = time.monotonic() + float(overall_timeout_seconds)
     transcript: list[dict[str, Any]] = []
     resolved_challenges: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
@@ -268,15 +292,23 @@ def challenge_resolution_loop(challenges: Sequence[Mapping[str, Any]],
 
         resolved = False
         for round_no in range(1, max_rounds + 1):
-            raw_response, resolver_error = _run_bounded_challenge_resolver(
-                resolver, challenge, round_no, float(resolver_timeout_seconds),
-            )
-            if resolver_error:
-                response = {"resolved": False, "error_code": resolver_error}
+            remaining = resolution_deadline - time.monotonic()
+            if remaining <= 0:
+                response = {"resolved": False, "error_code": "RESOLVER_CYCLE_TIMEOUT"}
             else:
-                response = dict(raw_response) if isinstance(raw_response, Mapping) else {
-                    "resolved": False, "error_code": "INVALID_RESOLVER_RESPONSE"
-                }
+                overall_limited = remaining < float(resolver_timeout_seconds)
+                raw_response, resolver_error = _run_bounded_challenge_resolver(
+                    resolver, challenge, round_no,
+                    min(float(resolver_timeout_seconds), remaining),
+                )
+                if resolver_error and overall_limited and resolver_error == "RESOLVER_TIMEOUT":
+                    response = {"resolved": False, "error_code": "RESOLVER_CYCLE_TIMEOUT"}
+                elif resolver_error:
+                    response = {"resolved": False, "error_code": resolver_error}
+                else:
+                    response = dict(raw_response) if isinstance(raw_response, Mapping) else {
+                        "resolved": False, "error_code": "INVALID_RESOLVER_RESPONSE"
+                    }
             transcript.append({"challenge_id": challenge_id, "round": round_no, "response": response})
             response_refs = response.get("evidence_refs")
             valid_response_refs = (
@@ -293,6 +325,8 @@ def challenge_resolution_loop(challenges: Sequence[Mapping[str, Any]],
                 resolved = True
                 break
             challenge["last_resolution_attempt"] = response
+            if response.get("error_code") == "RESOLVER_CYCLE_TIMEOUT":
+                break
         if not resolved:
             challenge["status"] = "OPEN"
             unresolved.append(challenge)
