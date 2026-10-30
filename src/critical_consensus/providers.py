@@ -187,10 +187,10 @@ class OpenAICompatibleAgent:
         refs = result.get("evidence_refs")
         valid_types = {"DATA_CONTRADICTION", "SOURCE_WEAK", "STALE_DATA", "LOGIC_GAP",
                        "REGIME_MISMATCH", "CORRELATION_RISK"}
-        allowed_set = set(allowed)
+        available_refs = set(evidence_context) if evidence_context else set(allowed)
         if (stance not in {"CONFIRM", "CHALLENGE"} or not argument
                 or not isinstance(refs, list) or not refs
-                or any(not isinstance(ref, str) or ref not in set(evidence_context) for ref in refs)
+                or any(not isinstance(ref, str) or ref not in available_refs for ref in refs)
                 or (stance == "CHALLENGE" and challenge_type not in valid_types)):
             raise RuntimeError("provider_peer_review_invalid")
         return {
@@ -250,11 +250,11 @@ class OpenAICompatibleAgent:
         resolved = result.get("resolved")
         refs = result.get("evidence_refs")
         summary = str(result.get("summary", "")).strip()
-        allowed_set = set(allowed)
+        available_refs = set(evidence_context) if evidence_context else set(allowed)
         if not isinstance(resolved, bool):
             raise RuntimeError("provider_challenge_resolution_invalid")
         if resolved and (not isinstance(refs, list) or not refs
-                         or any(not isinstance(ref, str) or ref not in set(evidence_context) for ref in refs)
+                         or any(not isinstance(ref, str) or ref not in available_refs for ref in refs)
                          or not summary):
             raise RuntimeError("provider_challenge_resolution_evidence_invalid")
         if not resolved:
