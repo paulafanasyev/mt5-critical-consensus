@@ -24,3 +24,18 @@ def test_audit_chain_detects_broken_link():
     result = verify_audit_chain([first, second])
     assert result["valid"] is False
     assert result["reason"] == "PREVIOUS_HASH_MISMATCH"
+
+
+def test_canonical_hash_rejects_nan_and_infinity():
+    import pytest
+    from critical_consensus.audit import canonical_hash
+    with pytest.raises(ValueError):
+        canonical_hash({"confidence": float("nan")})
+    with pytest.raises(ValueError):
+        canonical_hash({"confidence": float("inf")})
+
+
+def test_audit_event_rejects_nonfinite_payload_before_signing():
+    import pytest
+    with pytest.raises(ValueError):
+        make_audit_event("INVALID", {"probability": float("nan")})
