@@ -3,6 +3,7 @@
 #property description "Demo-only reference bridge. Disabled by default; live execution is blocked."
 
 input string BridgeUrl = "http://127.0.0.1:8000/v1/execution/next";
+input string KillSwitchUrl = "http://127.0.0.1:8000/v1/risk/kill-switch";
 input string BridgeToken = ""; // For local testing only; use a proper secret manager/short-lived signing in production.
 input bool EnableDemoExecution = false;
 input bool AllowLiveExecution = false; // Template intentionally does not permit live execution even if set true.
@@ -68,6 +69,46 @@ string SafeGlobalKey(string command_id)
    StringReplace(command_id, ".", "_");
    if(StringLen(command_id) > 48) command_id = StringSubstr(command_id,0,48);
    return "CC_TRIED_" + command_id;
+}
+
+bool JsonFalse(const string json, const string key)
+{
+   string needle = "\"" + key + "\"";
+   int p = StringFind(json, needle);
+   if(p < 0) return false;
+   p = StringFind(json, ":", p + StringLen(needle));
+   if(p < 0) return false;
+   string tail = StringSubstr(json, p+1, 16);
+   StringTrimLeft(tail); StringTrimRight(tail);
+   return StringFind(tail, "false") == 0;
+}
+
+bool CheckKillSwitch()
+{
+   if(StringLen(BridgeToken)==0 || StringLen(KillSwitchUrl)==0)
+   {
+      Print("BLOCKED: bridge token or kill-switch URL is empty.");
+      return false;
+   }
+   char data[];
+   char result[];
+   string result_headers = "";
+   string headers = "Accept: application/json\r\n";
+   headers += "X-Bridge-Key: " + BridgeToken + "\r\n";
+   ResetLastError();
+   int code = WebRequest("GET", KillSwitchUrl, headers, 3000, data, result, result_headers);
+   if(code != 200)
+   {
+      Print("BLOCKED: kill-switch state unavailable; HTTP ", code, ", error=", GetLastError());
+      return false;
+   }
+   string response = CharArrayToString(result, 0, -1, CP_UTF8);
+   if(!JsonFalse(response, "kill_switch_active"))
+   {
+      Print("BLOCKED: kill switch is active or state is invalid.");
+      return false;
+   }
+   return true;
 }
 
 bool FetchCommand(string &body)
@@ -191,6 +232,8 @@ void OnInit()
 {
    if(StringFind(BridgeUrl, "http://127.0.0.1:") != 0 && StringFind(BridgeUrl, "http://localhost:") != 0)
       Print("WARNING: Bridge URL is not localhost. Production must use authenticated/TLS network policy.");
+   if(StringFind(KillSwitchUrl, "http://127.0.0.1:") != 0 && StringFind(KillSwitchUrl, "http://localhost:") != 0)
+      Print("WARNING: Kill-switch URL is not localhost. Verify the authenticated network policy.");
    EventSetTimer(MathMax(1, PollSeconds));
    Print("CriticalConsensusEA initialized. Demo execution default is disabled. Add bridge URL to MT5 WebRequest allowlist.");
 }
@@ -199,6 +242,8 @@ void OnDeinit(const int reason) { EventKillTimer(); }
 
 void OnTimer()
 {
+   // Before each command poll, require a fresh explicit false from the persisted stop endpoint.
+   if(!CheckKillSwitch()) return;
    string body = "";
    if(!FetchCommand(body)) return;
    ExecuteDemoCommand(body);
