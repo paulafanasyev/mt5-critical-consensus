@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .market_data import MarketBar, validate_bar_series
+from .audit import verify_audit_chain
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -312,6 +313,94 @@ class PostgresRepository:
         output.setdefault("account_mode", row[1])
         output["snapshot_sha256"] = row[2]
         return output
+
+    def persist_pipeline_result(
+        self, result: Mapping[str, Any], *, signal_input_sha256: str,
+    ) -> dict[str, Any]:
+        """Atomically persist a verified pipeline audit chain and its immutable decision result."""
+        if not isinstance(result, Mapping):
+            raise ValueError("pipeline result must be an object")
+        signal_id = str(result.get("signal_id", "")).strip()
+        status = str(result.get("status", "")).upper()
+        allowed_statuses = {"GATHER_MORE", "ESCALATE", "HOLD", "REJECT", "DENY",
+                             "REQUIRE_HUMAN", "AUTHORIZED_ONCE"}
+        if not signal_id or status not in allowed_statuses:
+            raise ValueError("pipeline result has missing signal_id or unsupported status")
+        if (not isinstance(signal_input_sha256, str) or len(signal_input_sha256) != 71
+                or not signal_input_sha256.startswith("sha256:")
+                or any(ch not in "0123456789abcdef" for ch in signal_input_sha256[7:])):
+            raise ValueError("signal_input_sha256 must use sha256:<64 lowercase hex characters>")
+        events = result.get("audit_events")
+        if not isinstance(events, list) or not events:
+            raise ValueError("pipeline result must contain a non-empty audit_events list")
+        chain = verify_audit_chain(events)
+        if chain.get("valid") is not True:
+            raise ValueError("pipeline audit chain is invalid; result was not persisted")
+        if result.get("audit_chain_valid") is not True:
+            raise ValueError("pipeline result did not mark its audit chain valid")
+
+        result_json = _canonical(dict(result))
+        result_hash = _sha256(result_json)
+        blockers = result.get("blockers", [])
+        if not isinstance(blockers, list) or any(not isinstance(item, str) for item in blockers):
+            raise ValueError("pipeline blockers must be an array of strings")
+        last_hash = str(events[-1].get("event_hash", ""))
+        event_count = len(events)
+
+        with self._connect() as conn:
+            inserted_events = 0
+            duplicate_events = 0
+            for event in events:
+                if not isinstance(event, Mapping):
+                    raise ValueError("audit event is not an object")
+                event_type = str(event.get("event_type", "")).strip()
+                event_hash = str(event.get("event_hash", ""))
+                occurred_at = _timestamp(event.get("timestamp", ""), "audit_event.timestamp")
+                previous_hash = event.get("previous_hash")
+                payload = event.get("payload")
+                if not event_type or not isinstance(payload, Mapping):
+                    raise ValueError("audit event type or payload is invalid")
+                encoded_payload = _canonical(dict(payload))
+                returned = conn.execute(
+                    """INSERT INTO audit_events
+                       (event_type, schema_version, occurred_at, previous_hash, event_hash, payload)
+                       VALUES (%s,1,%s,%s,%s,%s::jsonb)
+                       ON CONFLICT (event_hash) DO NOTHING
+                       RETURNING id""",
+                    (event_type, occurred_at, previous_hash, event_hash, encoded_payload),
+                ).fetchone()
+                if returned:
+                    inserted_events += 1
+                    continue
+                existing = conn.execute(
+                    """SELECT event_type, schema_version, occurred_at, previous_hash, payload
+                       FROM audit_events WHERE event_hash=%s""", (event_hash,)
+                ).fetchone()
+                if existing is None:
+                    raise RuntimeError("audit event conflict row disappeared")
+                existing_payload = existing[4] if isinstance(existing[4], Mapping) else json.loads(existing[4])
+                if (existing[0] != event_type or int(existing[1]) != 1 or existing[2] != occurred_at
+                        or existing[3] != previous_hash
+                        or _canonical(dict(existing_payload)) != encoded_payload):
+                    raise ValueError("audit event hash already exists with different persisted content")
+                duplicate_events += 1
+
+            inserted = conn.execute(
+                """INSERT INTO decision_runs
+                   (signal_id, signal_input_sha256, status, blockers, result_sha256,
+                    last_audit_event_hash, audit_event_count, result)
+                   VALUES (%s,%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb)
+                   RETURNING decision_id, created_at""",
+                (signal_id, signal_input_sha256, status, _canonical(blockers), result_hash,
+                 last_hash, event_count, result_json),
+            ).fetchone()
+        return {
+            "decision_id": str(inserted[0]), "created_at": inserted[1].isoformat(),
+            "signal_id": signal_id, "status": status, "result_sha256": result_hash,
+            "last_audit_event_hash": last_hash, "audit_event_count": event_count,
+            "audit_events_inserted": inserted_events, "audit_events_already_present": duplicate_events,
+            "trade_allowed": False,
+        }
 
     def persist_event_once(self, event: Mapping[str, Any], *, consumer_name: str) -> bool:
         """Commit processed-event marker and event evidence atomically before Redis ACK."""
