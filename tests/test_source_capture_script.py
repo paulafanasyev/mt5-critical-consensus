@@ -214,3 +214,52 @@ def test_capture_manifest_rejects_registry_size_limit_above_database_cap(tmp_pat
         assert False, "oversized registry cap should be rejected before any fetch"
     except ValueError as exc:
         assert "max_content_bytes" in str(exc)
+
+
+def test_capture_manifest_extracts_publication_timestamp_from_configured_json_pointer(tmp_path, monkeypatch):
+    published = datetime.now(timezone.utc) - timedelta(minutes=1)
+    body = json.dumps({
+        "metadata": {"publishedAt": published.isoformat()},
+        "headline": "Official policy update",
+        "body": "The publisher exposes an explicit publication timestamp field.",
+    }).encode("utf-8")
+    monkeypatch.setattr(CAPTURE, "_fetch", lambda url, max_bytes, timeout: (body, "application/json"))
+    configured = policy()
+    profile = configured["publishers"]["official-a"]
+    profile["published_at_json_pointer"] = "/metadata/publishedAt"
+    profile["allowed_publication_time_attestations"] = ["publisher_json_pointer"]
+    registry_path = tmp_path / "registry.yaml"
+    manifest_path = tmp_path / "manifest.json"
+    registry_path.write_text(yaml.safe_dump(configured), encoding="utf-8")
+    manifest_path.write_text(json.dumps({"sources": [{
+        "publisher_id": "official-a",
+        "url": "https://official-a.example/api/releases/latest",
+    }]}), encoding="utf-8")
+    records = CAPTURE.capture_manifest(manifest_path, registry_path)
+    assert len(records) == 1
+    record = records[0]
+    assert record["published_at"] == published.isoformat()
+    assert record["publication_time_attestation"] == "publisher_json_pointer"
+    assert record["publication_time_field"] == "/metadata/publishedAt"
+    assert record["source_id"].startswith("src-")
+
+
+def test_capture_manifest_rejects_api_timestamp_pointer_when_field_missing(tmp_path, monkeypatch):
+    body = b'{"metadata":{"published":"not-the-configured-field"}}'
+    monkeypatch.setattr(CAPTURE, "_fetch", lambda url, max_bytes, timeout: (body, "application/json"))
+    configured = policy()
+    profile = configured["publishers"]["official-a"]
+    profile["published_at_json_pointer"] = "/metadata/publishedAt"
+    profile["allowed_publication_time_attestations"] = ["publisher_json_pointer"]
+    registry_path = tmp_path / "registry.yaml"
+    manifest_path = tmp_path / "manifest.json"
+    registry_path.write_text(yaml.safe_dump(configured), encoding="utf-8")
+    manifest_path.write_text(json.dumps({"sources": [{
+        "publisher_id": "official-a",
+        "url": "https://official-a.example/api/releases/latest",
+    }]}), encoding="utf-8")
+    try:
+        CAPTURE.capture_manifest(manifest_path, registry_path)
+        assert False, "missing publisher timestamp field should be rejected"
+    except ValueError as exc:
+        assert "invalid publisher JSON timestamp field" in str(exc)
