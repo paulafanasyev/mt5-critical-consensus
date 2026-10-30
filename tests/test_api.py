@@ -263,3 +263,25 @@ def test_permission_route_refuses_caller_supplied_risk_aggregates(monkeypatch):
                            json={"payload": {}})
     assert response.status_code == 423
     assert "/v1/risk/permission/check" in response.json()["detail"]
+
+
+def test_policy_endpoint_rejects_shared_signing_issuers(monkeypatch):
+    configure(monkeypatch, governance_issuer=EVIDENCE_ISSUER)
+    response = client.post(
+        "/v1/certainty/evaluate", headers={"X-Bridge-Key": BRIDGE},
+        json={**signed_body({}), "governance_attestation": governance_attestation()},
+    )
+    assert response.status_code == 503
+    assert "issuers" in response.json()["detail"]
+
+
+def test_health_is_hermetic_when_no_secrets_are_configured(monkeypatch):
+    for name in ("MT5_BRIDGE_TOKEN", "MT5_EVIDENCE_HMAC_KEY", "MT5_GOVERNANCE_HMAC_KEY",
+                 "MT5_OPERATOR_HMAC_KEY", "MT5_EVIDENCE_ISSUER", "MT5_GOVERNANCE_ISSUER",
+                 "MT5_OPERATOR_ISSUER", "MT5_KILL_SWITCH_ADMIN_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    body = client.get("/health").json()
+    assert body["execution_enabled"] is False
+    assert body["authenticated_policy_endpoints"] is False
+    assert body["evidence_verification_configured"] is False
+    assert body["governance_verification_configured"] is False

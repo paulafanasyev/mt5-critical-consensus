@@ -7,7 +7,7 @@
 - Автономная торговля запрещена. Необходимо отдельное разрешение пользователя на каждую команду.
 - Live-исполнение в MQL5-шаблоне заблокировано без возможности включения одной настройкой; сначала требуются аудит, paper/demo-forward и отдельное изменение политики.
 - API-эндпоинт получения команд в каркасе отвечает `204 No Content`, пока очередь исполнения не реализована и не проверена. Поэтому включение EA само по себе не должно породить ордер.
-- Любой недостающий verdict, открытый challenge, stale source, VETO, риск-флаг, провал калибровки, отсутствие risk snapshot/news state, запрещённое UTC-окно, истёкший TTL или недействительное подтверждение блокирует исполнение.
+- Любой недостающий verdict, открытый challenge, stale source, VETO, риск-флаг, провал калибровки, отсутствие risk snapshot/news state, запрещённое UTC-окно, истёкший TTL, недействительное подтверждение или расхождение risk snapshot с точными параметрами ордера и equity-базой блокирует исполнение.
 - Упоминание `confidence >= 0.98` означает лишь порог допуска по политике. Для CertaintyGate дополнительно нужны калибровочная история и health-метрики: минимум 30 наблюдений для `dissent_rate` и `false_certainty_rate`; отсутствующие метрики блокируют PASS. Это **не** означает 98% вероятность прибыли и не гарантирует исход сделки.
 
 ## Состав
@@ -16,15 +16,15 @@
 - `src/critical_consensus/pipeline.py` — deterministic Certainty → nine-step Chief → Permission → human-review path with an immutable `signal_input` hash bound to every verdict; `scripts/evaluate_signal_bundle.py` evaluates trusted evidence packets without accepting client-supplied human approval; `--persist` additionally requires an inactive persisted kill switch and a fresh MT5 risk snapshot bound to the exact requested order parameters.
 - `src/critical_consensus/calibration.py` — Brier score, shrinkage penalty, weighted consensus; `calibration_eval.py` — chronological walk-forward Platt calibration and sample-aware reliability report.
 - `src/critical_consensus/api.py` — FastAPI policy endpoints; every policy evaluation requires a fresh HMAC-signed evidence wrapper and, for certainty, a separately signed calibration-service attestation. Authorization and order submission endpoints deliberately remain disabled until durable permission state and a real 2FA/signature verifier exist.
-- `src/critical_consensus/evidence.py` — HMAC-SHA256 envelopes binding exact canonical payloads, issuer, nonce, TTL and payload hash; `governance.py` — signed historical dissent/false-certainty attestations; `authorization.py` — one-time nonce stores (in-memory for tests, PostgreSQL for durable use).
+- `src/critical_consensus/evidence.py` — HMAC-SHA256 envelopes binding exact canonical payloads, issuer, nonce, TTL and payload hash, with distinct `evidence`, `governance` and `operator` signing domains; `governance.py` — signed historical dissent/false-certainty attestations; `authorization.py` — one-time nonce stores (in-memory for tests, insert-only PostgreSQL tombstones for durable use).
 - `src/critical_consensus/market_data.py` — read-only MT5 history + CSV adapter and OHLC validation; `providers.py` / `agent_runtime.py` — configurable OpenAI-compatible research agents, exact input-hash binding, TTL checks, unique provider-origin checks and fail-closed collection. `scripts/run_agent_analysis.py` requires all nine mandatory policy-agent IDs, then runs provider-backed anonymized peer review (two reviewers per verdict) and up to three evidence-bound challenge-resolution rounds. `READY_FOR_CHIEF` only means this review ledger is complete; it does not run Certainty Gate or authorize trading.
-- `src/critical_consensus/redis_streams.py` — idempotent event publishing, consumer groups, retry/DLQ and pending-message recovery; `scripts/run_worker.py` durably writes events to PostgreSQL before ACK. This worker archives events; it does not dispatch orders.
+- `src/critical_consensus/redis_streams.py` — idempotent event publishing, consumer groups, retry/DLQ and pending-message recovery; `scripts/run_worker.py` durably writes valid events to PostgreSQL before ACK, while poison/invalid events are written to the DLQ and only then ACKed; an event whose handler raises stays pending for retry. This worker archives events; it does not dispatch orders.
 - `schemas/` — JSON Schema Draft 2020-12 для 11 контрактов.
 - `config/` — deny-by-default policy thresholds и permissions.
 - `mql5/CriticalConsensusEA.mq5` — демонстрационный EA: demo account only, disabled by default; строгая проверка loopback-URL (точный host `127.0.0.1`/`localhost`, числовой порт, без userinfo/query), header-safe `BridgeToken`, TTL/SL/TP/slippage checks и flushed idempotency-заглушка перед `OrderSend`.
-- `src/critical_consensus/persistence.py` — PostgreSQL repository for immutable market bars, pre-outcome forecasts, one-time labels, kill-switch/risk evidence, Redis inbox events and full pipeline decision/audit persistence. `db/postgres_schema.sql` + `db/migrations/` — base and append-only evidence schemas; `neo4j/schema.cypher` — graph schema.
+- `src/critical_consensus/persistence.py` — PostgreSQL repository for immutable market bars, pre-outcome forecasts, one-time labels, kill-switch/risk evidence, Redis inbox events and full pipeline decision/audit persistence. `db/postgres_schema.sql` + `db/migrations/` — base schema plus ordered, forward-only migrations (immutable evidence tables and insert-only nonce tombstones); `neo4j/schema.cypher` — graph schema.
 - `tests/` — adversarial unit tests.
-- `.github/workflows/security-audit.yml` and `.github/workflows/validation-suite.yml` — dependency/source security scans, unit contracts and PostgreSQL/Redis integration checks.
+- `.github/workflows/security-audit.yml`, `tests.yml` and `validation-suite.yml` — dependency/source security scans, unit contracts and PostgreSQL/Redis integration checks.
 - `docs/` — архитектура, формулы, пример trace и недельный roadmap.
 
 ## Быстрый запуск (Linux, Python 3.11+)
@@ -37,17 +37,18 @@ pytest -q
 export MT5_BRIDGE_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 export MT5_EVIDENCE_HMAC_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 export MT5_GOVERNANCE_HMAC_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export MT5_OPERATOR_HMAC_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 uvicorn critical_consensus.api:app --host 127.0.0.1 --port 8000
 ```
 
-`MT5_EVIDENCE_HMAC_KEY` и `MT5_GOVERNANCE_HMAC_KEY` должны быть разными ключами длиной 32–256 байт. Первый подписывает evidence-пакеты на доверенном ingress, второй — исторические метрики калибровочного сервиса. Ключи провайдеров задаются только через переменные вида `MT5_AGENT_KEY_*`, на которые ссылается `api_key_env`; произвольные имена переменных и inline-секреты отклоняются.
+`MT5_EVIDENCE_HMAC_KEY`, `MT5_GOVERNANCE_HMAC_KEY` и `MT5_OPERATOR_HMAC_KEY` должны быть тремя разными ключами длиной 32–256 байт; соответствующие issuer (`MT5_EVIDENCE_ISSUER`, `MT5_GOVERNANCE_ISSUER`, `MT5_OPERATOR_ISSUER`) также должны различаться. Первый подписывает evidence-пакеты на доверенном ingress, второй — исторические метрики калибровочного сервиса, третий — решение оператора (approval) в отдельном домене `operator`. Без operator-ключа и issuer бандл с решением человека блокируется, а не принимается без подписи. `MT5_BRIDGE_TOKEN` должен содержать не менее 24 символов `[A-Za-z0-9._~-]`. Ключи провайдеров задаются только через переменные вида `MT5_AGENT_KEY_*`, на которые ссылается `api_key_env`; произвольные имена переменных и inline-секреты отклоняются.
 
 Для Windows VPS с MT5: Python bridge должен слушать только `127.0.0.1`; в MT5 добавьте localhost в список разрешённых адресов для `WebRequest`. Не публикуйте bridge на `0.0.0.0` без отдельного сетевого и криптографического контроля.
 
 
 ## Опциональный локальный слой данных
 
-`docker-compose.yml` поднимает PostgreSQL/TimescaleDB, Redis и Neo4j только на loopback. В репозитории есть PostgreSQL repository adapter (`persistence.py`), миграции и worker-скрипт (`scripts/run_worker.py`); они покрыты интеграционными тестами, которые запускаются только при настроенных `TEST_DATABASE_URL`/`TEST_REDIS_URL`. Развёрнутый и эксплуатируемый worker service и реальная broker/database инсталляция не проверялись.
+`docker-compose.yml` поднимает PostgreSQL 16 (образ TimescaleDB; hypertables в схеме не создаются), Redis и Neo4j только на loopback. В репозитории есть PostgreSQL repository adapter (`persistence.py`), миграции и worker-скрипт (`scripts/run_worker.py`); они покрыты интеграционными тестами, которые запускаются только при настроенных `TEST_DATABASE_URL`/`TEST_REDIS_URL`. Развёрнутый и эксплуатируемый worker service и реальная broker/database инсталляция не проверялись.
 
 ```bash
 cp .env.example .env
@@ -60,7 +61,7 @@ docker compose up -d
 
 ## Сквозной demo evaluation flow
 
-`evaluate_signal_bundle(...)` принимает уже сформированные verdicts, peer reviews, challenge ledger, source reports и ChiefReasoning. Он пересчитывает coverage peer-review, использует калибровочные метаданные для consensus, связывает PermissionRequest с хэшем ChiefReasoning, пересчитанным consensus и точными сводками источников, затем применяет certainty gate, ChiefAgent и PermissionGate. Если пользователь не передал решение, возвращается `REQUIRE_HUMAN` вместе с `human_review_packet`: все peer reviews, dissenting opinions, challenge ledger, ChiefReasoning, источники, риск-снимок и tail-risk. Валидное решение приводит только к `AUTHORIZED_ONCE`; команда ордера не создаётся.
+`evaluate_signal_bundle(...)` принимает уже сформированные verdicts, peer reviews, challenge ledger, source reports и ChiefReasoning. Он пересчитывает coverage peer-review, использует калибровочные метаданные для consensus, связывает PermissionRequest с хэшем ChiefReasoning, пересчитанным consensus и точными сводками источников, затем применяет certainty gate, ChiefAgent и PermissionGate. Если пользователь не передал решение, возвращается `REQUIRE_HUMAN` вместе с `human_review_packet`: все peer reviews, dissenting opinions, challenge ledger, ChiefReasoning, источники, риск-снимок и tail-risk. Решение человека принимается только как отдельно подписанный operator-envelope, привязанный к `signal_id` и хэшу ChiefReasoning, и только при `require_persisted_risk=True`. Валидное решение приводит только к `AUTHORIZED_ONCE`; команда ордера не создаётся.
 
 ```python
 from critical_consensus.evidence import sign_bundle
@@ -75,9 +76,9 @@ print(result["status"], result["blockers"])
 assert result["trade_allowed"] is False
 ```
 
-Бандл обязан нести свежий `evidence_envelope`; исторические `dissent_rate`/`false_certainty_rate` принимаются только из подписанной атестации калибровочного сервиса (отдельный ключ, отдельный issuer). `mandatory_agents` и `compliance_agent_id` берутся только из политики. `compliance_status` вычисляется по verdict `ComplianceAgent`, а не по полю бандла. PermissionRequest обязан совпадать с `signal_input` по `instrument` и `direction`. Разрешение человека требует `decision_id` и одноразовый `nonce`, атомарно потребляемый через `InMemoryNonceStore` (тесты/демо) или `PostgresNonceStore`; повторное использование отклоняется.
+Бандл обязан нести свежий `evidence_envelope`; исторические `dissent_rate`/`false_certainty_rate` принимаются только из подписанной атестации калибровочного сервиса (отдельный ключ, отдельный issuer). `mandatory_agents` и `compliance_agent_id` берутся только из политики. `compliance_status` вычисляется по verdict `ComplianceAgent`, а не по полю бандла. PermissionRequest обязан совпадать с `signal_input` по `instrument` и `direction`. Persisted MT5 risk snapshot должен совпадать с заказом по symbol и request-binding hash, а `risk_value`/`risk_fraction` пересчитываются из `size × |entry − SL|`, tick size/tick value и equity и сравниваются с допуском 1%; daily loss и drawdown пересчитываются из equity-баз. Разрешение человека требует `decision_id` и одноразовый `nonce`, атомарно потребляемый через `InMemoryNonceStore` (тесты/демо) или `PostgresNonceStore`; повторное использование отклоняется. `PostgresNonceStore` хранит insert-only tombstones: приложение не удаляет строки в обработке запроса, ручная очистка допускается только после `expires_at` и согласованного retention-окна.
 
-Защищённые policy API endpoints требуют `X-Bridge-Key` и тело `{"payload": ..., "envelope": ...}` с валидной HMAC-подписью. Если `MT5_BRIDGE_TOKEN`, `MT5_EVIDENCE_HMAC_KEY` или (для certainty) `MT5_GOVERNANCE_HMAC_KEY` не настроены, endpoint отвечает HTTP 503; неверная или изменённая подпись — HTTP 403. `/health` не содержит секретов и честно показывает, какие проверки сконфигурированы, но всегда сообщает execution disabled. Ключ bridge — защита localhost-транспорта, а не 2FA/цифровая подпись пользователя. `/v1/authorization/check` намеренно отвечает HTTP 423: он не принимает переданный клиентом объект PermissionResult как доказательство выданного разрешения, поскольку долговременного server-side permission store и настоящего 2FA/signature verifier пока нет.
+Защищённые policy API endpoints требуют `X-Bridge-Key` и тело `{"payload": ..., "envelope": ...}` с валидной HMAC-подписью. Если `MT5_BRIDGE_TOKEN`, `MT5_EVIDENCE_HMAC_KEY` или (для certainty) `MT5_GOVERNANCE_HMAC_KEY` не настроены, endpoint отвечает HTTP 503; отсутствующий или неверный `X-Bridge-Key` — HTTP 401; неверная или изменённая подпись — HTTP 403; неверная схема тела — HTTP 422. API пересчитывает `reviewer_count`, consensus и `open_challenges` из raw-записей и игнорирует заявленные клиентом агрегаты; `/v1/permission/check` намеренно отвечает HTTP 423 и требует persisted-risk эндпоинт `/v1/risk/permission/check`. `/health` не содержит секретов и честно показывает, какие проверки сконфигурированы, но всегда сообщает execution disabled. Ключ bridge — защита localhost-транспорта, а не 2FA/цифровая подпись пользователя. `/v1/authorization/check` намеренно отвечает HTTP 423: он не принимает переданный клиентом объект PermissionResult как доказательство выданного разрешения, поскольку долговременного server-side permission store и настоящего 2FA/signature verifier пока нет.
 
 ## Где ещё нет production-функций
 
@@ -99,7 +100,7 @@ assert result["trade_allowed"] is False
 
 ## Проверка текущего каркаса
 
-- Локальная проверка ветки `harden/10of10` на Python 3.12 (Windows): `pytest -q` — **201 passed, 9 skipped**. Все пропуски требуют `TEST_DATABASE_URL` и/или `TEST_REDIS_URL` и здесь не запускались. Результаты GitHub Actions относятся к предыдущим коммитам и для этой ветки должны быть подтверждены отдельным run после push; они не наследуются автоматически.
+- Локальная проверка ветки `harden/10of10` на Python 3.12 (Windows): `pytest -q` — **225 passed, 10 skipped**; `python scripts/check_mql5_safety.py` — **116 static invariants verified, 14 mutations rejected** (компиляция EA и demo-исполнение по-прежнему NOT PROVEN). Все пропуски требуют `TEST_DATABASE_URL` и/или `TEST_REDIS_URL` и здесь не запускались. Результаты GitHub Actions относятся к предыдущим коммитам и для этой ветки должны быть подтверждены отдельным run после push; они не наследуются автоматически.
 - Проверяются fail-closed gates, HMAC evidence/governance envelopes, одноразовые authorization nonce, integrity binding между ChiefReasoning/consensus/source summary и PermissionRequest, выдача полного human review packet, hash chain, API key gate, строгая каноническая сериализация и Redis Streams helpers.
 - Проверка зелёных тестов доказывает поведение локальных функций на синтетических входах, но не проверяет брокер, MQL5-компиляцию, реальную очередь, рыночные данные или доходность.
 - ChiefReasoning hash вычисляется по каноническому JSON без поля `reasoning_hash`; изменение любого шага делает hash невалидным.

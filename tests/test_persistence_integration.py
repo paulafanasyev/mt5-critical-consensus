@@ -65,27 +65,30 @@ def test_persisted_kill_switch_defaults_active_and_appends_audit_events():
     initial = repo.get_kill_switch_state()
     assert initial["status"] == "PERSISTED"
     assert initial["kill_switch_active"] is True
-    disabled = repo.set_kill_switch(active=False, actor_id="pytest-operator",
-                                    reason="test-only controlled disable")
-    assert disabled["kill_switch_active"] is False
-    assert repo.get_kill_switch_state()["kill_switch_active"] is False
-    enabled = repo.set_kill_switch(active=True, actor_id="pytest-operator",
-                                   reason="test complete; stop re-enabled")
-    assert enabled["kill_switch_active"] is True
+    try:
+        disabled = repo.set_kill_switch(active=False, actor_id="pytest-operator",
+                                        reason="test-only controlled disable")
+        assert disabled["kill_switch_active"] is False
+        assert repo.get_kill_switch_state()["kill_switch_active"] is False
+    finally:
+        # Restore the fail-closed default even if an assertion above fails.
+        repo.set_kill_switch(active=True, actor_id="pytest-operator",
+                             reason="test complete; stop re-enabled")
     assert repo.get_kill_switch_state()["kill_switch_active"] is True
 
 
 def test_mt5_risk_snapshot_is_persisted_immutably():
     repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
     repo.migrate()
+    symbol = "RSK" + uuid.uuid4().hex[:8].upper()
     snapshot = {
         "observed_at": datetime.now(timezone.utc).isoformat(), "status": "DENY",
-        "account_mode": "unknown", "symbol": "EURUSD", "trade_allowed": False,
+        "account_mode": "unknown", "symbol": symbol, "trade_allowed": False,
         "blockers": ["TEST_MISSING_TERMINAL"],
     }
     stored = repo.record_mt5_risk_snapshot(snapshot)
     assert stored["snapshot_sha256"].startswith("sha256:")
-    loaded = repo.get_latest_mt5_risk_snapshot("EURUSD")
+    loaded = repo.get_latest_mt5_risk_snapshot(symbol)
     assert loaded is not None
     assert loaded["status"] == "DENY"
     assert loaded["blockers"] == ["TEST_MISSING_TERMINAL"]
@@ -144,3 +147,44 @@ def test_postgres_authorization_nonce_is_consumed_exactly_once():
     assert store.consume(scope=scope, nonce="expired-" + nonce, expires_at=expired) is False
     with pytest.raises(ValueError, match="future"):
         repo.consume_authorization_nonce(scope=scope, nonce="past-" + nonce, expires_at=expired)
+
+
+def test_persist_cli_requires_persisted_risk_before_writing_a_decision(tmp_path):
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from critical_consensus.audit import canonical_hash
+    from critical_consensus.evidence import sign_bundle
+
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    repo.set_kill_switch(active=True, actor_id="pytest-operator", reason="persist-cli isolation")
+    signal_input = {"signal_id": "cli-persist-" + uuid.uuid4().hex, "instrument": "EURUSD"}
+    bundle = sign_bundle({
+        "signal_id": signal_input["signal_id"],
+        "signal_input": signal_input,
+        "signal_input_hash": canonical_hash(signal_input),
+        "permission_request": {"instrument": "EURUSD"},
+        "verdicts": [],
+    }, key="e" * 64, issuer="test-ingress")
+    bundle_path = tmp_path / "bundle.json"
+    output_path = tmp_path / "result.json"
+    bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+    env = {**os.environ, "DATABASE_URL": os.environ["TEST_DATABASE_URL"],
+           "MT5_EVIDENCE_HMAC_KEY": "e" * 64, "MT5_EVIDENCE_ISSUER": "test-ingress",
+           "MT5_GOVERNANCE_HMAC_KEY": "g" * 64, "MT5_GOVERNANCE_ISSUER": "calibration-service"}
+    completed = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parents[1] / "scripts" / "evaluate_signal_bundle.py"),
+         str(bundle_path), "--output", str(output_path), "--persist"],
+        capture_output=True, text=True, check=False, env=env,
+    )
+    assert completed.returncode == 2, completed.stderr
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    assert report["persisted_risk_checked"] is True
+    assert report["result"]["status"] == "DENY"
+    assert report["result"]["trade_allowed"] is False
+    assert "KILL_SWITCH_ACTIVE_OR_INVALID" in report["result"]["blockers"]
+    assert report["persistence"]["decision_id"]
+    assert report["order_created"] is False

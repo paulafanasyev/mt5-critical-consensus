@@ -12,10 +12,13 @@
 - Calibration is attested rather than self-declared: governance attestations must include per-agent `agent_calibration`, and the verified rows overwrite any bundle-supplied `calibration_meta` before consensus is recomputed.
 - Any caller-supplied `user_decision` now requires `require_persisted_risk` evidence; peer reviews and challenge records are TTL-bounded, the contradiction lookback must match policy, `news_or_rumor` must be explicit, and source freshness uses absolute `observed_at`.
 - MT5 risk capture requires an explicit broker `server_utc_offset_seconds` and fails closed before initialization when it is missing or malformed; tick freshness and the broker-day deal window use that offset.
-- MQL5 EA v0.12 rejects non-exact loopback URLs (userinfo, query/fragment, whitespace, non-ASCII, non-numeric or out-of-range ports), validates a header-safe 16–256 character bridge token before use, and flushes the idempotency tombstone before `OrderSend`. The static checker now verifies 44 invariants.
-- Added a PostgreSQL nonce-store integration test, documented migration 005 tombstone retention, and ignored generated `*.egg-info`/`build`/`dist` artifacts.
+- Human approvals now require a third, distinct `operator` signing domain (`MT5_OPERATOR_HMAC_KEY`/`MT5_OPERATOR_ISSUER`) bound to the `signal_id` and `ChiefReasoning` hash; evidence and governance signers cannot approve a trade. Evidence exists only as a separate `user_decision_envelope`.
+- The policy API recomputes `reviewer_count`, consensus and `open_challenges` from raw peer-review/challenge records instead of trusting bridge aggregates, and `/v1/permission/check` now returns 423 in favor of persisted-risk `/v1/risk/permission/check`.
+- Persisted MT5 risk snapshots must reconcile `risk_value`/`risk_fraction` (from tick size/tick value), daily loss and drawdown against the exact order and captured equity baselines within 1%; symbol and tick-spec mismatches deny.
+- MQL5 EA rejects non-exact loopback URLs (userinfo, query/fragment, whitespace, non-ASCII, non-numeric or out-of-range ports), validates a header-safe 24–256 character bridge token before use, and flushes the idempotency tombstone before `OrderSend`. The static checker verifies 116 invariants and rejects 14 weakening mutations.
+- Added PostgreSQL nonce-store and `--persist` CLI integration tests, made DB tests use unique symbols and restore the kill switch, documented migration 005 tombstone retention, and ignored generated `*.egg-info`/`build`/`dist` artifacts.
 - Added `tzdata` for Windows and a UTC/`ZoneInfo` fallback for MT5 CSV timestamps.
-- Verification: local `pytest -q` — 201 passed, 9 skipped (all skips require `TEST_DATABASE_URL` and/or `TEST_REDIS_URL`). No PostgreSQL/Redis integration, broker, MetaEditor compilation, or live-market validation was performed.
+- Verification: local `pytest -q` — 225 passed, 10 skipped (all skips require `TEST_DATABASE_URL` and/or `TEST_REDIS_URL`; no local PostgreSQL/Redis was available). Static MQL5 checks pass; broker, MetaEditor compilation, demo execution and live-market validation were not performed.
 
 ## 0.2.0 — 2026-10-29
 

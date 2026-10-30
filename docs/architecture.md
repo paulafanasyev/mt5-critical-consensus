@@ -45,8 +45,8 @@ flowchart TB
   BUS[(Redis Streams / NATS)] <--> HUB
   BUS <--> PR
   BUS <--> EX
-  TS[(TimescaleDB market data)] --> ING
-  PGDB[(PostgreSQL orders / decisions / audit)] <--> AUD
+  TS[(PostgreSQL 16: market data)] --> ING
+  PGDB[(PostgreSQL decisions / audit / nonce tombstones)] <--> AUD
   MT5[MT5 terminal / broker] <--> EX
 ```
 
@@ -57,17 +57,20 @@ flowchart TB
 - Калибровочные метрики (dissent rate, false-certainty rate, sample size) берутся только из отдельной governance-аттестации, подписанной другим ключом (`MT5_GOVERNANCE_HMAC_KEY`) и другим issuer (`MT5_GOVERNANCE_ISSUER`, по умолчанию `calibration-service`). Значения из самого bundle для гейта не используются.
 - `mandatory_agents` и `compliance_agent_id` принадлежат policy-конфигу; `compliance_status` вычисляется из verdict `ComplianceAgent`, а не принимается из bundle.
 - `PermissionRequest` привязывается к сигналу (instrument, direction), exact `ChiefReasoning` hash, рассчитанному consensus и сводкам проверенных источников; расхождение блокирует переход к human gate.
+- Решение человека принимается только как отдельный envelope в домене `operator` (`MT5_OPERATOR_HMAC_KEY` + отдельные issuer/ключ), привязанный к `signal_id` и `ChiefReasoning` hash. Evidence-подписант не может одобрить сделку: evidence-envelope исключает `user_decision`, а без operator-конфигурации approval блокируется.
+- API не доверяет агрегатам клиента: `reviewer_count`, consensus и `open_challenges` пересчитываются из raw peer reviews/challenge ledger; `/v1/permission/check` отключён (HTTP 423), а `/v1/risk/permission/check` использует только persisted kill-switch и MT5 snapshot.
+- Persisted risk snapshot сверяется с заказом: symbol и request-binding hash, `risk_value`/`risk_fraction` из tick size/tick value, daily loss и drawdown из equity-баз — с допуском 1%; несовпадение или отсутствие tick-спецификации даёт DENY.
 - Human review packet содержит все peer reviews, dissenting opinions, полный challenge ledger, ChiefReasoning, source reports, risk snapshot и tail-risk fields.
 - API endpoint проверки authorization отключён (HTTP 423), пока отсутствуют persistent server-side permission state и настоящий криптографический 2FA/signature verifier.
-- PostgreSQL persistence stores immutable market history, forecast labels, risk/kill-switch snapshots and full decision/audit runs. The Redis worker script persists events before ACK, but a production-managed worker service is not deployed. The provider-backed anonymized peer-review and challenge-resolution runner exists and is unit-tested, but it has not been exercised against real independent provider endpoints and its confidence values remain uncalibrated. Trusted source ingestion/registry, historical calibration/health datasets, TOTP/signature provider, broker order dispatcher and MetaEditor/MT5 forward testing remain unimplemented or unverified.
+- PostgreSQL persistence stores immutable market history, forecast labels, risk/kill-switch snapshots and full decision/audit runs. The Redis worker script persists valid events before ACK (poison events are dead-lettered before ACK, and handler failures stay pending), but a production-managed worker service is not deployed. The provider-backed anonymized peer-review and challenge-resolution runner exists and is unit-tested, but it has not been exercised against real independent provider endpoints and its confidence values remain uncalibrated. Trusted source ingestion/registry, historical calibration/health datasets, TOTP/signature provider, broker order dispatcher and MetaEditor/MT5 forward testing remain unimplemented or unverified.
 - Execution-related endpoints intentionally cannot publish, fetch or send an order command. The diagram includes the future production boundary, not an enabled path.
 
 ## Invariants
 
 - Любое решение вычисляется как conjunction обязательных условий, не по большинству голосов.
 - `PASS` у CertaintyGate означает только передачу на ChiefAgent; `CONFIRM` ChiefAgent означает только разрешение перейти к PermissionGate.
-- PermissionGate возвращает `REQUIRE_HUMAN`; authorization формирует одноразовое разрешение, но не создаёт ордер.
-- Каждый `nonce` авторизации расходуется ровно один раз через `authorization_store` (`InMemoryNonceStore` или append-only `PostgresNonceStore`); повтор того же nonce получает `AUTHORIZATION_NONCE_REPLAYED`. Без store authorization не выдаётся.
+- PermissionGate не выдаёт исполнение: он либо возвращает `REQUIRE_HUMAN`, либо `DENY`, и ни один результат не делает `trade_allowed=True`; authorization формирует одноразовое разрешение, но не создаёт ордер. Эндпоинты исполнения остаются HTTP 423.
+- Каждый `nonce` авторизации расходуется ровно один раз через `authorization_store` (`InMemoryNonceStore` или `PostgresNonceStore` с insert-only tombstones: атомарный INSERT, без обновлений/удалений в обработке запроса; ручная очистка только после `expires_at` и retention-окна); повтор того же nonce получает `AUTHORIZATION_NONCE_REPLAYED`. Без store authorization не выдаётся.
 - Исполнительный мост перепроверяет TTL, client_order_id, slippage, SL/TP, состояние счёта и текущие позиции непосредственно перед операцией.
 - При неопределённом результате вызова брокера не выполняется слепой retry; запускается reconcile.
 

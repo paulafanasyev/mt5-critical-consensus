@@ -42,6 +42,20 @@ Score не заменяет обязательные проверки каждо
 
 Денежный риск по стопу: `risk_cash = equity * risk_fraction`, `volume = risk_cash / loss_per_lot_at_SL`, с нормализацией на `volume_min`, `volume_step`, `volume_max`, валюту счёта, tick size/value, комиссии и гэп-риск. Не вычисляйте объём только по расстоянию в пунктах. Нужны брокерские `order_calc_profit`/`order_check` или эквивалентная проверка.
 
+## Сверка persisted risk snapshot с заказом
+
+Персистентный snapshot не считается доказательством сам по себе: перед допуском значения пересчитываются из точных параметров заказа и equity-баз.
+
+`risk_value_expected = |entry_price - stop_loss| / tick_size * tick_value_loss * size`
+
+`risk_fraction_expected = risk_value_expected / account_equity`
+
+`daily_loss_fraction_expected = max(0, day_start_equity - account_equity) / day_start_equity`
+
+`drawdown_fraction_expected = max(0, equity_high_watermark - account_equity) / equity_high_watermark`
+
+Snapshot принимается, только если symbol совпадает, `request_binding_sha256` совпадает с заказом, tick size/value положительны, а `risk_value`, `risk_fraction`, `daily_loss_fraction` и `drawdown_fraction` отличаются от пересчитанных не более чем на 1% (`RISK_*_DOES_NOT_MATCH_*`). Отсутствующая tick-спецификация или нулевая equity-база — DENY, а не допуск. Комиссии, спред и гэп-риск в эту оценку не входят; их должен проверять исполнительный слой.
+
 ## False certainty rate
 
 Долю ложных высокоуверенных предсказаний считать только на outcome-верифицированных прогнозах и фиксированном горизонте. Не смешивать недоступные/неразрешённые наблюдения с проигрышами; показывать числитель, знаменатель и confidence interval.
