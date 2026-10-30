@@ -23,6 +23,14 @@ def main() -> int:
         "broker preflight": r"OrderCheck\s*\(",
         "localhost bridge default": r"http://127\.0\.0\.1:8000/v1/execution/next",
         "duplicate order guard": r"DUPLICATE BLOCKED",
+        "atomic account execution mutex": r"GlobalVariableSetOnCondition\\s*\\(",
+        "temporary mutex creation": r"GlobalVariableTemp\\s*\\(",
+        "persistent marker flushed before send": r"GlobalVariablesFlush\\s*\\(\\)",
+        "order key bound to account login": r"AccountInfoInteger\\(ACCOUNT_LOGIN\\)",
+        "order key rejects values that could be truncated": r"StringLen\\(order_id\\)\\s*>\\s*38",
+        "persistent marker write failure is checked": r"marker_written\\s*==\\s*0",
+        "idempotency expiry limitation documented": r"four weeks of inactivity",
+        "server ledger requirement documented": r"PostgreSQL idempotency ledger",
         "kill-switch endpoint configured": r"KillSwitchUrl",
         "kill-switch response must explicitly be false": r"JsonFalse",
         "strict JSON boolean parser is present": r"JsonBooleanValue",
@@ -60,10 +68,17 @@ def main() -> int:
     execute_body = source[execute_start:execute_end]
     preflight = execute_body.find("if(!OrderCheck(request, check))")
     recheck = execute_body.find("if(!CheckKillSwitch())")
+    lock = execute_body.find("if(!AcquireExecutionLock(lock_key, lock_lease))")
+    duplicate = execute_body.find("if(GlobalVariableCheck(global_key))")
     attempt = execute_body.find("GlobalVariableSet(global_key")
+    flush = execute_body.find("GlobalVariablesFlush()")
+    release = execute_body.find("ReleaseExecutionLock(lock_key, lock_lease)", attempt)
     send = execute_body.find("OrderSend(request, result)")
-    if min(preflight, recheck, attempt, send) < 0 or not (preflight < recheck < attempt < send):
-        print("FAIL: fresh kill-switch recheck must follow OrderCheck and precede the order attempt")
+    if min(preflight, recheck, lock, duplicate, attempt, flush, release, send) < 0:
+        print("FAIL: one or more order attempt controls are missing")
+        return 1
+    if not (preflight < recheck < lock < duplicate < attempt < flush < release < send):
+        print("FAIL: order attempt must be locked, duplicate-checked, flushed and unlocked before OrderSend")
         return 1
     print(f"PASS: {len(required) + 5} static EA safety invariants verified.")
     print("LIMIT: MQL5 compilation and terminal/demo-account execution are NOT PROVEN by static checks.")
