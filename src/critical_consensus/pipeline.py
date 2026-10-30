@@ -94,6 +94,13 @@ def evaluate_signal_bundle(
     except (ValueError, TypeError, OverflowError):
         return {"status": "GATHER_MORE", "trade_allowed": False, "blockers": ["INVALID_CURRENT_TIME"], "audit_events": []}
 
+    try:
+        bundle_hash = canonical_hash(bundle)
+    except (TypeError, ValueError, OverflowError):
+        return {"signal_id": signal_id or "unknown", "status": "GATHER_MORE",
+                "trade_allowed": False, "blockers": ["SIGNAL_BUNDLE_NOT_CANONICALLY_HASHABLE"],
+                "audit_events": [], "audit_chain_valid": False}
+
     trace: list[dict[str, Any]] = []
     previous_hash: str | None = None
     signal_id = str(bundle.get("signal_id", "")).strip()
@@ -114,7 +121,7 @@ def evaluate_signal_bundle(
                 "audit_events": trace, "audit_chain_valid": chain_check.get("valid") is True,
                 "audit_chain_check": chain_check}
 
-    emit("SIGNAL_RECEIVED", {"signal_id": signal_id or "unknown", "bundle_hash": canonical_hash(bundle)})
+    emit("SIGNAL_RECEIVED", {"signal_id": signal_id or "unknown", "bundle_hash": bundle_hash})
 
     signal_input = bundle.get("signal_input")
     supplied_signal_hash = bundle.get("signal_input_hash")
@@ -122,7 +129,12 @@ def evaluate_signal_bundle(
         emit("SIGNAL_INPUT_BINDING", {"signal_id": signal_id or "unknown", "status": "FAILED",
                                       "reason": "SIGNAL_INPUT_OR_HASH_MISSING"})
         return finish("GATHER_MORE", ["SIGNAL_INPUT_OR_HASH_MISSING"])
-    expected_signal_hash = canonical_hash(signal_input)
+    try:
+        expected_signal_hash = canonical_hash(signal_input)
+    except (TypeError, ValueError, OverflowError):
+        emit("SIGNAL_INPUT_BINDING", {"signal_id": signal_id, "status": "FAILED",
+                                      "reason": "SIGNAL_INPUT_NOT_CANONICALLY_HASHABLE"})
+        return finish("GATHER_MORE", ["SIGNAL_INPUT_NOT_CANONICALLY_HASHABLE"])
     if supplied_signal_hash != expected_signal_hash:
         emit("SIGNAL_INPUT_BINDING", {"signal_id": signal_id, "status": "FAILED",
                                       "reason": "SIGNAL_INPUT_HASH_MISMATCH"})
