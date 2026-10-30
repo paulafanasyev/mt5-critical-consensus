@@ -51,16 +51,36 @@ double JsonNumber(const string json, const string key)
    return StringToDouble(StringSubstr(json,p,e-p));
 }
 
-bool JsonTrue(const string json, const string key)
+bool JsonBooleanValue(const string json, const string key, const string expected)
 {
    string needle = "\"" + key + "\"";
    int p = StringFind(json, needle);
    if(p < 0) return false;
    p = StringFind(json, ":", p + StringLen(needle));
    if(p < 0) return false;
-   string tail = StringSubstr(json, p+1, 12);
-   StringTrimLeft(tail); StringTrimRight(tail);
-   return StringFind(tail, "true") == 0;
+   p++;
+   while(p < StringLen(json))
+   {
+      ushort c = StringGetCharacter(json,p);
+      if(c!=' ' && c!='\\t' && c!='\\r' && c!='\\n') break;
+      p++;
+   }
+   if(StringSubstr(json,p,StringLen(expected)) != expected) return false;
+   p += StringLen(expected);
+   while(p < StringLen(json))
+   {
+      ushort c = StringGetCharacter(json,p);
+      if(c!=' ' && c!='\\t' && c!='\\r' && c!='\\n') break;
+      p++;
+   }
+   if(p >= StringLen(json)) return false;
+   ushort tail = StringGetCharacter(json,p);
+   return tail==',' || tail=='}';
+}
+
+bool JsonTrue(const string json, const string key)
+{
+   return JsonBooleanValue(json, key, "true");
 }
 
 string SafeGlobalKey(string command_id)
@@ -74,14 +94,7 @@ string SafeGlobalKey(string command_id)
 
 bool JsonFalse(const string json, const string key)
 {
-   string needle = "\"" + key + "\"";
-   int p = StringFind(json, needle);
-   if(p < 0) return false;
-   p = StringFind(json, ":", p + StringLen(needle));
-   if(p < 0) return false;
-   string tail = StringSubstr(json, p+1, 16);
-   StringTrimLeft(tail); StringTrimRight(tail);
-   return StringFind(tail, "false") == 0;
+   return JsonBooleanValue(json, key, "false");
 }
 
 bool CheckKillSwitch()
