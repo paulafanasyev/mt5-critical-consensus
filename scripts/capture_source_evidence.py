@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import ipaddress
 import json
-import urllib.error
-import urllib.request
+import socket
+import ssl
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
@@ -51,37 +52,99 @@ def _safe_url(url: str, profile: dict) -> str:
     return host
 
 
-def _fetch(url: str, *, max_bytes: int, timeout: float) -> tuple[bytes, str]:
-    request = urllib.request.Request(
-        url, headers={"User-Agent": "MT5-Critical-Consensus-SourceCapture/1.0",
-                      "Accept": "text/html,application/json,application/xml,text/plain"},
-        method="GET",
-    )
+def _resolve_public_addresses(host: str) -> list[str]:
+    """Resolve once, reject every non-public answer, and pin HTTPS to a checked IP."""
     try:
-        opener = urllib.request.build_opener(_NoRedirectHandler())
-        with opener.open(request, timeout=timeout) as response:
-            content_type = response.headers.get_content_type().lower()
+        answers = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise RuntimeError("publisher_dns_resolution_failed") from None
+    addresses: list[str] = []
+    for answer in answers:
+        raw_ip = str(answer[4][0]).split("%", 1)[0]
+        try:
+            parsed = ipaddress.ip_address(raw_ip)
+        except ValueError:
+            raise RuntimeError("publisher_dns_returned_invalid_address") from None
+        if not parsed.is_global:
+            raise ValueError("publisher DNS resolved to a non-public network address")
+        normalized = parsed.compressed
+        if normalized not in addresses:
+            addresses.append(normalized)
+    if not addresses:
+        raise RuntimeError("publisher_dns_returned_no_addresses")
+    return addresses
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection pinned to a previously validated public IP, retaining host SNI/cert checks."""
+
+    def __init__(self, hostname: str, pinned_ip: str, *, timeout: float):
+        super().__init__(hostname, port=443, timeout=timeout, context=ssl.create_default_context())
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        if self._tunnel_host:
+            raise OSError("HTTPS proxy tunnels are disabled for publisher capture")
+        raw = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+        except Exception:
+            raw.close()
+            raise
+
+
+def _fetch(url: str, *, max_bytes: int, timeout: float) -> tuple[bytes, str]:
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme != "https" or not host or parsed.port not in (None, 443):
+        raise ValueError("publisher URL must be HTTPS on the default port")
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    addresses = _resolve_public_addresses(host)
+    headers = {
+        "User-Agent": "MT5-Critical-Consensus-SourceCapture/1.0",
+        "Accept": "text/html,application/json,application/xml,text/plain",
+        "Connection": "close",
+    }
+    last_network_error: OSError | None = None
+    for address in addresses:
+        connection = _PinnedHTTPSConnection(host, address, timeout=timeout)
+        try:
+            connection.request("GET", path, headers=headers)
+            response = connection.getresponse()
+            if response.status < 200 or response.status >= 300:
+                status = response.status
+                response.close()
+                raise RuntimeError(f"publisher_http_error:{status}")
+            content_type = response.getheader("Content-Type", "").split(";", 1)[0].strip().lower()
             if not (content_type.startswith("text/") or content_type in {
                 "application/json", "application/xml", "application/rss+xml", "application/atom+xml"
             }):
+                response.close()
                 raise ValueError("publisher response is not a supported text or JSON document")
-            declared = response.headers.get("Content-Length")
-            if declared:
+            declared = response.getheader("Content-Length")
+            if declared is not None:
                 try:
-                    if int(declared) > max_bytes:
-                        raise ValueError("publisher response exceeds the configured size limit")
-                except ValueError as exc:
-                    if str(exc).startswith("publisher response"):
-                        raise
-                    raise ValueError("publisher returned an invalid Content-Length") from exc
+                    declared_length = int(declared)
+                except ValueError:
+                    response.close()
+                    raise ValueError("publisher returned an invalid Content-Length") from None
+                if declared_length < 0 or declared_length > max_bytes:
+                    response.close()
+                    raise ValueError("publisher response exceeds the configured size limit")
             body = response.read(max_bytes + 1)
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"publisher_http_error:{exc.code}") from None
-    except (urllib.error.URLError, TimeoutError, OSError):
-        raise RuntimeError("publisher_network_or_timeout_error") from None
-    if not body or len(body) > max_bytes:
-        raise ValueError("publisher response is empty or exceeds the configured size limit")
-    return body, content_type
+            response.close()
+            if not body or len(body) > max_bytes:
+                raise ValueError("publisher response is empty or exceeds the configured size limit")
+            return body, content_type
+        except (OSError, http.client.HTTPException) as exc:
+            last_network_error = exc
+        finally:
+            connection.close()
+    if last_network_error is not None:
+        raise RuntimeError("publisher_network_or_tls_error") from None
+    raise RuntimeError("publisher_fetch_failed")
 
 
 def capture_manifest(manifest_path: Path, registry_path: Path, *, timeout: float = 12.0) -> list[dict]:
