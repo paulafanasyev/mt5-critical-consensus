@@ -155,7 +155,8 @@ def test_publisher_source_capture_is_immutable_and_retrieved_by_exact_id():
         "source_url": url, "published_at": (now - timedelta(minutes=1)).isoformat(),
         "retrieved_at": (now - timedelta(seconds=1)).isoformat(),
         "independence_group": "publisher-a", "credibility": 0.95, "ttl_seconds": 900,
-        "content_sha256": digest, "content_bytes": len(body), "captured_content": body,\n        "response_content_type": "application/json",
+        "content_sha256": digest, "content_bytes": len(body), "captured_content": body,
+        "response_content_type": "application/json",
         "publication_time_attestation": "operator_attested",
         "capture_method": "https_fetch", "registry_version": "1",
     }
