@@ -13,15 +13,15 @@
 ## Состав
 
 - `src/critical_consensus/gates.py` — self-adversarial checks, peer-review validation, challenge loop, fail-closed certainty/chief/permission/authorization gates.
-- `src/critical_consensus/pipeline.py` — orchestration of existing agent outputs through Certainty → Chief → Permission → human approval; it never creates an order.
+- `src/critical_consensus/pipeline.py` — deterministic Certainty → nine-step Chief → Permission → human-review path with an immutable `signal_input` hash bound to every verdict; `scripts/evaluate_signal_bundle.py` evaluates trusted evidence packets without accepting client-supplied human approval.
 - `src/critical_consensus/calibration.py` — Brier score, shrinkage penalty, weighted consensus; `calibration_eval.py` — chronological walk-forward Platt calibration and sample-aware reliability report.
 - `src/critical_consensus/api.py` — FastAPI policy endpoints; authorization and order submission endpoints deliberately disabled until durable permission state and a real 2FA/signature verifier exist.
-- `src/critical_consensus/market_data.py` — read-only MT5 history + CSV adapter and OHLC validation; `providers.py` / `agent_runtime.py` — configurable OpenAI-compatible research agents, TTL/binding validation and fail-closed collection. `scripts/run_agent_analysis.py` runs a read-only snapshot-to-agent pass when providers are configured.
+- `src/critical_consensus/market_data.py` — read-only MT5 history + CSV adapter and OHLC validation; `providers.py` / `agent_runtime.py` — configurable OpenAI-compatible research agents, exact input-hash binding, TTL checks, unique provider-origin checks and fail-closed collection. `scripts/run_agent_analysis.py` requires all nine mandatory policy-agent IDs before contacting providers; it is explicitly an agent-collection stage, not a Certainty Gate decision.
 - `src/critical_consensus/redis_streams.py` — idempotent event publishing, consumer groups, retry/DLQ and pending-message recovery; `scripts/run_worker.py` durably writes events to PostgreSQL before ACK. This worker archives events; it does not dispatch orders.
 - `schemas/` — JSON Schema Draft 2020-12 для 11 контрактов.
 - `config/` — deny-by-default policy thresholds и permissions.
 - `mql5/CriticalConsensusEA.mq5` — демонстрационный EA: demo account only, disabled by default, TTL/SL/TP/slippage/idempotency checks.
-- `src/critical_consensus/persistence.py` — optional PostgreSQL repository for immutable market bars, forecasts, labels and audit reports. `db/postgres_schema.sql` + `db/migrations/` — base and append-only evidence schemas; `neo4j/schema.cypher` — graph schema.
+- `src/critical_consensus/persistence.py` — PostgreSQL repository for immutable market bars, pre-outcome forecasts, one-time labels, kill-switch/risk evidence, Redis inbox events and full pipeline decision/audit persistence. `db/postgres_schema.sql` + `db/migrations/` — base and append-only evidence schemas; `neo4j/schema.cypher` — graph schema.
 - `tests/` — adversarial unit tests.
 - `.github/workflows/security-audit.yml` and `.github/workflows/validation-suite.yml` — dependency/source security scans, unit contracts and PostgreSQL/Redis integration checks.
 - `docs/` — архитектура, формулы, пример trace и недельный roadmap.
@@ -68,7 +68,7 @@ assert result["trade_allowed"] is False
 
 ## Где ещё нет production-функций
 
-Это не готовая торговая система: не реализованы реальные коннекторы новостей/бирж, запущенный worker service для Redis Streams, production DB repository/persistence adapter, TOTP-провайдер, проверка санкций, калибровка на размеченных out-of-sample результатах, проверенный парсер JSON для MQL5 и реальная диспетчеризация ордеров. Redis helpers используют at-least-once модель; реальный handler обязан фиксировать `processed_events` вместе со своими эффектами в одной транзакции. Они представлены интерфейсами/схемами, но не объявляются готовыми. Не подключайте реальный счёт к этому каркасу. MQL5-файл не проверен компиляцией в MetaEditor в этой среде; встроенный парсер рассчитан на строго ограниченный flat JSON и перед использованием должен быть заменён на проверенный JSON-парсер и подписанный payload.
+Это не готовая торговая система. Нет настроенных реальных API-ключей/моделей для девяти обязательных агентов, независимых подтверждённых источников новостей и их source registry, производственного peer-review/challenge resolver, подтверждённых dissent/false-certainty метрик и размеченной out-of-sample калибровки. Walk-forward evaluator и хранение прогнозов реализованы, но реальные калибровочные результаты не получены. CLI полного Chief Gate принимает только внутренний evidence packet; он не создаёт reviews/challenges, не подделывает source credibility и не принимает human approval. Отдельный TOTP/signature verifier, production-развёртывание worker/API и реальная диспетчеризация ордеров отсутствуют. Не подключайте реальный счёт. MQL5 не подтверждён компиляцией MetaEditor или демосчётом; статические проверки не заменяют эти испытания.
 
 ## Нормативные invariants
 
