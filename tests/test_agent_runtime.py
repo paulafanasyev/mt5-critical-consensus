@@ -16,6 +16,8 @@ def provider(agent_id, *, signal_id="s1", confidence=0.8, ttl=300, created=None)
             "verdict": "APPROVE", "ttl_seconds": ttl,
             "created_at": (created or NOW).isoformat(), "evidence_refs": ["source:1"],
         }
+    run.provider_origin = f"provider-{agent_id}.test"
+    run.provider_identity = f"provider-{agent_id}.test::test-model-{agent_id}"
     return run
 
 
@@ -27,7 +29,7 @@ async def test_three_declared_independent_agents_are_ready_for_review_not_trade(
     result = await collect_agent_verdicts({"signal_id": "s1"}, agents, now=NOW)
     assert result["status"] == "READY_FOR_REVIEW"
     assert result["trade_allowed"] is False
-    assert result["independence_evidence"] == "DECLARED_ONLY_NOT_VERIFIED"
+    assert result["independence_evidence"] == "CONFIGURATION_CHECKED_STATISTICAL_INDEPENDENCE_NOT_VERIFIED"
 
 
 @pytest.mark.asyncio
@@ -78,3 +80,35 @@ async def test_agent_role_is_trusted_registry_metadata_not_provider_claim():
     result = await collect_agent_verdicts({"signal_id": "s1"}, agents, now=NOW)
     assert result["verdicts"][0]["role"] == "critic"
     assert result["verdicts"][0]["confidence_kind"] == "UNCALIBRATED_SUBJECTIVE"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_provider_origin_is_rejected_even_when_groups_have_different_names():
+    a1 = provider("a1")
+    a2 = provider("a2")
+    a2.provider_origin = a1.provider_origin
+    result = await collect_agent_verdicts(
+        {"signal_id": "s1"},
+        [AgentSpec("a1", "group-one", a1), AgentSpec("a2", "group-two", a2)],
+        now=NOW,
+    )
+    assert result["status"] == "GATHER_MORE"
+    assert "PROVIDER_ORIGIN_REUSED" in result["blockers"]
+    assert result["trade_allowed"] is False
+
+
+@pytest.mark.asyncio
+async def test_missing_provider_origin_fails_closed_before_calling_agents():
+    called = False
+    async def unconfigured(signal):
+        nonlocal called
+        called = True
+        return {}
+    result = await collect_agent_verdicts(
+        {"signal_id": "s1"}, [AgentSpec("unconfigured", "group", unconfigured)],
+        now=NOW,
+    )
+    assert result["status"] == "GATHER_MORE"
+    assert "PROVIDER_MODEL_IDENTITY_MISSING" in result["blockers"]
+    assert "PROVIDER_ORIGIN_MISSING" in result["blockers"]
+    assert called is False
