@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import socket
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -86,3 +87,56 @@ def test_capture_manifest_rejects_unapproved_query_and_non_operator_date_basis(t
         assert False, "generic fetcher must not claim API-specific timestamp verification"
     except ValueError as exc:
         assert "publication-time attestation" in str(exc)
+
+
+def test_dns_resolution_rejects_private_and_loopback_addresses(monkeypatch):
+    private_answer = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))
+    monkeypatch.setattr(CAPTURE.socket, "getaddrinfo", lambda *args, **kwargs: [private_answer])
+    try:
+        CAPTURE._resolve_public_addresses("official-a.example")
+        assert False, "loopback DNS answer must be rejected"
+    except ValueError as exc:
+        assert "non-public" in str(exc)
+
+
+def test_dns_resolution_returns_only_public_validated_addresses(monkeypatch):
+    public_answer = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+    monkeypatch.setattr(CAPTURE.socket, "getaddrinfo", lambda *args, **kwargs: [public_answer])
+    assert CAPTURE._resolve_public_addresses("official-a.example") == ["93.184.216.34"]
+
+
+def test_fetch_uses_the_prevalidated_ip_and_does_not_follow_redirects(monkeypatch):
+    calls = {}
+    class FakeResponse:
+        status = 200
+        def getheader(self, name, default=None):
+            return {"Content-Type": "application/json", "Content-Length": "32"}.get(name, default)
+        def read(self, size):
+            return b'{"headline":"approved content"}'
+        def close(self):
+            calls["response_closed"] = True
+
+    class FakeConnection:
+        def __init__(self, hostname, pinned_ip, *, timeout):
+            calls.update({"hostname": hostname, "pinned_ip": pinned_ip, "timeout": timeout})
+        def request(self, method, path, headers):
+            calls.update({"method": method, "path": path, "headers": headers})
+        def getresponse(self):
+            return FakeResponse()
+        def close(self):
+            calls["connection_closed"] = True
+
+    monkeypatch.setattr(CAPTURE, "_resolve_public_addresses", lambda host: ["93.184.216.34"])
+    monkeypatch.setattr(CAPTURE, "_PinnedHTTPSConnection", FakeConnection)
+    body, content_type = CAPTURE._fetch(
+        "https://official-a.example/releases/item?id=42", max_bytes=512000, timeout=4,
+    )
+    assert calls["hostname"] == "official-a.example"
+    assert calls["pinned_ip"] == "93.184.216.34"
+    assert calls["method"] == "GET"
+    assert calls["path"] == "/releases/item?id=42"
+    assert calls["headers"]["Connection"] == "close"
+    assert calls["response_closed"] is True
+    assert calls["connection_closed"] is True
+    assert body == b'{"headline":"approved content"}'
+    assert content_type == "application/json"
