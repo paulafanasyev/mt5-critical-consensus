@@ -535,6 +535,17 @@ def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probabilit
                 valid_scenarios.append(scenario)
     if not valid_scenarios:
         blockers_identity.append("CHIEF_TAIL_RISK_SCENARIOS_MISSING_OR_INVALID")
+    required_step_names = {
+        "a": "ADVERSARIAL_PASS",
+        "b": "CONTRADICTION_CHECK",
+        "c": "SOURCE_AUDIT",
+        "d": "TAIL_RISK_CHECK",
+        "e": "RED_TEAM_SELF_REVIEW",
+        "f": "FULL_CHALLENGE_LEDGER_REVIEW",
+        "g": "GROUPTHINK_CHECK",
+        "h": "SIMILAR_REGIME_CALIBRATION",
+        "i": "ERROR_PROBABILITY_SCENARIO",
+    }
     steps = reasoning.get("steps", {})
     if not isinstance(steps, Mapping):
         steps = {}
@@ -546,6 +557,8 @@ def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probabilit
             continue
         evidence = item.get("evidence_refs")
         has_evidence = isinstance(evidence, Sequence) and not isinstance(evidence, (str, bytes)) and bool(evidence) and all(str(x).strip() for x in evidence)
+        if item.get("check_name") != required_step_names[step]:
+            failed.append(step + ":CHECK_NAME_MISMATCH")
         if item.get("passed") is not True or not str(item.get("detail", "")).strip() or not has_evidence:
             failed.append(step)
     blockers: list[str] = list(blockers_identity)
