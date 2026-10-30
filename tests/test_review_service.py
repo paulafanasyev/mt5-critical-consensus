@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from critical_consensus.review_service import run_peer_review_cycle
+from critical_consensus.review_service import make_non_author_challenge_resolver, run_peer_review_cycle
 
 
 VERDICTS = [
@@ -114,3 +114,32 @@ async def test_peer_review_cycle_without_challenges_is_ready_for_chief_not_trade
     assert result["challenge_resolution_status"] == "NONE"
     assert result["challenge_records"] == []
     assert result["trade_allowed"] is False
+
+
+def test_challenge_resolution_is_routed_away_from_the_verdict_author():
+    calls = []
+    def author_resolver(challenge, round_no):
+        calls.append("agent-0")
+        return {"resolved": True, "evidence_refs": ["resolution:evidence:1"]}
+    def independent_resolver(challenge, round_no):
+        calls.append("agent-1")
+        return {"resolved": True, "evidence_refs": ["resolution:evidence:1"]}
+    route = make_non_author_challenge_resolver(
+        [{"verdict_id": "v0", "agent_id": "agent-0"},
+         {"verdict_id": "v1", "agent_id": "agent-1"}],
+        [("agent-0", author_resolver), ("agent-1", independent_resolver)],
+    )
+    result = route({"challenge_id": "ch-0", "target_verdict_id": "v0"}, 1)
+    assert result["resolved"] is True
+    assert calls == ["agent-1"]
+
+
+def test_challenge_resolution_without_non_author_resolver_fails_closed():
+    route = make_non_author_challenge_resolver(
+        [{"verdict_id": "v0", "agent_id": "agent-0"}],
+        [("agent-0", lambda challenge, round_no: {"resolved": True, "evidence_refs": ["resolution:evidence:1"]})],
+    )
+    result = route({"challenge_id": "ch-0", "target_verdict_id": "v0"}, 1)
+    assert result["resolved"] is False
+    assert result["error_code"] == "NO_NON_AUTHOR_CHALLENGE_RESOLVER"
+    assert result["evidence_refs"] == []
