@@ -46,6 +46,8 @@ class OpenAICompatibleAgent:
         self.ttl_seconds = int(ttl_seconds)
         self.role = str(role).strip().lower()
         parsed = urlparse(self.base_url)
+        self.provider_origin = (parsed.hostname or "").lower()
+        self.provider_identity = self.provider_origin + "::" + self.model.lower()
         if not self.agent_id or not self.model or not self.api_key:
             raise ValueError("agent_id, model and api_key are required")
         if self.role not in {"analyst", "critic", "chief_review", "risk_review", "devil_advocate"}:
@@ -196,5 +198,7 @@ def load_agent_specs_from_env():
             ttl_seconds=int(entry.get("ttl_seconds", 300)),
             role=str(entry.get("role", "analyst")),
         )
-        specs.append(AgentSpec(agent_id, group, agent, role=agent.role))
+        specs.append(AgentSpec(agent_id, group, agent, role=agent.role,
+                               provider_identity=agent.provider_identity,
+                               provider_origin=agent.provider_origin))
     return specs
