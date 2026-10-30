@@ -179,4 +179,13 @@ async def test_dead_letter_is_idempotent_for_same_source_message():
         assert stats["dead_lettered"] == 1
     dead_letters = redis.streams[STREAM_DLQ]
     assert len(dead_letters) == 1
-    assert redis.acks.count(("cc:signals:v1", "workers", "22-0")) == 2
+    assert redis.acks.count(("cc:signals:v1", "workers", "22-0")) == 3
+
+
+@pytest.mark.asyncio
+async def test_publish_event_rejects_legacy_unhashed_dedupe_entry():
+    redis = FakeRedis()
+    redis.values["cc:published:cc:signals:v1:e-1"] = "15-0"
+    with pytest.raises(RuntimeError, match="EVENT_ID_DEDUPE_RECORD_LEGACY_OR_CORRUPT"):
+        await publish_event(redis, "cc:signals:v1", event())
+    assert not redis.streams.get("cc:signals:v1")
