@@ -132,6 +132,7 @@ async def run(args) -> int:
                 result.get("verdicts", []), reviewer_registry,
                 allowed_evidence_refs=signal["available_evidence_refs"],
                 resolver=resolver, min_reviewers_per_verdict=2, max_resolution_rounds=3,
+                review_timeout_seconds=args.timeout,
             )
             result["agent_collection"] = dict(result)
             result["peer_review_cycle"] = review_cycle
