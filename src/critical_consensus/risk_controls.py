@@ -1,6 +1,8 @@
 """Execution-adjacent risk controls; all unknown or stale state blocks by default."""
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -29,6 +31,37 @@ def _stamp(value: Any) -> datetime | None:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return None
     return parsed.astimezone(timezone.utc)
+
+
+def risk_request_binding_hash(request: Mapping[str, Any]) -> str:
+    """Hash the exact proposed order fields measured by the terminal risk collector."""
+    if not isinstance(request, Mapping):
+        raise ValueError("request must be an object")
+    instrument = str(request.get("instrument", "")).strip().upper()
+    direction = str(request.get("direction", "")).strip().upper()
+    sl_tp = request.get("sl_tp")
+    if not isinstance(sl_tp, Mapping):
+        raise ValueError("sl_tp must be an object")
+    values = {}
+    for key, value in (
+        ("size", request.get("size")),
+        ("expected_price", request.get("expected_price")),
+        ("sl", sl_tp.get("sl")),
+        ("tp", sl_tp.get("tp")),
+    ):
+        number = _finite(value)
+        if number is None or number <= 0:
+            raise ValueError(f"{key} must be a positive finite number")
+        values[key] = number
+    if not instrument or direction not in {"BUY", "SELL"}:
+        raise ValueError("instrument and BUY/SELL direction are required")
+    if direction == "BUY" and not values["sl"] < values["expected_price"] < values["tp"]:
+        raise ValueError("BUY request has invalid SL/entry/TP geometry")
+    if direction == "SELL" and not values["tp"] < values["expected_price"] < values["sl"]:
+        raise ValueError("SELL request has invalid SL/entry/TP geometry")
+    payload = {"instrument": instrument, "direction": direction, **values}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def global_kill_switch_gate(state: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -93,6 +126,9 @@ def risk_snapshot_gate(
             blockers.append(f"{key.upper()}_MISSING_OR_INVALID")
     if snapshot.get("symbol_group") is None:
         blockers.append("SYMBOL_CORRELATION_GROUP_UNKNOWN")
+    binding = snapshot.get("request_binding_sha256")
+    if not isinstance(binding, str) or len(binding) != 71 or not binding.startswith("sha256:") or any(ch not in "0123456789abcdef" for ch in binding[7:]):
+        blockers.append("RISK_REQUEST_BINDING_MISSING_OR_INVALID")
     if blockers:
         return {"status": "DENY", "trade_allowed": False, "blockers": sorted(set(blockers))}
     return {"status": "PASS", "trade_allowed": False, "blockers": [], "observed_at": stamp.isoformat()}
@@ -112,6 +148,14 @@ def risk_controlled_permission(
         blockers = list(switch.get("blockers", [])) + list(risk.get("blockers", []))
         return {"status": "DENY", "allowed": False, "trade_allowed": False,
                 "blockers": sorted(set(blockers)), "kill_switch": switch, "risk_snapshot": risk}
+    try:
+        expected_binding = risk_request_binding_hash(request)
+    except ValueError:
+        return {"status": "DENY", "allowed": False, "trade_allowed": False,
+                "blockers": ["RISK_REQUEST_BINDING_INVALID"], "kill_switch": switch, "risk_snapshot": risk}
+    if snapshot.get("request_binding_sha256") != expected_binding:
+        return {"status": "DENY", "allowed": False, "trade_allowed": False,
+                "blockers": ["RISK_REQUEST_BINDING_MISMATCH"], "kill_switch": switch, "risk_snapshot": risk}
     merged = dict(request)
     merged["risk_snapshot"] = {
         **dict(merged.get("risk_snapshot", {}) if isinstance(merged.get("risk_snapshot"), Mapping) else {}),
