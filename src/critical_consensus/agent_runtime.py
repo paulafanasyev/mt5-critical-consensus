@@ -52,7 +52,7 @@ def _valid_stamp(value: Any) -> datetime | None:
 
 def _validate_result(
     result: Mapping[str, Any], spec: AgentSpec, signal_id: str, expected_input_hash: str,
-    *, now: datetime, max_future_skew_seconds: int = 30,
+    *, allowed_evidence_refs: set[str], now: datetime, max_future_skew_seconds: int = 30,
 ) -> list[str]:
     blockers: list[str] = []
     if str(result.get("agent_id", "")).strip() != spec.agent_id:
@@ -90,8 +90,14 @@ def _validate_result(
     elif created is not None and (now - created).total_seconds() > ttl:
         blockers.append("VERDICT_EXPIRED")
     refs = result.get("evidence_refs")
-    if not isinstance(refs, Sequence) or isinstance(refs, (str, bytes)) or not refs or any(not str(x).strip() for x in refs):
+    if (not isinstance(refs, Sequence) or isinstance(refs, (str, bytes)) or not refs
+            or any(not isinstance(ref, str) or not ref.strip() for ref in refs)):
         blockers.append("EVIDENCE_REFERENCES_MISSING")
+    else:
+        if len(set(refs)) != len(refs):
+            blockers.append("DUPLICATE_EVIDENCE_REFERENCES")
+        if any(ref not in allowed_evidence_refs for ref in refs):
+            blockers.append("EVIDENCE_REFERENCE_NOT_ALLOWLISTED")
     return blockers
 
 
@@ -109,6 +115,16 @@ async def collect_agent_verdicts(
     signal_id = str(signal.get("signal_id", "")).strip() if isinstance(signal, Mapping) else ""
     if not signal_id:
         return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["SIGNAL_ID_MISSING"], "trade_allowed": False}
+    raw_evidence_refs = signal.get("available_evidence_refs") if isinstance(signal, Mapping) else None
+    if (not isinstance(raw_evidence_refs, Sequence) or isinstance(raw_evidence_refs, (str, bytes))
+            or not raw_evidence_refs
+            or any(not isinstance(ref, str) or not ref.strip() for ref in raw_evidence_refs)):
+        return {"signal_id": signal_id, "status": "GATHER_MORE", "verdicts": [],
+                "blockers": ["SIGNAL_EVIDENCE_ALLOWLIST_MISSING_OR_INVALID"], "trade_allowed": False}
+    allowed_evidence_refs = set(raw_evidence_refs)
+    if len(allowed_evidence_refs) != len(raw_evidence_refs):
+        return {"signal_id": signal_id, "status": "GATHER_MORE", "verdicts": [],
+                "blockers": ["SIGNAL_EVIDENCE_ALLOWLIST_HAS_DUPLICATES"], "trade_allowed": False}
     try:
         canonical_signal = json.dumps(signal, sort_keys=True, separators=(",", ":"),
                                       ensure_ascii=False, allow_nan=False, default=str)
@@ -190,7 +206,10 @@ async def collect_agent_verdicts(
             result = await asyncio.wait_for(spec.run(signal), timeout=timeout_seconds)
             if not isinstance(result, Mapping):
                 return spec, None, "AGENT_RESULT_NOT_OBJECT"
-            reasons = _validate_result(result, spec, signal_id, expected_input_hash, now=current)
+            reasons = _validate_result(
+                result, spec, signal_id, expected_input_hash,
+                allowed_evidence_refs=allowed_evidence_refs, now=current,
+            )
             if reasons:
                 return spec, None, ",".join(sorted(set(reasons)))
             return spec, dict(result), None
