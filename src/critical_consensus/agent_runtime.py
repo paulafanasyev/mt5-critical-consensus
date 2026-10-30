@@ -122,8 +122,14 @@ async def collect_agent_verdicts(
     except (TypeError, ValueError, OverflowError):
         return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["SIGNAL_INPUT_NOT_CANONICALLY_HASHABLE"],
                 "trade_allowed": False}
-    if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
-            or not math.isfinite(timeout_seconds) or timeout_seconds <= 0
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+        return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["INVALID_COLLECTION_POLICY"],
+                "trade_allowed": False}
+    try:
+        timeout_value = float(timeout_seconds)
+    except (OverflowError, TypeError, ValueError):
+        timeout_value = math.inf
+    if (not math.isfinite(timeout_value) or timeout_value <= 0
             or isinstance(minimum_agents, bool) or not isinstance(minimum_agents, int) or minimum_agents < 1
             or isinstance(minimum_independence_groups, bool)
             or not isinstance(minimum_independence_groups, int) or minimum_independence_groups < 1):
@@ -209,7 +215,7 @@ async def collect_agent_verdicts(
 
     async def one(spec: AgentSpec) -> tuple[AgentSpec, Mapping[str, Any] | None, str | None]:
         try:
-            result = await asyncio.wait_for(spec.run(signal), timeout=timeout_seconds)
+            result = await asyncio.wait_for(spec.run(signal), timeout=timeout_value)
             if not isinstance(result, Mapping):
                 return spec, None, "AGENT_RESULT_NOT_OBJECT"
             reasons = _validate_result(
