@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from critical_consensus.risk_controls import (
-    global_kill_switch_gate, risk_controlled_permission, risk_snapshot_gate,
+    global_kill_switch_gate, risk_controlled_permission, risk_snapshot_gate, risk_request_binding_hash,
 )
 
 
@@ -13,12 +13,18 @@ def good_state(active=False):
             "updated_at": (NOW - timedelta(seconds=1)).isoformat(), "status": "PERSISTED"}
 
 
+def good_request():
+    return {"instrument": "EURUSD", "direction": "BUY", "size": 0.1, "expected_price": 1.1001,
+            "sl_tp": {"sl": 1.0991, "tp": 1.1020}, "mode": "demo"}
+
+
 def good_snapshot():
     return {"status": "PASS", "observed_at": NOW.isoformat(), "account_mode": "demo",
             "symbol": "EURUSD", "symbol_group": "fx-major", "account_equity": 10000.0,
             "day_start_equity": 10000.0, "equity_high_watermark": 10200.0,
             "risk_fraction": 0.002, "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0196,
             "open_positions": 1, "correlated_open_positions": 1,
+            "request_binding_sha256": risk_request_binding_hash(good_request()),
             "within_high_impact_news_window": None}
 
 
@@ -66,3 +72,14 @@ def test_risk_controlled_permission_fails_closed_when_account_baseline_unknown()
     assert result["status"] == "DENY"
     assert result["trade_allowed"] is False
     assert "RISK_SNAPSHOT_EQUITY_HIGH_WATERMARK_MISSING_OR_INVALID" in result["blockers"]
+
+def test_risk_snapshot_cannot_be_reused_for_a_different_order_size():
+    request = good_request()
+    request["size"] = 0.2
+    result = risk_controlled_permission(
+        request, {"permission_matrix": {}},
+        kill_switch_state=good_state(active=False), snapshot=good_snapshot(), now=NOW,
+    )
+    assert result["status"] == "DENY"
+    assert "RISK_REQUEST_BINDING_MISMATCH" in result["blockers"]
+    assert result["trade_allowed"] is False
