@@ -76,6 +76,7 @@ def test_challenge_resolver_timeout_fails_closed_without_retrying_or_starting_ne
              "challenge_type": "LOGIC_GAP", "status": "OPEN", "evidence_refs": ["ev-0"]},
             {"challenge_id": "slow-2", "target_verdict_id": "v-2",
              "challenge_type": "DATA_CONTRADICTION", "status": "OPEN", "evidence_refs": ["ev-2"]},
+            {"status": "RESOLVED", "resolution_evidence_refs": ["untrusted-pre-resolved-ref"]},
         ],
         slow_resolver, max_rounds=3, resolver_timeout_seconds=0.05,
         overall_timeout_seconds=1,
@@ -88,6 +89,9 @@ def test_challenge_resolver_timeout_fails_closed_without_retrying_or_starting_ne
     assert result["open_challenges"][0]["last_resolution_attempt"]["error_code"] == "RESOLVER_TIMEOUT"
     assert result["open_challenges"][1]["resolution_error"] == "RESOLUTION_PAUSED_AFTER_TIMEOUT"
     assert result["open_challenges"][1]["resolution_pause_reason"] == "RESOLVER_TIMEOUT"
+    assert result["open_challenges"][2]["status"] == "OPEN"
+    assert result["open_challenges"][2]["resolution_error"] == "RESOLUTION_PAUSED_AFTER_TIMEOUT"
+    assert result["resolved_challenges"] == []
     assert result["trade_allowed"] is False
 
 
