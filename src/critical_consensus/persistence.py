@@ -12,7 +12,7 @@ import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from .market_data import MarketBar, validate_bar_series
 from .audit import verify_audit_chain
