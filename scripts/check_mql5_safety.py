@@ -22,7 +22,7 @@ def main() -> int:
         "localhost bridge default": r"http://127\.0\.0\.1:8000/v1/execution/next",
         "duplicate order guard": r"DUPLICATE BLOCKED",
         "kill-switch endpoint configured": r"KillSwitchUrl",
-        "kill-switch response must explicitly be false": r"JsonFalse",
+        "kill-switch response must explicitly be false": r"JsonFalse",\n        "kill switch checked before every command poll": r"if\\(!CheckKillSwitch\\(\\)\\) return;",
         "live-path remains blocked": r"if\s*\(!EnableDemoExecution\s*\|\|\s*AllowLiveExecution\)",
     }
     failures = [name for name, pattern in required.items() if re.search(pattern, source) is None]
