@@ -134,7 +134,8 @@ def test_missing_group_for_an_open_position_blocks_snapshot(monkeypatch):
         proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
     )
     assert result["status"] == "DENY"
-    assert "OPEN_POSITION_GROUP_UNKNOWN" in result["blockers"]\n
+    assert "OPEN_POSITION_GROUP_UNKNOWN" in result["blockers"]
+
 def test_stale_mt5_tick_blocks_risk_snapshot(monkeypatch):
     fake = FakeMT5()
     fake.tick.time = int((NOW.timestamp()) - 60)
