@@ -51,7 +51,7 @@ def record(publisher_id="central-bank-a", url="https://cb-a.example/releases/1",
         "retrieved_at": (NOW - timedelta(seconds=5)).isoformat(),
         "independence_group": independence_group or cfg["independence_group"],
         "credibility": cfg["credibility"], "ttl_seconds": cfg["ttl_seconds"],
-        "content_sha256": digest, "content_bytes": len(body), "captured_content": body,
+        "content_sha256": digest, "content_bytes": len(body), "captured_content": body,\n        "response_content_type": "application/json",
         "publication_time_attestation": "operator_attested",
         "capture_method": "https_fetch", "registry_version": "1",
     }
