@@ -89,6 +89,11 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
 
 
 def _fetch(url: str, *, max_bytes: int, timeout: float) -> tuple[bytes, str]:
+    if (isinstance(max_bytes, bool) or not isinstance(max_bytes, int)
+            or not 1 <= max_bytes <= 512_000):
+        raise ValueError("max_bytes must be an integer between 1 and 512000")
+    if not 1 <= timeout <= 30:
+        raise ValueError("timeout must be between 1 and 30 seconds")
     parsed = urlsplit(url)
     host = (parsed.hostname or "").lower().rstrip(".")
     if parsed.scheme != "https" or not host or parsed.port not in (None, 443):
@@ -150,7 +155,11 @@ def capture_manifest(manifest_path: Path, registry_path: Path, *, timeout: float
     entries = manifest.get("sources") if isinstance(manifest, dict) else None
     if not isinstance(entries, list) or not entries:
         raise ValueError("manifest must contain a non-empty 'sources' array")
-    max_bytes = int(registry.get("max_content_bytes", 512_000))
+    raw_max_bytes = registry.get("max_content_bytes", 512_000)
+    if (isinstance(raw_max_bytes, bool) or not isinstance(raw_max_bytes, int)
+            or not 1 <= raw_max_bytes <= 512_000):
+        raise ValueError("max_content_bytes must be an integer between 1 and 512000")
+    max_bytes = raw_max_bytes
     now = datetime.now(timezone.utc)
     output = []
     for index, item in enumerate(entries):
