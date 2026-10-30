@@ -25,12 +25,12 @@ def registry():
             "central-bank-a": {
                 "domains": ["cb-a.example"], "independence_group": "official-bank-a",
                 "credibility": 0.98, "ttl_seconds": 900,
-                "allowed_publication_time_attestations": ["publisher_api_field"],
+                "allowed_publication_time_attestations": ["operator_attested"],
             },
             "news-wire-b": {
                 "domains": ["news-b.example"], "independence_group": "news-wire-b",
                 "credibility": 0.9, "ttl_seconds": 600,
-                "allowed_publication_time_attestations": ["publisher_document_metadata"],
+                "allowed_publication_time_attestations": ["operator_attested"],
             },
         },
     }
@@ -50,7 +50,7 @@ def record(publisher_id="central-bank-a", url="https://cb-a.example/releases/1",
         "independence_group": independence_group or cfg["independence_group"],
         "credibility": cfg["credibility"], "ttl_seconds": cfg["ttl_seconds"],
         "content_sha256": digest, "content_bytes": len(body), "captured_content": body,
-        "publication_time_attestation": cfg["allowed_publication_time_attestations"][0],
+        "publication_time_attestation": "operator_attested",
         "capture_method": "https_fetch", "registry_version": "1",
     }
 
