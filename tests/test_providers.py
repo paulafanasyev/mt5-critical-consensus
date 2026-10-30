@@ -110,7 +110,7 @@ def test_peer_reviewer_receives_only_cited_source_documents(monkeypatch):
     )
     captured = {}
     def fake_request_json_sync(*, system_prompt, user_prompt):
-        captured["prompt"] = json.loads(user_prompt.split("\n", 1)[1])
+        captured["prompt"] = _extract_json_payload(user_prompt)
         return {"stance": "CONFIRM", "challenge_type": "NONE", "argument": "No contradiction found",
                 "evidence_refs": ["source-a"]}
     monkeypatch.setattr(agent, "_request_json_sync", fake_request_json_sync)
@@ -136,7 +136,7 @@ def test_challenge_resolver_receives_only_challenge_cited_documents(monkeypatch)
     )
     captured = {}
     def fake_request_json_sync(*, system_prompt, user_prompt):
-        captured["prompt"] = json.loads(user_prompt.split("\n", 1)[1])
+        captured["prompt"] = _extract_json_payload(user_prompt)
         return {"resolved": False, "summary": "insufficient", "evidence_refs": []}
     monkeypatch.setattr(agent, "_request_json_sync", fake_request_json_sync)
     resolver = agent.make_challenge_resolver(
