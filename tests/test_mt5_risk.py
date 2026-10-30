@@ -28,7 +28,7 @@ class FakeMT5:
         self.deals = deals or [SimpleNamespace(profit=10.0, commission=-1.0, swap=0.0, fee=0.0)]
         self.spec = SimpleNamespace(trade_tick_size=0.00001, trade_tick_value_loss=1.0,
                                     trade_tick_value=1.0, point=0.00001)
-        self.tick = SimpleNamespace(bid=1.1000, ask=1.1001)
+        self.tick = SimpleNamespace(bid=1.1000, ask=1.1001, time=int(NOW.timestamp()))
         self.fail_positions = fail_positions
         self.shutdown_called = False
 
@@ -134,4 +134,14 @@ def test_missing_group_for_an_open_position_blocks_snapshot(monkeypatch):
         proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
     )
     assert result["status"] == "DENY"
-    assert "OPEN_POSITION_GROUP_UNKNOWN" in result["blockers"]
+    assert "OPEN_POSITION_GROUP_UNKNOWN" in result["blockers"]\n
+def test_stale_mt5_tick_blocks_risk_snapshot(monkeypatch):
+    fake = FakeMT5()
+    fake.tick.time = int((NOW.timestamp()) - 60)
+    monkeypatch.setitem(__import__("sys").modules, "MetaTrader5", fake)
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
+        proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+    )
+    assert result["status"] == "DENY"
+    assert "MT5_QUOTE_STALE" in result["blockers"]
