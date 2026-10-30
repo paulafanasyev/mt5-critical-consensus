@@ -10,7 +10,7 @@ from redis.asyncio import Redis
 
 from critical_consensus.persistence import PostgresRepository
 from critical_consensus.redis_streams import (
-    ensure_consumer_group, process_message_batch, read_new_messages, reclaim_pending_messages,
+    ensure_consumer_group, process_message_batch, read_new_messages, reclaim_and_process_batch,
 )
 
 
@@ -28,7 +28,15 @@ async def main() -> None:
         await ensure_consumer_group(redis, stream, group, start_id="0-0")
         await asyncio.to_thread(repo.migrate)
         print(json.dumps({"status": "ready", "stream": stream, "group": group, "consumer": consumer}))
+        reclaim_cursor = "0-0"
         while True:
+            reclaim_cursor, reclaimed_stats = await reclaim_and_process_batch(
+                redis, stream, group, consumer, persist,
+                start_id=reclaim_cursor, min_idle_ms=30_000, count=20, max_attempts=3,
+            )
+            if any(reclaimed_stats.values()):
+                print(json.dumps({"stream": stream, "source": "reclaimed_pending",
+                                  **reclaimed_stats}, sort_keys=True))
             messages = await read_new_messages(redis, stream, group, consumer, count=20, block_ms=5000)
             if not messages:
                 continue
