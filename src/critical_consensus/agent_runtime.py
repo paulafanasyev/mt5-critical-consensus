@@ -115,16 +115,6 @@ async def collect_agent_verdicts(
     signal_id = str(signal.get("signal_id", "")).strip() if isinstance(signal, Mapping) else ""
     if not signal_id:
         return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["SIGNAL_ID_MISSING"], "trade_allowed": False}
-    raw_evidence_refs = signal.get("available_evidence_refs") if isinstance(signal, Mapping) else None
-    if (not isinstance(raw_evidence_refs, Sequence) or isinstance(raw_evidence_refs, (str, bytes))
-            or not raw_evidence_refs
-            or any(not isinstance(ref, str) or not ref.strip() for ref in raw_evidence_refs)):
-        return {"signal_id": signal_id, "status": "GATHER_MORE", "verdicts": [],
-                "blockers": ["SIGNAL_EVIDENCE_ALLOWLIST_MISSING_OR_INVALID"], "trade_allowed": False}
-    allowed_evidence_refs = set(raw_evidence_refs)
-    if len(allowed_evidence_refs) != len(raw_evidence_refs):
-        return {"signal_id": signal_id, "status": "GATHER_MORE", "verdicts": [],
-                "blockers": ["SIGNAL_EVIDENCE_ALLOWLIST_HAS_DUPLICATES"], "trade_allowed": False}
     try:
         canonical_signal = json.dumps(signal, sort_keys=True, separators=(",", ":"),
                                       ensure_ascii=False, allow_nan=False, default=str)
@@ -200,6 +190,17 @@ async def collect_agent_verdicts(
                 "independence_evidence": "CONFIGURATION_CHECKED_STATISTICAL_INDEPENDENCE_NOT_VERIFIED",
                 "blockers": blockers, "trade_allowed": False,
             }
+
+    raw_evidence_refs = signal.get("available_evidence_refs") if isinstance(signal, Mapping) else None
+    if (not isinstance(raw_evidence_refs, Sequence) or isinstance(raw_evidence_refs, (str, bytes))
+            or not raw_evidence_refs
+            or any(not isinstance(ref, str) or not ref.strip() for ref in raw_evidence_refs)):
+        return {"signal_id": signal_id, "status": "GATHER_MORE", "verdicts": [],
+                "blockers": ["SIGNAL_EVIDENCE_ALLOWLIST_MISSING_OR_INVALID"], "trade_allowed": False}
+    allowed_evidence_refs = set(raw_evidence_refs)
+    if len(allowed_evidence_refs) != len(raw_evidence_refs):
+        return {"signal_id": signal_id, "status": "GATHER_MORE", "verdicts": [],
+                "blockers": ["SIGNAL_EVIDENCE_ALLOWLIST_HAS_DUPLICATES"], "trade_allowed": False}
 
     async def one(spec: AgentSpec) -> tuple[AgentSpec, Mapping[str, Any] | None, str | None]:
         try:
