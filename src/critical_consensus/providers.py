@@ -43,8 +43,8 @@ def _validated_evidence_context(
         if len(text_value) > 8_000:
             raise ValueError("evidence_context entry exceeds 8000 characters")
         output[source_id] = text_value
-    if len(output) > 12:
-        raise ValueError("evidence_context may include at most 12 documents")
+    if len(output) > 13:
+        raise ValueError("evidence_context may include at most 13 documents")
     return output
 
 
