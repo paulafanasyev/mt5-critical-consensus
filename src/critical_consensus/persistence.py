@@ -125,6 +125,111 @@ class PostgresRepository:
             for row in reversed(rows)
         ]
 
+    def record_source_evidence(self, record: Mapping[str, Any]) -> dict[str, Any]:
+        """Store a publisher capture and its exact bytes immutably; identical replays are idempotent."""
+        if not isinstance(record, Mapping):
+            raise ValueError("source evidence record must be an object")
+        required = (
+            "source_id", "publisher_id", "publisher_domain", "source_url", "published_at",
+            "retrieved_at", "independence_group", "credibility", "ttl_seconds",
+            "content_sha256", "content_bytes", "captured_content",
+            "publication_time_attestation", "capture_method", "registry_version",
+        )
+        if any(key not in record for key in required):
+            raise ValueError("source evidence record is missing required fields")
+        captured = record.get("captured_content")
+        if not isinstance(captured, (bytes, bytearray, memoryview)) or not captured:
+            raise ValueError("captured_content must be non-empty raw HTTPS response bytes")
+        content = bytes(captured)
+        digest = str(record.get("content_sha256", ""))
+        if digest != _sha256(content.decode("latin-1")) and (
+            not digest.startswith("sha256:") or hashlib.sha256(content).hexdigest() != digest[7:]
+        ):
+            raise ValueError("captured source bytes do not match content_sha256")
+        if len(content) != int(record.get("content_bytes", -1)) or len(content) > 512_000:
+            raise ValueError("source content byte count is invalid")
+        source_id = str(record.get("source_id", "")).strip()
+        if not source_id.startswith("src-") or len(source_id) != 44:
+            raise ValueError("source_id must be a deterministic src- identifier")
+        published = _timestamp(record.get("published_at"), "published_at")
+        retrieved = _timestamp(record.get("retrieved_at"), "retrieved_at")
+        credibility = record.get("credibility")
+        if isinstance(credibility, bool) or not math.isfinite(float(credibility)) or not 0 <= float(credibility) <= 1:
+            raise ValueError("credibility must be finite and in [0,1]")
+        ttl = record.get("ttl_seconds")
+        if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
+            raise ValueError("ttl_seconds must be a positive integer")
+
+        args = (
+            source_id, str(record["publisher_id"]), str(record["publisher_domain"]),
+            str(record["source_url"]), published, retrieved, str(record["independence_group"]),
+            float(credibility), ttl, digest, len(content), content,
+            str(record["publication_time_attestation"]), str(record["capture_method"]),
+            str(record["registry_version"]),
+        )
+        with self._connect() as conn:
+            inserted = conn.execute(
+                """INSERT INTO source_evidence
+                   (source_id, publisher_id, publisher_domain, source_url, published_at, retrieved_at,
+                    independence_group, credibility, ttl_seconds, content_sha256, content_bytes,
+                    captured_content, publication_time_attestation, capture_method, registry_version)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (source_id) DO NOTHING RETURNING source_id""", args
+            ).fetchone()
+            if inserted:
+                return {"source_id": source_id, "inserted": True,
+                        "content_sha256": digest, "content_bytes": len(content)}
+            existing = conn.execute(
+                """SELECT publisher_id, publisher_domain, source_url, published_at, retrieved_at,
+                          independence_group, credibility, ttl_seconds, content_sha256, content_bytes,
+                          captured_content, publication_time_attestation, capture_method, registry_version
+                   FROM source_evidence WHERE source_id=%s""", (source_id,)
+            ).fetchone()
+            if existing is None:
+                raise RuntimeError("source evidence conflict row disappeared")
+            expected = args[1:]
+            actual = tuple(existing)
+            # BYTEA is compared byte-for-byte; numeric database values are compared as floats.
+            equal = (
+                actual[0] == expected[0] and actual[1] == expected[1] and actual[2] == expected[2]
+                and actual[3] == expected[3] and actual[4] == expected[4] and actual[5] == expected[5]
+                and math.isclose(float(actual[6]), float(expected[6]), rel_tol=0, abs_tol=1e-12)
+                and int(actual[7]) == int(expected[7]) and actual[8] == expected[8]
+                and int(actual[9]) == int(expected[9]) and bytes(actual[10]) == expected[10]
+                and actual[11] == expected[11] and actual[12] == expected[12] and actual[13] == expected[13]
+            )
+            if not equal:
+                raise ValueError("source_id already exists with different captured evidence")
+        return {"source_id": source_id, "inserted": False,
+                "content_sha256": digest, "content_bytes": len(content)}
+
+    def get_source_evidence(self, source_ids: Sequence[str]) -> list[dict[str, Any]]:
+        """Load immutable publisher captures by exact IDs; never substitutes a similar URL."""
+        if (not isinstance(source_ids, Sequence) or isinstance(source_ids, (str, bytes))
+                or any(not isinstance(item, str) or not item.strip() for item in source_ids)):
+            raise ValueError("source_ids must be a sequence of non-empty strings")
+        ids = [item.strip() for item in source_ids]
+        if len(set(ids)) != len(ids):
+            raise ValueError("source_ids must be unique")
+        if not ids:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT source_id, publisher_id, publisher_domain, source_url, published_at,
+                          retrieved_at, independence_group, credibility, ttl_seconds, content_sha256,
+                          content_bytes, captured_content, publication_time_attestation, capture_method,
+                          registry_version
+                   FROM source_evidence WHERE source_id = ANY(%s)""", (ids,)
+            ).fetchall()
+        columns = (
+            "source_id", "publisher_id", "publisher_domain", "source_url", "published_at",
+            "retrieved_at", "independence_group", "credibility", "ttl_seconds", "content_sha256",
+            "content_bytes", "captured_content", "publication_time_attestation", "capture_method",
+            "registry_version",
+        )
+        by_id = {str(row[0]): dict(zip(columns, row)) for row in rows}
+        return [by_id[item] for item in ids if item in by_id]
+
     def record_forecast(
         self, *, model_id: str, signal_id: str, issued_at: datetime | str,
         probability: float, input_sha256: str,
