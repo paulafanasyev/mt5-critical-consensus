@@ -120,11 +120,17 @@ def risk_snapshot_gate(
         blockers.append("DAILY_LOSS_MISSING_OR_INVALID")
     if drawdown is None or not 0 <= drawdown <= 1:
         blockers.append("DRAWDOWN_MISSING_OR_INVALID")
+    position_counts: dict[str, float | None] = {}
     for key in ("open_positions", "correlated_open_positions"):
         count = _finite(snapshot.get(key))
+        position_counts[key] = count
         if count is None or count < 0 or not count.is_integer():
             blockers.append(f"{key.upper()}_MISSING_OR_INVALID")
-    if snapshot.get("symbol_group") is None:
+    if (position_counts["open_positions"] is not None
+            and position_counts["correlated_open_positions"] is not None
+            and position_counts["correlated_open_positions"] > position_counts["open_positions"]):
+        blockers.append("CORRELATED_POSITION_COUNT_EXCEEDS_OPEN_POSITIONS")
+    if not str(snapshot.get("symbol_group", "")).strip():
         blockers.append("SYMBOL_CORRELATION_GROUP_UNKNOWN")
     binding = snapshot.get("request_binding_sha256")
     if not isinstance(binding, str) or len(binding) != 71 or not binding.startswith("sha256:") or any(ch not in "0123456789abcdef" for ch in binding[7:]):
@@ -148,6 +154,12 @@ def risk_controlled_permission(
         blockers = list(switch.get("blockers", [])) + list(risk.get("blockers", []))
         return {"status": "DENY", "allowed": False, "trade_allowed": False,
                 "blockers": sorted(set(blockers)), "kill_switch": switch, "risk_snapshot": risk}
+    request_symbol = str(request.get("instrument", "")).strip().upper()
+    snapshot_symbol = str(snapshot.get("symbol", "")).strip().upper()
+    if not request_symbol or snapshot_symbol != request_symbol:
+        return {"status": "DENY", "allowed": False, "trade_allowed": False,
+                "blockers": ["RISK_SNAPSHOT_SYMBOL_MISMATCH"], "kill_switch": switch,
+                "risk_snapshot": risk}
     try:
         expected_binding = risk_request_binding_hash(request)
     except ValueError:
