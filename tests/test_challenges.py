@@ -55,3 +55,32 @@ def test_challenge_resolver_exception_escalates_without_crashing():
     result = challenge_resolution_loop([{"challenge_id": "c-fail", "target_verdict_id": "v-fail", "challenge_type": "LOGIC_GAP", "status": "OPEN", "evidence_refs": ["ev-0"]}], broken_resolver, max_rounds=2)
     assert result["status"] == "ESCALATE"
     assert all("sensitive internals" not in str(item) for item in result["transcript"])
+
+
+def test_challenge_resolver_timeout_fails_closed_without_blocking_caller():
+    import time
+
+    def slow_resolver(_challenge, _round_no):
+        time.sleep(0.5)
+        return {"resolved": True, "evidence_refs": ["ev-1"]}
+
+    started = time.monotonic()
+    result = challenge_resolution_loop(
+        [{"challenge_id": "slow-1", "target_verdict_id": "v-1",
+          "challenge_type": "LOGIC_GAP", "status": "OPEN", "evidence_refs": ["ev-0"]}],
+        slow_resolver, max_rounds=1, resolver_timeout_seconds=0.05,
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.3
+    assert result["status"] == "ESCALATE"
+    assert result["open_challenges"][0]["last_resolution_attempt"]["error_code"] == "RESOLVER_TIMEOUT"
+    assert result["trade_allowed"] is False
+
+
+def test_challenge_resolver_rejects_invalid_timeout():
+    import pytest
+
+    challenge = [{"challenge_id": "c-1", "target_verdict_id": "v-1",
+                  "challenge_type": "LOGIC_GAP", "status": "OPEN", "evidence_refs": ["ev-0"]}]
+    with pytest.raises(ValueError, match="resolver_timeout_seconds"):
+        challenge_resolution_loop(challenge, lambda *_: {}, resolver_timeout_seconds=float("inf"))
