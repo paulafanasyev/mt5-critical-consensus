@@ -141,6 +141,16 @@ def evaluate_signal_bundle(
         return finish("GATHER_MORE", ["SIGNAL_INPUT_HASH_MISMATCH"])
     emit("SIGNAL_INPUT_BINDING", {"signal_id": signal_id, "status": "PASSED",
                                   "signal_input_hash": expected_signal_hash})
+    raw_evidence_refs = signal_input.get("available_evidence_refs")
+    if (not isinstance(raw_evidence_refs, Sequence) or isinstance(raw_evidence_refs, (str, bytes))
+            or not raw_evidence_refs or any(not isinstance(item, str) or not item.strip() for item in raw_evidence_refs)
+            or len(set(raw_evidence_refs)) != len(raw_evidence_refs)):
+        emit("SIGNAL_EVIDENCE_REGISTRY", {"signal_id": signal_id, "status": "FAILED",
+                                         "reason": "SIGNAL_EVIDENCE_REGISTRY_MISSING_INVALID_OR_DUPLICATE"})
+        return finish("GATHER_MORE", ["SIGNAL_EVIDENCE_REGISTRY_MISSING_INVALID_OR_DUPLICATE"])
+    allowed_evidence_refs = {item.strip() for item in raw_evidence_refs}
+    emit("SIGNAL_EVIDENCE_REGISTRY", {"signal_id": signal_id, "status": "PASSED",
+                                     "evidence_ref_count": len(allowed_evidence_refs)})
 
     raw_verdicts = bundle.get("verdicts")
     verdicts = [dict(v) for v in _as_records(raw_verdicts)]
@@ -160,6 +170,10 @@ def evaluate_signal_bundle(
         )
         if verdict.get("input_hash") != expected_signal_hash:
             metadata_blockers.append(f"VERDICT_{index}:VERDICT_INPUT_HASH_DOES_NOT_MATCH_SIGNAL_INPUT")
+        verdict_refs = verdict.get("evidence_refs")
+        if (not isinstance(verdict_refs, Sequence) or isinstance(verdict_refs, (str, bytes))
+                or not verdict_refs or any(str(ref).strip() not in allowed_evidence_refs for ref in verdict_refs)):
+            metadata_blockers.append(f"VERDICT_{index}:VERDICT_EVIDENCE_NOT_IN_SIGNAL_REGISTRY")
     if metadata_blockers:
         emit("VERDICT_METADATA_VALIDATION", {"signal_id": signal_id or "unknown", "status": "FAILED",
                                                "blockers": sorted(set(metadata_blockers))})
@@ -178,7 +192,9 @@ def evaluate_signal_bundle(
         reviewer_alias = str(review.get("reviewer_alias", "")).strip()
         stance = str(review.get("stance", "")).upper()
         evidence_refs = review.get("evidence_refs")
-        evidence_ok = isinstance(evidence_refs, Sequence) and not isinstance(evidence_refs, (str, bytes)) and bool(evidence_refs) and all(str(x).strip() for x in evidence_refs)
+        evidence_ok = (isinstance(evidence_refs, Sequence) and not isinstance(evidence_refs, (str, bytes))
+                       and bool(evidence_refs)
+                       and all(str(x).strip() and str(x).strip() in allowed_evidence_refs for x in evidence_refs))
         argument = str(review.get("argument", "")).strip()
         challenge_type = str(review.get("challenge_type", "")).upper()
         valid_challenge_types = {"DATA_CONTRADICTION", "SOURCE_WEAK", "STALE_DATA", "LOGIC_GAP", "REGIME_MISMATCH", "CORRELATION_RISK"}
@@ -216,6 +232,16 @@ def evaluate_signal_bundle(
         challenge_records = _as_records(raw_challenge_records)
         if len(challenge_records) != len(raw_challenge_records):
             challenge_blockers.append("CHALLENGE_LEDGER_HAS_INVALID_RECORDS")
+    for challenge_index, challenge in enumerate(challenge_records):
+        refs = challenge.get("evidence_refs", [])
+        resolution_refs = challenge.get("resolution_evidence_refs", [])
+        if (not isinstance(refs, Sequence) or isinstance(refs, (str, bytes))
+                or any(str(ref).strip() not in allowed_evidence_refs for ref in refs)):
+            challenge_blockers.append(f"CHALLENGE_{challenge_index}_EVIDENCE_NOT_IN_SIGNAL_REGISTRY")
+        if (not isinstance(resolution_refs, Sequence) or isinstance(resolution_refs, (str, bytes))
+                or any(str(ref).strip() not in allowed_evidence_refs for ref in resolution_refs)):
+            challenge_blockers.append(f"CHALLENGE_{challenge_index}_RESOLUTION_EVIDENCE_NOT_IN_SIGNAL_REGISTRY")
+
     registered_challenges = {(str(ch.get("target_verdict_id", "")), str(ch.get("challenge_type", "")).upper()) for ch in challenge_records}
     for review in challenge_reviews:
         key = (str(review.get("target_verdict_id", "")), str(review.get("challenge_type", "")).upper())
@@ -264,6 +290,27 @@ def evaluate_signal_bundle(
     all_risk_flags.extend(review_blockers)
     all_risk_flags.extend(challenge_blockers)
 
+    raw_key_sources = bundle.get("key_sources", [])
+    if isinstance(raw_key_sources, Sequence) and not isinstance(raw_key_sources, (str, bytes)):
+        for source in raw_key_sources:
+            if isinstance(source, Mapping):
+                source_id = str(source.get("source_id", "")).strip()
+                if not source_id or source_id not in allowed_evidence_refs:
+                    all_risk_flags.append("KEY_SOURCE_NOT_IN_SIGNAL_EVIDENCE_REGISTRY:" + (source_id or "missing"))
+
+    devil_report = bundle.get("devil_advocate_report")
+    if isinstance(devil_report, Mapping):
+        hypotheses = devil_report.get("counter_hypotheses", [])
+        if isinstance(hypotheses, Sequence) and not isinstance(hypotheses, (str, bytes)):
+            for hypothesis_index, hypothesis in enumerate(hypotheses):
+                if not isinstance(hypothesis, Mapping):
+                    all_risk_flags.append(f"DEVIL_ADVOCATE_HYPOTHESIS_{hypothesis_index}_INVALID")
+                    continue
+                refs = hypothesis.get("evidence_refs")
+                if (not isinstance(refs, Sequence) or isinstance(refs, (str, bytes)) or not refs
+                        or any(str(ref).strip() not in allowed_evidence_refs for ref in refs)):
+                    all_risk_flags.append(f"DEVIL_ADVOCATE_HYPOTHESIS_{hypothesis_index}_EVIDENCE_NOT_IN_SIGNAL_REGISTRY")
+
     certainty_input = {
         "verdicts": verdicts,
         "consensus_score": consensus_score,
@@ -308,6 +355,31 @@ def evaluate_signal_bundle(
     elif supplied_reasoning_hash != expected_hash:
         emit("CHIEF_REVIEW", {"signal_id": signal_id, "status": "HOLD", "reason": "CHIEF_REASONING_HASH_MISMATCH"})
         return finish("HOLD", ["CHIEF_REASONING_HASH_MISMATCH"], certainty=certainty)
+    chief_evidence_blockers: list[str] = []
+    chief_steps = chief_input.get("steps", {})
+    if isinstance(chief_steps, Mapping):
+        for step_name, step in chief_steps.items():
+            if not isinstance(step, Mapping):
+                chief_evidence_blockers.append(f"CHIEF_STEP_{step_name}_INVALID")
+                continue
+            refs = step.get("evidence_refs")
+            if (not isinstance(refs, Sequence) or isinstance(refs, (str, bytes)) or not refs
+                    or any(str(ref).strip() not in allowed_evidence_refs for ref in refs)):
+                chief_evidence_blockers.append(f"CHIEF_STEP_{step_name}_EVIDENCE_NOT_IN_SIGNAL_REGISTRY")
+    chief_scenarios = chief_input.get("tail_risk_scenarios", [])
+    if isinstance(chief_scenarios, Sequence) and not isinstance(chief_scenarios, (str, bytes)):
+        for scenario_index, scenario in enumerate(chief_scenarios):
+            if not isinstance(scenario, Mapping):
+                chief_evidence_blockers.append(f"CHIEF_TAIL_SCENARIO_{scenario_index}_INVALID")
+                continue
+            refs = scenario.get("evidence_refs")
+            if (not isinstance(refs, Sequence) or isinstance(refs, (str, bytes)) or not refs
+                    or any(str(ref).strip() not in allowed_evidence_refs for ref in refs)):
+                chief_evidence_blockers.append(f"CHIEF_TAIL_SCENARIO_{scenario_index}_EVIDENCE_NOT_IN_SIGNAL_REGISTRY")
+    if chief_evidence_blockers:
+        emit("CHIEF_EVIDENCE_VALIDATION", {"signal_id": signal_id, "status": "HOLD",
+                                           "blockers": sorted(set(chief_evidence_blockers))})
+        return finish("HOLD", chief_evidence_blockers, certainty=certainty)
     chief = chief_skeptic_pass(chief_input, now=current)
     emit("CHIEF_REVIEW", {"signal_id": signal_id, "status": chief.get("verdict"),
                           "reasoning_hash": chief.get("reasoning_hash"), "blockers": chief.get("blockers", [])})
