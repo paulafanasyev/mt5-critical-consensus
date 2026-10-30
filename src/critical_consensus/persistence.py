@@ -434,7 +434,16 @@ class PostgresRepository:
             ).fetchone()
         if row is None:
             return None
-        snapshot = row[4] if isinstance(row[4], Mapping) else json.loads(row[4])
+        raw_snapshot = row[4]
+        if isinstance(raw_snapshot, Mapping):
+            snapshot = raw_snapshot
+        elif isinstance(raw_snapshot, (str, bytes, bytearray)):
+            try:
+                snapshot = json.loads(raw_snapshot)
+            except (TypeError, ValueError, UnicodeDecodeError) as exc:
+                raise RuntimeError("persisted MT5 risk snapshot is not valid JSON") from exc
+        else:
+            raise RuntimeError("persisted MT5 risk snapshot is not a JSON object")
         if not isinstance(snapshot, Mapping):
             raise RuntimeError("persisted MT5 risk snapshot is not a JSON object")
         output = dict(snapshot)
