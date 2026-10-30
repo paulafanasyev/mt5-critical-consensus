@@ -111,9 +111,9 @@ def risk_snapshot_gate(
         blockers.append("MT5_RISK_COLLECTION_NOT_PASS")
     raw_quote_age = snapshot.get("quote_age_seconds")
     quote_age = (
-        float(raw_quote_age)
+        _finite(raw_quote_age)
         if not isinstance(raw_quote_age, bool) and isinstance(raw_quote_age, (int, float))
-        and math.isfinite(float(raw_quote_age)) else None
+        else None
     )
     raw_quote_age_policy = snapshot.get("max_quote_age_seconds")
     quote_age_policy = (
