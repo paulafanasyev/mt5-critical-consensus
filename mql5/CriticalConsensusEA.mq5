@@ -251,18 +251,37 @@ bool ExecuteDemoCommand(const string body)
    double sl = JsonNumber(body, "sl");
    double tp = JsonNumber(body, "tp");
    double expected_price = JsonNumber(body, "expected_price");
-   long expires_at = (long)JsonNumber(body, "expires_at_epoch");
+   double expires_at_value = JsonNumber(body, "expires_at_epoch");
+   long expires_at = 0;
    bool user_approved = JsonTrue(body, "user_approved");
+   string permission_id = JsonString(body, "permission_id");
+   string signal_id = JsonString(body, "signal_id");
+   string user_decision_id = JsonString(body, "user_decision_id");
+   string payload_hash = JsonString(body, "payload_hash");
+   string created_at = JsonString(body, "created_at");
 
-   if(command_id=="" || order_id=="" || symbol=="" || direction=="" || mode=="" || decision=="")
-   { Print("BLOCKED: required OrderCommand field missing."); return false; }
+   if(command_id=="" || order_id=="" || permission_id=="" || signal_id=="" ||
+      symbol=="" || direction=="" || mode=="" || decision=="" ||
+      user_decision_id=="" || payload_hash=="" || created_at=="")
+   { Print("BLOCKED: required OrderCommand audit/integrity field missing."); return false; }
    if(mode != "demo" || decision != "APPROVE" || !user_approved)
    { Print("BLOCKED: demo mode and explicit user approval are required."); return false; }
    if(AccountInfoInteger(ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO)
    { Print("BLOCKED: account is not demo. This EA does not execute live trades."); return false; }
    if(!EnableDemoExecution || AllowLiveExecution)
    { Print("BLOCKED: demo execution is disabled, or live mode was requested."); return false; }
-   if(expires_at <= (long)TimeGMT())
+   if(!MathIsValidNumber(volume) || !MathIsValidNumber(sl) ||
+      !MathIsValidNumber(tp) || !MathIsValidNumber(expected_price) ||
+      !MathIsValidNumber(expires_at_value) || !MathIsValidNumber(MaxVolume) ||
+      MaxVolume <= 0 || MaxSlippagePoints < 0 || MaxSpreadPoints < 0)
+   { Print("BLOCKED: non-finite command number or invalid EA risk input."); return false; }
+   long current_time = (long)TimeGMT();
+   // Reject fractional/overflowing expiries and commands whose lifetime exceeds five minutes.
+   if(expires_at_value < 1.0 || MathFloor(expires_at_value) != expires_at_value ||
+      expires_at_value > (double)current_time + 300.0)
+   { Print("BLOCKED: invalid command expiry or TTL exceeds 300 seconds."); return false; }
+   expires_at = (long)expires_at_value;
+   if(expires_at <= current_time)
    { Print("BLOCKED: command expired."); return false; }
    if(volume <= 0 || volume > MaxVolume || sl <= 0 || tp <= 0 || expected_price <= 0)
    { Print("BLOCKED: invalid volume/SL/TP/expected price."); return false; }
@@ -277,7 +296,9 @@ bool ExecuteDemoCommand(const string body)
    if(!SymbolInfoTick(symbol, tick)) { Print("BLOCKED: no current tick."); return false; }
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-   if(point <= 0) { Print("BLOCKED: invalid symbol point."); return false; }
+   if(!MathIsValidNumber(tick.bid) || !MathIsValidNumber(tick.ask) ||
+      !MathIsValidNumber(point) || point <= 0)
+   { Print("BLOCKED: non-finite or invalid market quote."); return false; }
    if(tick.bid <= 0 || tick.ask <= 0 || tick.ask < tick.bid)
    { Print("BLOCKED: invalid bid/ask quote."); return false; }
    if(MaxSpreadPoints < 0 || (tick.ask - tick.bid) / point > MaxSpreadPoints)
@@ -294,8 +315,12 @@ bool ExecuteDemoCommand(const string body)
    double step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
    double minvol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
    double maxvol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
-   if(step <= 0 || volume < minvol || volume > maxvol || MathAbs(volume/step - MathRound(volume/step)) > 0.000001)
-   { Print("BLOCKED: broker volume constraints not satisfied."); return false; }
+   double volume_steps = volume / step;
+   if(!MathIsValidNumber(step) || !MathIsValidNumber(minvol) || !MathIsValidNumber(maxvol) ||
+      !MathIsValidNumber(volume_steps) || step <= 0 || minvol <= 0 || maxvol < minvol ||
+      volume < minvol || volume > maxvol ||
+      MathAbs(volume_steps - MathRound(volume_steps)) > 0.000001)
+   { Print("BLOCKED: broker volume constraints invalid or unsatisfied."); return false; }
 
    MqlTradeRequest request = {};
    MqlTradeCheckResult check = {};
