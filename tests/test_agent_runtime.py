@@ -132,3 +132,23 @@ async def test_agent_runtime_rejects_verdict_hash_for_a_different_signal():
     assert result["status"] == "GATHER_MORE"
     assert result["agent_errors"][0]["code"].find("INPUT_HASH_DOES_NOT_MATCH_COLLECTED_SIGNAL") >= 0
     assert result["trade_allowed"] is False
+
+
+@pytest.mark.asyncio
+async def test_all_policy_mandatory_agent_ids_are_required_before_any_provider_call():
+    calls = []
+    async def run(signal):
+        calls.append(signal["signal_id"])
+        return {}
+    run.provider_origin = "provider.example"
+    run.provider_identity = "provider.example::model"
+    result = await collect_agent_verdicts(
+        {"signal_id": "s1"},
+        [AgentSpec("PlatformScoutAgent", "provider", run)],
+        required_agent_ids=("PlatformScoutAgent", "GlobalNewsAgent", "TechnicalAnalystAgent"),
+        now=NOW,
+    )
+    assert result["status"] == "GATHER_MORE"
+    assert result["missing_agent_ids"] == ["GlobalNewsAgent", "TechnicalAnalystAgent"]
+    assert calls == []
+    assert result["trade_allowed"] is False
