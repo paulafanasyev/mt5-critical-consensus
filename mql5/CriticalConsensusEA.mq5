@@ -212,6 +212,11 @@ bool ExecuteDemoCommand(const string body)
    if(!OrderCheck(request, check))
    { Print("BLOCKED: OrderCheck failed; retcode=",check.retcode," ",check.comment); return false; }
 
+   // Recheck after potentially expensive preflight and immediately before recording/sending the attempt.
+   // This narrows (but cannot atomically eliminate) the race with a remotely activated kill switch.
+   if(!CheckKillSwitch())
+   { Print("BLOCKED: kill switch changed before order submission."); return false; }
+
    // At-most-once: record attempt before network operation. A timeout/uncertain result needs reconciliation,
    // never blind retry. A production bridge must persist the same idempotency key in PostgreSQL too.
    GlobalVariableSet(global_key, (double)TimeGMT());
