@@ -69,3 +69,43 @@ def test_csv_loader_rejects_duplicate_model_signal(tmp_path):
     )
     with pytest.raises(ValueError, match="duplicate"):
         load_forecasts_csv(path)
+
+
+
+def test_walk_forward_rejects_naive_datetimes_in_direct_forecast_objects():
+    start = datetime(2026, 1, 1)
+    row = Forecast("m", "s", start, start + timedelta(hours=1), 0.7, 1)
+    with pytest.raises(ValueError, match="issued_at must include a timezone"):
+        evaluate_walk_forward([row])
+
+
+@pytest.mark.parametrize("probability", [float("nan"), float("inf"), -0.01, 1.01, True])
+def test_walk_forward_rejects_invalid_direct_probabilities(probability):
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    row = Forecast("m", "s", start, start + timedelta(hours=1), probability, 1)
+    with pytest.raises(ValueError, match="probability"):
+        evaluate_walk_forward([row])
+
+
+@pytest.mark.parametrize("outcome", [-1, 2, 0.5, True])
+def test_walk_forward_rejects_invalid_direct_outcomes(outcome):
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    row = Forecast("m", "s", start, start + timedelta(hours=1), 0.7, outcome)
+    with pytest.raises(ValueError, match="outcome must be integer 0 or 1"):
+        evaluate_walk_forward([row])
+
+
+def test_walk_forward_rejects_duplicate_model_signal_pairs():
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    first = Forecast("m", "same", start, start + timedelta(hours=1), 0.7, 1)
+    second = Forecast("m", "same", start + timedelta(days=1),
+                      start + timedelta(days=1, hours=1), 0.6, 0)
+    with pytest.raises(ValueError, match="duplicate"):
+        evaluate_walk_forward([first, second])
+
+
+def test_walk_forward_rejects_outcome_resolved_before_forecast_issue():
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    row = Forecast("m", "s", start, start - timedelta(seconds=1), 0.7, 1)
+    with pytest.raises(ValueError, match="resolved_at must be later"):
+        evaluate_walk_forward([row])
