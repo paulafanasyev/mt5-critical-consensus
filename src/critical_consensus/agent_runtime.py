@@ -122,8 +122,13 @@ async def collect_agent_verdicts(
     except (TypeError, ValueError, OverflowError):
         return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["SIGNAL_INPUT_NOT_CANONICALLY_HASHABLE"],
                 "trade_allowed": False}
-    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0 or minimum_agents < 1 or minimum_independence_groups < 1:
-        return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["INVALID_COLLECTION_POLICY"], "trade_allowed": False}
+    if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds) or timeout_seconds <= 0
+            or isinstance(minimum_agents, bool) or not isinstance(minimum_agents, int) or minimum_agents < 1
+            or isinstance(minimum_independence_groups, bool)
+            or not isinstance(minimum_independence_groups, int) or minimum_independence_groups < 1):
+        return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["INVALID_COLLECTION_POLICY"],
+                "trade_allowed": False}
     if not isinstance(agents, Sequence) or not agents or any(not isinstance(agent, AgentSpec) for agent in agents):
         return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["AGENT_REGISTRY_INVALID"], "trade_allowed": False}
     if (not isinstance(required_roles, Sequence) or isinstance(required_roles, (str, bytes))
