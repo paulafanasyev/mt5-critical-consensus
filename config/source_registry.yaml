@@ -1,0 +1,10 @@
+# A publisher only becomes trusted after an operator explicitly reviews and adds
+# its official HTTPS hostname, independence group, conservative credibility weight
+# and maximum source age. This score is a policy input, not a calibrated probability.
+version: "1"
+max_clock_skew_seconds: 60
+max_capture_age_seconds: 300
+max_source_age_seconds: 900
+min_independent_publishers: 2
+max_content_bytes: 512000
+publishers: {}
