@@ -114,7 +114,7 @@ def capture_manifest(manifest_path: Path, registry_path: Path, *, timeout: float
         body, content_type = _fetch(url, max_bytes=max_bytes, timeout=timeout)
         digest = "sha256:" + hashlib.sha256(body).hexdigest()
         record = {
-            "source_id": source_id_for_capture(publisher_id, url, digest),
+            "source_id": source_id_for_capture(publisher_id, url, digest, registry_version=str(registry.get("version", "")),\n                                           published_at=str(published_at), publication_time_attestation=attestation),
             "publisher_id": publisher_id,
             "publisher_domain": host,
             "source_url": url,
