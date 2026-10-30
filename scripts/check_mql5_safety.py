@@ -33,6 +33,8 @@ def main() -> int:
         "persistent marker write failure is checked": r"marker_written\s*==\s*0",
         "idempotency expiry limitation documented": r"four weeks of inactivity",
         "server ledger requirement documented": r"PostgreSQL idempotency ledger",
+        "legacy order-attempt markers survive EA upgrades": r"LegacyGlobalKey\\(order_id\\)",
+        "legacy order-attempt marker checked": r"GlobalVariableCheck\\(legacy_global_key\\)",
         "kill-switch endpoint configured": r"KillSwitchUrl",
         "kill-switch response must explicitly be false": r"JsonFalse",
         "strict JSON boolean parser is present": r"JsonBooleanValue",
