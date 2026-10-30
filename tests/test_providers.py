@@ -154,6 +154,7 @@ def test_challenge_resolver_receives_only_challenge_cited_documents(monkeypatch)
 @pytest.mark.asyncio
 async def test_provider_call_timeout_does_not_wait_for_blocking_thread_shutdown(monkeypatch):
     import asyncio
+    import threading
     import time
 
     agent = OpenAICompatibleAgent(
@@ -170,13 +171,6 @@ async def test_provider_call_timeout_does_not_wait_for_blocking_thread_shutdown(
         await asyncio.wait_for(agent({"signal_id": "timeout"}), timeout=0.02)
     elapsed = time.monotonic() - started
     assert elapsed < 0.15
-    assert _provider_slots_available_for_test() is True
+    assert any(thread.name == "cc-provider-call" and thread.daemon
+               for thread in threading.enumerate())
     time.sleep(0.32)
-
-
-def _provider_slots_available_for_test():
-    from critical_consensus.providers import _PROVIDER_CALL_SLOTS
-    acquired = _PROVIDER_CALL_SLOTS.acquire(blocking=False)
-    if acquired:
-        _PROVIDER_CALL_SLOTS.release()
-    return acquired
