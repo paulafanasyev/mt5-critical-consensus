@@ -719,7 +719,8 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
     if not isinstance(risk, Mapping):
         blockers.append("RISK_SNAPSHOT_MISSING")
         risk = {}
-    required_risk_fields = ("risk_fraction", "daily_loss_fraction", "drawdown_fraction", "open_positions", "correlated_open_positions")
+    required_risk_fields = ("risk_fraction", "daily_loss_fraction", "drawdown_fraction",
+                            "open_positions", "correlated_open_positions", "spread_points")
     missing_risk = [key for key in required_risk_fields if risk.get(key) is None]
     if missing_risk:
         blockers.append("RISK_SNAPSHOT_FIELDS_MISSING:" + ",".join(missing_risk))
@@ -739,6 +740,12 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
             blockers.append("DAILY_LOSS_LIMIT_REACHED")
         if risk_values["drawdown_fraction"] is not None and risk_limits["drawdown_fraction"] is not None and risk_values["drawdown_fraction"] >= risk_limits["drawdown_fraction"]:
             blockers.append("MAX_DRAWDOWN_REACHED")
+        spread_points = _finite_float(risk.get("spread_points"))
+        max_spread = _finite_float(policy.get("max_spread_points"))
+        if spread_points is None or spread_points < 0 or max_spread is None or max_spread < 0:
+            blockers.append("INVALID_SPREAD_VALUE_OR_LIMIT")
+        elif spread_points > max_spread:
+            blockers.append("SPREAD_LIMIT_EXCEEDED")
         for key, limit_key, message in (("open_positions", "max_positions", "MAX_OPEN_POSITIONS_REACHED"),
                                         ("correlated_open_positions", "max_correlated_positions", "CORRELATED_EXPOSURE_LIMIT_REACHED")):
             count = _finite_float(risk.get(key))
