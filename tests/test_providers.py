@@ -70,3 +70,74 @@ def test_provider_redirect_handler_refuses_redirects():
     assert _NoRedirectHandler().redirect_request(
         None, None, 302, "Found", {}, "https://attacker.example/collect"
     ) is None
+
+
+
+@pytest.mark.parametrize("base_url", [
+    "https://user:secret@provider.example/v1",
+    "https://provider.example/v1?token=secret",
+    "https://provider.example/v1#fragment",
+    "https://127.0.0.1/v1",
+    "http://provider.example/v1",
+    "https://provider.example:8443/v1",
+])
+def test_provider_endpoint_rejects_userinfo_query_fragment_ip_and_nonstandard_ports(base_url):
+    with pytest.raises(ValueError):
+        OpenAICompatibleAgent(
+            agent_id="agent", model="test-model", api_key="test-secret", base_url=base_url,
+        )
+
+
+def test_provider_origin_normalizes_hostname_case_and_trailing_dot():
+    agent = OpenAICompatibleAgent(
+        agent_id="agent", model="test-model", api_key="test-secret",
+        base_url="https://Provider.Example./v1",
+    )
+    assert agent.provider_origin == "provider.example"
+
+
+def test_peer_reviewer_receives_only_cited_source_documents(monkeypatch):
+    agent = OpenAICompatibleAgent(
+        agent_id="reviewer", model="test-model", api_key="test-secret",
+    )
+    captured = {}
+    def fake_request_json_sync(*, system_prompt, user_prompt):
+        captured["prompt"] = json.loads(user_prompt.split("\n", 1)[1])
+        return {"stance": "CONFIRM", "challenge_type": "NONE", "argument": "No contradiction found",
+                "evidence_refs": ["source-a"]}
+    monkeypatch.setattr(agent, "_request_json_sync", fake_request_json_sync)
+    callback = agent.make_peer_reviewer(
+        ["source-a", "source-b"],
+        evidence_context={"source-a": "relevant evidence", "source-b": "unrelated private evidence"},
+    )
+    import asyncio
+    callback_result = asyncio.run(callback(
+        {"agent_id": "target", "evidence_refs": ["source-a"]},
+        [{"agent_id": "peer", "evidence_refs": ["source-a"]}],
+    ))
+    assert callback_result["evidence_refs"] == ["source-a"]
+    assert captured["prompt"]["allowed_evidence_refs"] == ["source-a"]
+    assert captured["prompt"]["untrusted_source_documents"] == [
+        {"source_id": "source-a", "text": "relevant evidence"}
+    ]
+
+
+def test_challenge_resolver_receives_only_challenge_cited_documents(monkeypatch):
+    agent = OpenAICompatibleAgent(
+        agent_id="resolver", model="test-model", api_key="test-secret",
+    )
+    captured = {}
+    def fake_request_json_sync(*, system_prompt, user_prompt):
+        captured["prompt"] = json.loads(user_prompt.split("\n", 1)[1])
+        return {"resolved": False, "summary": "insufficient", "evidence_refs": []}
+    monkeypatch.setattr(agent, "_request_json_sync", fake_request_json_sync)
+    resolver = agent.make_challenge_resolver(
+        ["source-a", "source-b"],
+        evidence_context={"source-a": "challenge evidence", "source-b": "unrelated evidence"},
+    )
+    result = resolver({"evidence_refs": ["source-b"]}, 1)
+    assert result["resolved"] is False
+    assert captured["prompt"]["allowed_evidence_refs"] == ["source-b"]
+    assert captured["prompt"]["untrusted_source_documents"] == [
+        {"source_id": "source-b", "text": "unrelated evidence"}
+    ]
