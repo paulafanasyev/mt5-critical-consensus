@@ -49,7 +49,7 @@ def main() -> int:
         return 1
 
     execute_start = source.find("bool ExecuteDemoCommand")
-    execute_end = source.find("\\nvoid OnInit", execute_start)
+    execute_end = source.find("\nvoid OnInit", execute_start)
     if execute_start < 0 or execute_end < 0:
         print("FAIL: ExecuteDemoCommand function boundaries are missing")
         return 1
