@@ -13,13 +13,20 @@ def test_worker_declares_persistence_callback_before_pending_recovery_loop():
         node for node in tree.body
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "main"
     )
+    worker_try = next(
+        (node for node in main.body if isinstance(node, ast.Try)),
+        None,
+    )
+    assert worker_try is not None, "worker resource lifecycle try-block is missing"
+    worker_body = worker_try.body
+
     persist_index = next(
-        (index for index, node in enumerate(main.body)
+        (index for index, node in enumerate(worker_body)
          if isinstance(node, ast.AsyncFunctionDef) and node.name == "persist"),
         None,
     )
     recovery_index = next(
-        (index for index, node in enumerate(main.body)
+        (index for index, node in enumerate(worker_body)
          if isinstance(node, ast.While)
          and any(
              isinstance(child, ast.Call)
