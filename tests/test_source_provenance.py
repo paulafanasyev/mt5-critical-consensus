@@ -192,3 +192,12 @@ def test_publisher_json_timestamp_requires_configured_pointer_and_exact_field():
     result = validate_source_capture(item, registry(), now=NOW)
     assert result["status"] == "DENY"
     assert "SOURCE_PUBLISHER_JSON_TIMESTAMP_POLICY_MISMATCH" in result["blockers"]
+
+
+def test_malformed_configured_json_timestamp_pointer_fails_closed():
+    item = record()
+    policy = registry()
+    policy["publishers"]["central-bank-a"]["published_at_json_pointer"] = 7
+    result = validate_source_capture(item, policy, now=NOW)
+    assert result["status"] == "DENY"
+    assert "SOURCE_PUBLISHER_JSON_TIMESTAMP_POINTER_POLICY_INVALID" in result["blockers"]
