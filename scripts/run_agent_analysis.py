@@ -43,6 +43,7 @@ async def run(args) -> int:
                 signal, agents, timeout_seconds=args.timeout,
                 minimum_agents=args.minimum_agents,
                 minimum_independence_groups=args.minimum_independence_groups,
+                required_roles=("analyst", "critic", "chief_review", "risk_review"),
             )
     except Exception as exc:
         # Do not print provider endpoint secrets or exception strings.
@@ -88,7 +89,7 @@ def main() -> int:
     parser.add_argument("--timeframe", required=True, choices=["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"])
     parser.add_argument("--bars", type=int, default=200)
     parser.add_argument("--timeout", type=float, default=15.0)
-    parser.add_argument("--minimum-agents", type=int, default=3)
+    parser.add_argument("--minimum-agents", type=int, default=4)
     parser.add_argument("--minimum-independence-groups", type=int, default=3)
     args = parser.parse_args()
     if args.bars < 21 or args.bars > 5000:
