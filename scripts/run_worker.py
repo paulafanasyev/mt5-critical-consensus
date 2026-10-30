@@ -27,7 +27,12 @@ async def main() -> None:
         await redis.ping()
         await ensure_consumer_group(redis, stream, group, start_id="0-0")
         await asyncio.to_thread(repo.migrate)
-        print(json.dumps({"status": "ready", "stream": stream, "group": group, "consumer": consumer}))
+        print(json.dumps({"status": "ready", "stream": stream, "group": group, "consumer": consumer))
+
+        async def persist(event):
+            # Durable PostgreSQL commit completes before process_message_batch calls XACK.
+            await asyncio.to_thread(repo.persist_event_once, event, consumer_name=group)
+
         reclaim_cursor = "0-0"
         while True:
             reclaim_cursor, reclaimed_stats = await reclaim_and_process_batch(
@@ -40,10 +45,6 @@ async def main() -> None:
             messages = await read_new_messages(redis, stream, group, consumer, count=20, block_ms=5000)
             if not messages:
                 continue
-
-            async def persist(event):
-                # Durable PostgreSQL commit completes before process_message_batch calls XACK.
-                await asyncio.to_thread(repo.persist_event_once, event, consumer_name=group)
 
             stats = await process_message_batch(redis, stream, group, messages, persist, max_attempts=3)
             print(json.dumps({"stream": stream, **stats}, sort_keys=True))
