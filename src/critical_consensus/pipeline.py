@@ -14,6 +14,7 @@ from typing import Any, Mapping, Sequence
 from .audit import canonical_hash, make_audit_event, verify_audit_chain
 from .calibration import weighted_consensus
 from .gates import certainty_gate, chief_skeptic_pass, permission_gate, user_authorization_gate
+from .risk_controls import risk_controlled_permission
 
 _VERDICT_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _VERDICT_FUTURE_SKEW_SECONDS = 30
@@ -76,6 +77,9 @@ def evaluate_signal_bundle(
     permission_matrix: Mapping[str, Any],
     *,
     now: datetime | None = None,
+    require_persisted_risk: bool = False,
+    kill_switch_state: Mapping[str, Any] | None = None,
+    terminal_risk_snapshot: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate certainty → ChiefAgent → Permission → user authorization, fail-closed.
 
@@ -453,9 +457,21 @@ def evaluate_signal_bundle(
     req["certainty_status"] = certainty.get("status")
     req["compliance_status"] = bundle.get("compliance_status")
     req["risk_flags"] = all_risk_flags
-    permission = permission_gate(req, permission_matrix, now=current)
+    if require_persisted_risk:
+        permission = risk_controlled_permission(
+            req, permission_matrix,
+            kill_switch_state=kill_switch_state,
+            snapshot=terminal_risk_snapshot,
+            now=current,
+        )
+    else:
+        permission = permission_gate(req, permission_matrix, now=current)
     emit("PERMISSION_GATE", {"signal_id": signal_id, "status": permission.get("status"),
-                              "blockers": permission.get("blockers", []), "permission_id": permission.get("permission_id")})
+                              "blockers": permission.get("blockers", []),
+                              "permission_id": permission.get("permission_id"),
+                              "persisted_risk_required": require_persisted_risk,
+                              "kill_switch": permission.get("kill_switch"),
+                              "risk_snapshot_validation": permission.get("risk_snapshot_validation")})
     if permission.get("status") == "DENY":
         return finish("DENY", list(permission.get("blockers", [])), certainty=certainty, chief=chief, permission=permission)
 
