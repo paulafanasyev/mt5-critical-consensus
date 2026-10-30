@@ -191,18 +191,28 @@ class PostgresRepository:
             ).fetchone()
             if existing is None:
                 raise RuntimeError("source evidence conflict row disappeared")
-            expected = args[1:]
-            actual = tuple(existing)
-            # BYTEA is compared byte-for-byte; numeric database values are compared as floats.
-            # A repeated fetch of the same publisher bytes is idempotent even when
-            # retrieved_at differs. Preserve the first archived retrieval timestamp.
+            actual = dict(zip(
+                ("publisher_id", "publisher_domain", "source_url", "published_at", "retrieved_at",
+                 "independence_group", "credibility", "ttl_seconds", "content_sha256", "content_bytes",
+                 "captured_content", "publication_time_attestation", "capture_method", "registry_version"),
+                existing,
+            ))
+            # Compare by column name to avoid positional drift. retrieved_at is intentionally
+            # excluded: a later fetch of the same source bytes is an idempotent replay.
             equal = (
-                actual[0] == expected[0] and actual[1] == expected[1] and actual[2] == expected[2]
-                and actual[3] == expected[3] and actual[5] == expected[5]
-                and math.isclose(float(actual[6]), float(expected[7]), rel_tol=0, abs_tol=1e-12)
-                and int(actual[7]) == int(expected[8]) and actual[8] == expected[9]
-                and int(actual[9]) == int(expected[10]) and bytes(actual[10]) == expected[11]
-                and actual[11] == expected[12] and actual[12] == expected[13] and actual[13] == expected[14]
+                actual["publisher_id"] == str(record["publisher_id"])
+                and actual["publisher_domain"] == str(record["publisher_domain"])
+                and actual["source_url"] == str(record["source_url"])
+                and actual["published_at"] == published
+                and actual["independence_group"] == str(record["independence_group"])
+                and math.isclose(float(actual["credibility"]), float(credibility), rel_tol=0, abs_tol=1e-12)
+                and int(actual["ttl_seconds"]) == ttl
+                and actual["content_sha256"] == digest
+                and int(actual["content_bytes"]) == len(content)
+                and bytes(actual["captured_content"]) == content
+                and actual["publication_time_attestation"] == str(record["publication_time_attestation"])
+                and actual["capture_method"] == str(record["capture_method"])
+                and actual["registry_version"] == str(record["registry_version"])
             )
             if not equal:
                 raise ValueError("source_id already exists with different captured evidence")
