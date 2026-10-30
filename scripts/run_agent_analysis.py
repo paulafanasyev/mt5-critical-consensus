@@ -54,7 +54,7 @@ async def run(args) -> int:
             result = await collect_agent_verdicts(
                 signal, agents, timeout_seconds=args.timeout,
                 minimum_agents=max(args.minimum_agents, len(mandatory_agent_ids)),
-                minimum_independence_groups=args.minimum_independence_groups,
+                minimum_independence_groups=max(args.minimum_independence_groups, len(mandatory_agent_ids)),
                 required_roles=("analyst", "critic", "devil_advocate", "risk_review"),
                 required_agent_ids=mandatory_agent_ids,
             )
