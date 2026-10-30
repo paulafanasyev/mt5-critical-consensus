@@ -117,12 +117,16 @@ def self_adversarial_pass(verdict: Mapping[str, Any], *, counterarguments: Seque
 async def anonymized_peer_review(
     verdicts: Sequence[Mapping[str, Any]],
     reviewers: Sequence[tuple[str, Callable[[dict[str, Any], list[dict[str, Any]]], Awaitable[dict[str, Any]]]]],
-    *, min_reviewers_per_verdict: int = 2,
+    *, min_reviewers_per_verdict: int = 2, review_timeout_seconds: float = 30.0,
 ) -> list[dict[str, Any]]:
     """Obtain anonymized peer reviews and reject malformed or evidence-free reviews."""
     output: list[dict[str, Any]] = []
-    if min_reviewers_per_verdict < 1:
+    if isinstance(min_reviewers_per_verdict, bool) or min_reviewers_per_verdict < 1:
         raise ValueError("min_reviewers_per_verdict must be >= 1")
+    if (isinstance(review_timeout_seconds, bool) or not isinstance(review_timeout_seconds, (int, float))
+            or not math.isfinite(review_timeout_seconds) or review_timeout_seconds <= 0
+            or review_timeout_seconds > 120):
+        raise ValueError("review_timeout_seconds must be finite and in (0,120]")
     if not verdicts or any(not isinstance(v, Mapping) for v in verdicts):
         return [{"status": "BLOCKED", "reason": "INVALID_OR_EMPTY_VERDICTS"}]
     if any(not isinstance(item, tuple) or len(item) != 2 or not str(item[0]).strip() or not callable(item[1]) for item in reviewers):
@@ -142,7 +146,14 @@ async def anonymized_peer_review(
         peers = [dict(v) for j, v in enumerate(public) if j != target_idx]
         for i, (_private_reviewer_id, review_fn) in enumerate(possible[:min_reviewers_per_verdict], start=1):
             try:
-                review = await review_fn(dict(target), [dict(x) for x in peers])
+                review = await asyncio.wait_for(
+                    review_fn(dict(target), [dict(x) for x in peers]),
+                    timeout=review_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                output.append({"target_verdict_id": target.get("verdict_id"), "status": "BLOCKED",
+                               "reason": "REVIEWER_TIMEOUT", "reviewer_alias": f"reviewer-{i:02d}"})
+                continue
             except Exception as exc:  # fail closed; do not include potentially sensitive exception text
                 output.append({"target_verdict_id": target.get("verdict_id"), "status": "BLOCKED",
                                "reason": "REVIEWER_CALLBACK_FAILED", "reviewer_alias": f"reviewer-{i:02d}"})
