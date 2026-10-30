@@ -306,3 +306,13 @@ def test_pipeline_binds_every_agent_verdict_to_the_same_input_snapshot():
     assert result["status"] == "GATHER_MORE"
     assert "VERDICT_0:VERDICT_INPUT_HASH_DOES_NOT_MATCH_SIGNAL_INPUT" in result["blockers"]
     assert "certainty" not in result["details"]
+
+
+def test_pipeline_rejects_nonfinite_bundle_before_creating_an_invalid_audit_hash():
+    bundle = make_bundle()
+    bundle["signal_input"]["nonfinite"] = float("nan")
+    result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
+    assert result["status"] == "GATHER_MORE"
+    assert result["blockers"] == ["SIGNAL_BUNDLE_NOT_CANONICALLY_HASHABLE"]
+    assert result["audit_events"] == []
+    assert result["trade_allowed"] is False
