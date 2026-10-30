@@ -214,3 +214,65 @@ async def test_peer_review_cycle_applies_review_timeout_to_sync_challenge_resolv
     assert all(challenge["last_resolution_attempt"]["error_code"] == "RESOLVER_TIMEOUT"
                for challenge in result["open_challenges"])
     assert result["trade_allowed"] is False
+
+
+@pytest.mark.asyncio
+async def test_peer_review_cycle_has_one_overall_deadline_for_all_reviewers():
+    import time
+
+    calls = []
+
+    async def slow_reviewer(target, peers):
+        calls.append(target["verdict_id"])
+        await asyncio.sleep(0.5)
+        return {
+            "stance": "CONFIRM", "challenge_type": "NONE",
+            "argument": "too late", "evidence_refs": ["review:evidence:1"],
+        }
+
+    started = time.monotonic()
+    result = await run_peer_review_cycle(
+        VERDICTS,
+        [("review-provider-a", slow_reviewer),
+         ("review-provider-b", slow_reviewer),
+         ("review-provider-c", slow_reviewer)],
+        allowed_evidence_refs=ALLOWED,
+        resolver=lambda challenge, round_no: {"resolved": False, "evidence_refs": []},
+        min_reviewers_per_verdict=2, review_timeout_seconds=0.2,
+        review_cycle_timeout_seconds=0.07,
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.2
+    assert result["status"] == "GATHER_MORE"
+    assert "REVIEW_CYCLE_TIMEOUT" in result["blockers"]
+    assert len(calls) <= 2
+    assert result["trade_allowed"] is False
+
+
+@pytest.mark.asyncio
+async def test_peer_review_cycle_has_one_overall_deadline_for_challenges():
+    import time
+
+    calls = []
+
+    def slow_resolver(_challenge, _round_no):
+        calls.append(1)
+        time.sleep(0.15)
+        return {"resolved": True, "evidence_refs": ["resolution:evidence:1"]}
+
+    started = time.monotonic()
+    result = await run_peer_review_cycle(
+        VERDICTS, reviewers_for(), allowed_evidence_refs=ALLOWED,
+        resolver=slow_resolver, min_reviewers_per_verdict=2,
+        max_resolution_rounds=1, review_timeout_seconds=0.2,
+        challenge_cycle_timeout_seconds=0.07,
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.2
+    assert result["status"] == "ESCALATE"
+    assert "CHALLENGE_DEADLOCK" in result["blockers"]
+    assert result["challenge_resolution_status"] == "DEADLOCK"
+    assert all(item["status"] == "OPEN" for item in result["open_challenges"])
+    assert 1 <= len(calls) <= 2
+    time.sleep(0.2)  # Let bounded daemon callbacks release their slots before the next test.
+    assert result["trade_allowed"] is False
