@@ -1,6 +1,7 @@
 """Fail-closed policy gates. Functions return decision records; they never execute trades."""
 from __future__ import annotations
 import asyncio
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import datetime, timezone
 import math
 import re
@@ -8,6 +9,13 @@ import uuid
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from .audit import canonical_hash
+
+
+# A bounded shared pool prevents timed-out synchronous resolvers from spawning
+# unbounded worker threads. A running Python thread cannot be forcibly cancelled.
+_CHALLENGE_RESOLVER_EXECUTOR = ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="cc-challenge-resolver",
+)
 
 
 def _now_utc() -> datetime:
@@ -189,10 +197,16 @@ async def anonymized_peer_review(
 
 def challenge_resolution_loop(challenges: Sequence[Mapping[str, Any]],
                               resolver: Callable[[dict[str, Any], int], Mapping[str, Any]],
-                              *, max_rounds: int = 3) -> dict[str, Any]:
-    """Resolve challenges in at most three rounds and return both resolved and open records."""
-    if max_rounds < 1 or max_rounds > 3:
-        raise ValueError("max_rounds must be 1..3")
+                              *, max_rounds: int = 3,
+                              resolver_timeout_seconds: float = 30.0) -> dict[str, Any]:
+    """Resolve challenges with bounded waits; timeouts leave the challenge open."""
+    if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or max_rounds < 1 or max_rounds > 3:
+        raise ValueError("max_rounds must be an integer from 1 to 3")
+    if (isinstance(resolver_timeout_seconds, bool)
+            or not isinstance(resolver_timeout_seconds, (int, float))
+            or not math.isfinite(resolver_timeout_seconds)
+            or resolver_timeout_seconds <= 0 or resolver_timeout_seconds > 120):
+        raise ValueError("resolver_timeout_seconds must be finite and in (0,120]")
     transcript: list[dict[str, Any]] = []
     resolved_challenges: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
@@ -227,11 +241,17 @@ def challenge_resolution_loop(challenges: Sequence[Mapping[str, Any]],
 
         resolved = False
         for round_no in range(1, max_rounds + 1):
+            future = _CHALLENGE_RESOLVER_EXECUTOR.submit(resolver, dict(challenge), round_no)
             try:
-                raw_response = resolver(dict(challenge), round_no)
+                raw_response = future.result(timeout=float(resolver_timeout_seconds))
                 response = dict(raw_response) if isinstance(raw_response, Mapping) else {
                     "resolved": False, "error_code": "INVALID_RESOLVER_RESPONSE"
                 }
+            except FutureTimeout:
+                # Cancels queued work; already-running callbacks may continue, but the
+                # orchestration caller is released and the challenge remains unresolved.
+                future.cancel()
+                response = {"resolved": False, "error_code": "RESOLVER_TIMEOUT"}
             except Exception as exc:
                 response = {"resolved": False, "error_code": f"RESOLVER_FAILED:{type(exc).__name__}"}
             transcript.append({"challenge_id": challenge_id, "round": round_no, "response": response})
