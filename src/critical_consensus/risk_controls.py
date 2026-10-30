@@ -10,6 +10,9 @@ from typing import Any, Mapping
 from .gates import permission_gate
 
 
+MAX_RISK_SNAPSHOT_QUOTE_AGE_SECONDS = 15
+
+
 def _finite(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
@@ -106,6 +109,16 @@ def risk_snapshot_gate(
             blockers.append("RISK_SNAPSHOT_STALE")
     if snapshot.get("status") != "PASS":
         blockers.append("MT5_RISK_COLLECTION_NOT_PASS")
+    quote_age = _finite(snapshot.get("quote_age_seconds"))
+    quote_age_policy = _finite(snapshot.get("max_quote_age_seconds"))
+    if (quote_age_policy is None or not quote_age_policy.is_integer()
+            or not 1 <= quote_age_policy <= MAX_RISK_SNAPSHOT_QUOTE_AGE_SECONDS):
+        blockers.append("MT5_QUOTE_AGE_POLICY_INVALID")
+    if quote_age is None or quote_age < -5:
+        blockers.append("MT5_QUOTE_AGE_INVALID_OR_FUTURE")
+    elif quote_age_policy is not None and (
+            quote_age > min(float(MAX_RISK_SNAPSHOT_QUOTE_AGE_SECONDS), quote_age_policy)):
+        blockers.append("MT5_QUOTE_STALE")
     if snapshot.get("account_mode") != "demo":
         blockers.append("MT5_ACCOUNT_NOT_DEMO_OR_UNKNOWN")
     if not str(snapshot.get("symbol", "")).strip():
