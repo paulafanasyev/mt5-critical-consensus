@@ -94,6 +94,7 @@ def evaluate_signal_bundle(
     except (ValueError, TypeError, OverflowError):
         return {"status": "GATHER_MORE", "trade_allowed": False, "blockers": ["INVALID_CURRENT_TIME"], "audit_events": []}
 
+    signal_id = str(bundle.get("signal_id", "")).strip()
     try:
         bundle_hash = canonical_hash(bundle)
     except (TypeError, ValueError, OverflowError):
@@ -103,7 +104,6 @@ def evaluate_signal_bundle(
 
     trace: list[dict[str, Any]] = []
     previous_hash: str | None = None
-    signal_id = str(bundle.get("signal_id", "")).strip()
 
     def emit(event_type: str, payload: Mapping[str, Any]) -> None:
         nonlocal previous_hash
