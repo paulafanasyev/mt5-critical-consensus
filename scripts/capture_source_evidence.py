@@ -102,7 +102,7 @@ def capture_manifest(manifest_path: Path, registry_path: Path, *, timeout: float
         published_at = item.get("published_at")
         attestation = str(item.get("publication_time_attestation", "")).strip()
         allowed_attestations = profile.get("allowed_publication_time_attestations", [])
-        if attestation not in allowed_attestations:
+        if attestation != "operator_attested" or attestation not in allowed_attestations:
             raise ValueError(f"source entry {index} has no allowed publication-time attestation")
         body, content_type = _fetch(url, max_bytes=max_bytes, timeout=timeout)
         digest = "sha256:" + hashlib.sha256(body).hexdigest()
