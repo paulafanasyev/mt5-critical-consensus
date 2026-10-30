@@ -87,7 +87,7 @@ def make_bundle():
         "chief_reasoning": {
             "reasoning_id": "chief-r-100", "signal_id": "sig-100", "created_at": NOW.isoformat(),
             "verdict": "CONFIRM",
-            "steps": {step: {"passed": True, "detail": f"checked {step}", "evidence_refs": [f"chief-{step}"]}
+            "steps": {step: {"passed": True, "check_name": {"a":"ADVERSARIAL_PASS","b":"CONTRADICTION_CHECK","c":"SOURCE_AUDIT","d":"TAIL_RISK_CHECK","e":"RED_TEAM_SELF_REVIEW","f":"FULL_CHALLENGE_LEDGER_REVIEW","g":"GROUPTHINK_CHECK","h":"SIMILAR_REGIME_CALIBRATION","i":"ERROR_PROBABILITY_SCENARIO"}[step], "detail": f"checked {step}", "evidence_refs": [f"chief-{step}"]}
                       for step in "abcdefghi"},
             "reasons_against": ["macro risk", "news risk", "correlation risk", "liquidity risk", "regime mismatch"],
             "tail_risk_probability": 0.01,
