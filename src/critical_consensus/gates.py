@@ -1,5 +1,6 @@
 """Fail-closed policy gates. Functions return decision records; they never execute trades."""
 from __future__ import annotations
+import asyncio
 from datetime import datetime, timezone
 import math
 import re
