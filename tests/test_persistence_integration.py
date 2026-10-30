@@ -160,7 +160,9 @@ def test_publisher_source_capture_is_immutable_and_retrieved_by_exact_id():
         "capture_method": "https_fetch", "registry_version": "1",
     }
     first = repo.record_source_evidence(record, registry=registry)
-    duplicate = repo.record_source_evidence(record, registry=registry)
+    # Re-fetching identical publisher bytes later must be an idempotent replay.
+    repeated_capture = dict(record, retrieved_at=now.isoformat())
+    duplicate = repo.record_source_evidence(repeated_capture, registry=registry)
     assert first["inserted"] is True
     assert duplicate["inserted"] is False
     loaded = repo.get_source_evidence([record["source_id"]])
