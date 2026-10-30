@@ -148,7 +148,9 @@ def test_publisher_source_capture_is_immutable_and_retrieved_by_exact_id():
         }},
     }
     record = {
-        "source_id": source_id_for_capture("publisher-a", url, digest, registry_version="1",\n                                           published_at=(now - timedelta(minutes=1)).isoformat(),\n                                           publication_time_attestation="operator_attested"),
+        "source_id": source_id_for_capture("publisher-a", url, digest, registry_version="1",
+                                           published_at=(now - timedelta(minutes=1)).isoformat(),
+                                           publication_time_attestation="operator_attested"),
         "publisher_id": "publisher-a", "publisher_domain": "publisher-a.example",
         "source_url": url, "published_at": (now - timedelta(minutes=1)).isoformat(),
         "retrieved_at": (now - timedelta(seconds=1)).isoformat(),
