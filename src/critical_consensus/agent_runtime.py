@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
@@ -46,7 +47,7 @@ def _validate_result(
         blockers.append("SIGNAL_ID_MISMATCH")
     if not str(result.get("verdict_id", "")).strip():
         blockers.append("VERDICT_ID_MISSING")
-    if not str(result.get("input_hash", "")).startswith("sha256:") or len(str(result.get("input_hash", ""))) != 71:
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", str(result.get("input_hash", ""))) is None:
         blockers.append("INPUT_HASH_INVALID")
     confidence = result.get("confidence")
     if isinstance(confidence, bool):
