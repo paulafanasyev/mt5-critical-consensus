@@ -15,6 +15,7 @@ from .audit import canonical_hash, make_audit_event, verify_audit_chain
 from .calibration import weighted_consensus
 from .gates import certainty_gate, chief_skeptic_pass, permission_gate, user_authorization_gate
 from .risk_controls import risk_controlled_permission
+from .source_provenance import validate_persisted_source_set
 
 _VERDICT_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _VERDICT_FUTURE_SKEW_SECONDS = 30
@@ -80,6 +81,9 @@ def evaluate_signal_bundle(
     require_persisted_risk: bool = False,
     kill_switch_state: Mapping[str, Any] | None = None,
     terminal_risk_snapshot: Mapping[str, Any] | None = None,
+    require_persisted_sources: bool = False,
+    source_evidence_records: Sequence[Mapping[str, Any]] | None = None,
+    source_registry: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate certainty → ChiefAgent → Permission → user authorization, fail-closed.
 
@@ -294,9 +298,28 @@ def evaluate_signal_bundle(
     all_risk_flags.extend(review_blockers)
     all_risk_flags.extend(challenge_blockers)
 
-    raw_key_sources = bundle.get("key_sources", [])
-    if isinstance(raw_key_sources, Sequence) and not isinstance(raw_key_sources, (str, bytes)):
-        for source in raw_key_sources:
+    key_sources: Any = bundle.get("key_sources", [])
+    source_provenance: dict[str, Any] | None = None
+    if require_persisted_sources:
+        source_provenance = validate_persisted_source_set(
+            key_sources, source_evidence_records, source_registry or {}, now=current,
+        )
+        emit("SOURCE_PROVENANCE", {
+            "signal_id": signal_id, "status": source_provenance.get("status"),
+            "blockers": source_provenance.get("blockers", []),
+            "source_count": len(source_provenance.get("sources", [])),
+            "independence_groups": source_provenance.get("independence_groups", []),
+        })
+        if source_provenance.get("status") != "PASS":
+            return finish(
+                "GATHER_MORE",
+                ["PERSISTED_SOURCE_PROVENANCE_NOT_VERIFIED"] + list(source_provenance.get("blockers", [])),
+                source_provenance=source_provenance,
+            )
+        key_sources = source_provenance["sources"]
+
+    if isinstance(key_sources, Sequence) and not isinstance(key_sources, (str, bytes)):
+        for source in key_sources:
             if isinstance(source, Mapping):
                 source_id = str(source.get("source_id", "")).strip()
                 if not source_id or source_id not in allowed_evidence_refs:
@@ -321,7 +344,7 @@ def evaluate_signal_bundle(
         "open_challenges": open_challenges,
         "challenge_resolution_status": resolution_status,
         "contradictions_last_n_hours": bundle.get("contradictions_last_n_hours"),
-        "key_sources": bundle.get("key_sources", []),
+        "key_sources": key_sources,
         "news_or_rumor": bundle.get("news_or_rumor", False),
         "devil_advocate_report": bundle.get("devil_advocate_report"),
         "dissent_rate": bundle.get("dissent_rate"),
@@ -410,7 +433,6 @@ def evaluate_signal_bundle(
     if not math.isfinite(permission_score) or abs(permission_score - consensus_score) > 1e-9:
         metadata_blockers.append("PERMISSION_CONSENSUS_SCORE_MISMATCH")
     source_rows = req.get("sources")
-    key_sources = bundle.get("key_sources", [])
     if not isinstance(source_rows, Sequence) or isinstance(source_rows, (str, bytes)) or not isinstance(key_sources, Sequence) or isinstance(key_sources, (str, bytes)):
         metadata_blockers.append("PERMISSION_SOURCE_SUMMARY_MISSING_OR_INVALID")
     else:
