@@ -191,3 +191,26 @@ async def test_peer_review_rejects_invalid_timeout_policy():
             resolver=lambda challenge, round_no: {"resolved": False},
             review_timeout_seconds=float("inf"),
         )
+
+
+@pytest.mark.asyncio
+async def test_peer_review_cycle_applies_review_timeout_to_sync_challenge_resolver():
+    import time
+
+    def slow_resolver(_challenge, _round_no):
+        time.sleep(0.5)
+        return {"resolved": True, "evidence_refs": ["resolution:evidence:1"]}
+
+    started = time.monotonic()
+    result = await run_peer_review_cycle(
+        VERDICTS, reviewers_for(), allowed_evidence_refs=ALLOWED,
+        resolver=slow_resolver, min_reviewers_per_verdict=2,
+        max_resolution_rounds=1, review_timeout_seconds=0.05,
+    )
+    assert time.monotonic() - started < 0.3
+    assert result["status"] == "ESCALATE"
+    assert result["challenge_resolution_status"] == "DEADLOCK"
+    assert len(result["open_challenges"]) == 2
+    assert all(challenge["last_resolution_attempt"]["error_code"] == "RESOLVER_TIMEOUT"
+               for challenge in result["open_challenges"])
+    assert result["trade_allowed"] is False
