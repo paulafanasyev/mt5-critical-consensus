@@ -7,6 +7,14 @@ import pytest
 from critical_consensus.providers import OpenAICompatibleAgent, canonical_signal_hash, load_agent_specs_from_env
 
 
+def _extract_json_payload(prompt):
+    start = prompt.find("{")
+    if start < 0:
+        raise AssertionError("provider prompt contains no JSON payload")
+    value, _end = json.JSONDecoder().raw_decode(prompt[start:])
+    return value
+
+
 def test_openai_compatible_agent_binds_local_identity_and_rejects_unavailable_evidence(monkeypatch):
     signal = {"signal_id": "s1", "available_evidence_refs": ["market-bars:hash"], "market_snapshot": {"symbol": "EURUSD"}}
     content = json.dumps({"verdict": "ABSTAIN", "confidence": 0.4,
