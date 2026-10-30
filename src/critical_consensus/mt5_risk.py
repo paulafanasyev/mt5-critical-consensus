@@ -73,7 +73,7 @@ def collect_mt5_risk_snapshot(
                         + float(getattr(deal, "commission", 0.0))
                         + float(getattr(deal, "swap", 0.0))
                         + float(getattr(deal, "fee", 0.0)) for deal in deals)
-        daily_loss_fraction = max(0.0, -daily_pnl / float(day_start))
+        # Use equity change rather than realised deal P/L alone so current open losses are included.\n        # Deposits/withdrawals still require an operator-adjusted day-start baseline.\n        daily_loss_fraction = max(0.0, (float(day_start) - equity) / float(day_start))
         drawdown_fraction = max(0.0, (float(equity_peak) - equity) / float(equity_peak))
         correlated = 0
         for position in positions:
