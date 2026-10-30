@@ -59,6 +59,7 @@ def run(bundle_path: Path, output_path: Path, *, persist: bool,
         "order_created": False,
         "human_authorization_processed": False,
         "persisted_risk_checked": False,
+        "persisted_sources_checked": False,
         "source_bundle": bundle_path.name,
         "source_bundle_sha256": canonical_hash(bundle),
         "persistence": None,
@@ -74,13 +75,25 @@ def run(bundle_path: Path, output_path: Path, *, persist: bool,
         instrument = str(permission_request.get("instrument", "")).strip().upper() if isinstance(permission_request, dict) else ""
         kill_switch_state = repo.get_kill_switch_state()
         terminal_risk_snapshot = repo.get_latest_mt5_risk_snapshot(instrument) if instrument else None
+        source_registry = _load_yaml(policy_dir / "source_registry.yaml")
+        raw_key_sources = bundle.get("key_sources", [])
+        source_ids = [
+            str(item.get("source_id", "")).strip()
+            for item in raw_key_sources
+            if isinstance(item, dict) and str(item.get("source_id", "")).strip()
+        ] if isinstance(raw_key_sources, list) else []
+        source_records = repo.get_source_evidence(source_ids)
         result = evaluate_signal_bundle(
             bundle, certainty_policy, permission_matrix,
             require_persisted_risk=True,
             kill_switch_state=kill_switch_state,
             terminal_risk_snapshot=terminal_risk_snapshot,
+            require_persisted_sources=True,
+            source_evidence_records=source_records,
+            source_registry=source_registry,
         )
         report["persisted_risk_checked"] = True
+        report["persisted_sources_checked"] = True
         report["persistence"] = repo.persist_pipeline_result(
             result, signal_input_sha256=signal_input_hash,
         )
@@ -117,6 +130,7 @@ def main() -> int:
         "blockers": result.get("blockers", []),
         "audit_chain_valid": result.get("audit_chain_valid"),
         "persisted_risk_checked": report.get("persisted_risk_checked"),
+        "persisted_sources_checked": report.get("persisted_sources_checked"),
         "decision_id": (report.get("persistence") or {}).get("decision_id"),
         "output": str(args.output),
         "execution_enabled": False,
