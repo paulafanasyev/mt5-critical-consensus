@@ -109,15 +109,25 @@ def risk_snapshot_gate(
             blockers.append("RISK_SNAPSHOT_STALE")
     if snapshot.get("status") != "PASS":
         blockers.append("MT5_RISK_COLLECTION_NOT_PASS")
-    quote_age = _finite(snapshot.get("quote_age_seconds"))
-    quote_age_policy = _finite(snapshot.get("max_quote_age_seconds"))
-    if (quote_age_policy is None or not quote_age_policy.is_integer()
+    raw_quote_age = snapshot.get("quote_age_seconds")
+    quote_age = (
+        float(raw_quote_age)
+        if not isinstance(raw_quote_age, bool) and isinstance(raw_quote_age, (int, float))
+        and math.isfinite(float(raw_quote_age)) else None
+    )
+    raw_quote_age_policy = snapshot.get("max_quote_age_seconds")
+    quote_age_policy = (
+        raw_quote_age_policy
+        if not isinstance(raw_quote_age_policy, bool) and isinstance(raw_quote_age_policy, int)
+        else None
+    )
+    if (quote_age_policy is None
             or not 1 <= quote_age_policy <= MAX_RISK_SNAPSHOT_QUOTE_AGE_SECONDS):
         blockers.append("MT5_QUOTE_AGE_POLICY_INVALID")
     if quote_age is None or quote_age < -5:
         blockers.append("MT5_QUOTE_AGE_INVALID_OR_FUTURE")
-    elif quote_age_policy is not None and (
-            quote_age > min(float(MAX_RISK_SNAPSHOT_QUOTE_AGE_SECONDS), quote_age_policy)):
+    elif quote_age_policy is not None and quote_age > min(
+            float(MAX_RISK_SNAPSHOT_QUOTE_AGE_SECONDS), float(quote_age_policy)):
         blockers.append("MT5_QUOTE_STALE")
     if snapshot.get("account_mode") != "demo":
         blockers.append("MT5_ACCOUNT_NOT_DEMO_OR_UNKNOWN")
