@@ -53,13 +53,12 @@ def run(bundle_path: Path, output_path: Path, *, persist: bool,
 
     certainty_policy = _load_yaml(policy_dir / "certainty_thresholds.yaml")
     permission_matrix = _load_yaml(policy_dir / "permission_matrix.yaml")
-    result = evaluate_signal_bundle(bundle, certainty_policy, permission_matrix)
-
     report: dict[str, Any] = {
-        "result": result,
+        "result": None,
         "execution_enabled": False,
         "order_created": False,
         "human_authorization_processed": False,
+        "persisted_risk_checked": False,
         "source_bundle": bundle_path.name,
         "source_bundle_sha256": canonical_hash(bundle),
         "persistence": None,
@@ -71,9 +70,25 @@ def run(bundle_path: Path, output_path: Path, *, persist: bool,
             raise ValueError("cannot persist a decision without a valid immutable signal_input hash")
         repo = PostgresRepository()
         repo.migrate()
+        permission_request = bundle.get("permission_request")
+        instrument = str(permission_request.get("instrument", "")).strip().upper() if isinstance(permission_request, dict) else ""
+        kill_switch_state = repo.get_kill_switch_state()
+        terminal_risk_snapshot = repo.get_latest_mt5_risk_snapshot(instrument) if instrument else None
+        result = evaluate_signal_bundle(
+            bundle, certainty_policy, permission_matrix,
+            require_persisted_risk=True,
+            kill_switch_state=kill_switch_state,
+            terminal_risk_snapshot=terminal_risk_snapshot,
+        )
+        report["persisted_risk_checked"] = True
         report["persistence"] = repo.persist_pipeline_result(
             result, signal_input_sha256=signal_input_hash,
         )
+    else:
+        # Local/offline evaluation does not attest to the current terminal state.
+        result = evaluate_signal_bundle(bundle, certainty_policy, permission_matrix)
+
+    report["result"] = result
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
@@ -89,7 +104,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=Path("decision-result.json"))
     parser.add_argument("--policy-dir", type=Path, default=ROOT / "config")
     parser.add_argument("--persist", action="store_true",
-                        help="persist the verified audit chain and result to DATABASE_URL")
+                        help="require persisted kill-switch/risk evidence, then persist the verified audit chain and result to DATABASE_URL")
     args = parser.parse_args()
     try:
         report = run(args.bundle, args.output, persist=args.persist, policy_dir=args.policy_dir)
@@ -101,6 +116,7 @@ def main() -> int:
         "status": result.get("status"),
         "blockers": result.get("blockers", []),
         "audit_chain_valid": result.get("audit_chain_valid"),
+        "persisted_risk_checked": report.get("persisted_risk_checked"),
         "decision_id": (report.get("persistence") or {}).get("decision_id"),
         "output": str(args.output),
         "execution_enabled": False,
