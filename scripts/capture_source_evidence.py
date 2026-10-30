@@ -172,12 +172,15 @@ def capture_manifest(manifest_path: Path, registry_path: Path, *, timeout: float
             raise ValueError(f"source entry {index} references a publisher not in source_registry.yaml")
         url = str(item.get("url", "")).strip()
         host = _safe_url(url, profile)
+        has_json_timestamp_pointer = "published_at_json_pointer" in profile
+        configured_pointer = profile.get("published_at_json_pointer")
+        if has_json_timestamp_pointer and (
+            not isinstance(configured_pointer, str) or not configured_pointer.startswith("/")
+            or configured_pointer == "/"
+        ):
+            raise ValueError(f"source entry {index} has an invalid configured JSON timestamp pointer")
         body, content_type = _fetch(url, max_bytes=max_bytes, timeout=timeout)
-        if "published_at_json_pointer" in profile:
-            configured_pointer = profile.get("published_at_json_pointer")
-            if (not isinstance(configured_pointer, str) or not configured_pointer.startswith("/")
-                    or configured_pointer == "/"):
-                raise ValueError(f"source entry {index} has an invalid configured JSON timestamp pointer")
+        if has_json_timestamp_pointer:
             publication_time_field = configured_pointer
             if content_type != "application/json":
                 raise ValueError(f"source entry {index} JSON timestamp pointer requires application/json")
