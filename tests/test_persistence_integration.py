@@ -22,6 +22,8 @@ def test_postgres_migrations_immutable_bars_and_idempotent_event():
     bar = MarketBar(symbol, "H1", stamp, 1.0, 1.2, 0.9, 1.1, 100, 5)
     assert repo.append_market_bars([bar]) == {"inserted": 1, "identical_duplicates": 0, "total": 1}
     assert repo.append_market_bars([bar]) == {"inserted": 0, "identical_duplicates": 1, "total": 1}
+    loaded = repo.get_recent_market_bars(symbol, "H1", limit=21)
+    assert len(loaded) == 1 and loaded[0].close == pytest.approx(1.1)
     changed = MarketBar(symbol, "H1", stamp, 1.0, 1.25, 0.9, 1.1, 100, 5)
     with pytest.raises(ValueError, match="immutable"):
         repo.append_market_bars([changed])
