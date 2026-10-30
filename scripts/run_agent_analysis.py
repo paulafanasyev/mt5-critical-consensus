@@ -133,6 +133,8 @@ async def run(args) -> int:
                 allowed_evidence_refs=signal["available_evidence_refs"],
                 resolver=resolver, min_reviewers_per_verdict=2, max_resolution_rounds=3,
                 review_timeout_seconds=args.timeout,
+                review_cycle_timeout_seconds=args.review_cycle_timeout,
+                challenge_cycle_timeout_seconds=args.challenge_cycle_timeout,
             )
             result["agent_collection"] = dict(result)
             result["peer_review_cycle"] = review_cycle
@@ -200,6 +202,8 @@ def main() -> int:
     parser.add_argument("--timeframe", required=True, choices=["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"])
     parser.add_argument("--bars", type=int, default=200)
     parser.add_argument("--timeout", type=float, default=15.0)
+    parser.add_argument("--review-cycle-timeout", type=float, default=120.0)
+    parser.add_argument("--challenge-cycle-timeout", type=float, default=120.0)
     parser.add_argument("--source-id", action="append", default=[],
                         help="exact persisted trusted source ID; repeat at least twice for distinct publishers")
     parser.add_argument("--minimum-agents", type=int, default=4)
