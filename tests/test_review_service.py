@@ -260,6 +260,9 @@ async def test_peer_review_cycle_has_one_overall_deadline_for_challenges():
         time.sleep(0.15)
         return {"resolved": True, "evidence_refs": ["resolution:evidence:1"]}
 
+    # Earlier timeout tests deliberately leave daemon callbacks running briefly.
+    # Allow their bounded slots to clear so this test measures the overall deadline.
+    time.sleep(0.55)
     started = time.monotonic()
     result = await run_peer_review_cycle(
         VERDICTS, reviewers_for(), allowed_evidence_refs=ALLOWED,
@@ -276,3 +279,27 @@ async def test_peer_review_cycle_has_one_overall_deadline_for_challenges():
     assert 1 <= len(calls) <= 2
     time.sleep(0.2)  # Let bounded daemon callbacks release their slots before the next test.
     assert result["trade_allowed"] is False
+
+
+@pytest.mark.asyncio
+async def test_peer_review_cycle_rejects_invalid_overall_timeout_budgets():
+    common = dict(
+        verdicts=VERDICTS, reviewers=reviewers_for(), allowed_evidence_refs=ALLOWED,
+        resolver=lambda challenge, round_no: {"resolved": False, "evidence_refs": []},
+    )
+    for key in ("review_cycle_timeout_seconds", "challenge_cycle_timeout_seconds"):
+        result = await run_peer_review_cycle(**common, **{key: float("inf")})
+        assert result["status"] == "GATHER_MORE"
+        assert result["trade_allowed"] is False
+        assert key.upper() + "_INVALID" in result["blockers"]
+
+
+@pytest.mark.asyncio
+async def test_peer_review_cycle_rejects_fractional_reviewer_count():
+    result = await run_peer_review_cycle(
+        VERDICTS, reviewers_for(), allowed_evidence_refs=ALLOWED,
+        resolver=lambda challenge, round_no: {"resolved": False, "evidence_refs": []},
+        min_reviewers_per_verdict=1.5,
+    )
+    assert result["status"] == "GATHER_MORE"
+    assert "PEER_REVIEWER_POLICY_INVALID" in result["blockers"]
