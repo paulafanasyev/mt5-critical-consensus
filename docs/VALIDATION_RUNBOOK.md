@@ -54,7 +54,7 @@ The `independence_group` value is declared metadata only. It is **not proof** th
 
 The persisted decision path accepts source reports only when every `key_sources[].source_id` resolves to a byte-exact immutable capture in PostgreSQL and the source matches `config/source_registry.yaml`. The registry is intentionally empty by default. Do not add a publisher until its official HTTPS domain, actual independence group, policy credibility weight, TTL and permitted publication-time attestation have been reviewed. Different hostnames do not establish independent ownership or independent reporting.
 
-After adding an approved publisher profile, create a manifest containing the publisher ID, exact HTTPS article/API URL, publication timestamp and the attestation basis:
+After adding an approved publisher profile, create a manifest containing the publisher ID and exact HTTPS article/API URL. A publisher without a configured timestamp pointer also needs an explicitly inspected `published_at` value and `operator_attested` basis:
 
 ```json
 {
@@ -69,13 +69,30 @@ After adding an approved publisher profile, create a manifest containing the pub
 }
 ```
 
+For a publisher-specific JSON API whose timestamp field was verified by the operator, configure the profile as follows (the example pointer must be replaced with the real field path from that API):
+
+```yaml
+publishers:
+  OPERATOR_REVIEWED_ID:
+    domains: ["approved.example"]
+    independence_group: "OPERATOR_REVIEWED_GROUP"
+    credibility: 0.90
+    ttl_seconds: 900
+    allowed_publication_time_attestations: ["publisher_json_pointer"]
+    published_at_json_pointer: "/metadata/published_at"
+    allowed_query_parameters: []
+```
+
+For that profile, the manifest can omit both `published_at` and `publication_time_attestation`; the capture tool derives both timestamp and attestation from the configured pointer. Do not enable this mode unless the endpoint and timestamp semantics have been checked against the publisher's official API documentation.
+
+
 Then run:
 
 ```bash
 python scripts/capture_source_evidence.py source-manifest.json
 ```
 
-The generic fetcher accepts only the explicit `operator_attested` publication-time basis; it does not pretend to extract or verify publisher timestamps automatically. It refuses non-HTTPS URLs, redirects, unapproved domains, IP literals, unapproved or credential-like query parameters, unsupported response types and oversized documents. DNS is resolved before connect; every answer must be public/global, and the TLS connection is pinned to one of those validated IPs while preserving hostname SNI and certificate verification, preventing DNS rebinding to loopback/private services. It stores exact response bytes, SHA-256, retrieval time and registry-derived metadata in append-only `source_evidence`. An operator must inspect the publication date and attest it; that attestation remains an operator assertion, not cryptographic proof. A persisted decision also requires at least two configured independence groups. Keep the registry empty rather than promoting guessed domains or scores.
+For an API that returns a timezone-aware ISO-8601 publication field, the operator may configure `published_at_json_pointer` in that publisher's registry profile and set `allowed_publication_time_attestations: ["publisher_json_pointer"]`. The capture script derives the timestamp from the exact captured JSON bytes, persists the pointer and re-verifies the same field on every later source validation. A mismatch, missing field or malformed pointer blocks capture. Without this per-publisher JSON API configuration, the generic fetcher accepts only the explicit `operator_attested` basis; the operator must inspect and supply `published_at`. A JSON Pointer check proves which timestamp the allowlisted publisher response declared; it does not independently prove that the date is truthful or that the report is independent. It refuses non-HTTPS URLs, redirects, unapproved domains, IP literals, unapproved or credential-like query parameters, unsupported response types and oversized documents. DNS is resolved before connect; every answer must be public/global, and the TLS connection is pinned to one of those validated IPs while preserving hostname SNI and certificate verification, preventing DNS rebinding to loopback/private services. It stores exact response bytes, SHA-256, retrieval time and registry-derived metadata in append-only `source_evidence`. An operator must inspect the publication date and attest it; that attestation remains an operator assertion, not cryptographic proof. A persisted decision also requires at least two configured independence groups. Keep the registry empty rather than promoting guessed domains or scores.
 
 
 
