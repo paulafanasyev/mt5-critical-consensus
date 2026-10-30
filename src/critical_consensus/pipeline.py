@@ -116,6 +116,20 @@ def evaluate_signal_bundle(
 
     emit("SIGNAL_RECEIVED", {"signal_id": signal_id or "unknown", "bundle_hash": canonical_hash(bundle)})
 
+    signal_input = bundle.get("signal_input")
+    supplied_signal_hash = bundle.get("signal_input_hash")
+    if not isinstance(signal_input, Mapping) or not signal_id:
+        emit("SIGNAL_INPUT_BINDING", {"signal_id": signal_id or "unknown", "status": "FAILED",
+                                      "reason": "SIGNAL_INPUT_OR_HASH_MISSING"})
+        return finish("GATHER_MORE", ["SIGNAL_INPUT_OR_HASH_MISSING"])
+    expected_signal_hash = canonical_hash(signal_input)
+    if supplied_signal_hash != expected_signal_hash:
+        emit("SIGNAL_INPUT_BINDING", {"signal_id": signal_id, "status": "FAILED",
+                                      "reason": "SIGNAL_INPUT_HASH_MISMATCH"})
+        return finish("GATHER_MORE", ["SIGNAL_INPUT_HASH_MISMATCH"])
+    emit("SIGNAL_INPUT_BINDING", {"signal_id": signal_id, "status": "PASSED",
+                                  "signal_input_hash": expected_signal_hash})
+
     raw_verdicts = bundle.get("verdicts")
     verdicts = [dict(v) for v in _as_records(raw_verdicts)]
     if not verdicts:
@@ -132,6 +146,8 @@ def evaluate_signal_bundle(
             f"VERDICT_{index}:{blocker}"
             for blocker in _validate_verdict_metadata(verdict, signal_id, current)
         )
+        if verdict.get("input_hash") != expected_signal_hash:
+            metadata_blockers.append(f"VERDICT_{index}:VERDICT_INPUT_HASH_DOES_NOT_MATCH_SIGNAL_INPUT")
     if metadata_blockers:
         emit("VERDICT_METADATA_VALIDATION", {"signal_id": signal_id or "unknown", "status": "FAILED",
                                                "blockers": sorted(set(metadata_blockers))})
