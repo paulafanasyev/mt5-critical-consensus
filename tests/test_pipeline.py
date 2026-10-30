@@ -390,3 +390,16 @@ def test_persisted_pipeline_permission_fails_closed_when_risk_snapshot_missing()
     assert result["status"] == "DENY"
     assert "RISK_SNAPSHOT_MISSING" in result["blockers"]
     assert result["trade_allowed"] is False
+
+
+def test_persisted_pipeline_requires_database_backed_source_provenance_before_certainty():
+    bundle = make_bundle()
+    result = evaluate_signal_bundle(
+        bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
+        require_persisted_sources=True, source_evidence_records=[], source_registry={"publishers": {}},
+    )
+    assert result["status"] == "GATHER_MORE"
+    assert "PERSISTED_SOURCE_PROVENANCE_NOT_VERIFIED" in result["blockers"]
+    assert "certainty" not in result["details"]
+    assert result["audit_chain_valid"] is True
+    assert result["trade_allowed"] is False
