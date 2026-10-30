@@ -134,6 +134,13 @@ def capture_manifest(manifest_path: Path, registry_path: Path, *, timeout: float
     return output
 
 
+def _load_registry(path: Path) -> dict:
+    value = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(value, dict):
+        raise ValueError("source registry policy must be an object")
+    return value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path, help="JSON publisher/url/published_at manifest")
@@ -147,7 +154,7 @@ def main() -> int:
         records = capture_manifest(args.manifest, args.registry, timeout=args.timeout)
         repo = PostgresRepository()
         repo.migrate()
-        stored = [repo.record_source_evidence(record) for record in records]
+        stored = [repo.record_source_evidence(record, registry=_load_registry(args.registry)) for record in records]
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError, yaml.YAMLError) as exc:
         parser.error(str(exc))
     print(json.dumps({
