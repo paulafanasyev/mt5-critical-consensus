@@ -173,9 +173,12 @@ def capture_manifest(manifest_path: Path, registry_path: Path, *, timeout: float
         url = str(item.get("url", "")).strip()
         host = _safe_url(url, profile)
         body, content_type = _fetch(url, max_bytes=max_bytes, timeout=timeout)
-        configured_pointer = profile.get("published_at_json_pointer")
-        if isinstance(configured_pointer, str) and configured_pointer.strip():
-            publication_time_field = configured_pointer.strip()
+        if "published_at_json_pointer" in profile:
+            configured_pointer = profile.get("published_at_json_pointer")
+            if (not isinstance(configured_pointer, str) or not configured_pointer.startswith("/")
+                    or configured_pointer == "/"):
+                raise ValueError(f"source entry {index} has an invalid configured JSON timestamp pointer")
+            publication_time_field = configured_pointer
             if content_type != "application/json":
                 raise ValueError(f"source entry {index} JSON timestamp pointer requires application/json")
             try:
