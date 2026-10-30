@@ -41,9 +41,15 @@ def _stamp(value: Any) -> datetime | None:
 
 def _host_allowed(host: str, domains: Sequence[str]) -> bool:
     host = host.lower().rstrip(".")
-    return any(host == domain.lower().rstrip(".")
-               or host.endswith("." + domain.lower().rstrip("."))
-               for domain in domains)
+    if not isinstance(domains, Sequence) or isinstance(domains, (str, bytes)):
+        return False
+    for domain in domains:
+        if not isinstance(domain, str) or not domain.strip():
+            continue
+        normalized = domain.strip().lower().rstrip(".")
+        if host == normalized or host.endswith("." + normalized):
+            return True
+    return False
 
 
 def source_id_for_capture(
@@ -69,8 +75,8 @@ def validate_source_capture(
     """Validate a persisted source record against explicit publisher allowlist configuration."""
     if not isinstance(record, Mapping) or not isinstance(registry, Mapping):
         return {"status": "DENY", "blockers": ["SOURCE_RECORD_OR_REGISTRY_INVALID"], "trade_allowed": False}
-    current = now or datetime.now(timezone.utc)
-    if current.tzinfo is None or current.utcoffset() is None:
+    current = now if now is not None else datetime.now(timezone.utc)
+    if not isinstance(current, datetime) or current.tzinfo is None or current.utcoffset() is None:
         return {"status": "DENY", "blockers": ["SOURCE_VALIDATION_TIME_INVALID"], "trade_allowed": False}
     current = current.astimezone(timezone.utc)
     blockers: list[str] = []
@@ -81,7 +87,8 @@ def validate_source_capture(
         blockers.append("SOURCE_PUBLISHER_NOT_ALLOWLISTED")
         profile = {}
     domains = profile.get("domains", [])
-    if not isinstance(domains, Sequence) or isinstance(domains, (str, bytes)) or not domains:
+    if (not isinstance(domains, Sequence) or isinstance(domains, (str, bytes)) or not domains
+            or any(not isinstance(domain, str) or not domain.strip() for domain in domains)):
         blockers.append("SOURCE_PUBLISHER_DOMAIN_POLICY_MISSING")
         domains = []
 
@@ -126,16 +133,26 @@ def validate_source_capture(
     if retrieved is None:
         blockers.append("SOURCE_RETRIEVAL_TIME_INVALID")
     if published is not None and retrieved is not None:
-        max_future = _number(registry.get("max_clock_skew_seconds", 60)) or 60
+        max_future = _number(registry.get("max_clock_skew_seconds", 60))
+        max_capture_age = _number(registry.get("max_capture_age_seconds", 300))
+        max_source_age = _number(registry.get("max_source_age_seconds", 900))
+        if max_future is None or max_future < 0:
+            blockers.append("SOURCE_CLOCK_SKEW_POLICY_INVALID")
+            max_future = 60
+        if max_capture_age is None or max_capture_age <= 0:
+            blockers.append("SOURCE_CAPTURE_AGE_POLICY_INVALID")
+            max_capture_age = 300
+        if max_source_age is None or max_source_age <= 0:
+            blockers.append("SOURCE_MAX_AGE_POLICY_INVALID")
+            max_source_age = 900
         if (published - retrieved).total_seconds() > max_future:
             blockers.append("SOURCE_PUBLICATION_TIME_IN_FUTURE")
         if (retrieved - current).total_seconds() > max_future:
             blockers.append("SOURCE_RETRIEVAL_TIME_IN_FUTURE")
-        max_capture_age = _number(registry.get("max_capture_age_seconds", 300)) or 300
         if (current - retrieved).total_seconds() > max_capture_age:
             blockers.append("SOURCE_CAPTURE_STALE")
         age = (current - published).total_seconds()
-        max_age = min(float(ttl or 0), _number(registry.get("max_source_age_seconds", 900)) or 900)
+        max_age = min(float(ttl or 0), max_source_age)
         if age < -max_future:
             blockers.append("SOURCE_PUBLICATION_TIME_IN_FUTURE")
         elif age > max_age:
@@ -146,7 +163,7 @@ def validate_source_capture(
     attestation = str(record.get("publication_time_attestation", "")).strip()
     allowed_attestations = profile.get("allowed_publication_time_attestations", [])
     if (not isinstance(allowed_attestations, Sequence) or isinstance(allowed_attestations, (str, bytes))
-            or attestation not in allowed_attestations):
+            or attestation != "operator_attested" or attestation not in allowed_attestations):
         blockers.append("SOURCE_PUBLICATION_TIME_ATTESTATION_NOT_ALLOWED")
 
     digest = str(record.get("content_sha256", ""))
@@ -165,7 +182,12 @@ def validate_source_capture(
         content_bytes = int(record.get("content_bytes"))
     except (TypeError, ValueError, OverflowError):
         content_bytes = 0
-    max_content = int(registry.get("max_content_bytes", 512_000))
+    max_content_value = _number(registry.get("max_content_bytes", 512_000))
+    if (max_content_value is None or max_content_value < 1 or not max_content_value.is_integer()):
+        blockers.append("SOURCE_MAX_CONTENT_POLICY_INVALID")
+        max_content = 512_000
+    else:
+        max_content = int(max_content_value)
     if content_bytes < 1 or content_bytes > max_content or content_bytes != len(actual_bytes):
         blockers.append("SOURCE_CAPTURE_SIZE_INVALID")
     if str(record.get("capture_method", "")) != "https_fetch":
