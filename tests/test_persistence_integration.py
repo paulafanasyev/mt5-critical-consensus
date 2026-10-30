@@ -158,6 +158,7 @@ def test_publisher_source_capture_is_immutable_and_retrieved_by_exact_id():
         "content_sha256": digest, "content_bytes": len(body), "captured_content": body,
         "response_content_type": "application/json",
         "publication_time_attestation": "operator_attested",
+        "publication_time_field": "",
         "capture_method": "https_fetch", "registry_version": "1",
     }
     first = repo.record_source_evidence(record, registry=registry)
