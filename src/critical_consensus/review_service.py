@@ -67,6 +67,8 @@ async def run_peer_review_cycle(
     min_reviewers_per_verdict: int = 2,
     max_resolution_rounds: int = 3,
     review_timeout_seconds: float = 30.0,
+    review_cycle_timeout_seconds: float = 120.0,
+    challenge_cycle_timeout_seconds: float = 120.0,
 ) -> dict[str, Any]:
     """Create anonymized reviews and resolve registered challenges without author self-review."""
     if (not isinstance(allowed_evidence_refs, Sequence)
@@ -86,6 +88,18 @@ async def run_peer_review_cycle(
             "challenge_resolution_status": "MISSING", "trade_allowed": False,
         }
     allowed = set(allowed_list)
+    for timeout_name, timeout_value in (
+        ("review_cycle_timeout_seconds", review_cycle_timeout_seconds),
+        ("challenge_cycle_timeout_seconds", challenge_cycle_timeout_seconds),
+    ):
+        if (isinstance(timeout_value, bool) or not isinstance(timeout_value, (int, float))
+                or not float(timeout_value) > 0 or float(timeout_value) > 600
+                or not __import__("math").isfinite(float(timeout_value))):
+            return {
+                "status": "GATHER_MORE", "blockers": [f"{timeout_name.upper()}_INVALID"],
+                "peer_reviews": [], "challenge_records": [], "open_challenges": [],
+                "challenge_resolution_status": "MISSING", "trade_allowed": False,
+            }
     if not callable(resolver) or max_resolution_rounds < 1 or max_resolution_rounds > 3:
         return {
             "status": "GATHER_MORE", "blockers": ["CHALLENGE_RESOLVER_OR_ROUND_POLICY_INVALID"],
@@ -118,6 +132,7 @@ async def run_peer_review_cycle(
     reviews = await anonymized_peer_review(
         verdicts, reviewers, min_reviewers_per_verdict=min_reviewers_per_verdict,
         review_timeout_seconds=review_timeout_seconds,
+        overall_timeout_seconds=review_cycle_timeout_seconds,
     )
     blockers: list[str] = []
     review_counts = {verdict_id: 0 for verdict_id in verdict_ids}
@@ -174,6 +189,7 @@ async def run_peer_review_cycle(
     resolution = challenge_resolution_loop(
         challenges, resolver, max_rounds=max_resolution_rounds,
         resolver_timeout_seconds=review_timeout_seconds,
+        overall_timeout_seconds=challenge_cycle_timeout_seconds,
     )
     resolved: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
