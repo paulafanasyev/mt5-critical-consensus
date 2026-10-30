@@ -398,3 +398,22 @@ def test_fetch_revalidates_publisher_allowlist_before_dns(monkeypatch):
     except ValueError as exc:
         assert "allowlisted HTTPS publisher URL" in str(exc)
 
+def test_dns_resolution_rejects_nat64_addresses_that_embed_private_ipv4(monkeypatch):
+    nat64_loopback = (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("64:ff9b::7f00:1", 443, 0, 0))
+    monkeypatch.setattr(CAPTURE.socket, "getaddrinfo", lambda *args, **kwargs: [nat64_loopback])
+    try:
+        CAPTURE._resolve_public_addresses("official-a.example")
+        assert False, "NAT64 embedding loopback must be rejected"
+    except ValueError as exc:
+        assert "IPv6 transition" in str(exc)
+
+
+def test_dns_resolution_rejects_6to4_addresses_that_embed_private_ipv4(monkeypatch):
+    six_to_four_loopback = (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2002:7f00:1::", 443, 0, 0))
+    monkeypatch.setattr(CAPTURE.socket, "getaddrinfo", lambda *args, **kwargs: [six_to_four_loopback])
+    try:
+        CAPTURE._resolve_public_addresses("official-a.example")
+        assert False, "6to4 embedding loopback must be rejected"
+    except ValueError as exc:
+        assert "non-public" in str(exc) or "IPv6 transition" in str(exc)
+
