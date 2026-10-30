@@ -45,6 +45,8 @@ def _validated_evidence_context(
         output[source_id] = text_value
     if len(output) > 13:
         raise ValueError("evidence_context may include at most 13 documents")
+    if set(output) != allowed:
+        raise ValueError("evidence_context must include every allowlisted evidence item")
     return output
 
 
@@ -158,7 +160,7 @@ class OpenAICompatibleAgent:
             "allowed_evidence_refs": list(allowed),
             "untrusted_source_documents": [
                 {"source_id": ref, "text": evidence_context[ref]}
-                for ref in sorted(referenced) if ref in evidence_context
+                for ref in sorted(evidence_context)
             ],
         }
         prompt = (
@@ -188,7 +190,7 @@ class OpenAICompatibleAgent:
         allowed_set = set(allowed)
         if (stance not in {"CONFIRM", "CHALLENGE"} or not argument
                 or not isinstance(refs, list) or not refs
-                or any(not isinstance(ref, str) or ref not in allowed_set for ref in refs)
+                or any(not isinstance(ref, str) or ref not in set(evidence_context) for ref in refs)
                 or (stance == "CHALLENGE" and challenge_type not in valid_types)):
             raise RuntimeError("provider_peer_review_invalid")
         return {
@@ -227,7 +229,7 @@ class OpenAICompatibleAgent:
             "allowed_evidence_refs": list(allowed),
             "untrusted_source_documents": [
                 {"source_id": ref, "text": evidence_context[ref]}
-                for ref in referenced if ref in evidence_context
+                for ref in sorted(evidence_context)
             ],
         }
         prompt = (
@@ -252,7 +254,7 @@ class OpenAICompatibleAgent:
         if not isinstance(resolved, bool):
             raise RuntimeError("provider_challenge_resolution_invalid")
         if resolved and (not isinstance(refs, list) or not refs
-                         or any(not isinstance(ref, str) or ref not in allowed_set for ref in refs)
+                         or any(not isinstance(ref, str) or ref not in set(evidence_context) for ref in refs)
                          or not summary):
             raise RuntimeError("provider_challenge_resolution_evidence_invalid")
         if not resolved:
