@@ -29,7 +29,8 @@ def collect_mt5_risk_snapshot(
     *, symbol: str, day_start_equity: float | None, equity_high_watermark: float | None,
     proposed_request: Mapping[str, Any] | None, symbol_groups: Mapping[str, str],
     now: datetime | None = None, terminal_path: str | None = None,
-    max_positions: int = 1000, max_slippage_points: int = 20, max_quote_age_seconds: int = 15,
+    max_positions: int = 1000, max_slippage_points: int = 20,
+    max_spread_points: int = 20, max_quote_age_seconds: int = 15,
 ) -> dict[str, Any]:
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None or current.utcoffset() is None:
@@ -47,6 +48,8 @@ def collect_mt5_risk_snapshot(
         blockers.append("EQUITY_HIGH_WATERMARK_MISSING_OR_INVALID")
     if isinstance(max_slippage_points, bool) or not isinstance(max_slippage_points, int) or max_slippage_points < 0:
         blockers.append("MAX_SLIPPAGE_POLICY_INVALID")
+    if isinstance(max_spread_points, bool) or not isinstance(max_spread_points, int) or max_spread_points < 0:
+        blockers.append("MAX_SPREAD_POLICY_INVALID")
     group = str(symbol_groups.get(symbol, "")).strip() if isinstance(symbol_groups, Mapping) else ""
     if not group:
         blockers.append("SYMBOL_CORRELATION_GROUP_UNKNOWN")
@@ -123,8 +126,17 @@ def collect_mt5_risk_snapshot(
             return {"status": "DENY", "blockers": ["MT5_TICK_RISK_SPECIFICATION_INVALID"], "account_mode": mode, "trade_allowed": False}
         if point is None or point <= 0:
             return {"status": "DENY", "blockers": ["MT5_SYMBOL_POINT_INVALID"], "account_mode": mode, "trade_allowed": False}
-        reference_price = _number(getattr(tick, "ask" if direction == "BUY" else "bid", None))
-        if reference_price is None or reference_price <= 0:
+        bid = _number(getattr(tick, "bid", None))
+        ask = _number(getattr(tick, "ask", None))
+        if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
+            return {"status": "DENY", "blockers": ["MT5_BID_ASK_INVALID"], "account_mode": mode, "trade_allowed": False}
+        spread_points = (ask - bid) / point
+        if not math.isfinite(spread_points) or spread_points < 0:
+            return {"status": "DENY", "blockers": ["MT5_SPREAD_INVALID"], "account_mode": mode, "trade_allowed": False}
+        if spread_points > max_spread_points:
+            blockers.append("MT5_SPREAD_LIMIT_EXCEEDED")
+        reference_price = ask if direction == "BUY" else bid
+        if reference_price <= 0:
             return {"status": "DENY", "blockers": ["MT5_REFERENCE_PRICE_INVALID"], "account_mode": mode, "trade_allowed": False}
         slippage_points = abs(reference_price - expected_price) / point
         if slippage_points > max_slippage_points:
@@ -185,9 +197,11 @@ def collect_mt5_risk_snapshot(
             "request_binding_sha256": request_hash,
             "request_binding": {"instrument": symbol, "direction": direction, "size": size,
                                 "expected_price": expected_price, "sl_tp": {"sl": stop_loss, "tp": take_profit}},
-            "reference_price": reference_price, "quote_age_seconds": quote_age_seconds,
-            "max_quote_age_seconds": max_quote_age_seconds, "slippage_points_at_capture": slippage_points,
-            "max_slippage_points": max_slippage_points, "open_positions": len(positions),
+            "reference_price": reference_price, "bid": bid, "ask": ask,
+            "spread_points": spread_points, "max_spread_points": max_spread_points,
+            "quote_age_seconds": quote_age_seconds, "max_quote_age_seconds": max_quote_age_seconds,
+            "slippage_points_at_capture": slippage_points, "max_slippage_points": max_slippage_points,
+            "open_positions": len(positions),
             "correlated_open_positions": correlated, "position_symbols": position_symbols,
             "unknown_position_group_symbols": unknown_groups, "daily_deals_count": len(deals),
             "within_high_impact_news_window": None, "news_status": "NOT_CONNECTED_FAIL_CLOSED",
