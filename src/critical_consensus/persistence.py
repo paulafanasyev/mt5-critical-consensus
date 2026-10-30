@@ -16,6 +16,7 @@ from typing import Any, Iterable, Mapping
 
 from .market_data import MarketBar, validate_bar_series
 from .audit import verify_audit_chain
+from .source_provenance import validate_source_capture
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -125,10 +126,14 @@ class PostgresRepository:
             for row in reversed(rows)
         ]
 
-    def record_source_evidence(self, record: Mapping[str, Any]) -> dict[str, Any]:
+    def record_source_evidence(self, record: Mapping[str, Any], *, registry: Mapping[str, Any]) -> dict[str, Any]:
         """Store a publisher capture and its exact bytes immutably; identical replays are idempotent."""
-        if not isinstance(record, Mapping):
-            raise ValueError("source evidence record must be an object")
+        if not isinstance(record, Mapping) or not isinstance(registry, Mapping):
+            raise ValueError("source evidence record and registry must be objects")
+        validation = validate_source_capture(record, registry)
+        if validation.get("status") != "PASS":
+            raise ValueError("source evidence failed publisher provenance policy: " +
+                             ",".join(validation.get("blockers", [])))
         required = (
             "source_id", "publisher_id", "publisher_domain", "source_url", "published_at",
             "retrieved_at", "independence_group", "credibility", "ttl_seconds",
