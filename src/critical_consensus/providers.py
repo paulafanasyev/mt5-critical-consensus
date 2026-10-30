@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
+import threading
 import urllib.error
 import urllib.request
 import uuid
@@ -12,6 +13,49 @@ from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 import ipaddress
+
+
+_PROVIDER_CALL_SLOTS = threading.BoundedSemaphore(16)
+
+
+async def _run_provider_call(function, *args):
+    """Run blocking provider I/O in a bounded daemon thread, not asyncio's default executor."""
+    loop = asyncio.get_running_loop()
+    if not _PROVIDER_CALL_SLOTS.acquire(blocking=False):
+        raise RuntimeError("provider_worker_capacity_exhausted")
+    future = loop.create_future()
+
+    def deliver_result(value):
+        if not future.done():
+            future.set_result(value)
+
+    def deliver_error(error):
+        if not future.done():
+            future.set_exception(error)
+
+    def worker():
+        try:
+            result = function(*args)
+        except BaseException as exc:
+            try:
+                loop.call_soon_threadsafe(deliver_error, exc)
+            except RuntimeError:
+                pass  # The awaiting event loop may already have been closed after cancellation.
+        else:
+            try:
+                loop.call_soon_threadsafe(deliver_result, result)
+            except RuntimeError:
+                pass
+        finally:
+            _PROVIDER_CALL_SLOTS.release()
+
+    thread = threading.Thread(target=worker, name="cc-provider-call", daemon=True)
+    try:
+        thread.start()
+    except Exception:
+        _PROVIDER_CALL_SLOTS.release()
+        raise
+    return await future
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -105,7 +149,7 @@ class OpenAICompatibleAgent:
             raise ValueError("ttl_seconds must be in [1,3600]")
 
     async def __call__(self, signal: Mapping[str, Any]) -> Mapping[str, Any]:
-        return await asyncio.to_thread(self._call_sync, signal)
+        return await _run_provider_call(self._call_sync, signal)
 
     def _request_json_sync(self, *, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         """Call a provider with a bounded JSON-only response and no redirects."""
@@ -158,7 +202,7 @@ class OpenAICompatibleAgent:
         context = _validated_evidence_context(evidence_context, allowed)
 
         async def review(target: dict[str, Any], peers: list[dict[str, Any]]) -> Mapping[str, Any]:
-            return await asyncio.to_thread(self._review_sync, target, peers, allowed, context)
+            return await _run_provider_call(self._review_sync, target, peers, allowed, context)
         return review
 
     def _review_sync(
