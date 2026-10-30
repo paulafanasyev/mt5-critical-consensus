@@ -46,10 +46,15 @@ def _host_allowed(host: str, domains: Sequence[str]) -> bool:
                for domain in domains)
 
 
-def source_id_for_capture(publisher_id: str, url: str, content_sha256: str) -> str:
-    """Derive a stable ID from publisher, canonical URL and the actual captured bytes."""
+def source_id_for_capture(
+    publisher_id: str, url: str, content_sha256: str, *,
+    registry_version: str = "", published_at: str = "", publication_time_attestation: str = "",
+) -> str:
+    """Derive an immutable ID from publisher, bytes, policy version and date attestation."""
     payload = json.dumps(
-        {"publisher_id": publisher_id, "url": url, "content_sha256": content_sha256},
+        {"publisher_id": publisher_id, "url": url, "content_sha256": content_sha256,
+         "registry_version": registry_version, "published_at": published_at,
+         "publication_time_attestation": publication_time_attestation},
         sort_keys=True, separators=(",", ":"), ensure_ascii=False,
     )
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -167,7 +172,12 @@ def validate_source_capture(
     if str(record.get("registry_version", "")).strip() != registry_version or not registry_version:
         blockers.append("SOURCE_REGISTRY_VERSION_MISMATCH")
 
-    expected_source_id = source_id_for_capture(publisher_id, raw_url, digest) if _SHA256_RE.fullmatch(digest) else ""
+    expected_source_id = source_id_for_capture(
+        publisher_id, raw_url, digest,
+        registry_version=str(registry.get("version", "")),
+        published_at=published.isoformat() if published is not None else "",
+        publication_time_attestation=attestation,
+    ) if _SHA256_RE.fullmatch(digest) else ""
     if not expected_source_id or str(record.get("source_id", "")) != expected_source_id:
         blockers.append("SOURCE_ID_CONTENT_BINDING_MISMATCH")
 
