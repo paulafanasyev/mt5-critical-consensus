@@ -76,7 +76,16 @@ Do not describe the EA as compiled or forward-tested until those host-side artif
 
 ## 6. Risk and kill switch
 
-Before each demo order, the external execution service must supply a fresh risk snapshot, check absolute and percentage exposure, daily loss, drawdown, correlated positions, broker volume/stop constraints, market/news window and kill-switch status. Any missing or stale risk value must block. The current policy gates reject absent risk snapshots and block configured risk flags, but live account-state integration and broker reconciliation still require a host-level test.
+Capture a read-only terminal risk snapshot on the Windows MT5 host and persist it. The account-day baseline and equity high-water mark must be verified by the operator; if those are unavailable, the collector returns DENY instead of inventing drawdown. Supply a symbol-to-exposure-group JSON file covering every tradable symbol and its existing positions. The snapshot reads account equity/balance, open positions and current-day deal P/L; it does not send orders. The news-window field stays unknown because a news calendar is not integrated, so the risk-controlled permission check remains DENY until a verified news adapter is provided.
+
+```powershell
+$env:DATABASE_URL = "postgresql://USER:PASSWORD@DB_HOST:5432/mt5cc"
+python scripts/capture_mt5_risk.py --symbol EURUSD --day-start-equity 10000 --equity-high-watermark 10200 --risk-fraction 0.002 --symbol-groups .\\symbol-groups.json
+```
+
+The global emergency stop is persisted and active by default. Inspect it with authenticated `GET /v1/risk/kill-switch`; activate it with authenticated `POST /v1/risk/kill-switch`. Disabling requires both the bridge key and a separately configured `MT5_KILL_SWITCH_ADMIN_TOKEN` of at least 32 characters, supplied in `X-Kill-Switch-Admin`. Every switch change is added to an append-only hash-linked event log. The separate admin token is an operational guard, not a substitute for a proper TOTP/signature flow.
+
+The risk-controlled permission endpoint requires an inactive persisted kill switch, a passing snapshot no older than 15 seconds, demo-account mode, operator-provided baselines and policy risk fields. Missing database, missing row, stale snapshot or unknown field is a deny. Before each demo order, the external execution service must also check broker volume/stop constraints and position reconciliation. The news-window field remains fail-closed while the calendar integration is absent.
 
 Use a demo account only. Test at least: missing SL, missing TP, stale command, duplicate client order ID, adverse slippage, volume-step mismatch, closed market, rejected OrderCheck, network timeout after OrderSend and kill-switch activation. An ambiguous broker response requires reconciliation; never blindly retry.
 
