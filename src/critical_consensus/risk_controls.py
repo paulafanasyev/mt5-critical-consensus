@@ -84,6 +84,10 @@ def risk_snapshot_gate(
     max_age_seconds: int = 15,
 ) -> dict[str, Any]:
     """Validate freshness and coverage of a read-only MT5 account risk snapshot."""
+    if (isinstance(max_age_seconds, bool) or not isinstance(max_age_seconds, int)
+            or not 1 <= max_age_seconds <= 300):
+        return {"status": "DENY", "trade_allowed": False,
+                "blockers": ["RISK_SNAPSHOT_MAX_AGE_POLICY_INVALID"]}
     if not isinstance(snapshot, Mapping):
         return {"status": "DENY", "trade_allowed": False, "blockers": ["RISK_SNAPSHOT_MISSING"]}
     current = now or datetime.now(timezone.utc)
