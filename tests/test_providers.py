@@ -15,13 +15,15 @@ def test_openai_compatible_agent_binds_local_identity_and_rejects_unavailable_ev
     envelope = {"choices": [{"message": {"content": content}}]}
     response = io.BytesIO(json.dumps(envelope).encode())
 
-    def fake_urlopen(request, timeout):
-        assert request.get_header("Authorization") == "Bearer test-secret"
-        assert timeout == 2.0
-        assert urlparse(request.full_url).scheme == "https"
-        return response
+    class FakeOpener:
+        def open(self, request, timeout):
+            assert request.get_header("Authorization") == "Bearer test-secret"
+            assert timeout == 2.0
+            assert urlparse(request.full_url).scheme == "https"
+            return response
 
-    monkeypatch.setattr("critical_consensus.providers.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("critical_consensus.providers.urllib.request.build_opener",
+                        lambda *handlers: FakeOpener())
     agent = OpenAICompatibleAgent(agent_id="technical", model="test-model", api_key="test-secret",
                                   timeout_seconds=2.0)
     import asyncio
@@ -35,8 +37,10 @@ def test_openai_compatible_agent_binds_local_identity_and_rejects_unavailable_ev
         "verdict": "APPROVE", "confidence": 0.9, "evidence_refs": ["made-up-source"],
         "abstain_reason": "", "rationale": "fabricated citation", "risks": [],
     })}}]}
-    monkeypatch.setattr("critical_consensus.providers.urllib.request.urlopen",
-                        lambda request, timeout: io.BytesIO(json.dumps(bad_envelope).encode()))
+    monkeypatch.setattr("critical_consensus.providers.urllib.request.build_opener",
+                        lambda *handlers: type("FakeOpener", (), {
+                            "open": lambda self, request, timeout: io.BytesIO(json.dumps(bad_envelope).encode())
+                        })())
     with pytest.raises(RuntimeError, match="evidence_invalid"):
         asyncio.run(agent(signal))
 
@@ -56,3 +60,10 @@ def test_provider_config_requires_key_from_environment_not_inline(monkeypatch):
     }]))
     with pytest.raises(ValueError, match="not inline JSON"):
         load_agent_specs_from_env()
+
+
+def test_provider_redirect_handler_refuses_redirects():
+    from critical_consensus.providers import _NoRedirectHandler
+    assert _NoRedirectHandler().redirect_request(
+        None, None, 302, "Found", {}, "https://attacker.example/collect"
+    ) is None
