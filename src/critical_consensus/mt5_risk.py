@@ -29,7 +29,7 @@ def collect_mt5_risk_snapshot(
     *, symbol: str, day_start_equity: float | None, equity_high_watermark: float | None,
     proposed_request: Mapping[str, Any] | None, symbol_groups: Mapping[str, str],
     now: datetime | None = None, terminal_path: str | None = None,
-    max_positions: int = 1000, max_slippage_points: int = 20,
+    max_positions: int = 1000, max_slippage_points: int = 20, max_quote_age_seconds: int = 15,
 ) -> dict[str, Any]:
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None or current.utcoffset() is None:
@@ -73,6 +73,9 @@ def collect_mt5_risk_snapshot(
     stop_loss = float(sl_tp["sl"])
     take_profit = float(sl_tp["tp"])
 
+    if isinstance(max_quote_age_seconds, bool) or not isinstance(max_quote_age_seconds, int) or max_quote_age_seconds < 1:
+        return {"status": "DENY", "blockers": ["MAX_QUOTE_AGE_POLICY_INVALID"], "trade_allowed": False}
+
     try:
         mt5 = importlib.import_module("MetaTrader5")
     except ImportError:
@@ -97,6 +100,19 @@ def collect_mt5_risk_snapshot(
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             return {"status": "DENY", "blockers": ["MT5_CURRENT_TICK_MISSING"], "account_mode": mode, "trade_allowed": False}
+        raw_tick_time = getattr(tick, "time_msc", None)
+        if raw_tick_time is not None:
+            tick_timestamp = _number(raw_tick_time)
+            tick_timestamp = tick_timestamp / 1000.0 if tick_timestamp is not None else None
+        else:
+            tick_timestamp = _number(getattr(tick, "time", None))
+        if tick_timestamp is None or tick_timestamp <= 0:
+            return {"status": "DENY", "blockers": ["MT5_TICK_TIMESTAMP_MISSING"], "account_mode": mode, "trade_allowed": False}
+        quote_age_seconds = current.timestamp() - tick_timestamp
+        if quote_age_seconds < -5:
+            return {"status": "DENY", "blockers": ["MT5_QUOTE_FROM_FUTURE"], "account_mode": mode, "trade_allowed": False}
+        if quote_age_seconds > max_quote_age_seconds:
+            return {"status": "DENY", "blockers": ["MT5_QUOTE_STALE"], "account_mode": mode, "trade_allowed": False}
 
         tick_size = _number(getattr(symbol_info, "trade_tick_size", None))
         tick_value_loss = _number(getattr(symbol_info, "trade_tick_value_loss", None))
@@ -169,7 +185,7 @@ def collect_mt5_risk_snapshot(
             "request_binding_sha256": request_hash,
             "request_binding": {"instrument": symbol, "direction": direction, "size": size,
                                 "expected_price": expected_price, "sl_tp": {"sl": stop_loss, "tp": take_profit}},
-            "reference_price": reference_price, "slippage_points_at_capture": slippage_points,
+            "reference_price": reference_price, "quote_age_seconds": quote_age_seconds,\n            "max_quote_age_seconds": max_quote_age_seconds, "slippage_points_at_capture": slippage_points,
             "max_slippage_points": max_slippage_points, "open_positions": len(positions),
             "correlated_open_positions": correlated, "position_symbols": position_symbols,
             "unknown_position_group_symbols": unknown_groups, "daily_deals_count": len(deals),
