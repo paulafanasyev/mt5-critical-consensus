@@ -50,6 +50,35 @@ Register actual model/provider callables using `AgentSpec` and `collect_agent_ve
 
 The `independence_group` value is declared metadata only. It is **not proof** that models, training data, vendors, prompts or market inputs are independent. Production onboarding must document and review those dependencies. The existing policy pipeline remains the only place where gate sequencing is evaluated; collection success never authorizes a trade.
 
+### Publisher evidence capture
+
+The persisted decision path accepts source reports only when every `key_sources[].source_id` resolves to a byte-exact immutable capture in PostgreSQL and the source matches `config/source_registry.yaml`. The registry is intentionally empty by default. Do not add a publisher until its official HTTPS domain, actual independence group, policy credibility weight, TTL and permitted publication-time attestation have been reviewed. Different hostnames do not establish independent ownership or independent reporting.
+
+After adding an approved publisher profile, create a manifest containing the publisher ID, exact HTTPS article/API URL, publication timestamp and the attestation basis:
+
+```json
+{
+  "sources": [
+    {
+      "publisher_id": "OPERATOR_REVIEWED_ID",
+      "url": "https://approved.example/path/to/specific-resource",
+      "published_at": "2026-10-30T01:30:00Z",
+      "publication_time_attestation": "publisher_api_field"
+    }
+  ]
+}
+```
+
+Then run:
+
+```bash
+python scripts/capture_source_evidence.py source-manifest.json
+```
+
+The fetcher refuses non-HTTPS URLs, redirects, unapproved domains, IP literals, credential-bearing query strings, unsupported response types and oversized documents. It stores the exact response bytes, SHA-256, retrieval time and registry-derived metadata in append-only `source_evidence`. Publication timestamps are still explicitly attested according to the configured basis; the generic fetcher does not parse every publisher's page format or independently prove that a date is accurate. A persisted decision also requires at least two configured independence groups. Keep the registry empty rather than promoting guessed domains or scores.
+
+
+
 ## 4. Walk-forward calibration
 
 Capture the model forecast before its outcome is available, persist the exact issue timestamp and canonical input hash, then resolve it once the outcome is known. Export rows to a CSV with columns:
