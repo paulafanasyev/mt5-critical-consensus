@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
@@ -66,6 +67,31 @@ def _decode(value: Any) -> Any:
     return value
 
 
+def _validate_json_value(value: Any, *, depth: int = 0) -> None:
+    """Reject values that JSON would coerce ambiguously or cannot represent safely."""
+    if depth > 32:
+        raise ValueError("JSON nesting exceeds 32 levels")
+    if value is None or isinstance(value, (str, bool)):
+        return
+    if isinstance(value, int):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("JSON numbers must be finite")
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError("JSON object keys must be strings")
+            _validate_json_value(item, depth=depth + 1)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _validate_json_value(item, depth=depth + 1)
+        return
+    raise ValueError("value is not a JSON-native type")
+
+
 def _validate_event(event: Mapping[str, Any]) -> None:
     if not isinstance(event, Mapping):
         raise ValueError("event must be an object")
@@ -94,12 +120,15 @@ def _validate_event(event: Mapping[str, Any]) -> None:
     if stamp.tzinfo is None or stamp.utcoffset() is None:
         raise ValueError("created_at must include a timezone")
     try:
+        _validate_json_value(event)
         canonical = json.dumps(
             dict(event), sort_keys=True, separators=(",", ":"),
             ensure_ascii=False, allow_nan=False,
         )
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("event must contain only finite JSON values with string keys") from exc
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise ValueError(
+            "event must contain only finite JSON values with string keys and depth <= 32"
+        ) from exc
     if len(canonical.encode("utf-8")) > 256_000:
         raise ValueError("event payload exceeds 256 KB limit")
 
