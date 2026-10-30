@@ -221,6 +221,98 @@ class PostgresRepository:
                 raise RuntimeError("calibration report hash conflict")
         return {"report_sha256": report_hash, "inserted": False}
 
+    def get_kill_switch_state(self) -> dict[str, Any]:
+        """Return persisted switch state; missing/unavailable state must be interpreted as active."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT kill_switch_active, updated_at, updated_by, reason
+                   FROM risk_control_state WHERE singleton=TRUE"""
+            ).fetchone()
+        if row is None:
+            return {"kill_switch_active": True, "status": "UNKNOWN", "updated_by": "",
+                    "reason": "Missing risk-control row; fail closed", "updated_at": None}
+        return {"kill_switch_active": bool(row[0]), "status": "PERSISTED",
+                "updated_at": row[1].isoformat(), "updated_by": str(row[2]), "reason": str(row[3])}
+
+    def set_kill_switch(self, *, active: bool, actor_id: str, reason: str) -> dict[str, Any]:
+        """Persist emergency-stop state and append a hash-chained event in one transaction."""
+        if not isinstance(active, bool):
+            raise ValueError("active must be a boolean")
+        actor = str(actor_id).strip()
+        explanation = str(reason).strip()
+        if not actor or len(actor) > 128 or not explanation or len(explanation) > 1000:
+            raise ValueError("actor_id and a reason of at most 1000 characters are required")
+        occurred = datetime.now(timezone.utc)
+        with self._connect() as conn:
+            state = conn.execute(
+                """SELECT kill_switch_active FROM risk_control_state
+                   WHERE singleton=TRUE FOR UPDATE"""
+            ).fetchone()
+            if state is None:
+                # Still fail closed if migrations were skipped or the singleton was removed.
+                raise RuntimeError("risk_control_state missing; apply migrations before changing kill switch")
+            previous = conn.execute(
+                "SELECT event_hash FROM risk_control_events ORDER BY event_seq DESC LIMIT 1"
+            ).fetchone()
+            previous_hash = str(previous[0]) if previous else None
+            event = {"kill_switch_active": active, "actor_id": actor, "reason": explanation,
+                     "occurred_at": occurred.isoformat(), "previous_hash": previous_hash}
+            encoded = _canonical(event)
+            event_hash = _sha256(encoded)
+            conn.execute(
+                """INSERT INTO risk_control_events
+                   (kill_switch_active, actor_id, reason, occurred_at, previous_hash, event_hash, event)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb)""",
+                (active, actor, explanation, occurred, previous_hash, event_hash, encoded),
+            )
+            conn.execute(
+                """UPDATE risk_control_state SET kill_switch_active=%s, updated_at=%s,
+                   updated_by=%s, reason=%s WHERE singleton=TRUE""",
+                (active, occurred, actor, explanation),
+            )
+        return {"kill_switch_active": active, "status": "PERSISTED", "updated_at": occurred.isoformat(),
+                "updated_by": actor, "reason": explanation, "event_hash": event_hash}
+
+    def record_mt5_risk_snapshot(self, snapshot: Mapping[str, Any]) -> dict[str, Any]:
+        """Append an immutable read-only MT5 risk snapshot, including denied/partial captures."""
+        if not isinstance(snapshot, Mapping):
+            raise ValueError("snapshot must be an object")
+        observed = _timestamp(snapshot.get("observed_at", ""), "observed_at")
+        account_mode = str(snapshot.get("account_mode", "unknown")).lower()
+        if account_mode not in {"demo", "contest", "real", "unknown"}:
+            account_mode = "unknown"
+        symbol = str(snapshot.get("symbol", "")).strip().upper() or "UNKNOWN"
+        encoded = _canonical(dict(snapshot))
+        digest = _sha256(encoded)
+        with self._connect() as conn:
+            row = conn.execute(
+                """INSERT INTO mt5_risk_snapshots
+                   (observed_at, terminal_server, account_mode, symbol, snapshot_sha256, snapshot)
+                   VALUES (%s,%s,%s,%s,%s,%s::jsonb) RETURNING snapshot_id""",
+                (observed, str(snapshot.get("terminal_server", ""))[:255], account_mode, symbol, digest, encoded),
+            ).fetchone()
+        return {"snapshot_id": str(row[0]), "snapshot_sha256": digest, "status": snapshot.get("status", "UNKNOWN")}
+
+    def get_latest_mt5_risk_snapshot(self, symbol: str) -> dict[str, Any] | None:
+        """Fetch the newest snapshot for a symbol without treating age as valid; caller gates freshness."""
+        symbol = str(symbol).strip().upper()
+        if not symbol:
+            raise ValueError("symbol is required")
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT observed_at, account_mode, snapshot_sha256, snapshot
+                   FROM mt5_risk_snapshots WHERE symbol=%s ORDER BY observed_at DESC, inserted_at DESC
+                   LIMIT 1""", (symbol,)
+            ).fetchone()
+        if row is None:
+            return None
+        snapshot = row[3] if isinstance(row[3], Mapping) else json.loads(row[3])
+        output = dict(snapshot)
+        output.setdefault("observed_at", row[0].isoformat())
+        output.setdefault("account_mode", row[1])
+        output["snapshot_sha256"] = row[2]
+        return output
+
     def persist_event_once(self, event: Mapping[str, Any], *, consumer_name: str) -> bool:
         """Commit processed-event marker and event evidence atomically before Redis ACK."""
         if not isinstance(event, Mapping):
