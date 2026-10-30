@@ -11,8 +11,11 @@ from datetime import datetime, timezone
 
 from critical_consensus.agent_runtime import collect_agent_verdicts
 from critical_consensus.market_data import build_market_snapshot
+from redis.asyncio import Redis
+
 from critical_consensus.persistence import PostgresRepository
 from critical_consensus.providers import canonical_signal_hash, load_agent_specs_from_env
+from critical_consensus.redis_streams import publish_event
 
 
 async def run(args) -> int:
@@ -55,10 +58,28 @@ async def run(args) -> int:
         "payload": {"signal_id": signal_id, "snapshot_hash": snapshot_hash,
                     "snapshot": snapshot, "collection_result": result},
     }
+    # Persist a local durable trace first; then publish the same idempotent event for the Redis worker.
     await asyncio.to_thread(repo.persist_event_once, event, consumer_name="read-only-agent-analysis")
+    redis_status = {"status": "NOT_CONFIGURED"}
+    redis_url = os.getenv("REDIS_URL", "")
+    if redis_url:
+        redis = Redis.from_url(redis_url, decode_responses=True)
+        try:
+            await redis.ping()
+            stream = os.getenv("CC_STREAM", "cc:signals:v1")
+            stream_id = await publish_event(redis, stream, event)
+            redis_status = {"status": "PUBLISHED", "stream": stream, "stream_id": stream_id}
+        except Exception as exc:
+            # Report only the exception class, never a URL that could contain credentials.
+            redis_status = {"status": "FAILED", "error_code": type(exc).__name__}
+        finally:
+            await redis.aclose()
     print(json.dumps({"market_snapshot": snapshot, "collection": result,
-                      "audit_event_id": event["event_id"]}, indent=2, ensure_ascii=False))
-    return 0 if result.get("status") == "READY_FOR_REVIEW" else 2
+                      "audit_event_id": event["event_id"], "redis_publication": redis_status},
+                     indent=2, ensure_ascii=False))
+    if result.get("status") != "READY_FOR_REVIEW":
+        return 2
+    return 0 if redis_status.get("status") == "PUBLISHED" else 3
 
 
 def main() -> int:
