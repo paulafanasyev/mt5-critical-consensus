@@ -68,7 +68,7 @@ def test_missing_chief_step_cannot_confirm():
     assert result["verdict"] == "HOLD"
 
 def test_chief_confirm_requires_all_a_to_i():
-    reasoning = {"reasoning_id": "chief-r-1", "signal_id": "sig-1", "signal_input_hash": "sha256:" + "a" * 64, "signal_input_hash": "sha256:" + "a" * 64, "created_at": datetime.now(timezone.utc).isoformat(),
+    reasoning = {"reasoning_id": "chief-r-1", "signal_id": "sig-1", "signal_input_hash": "sha256:" + "a" * 64, "created_at": datetime.now(timezone.utc).isoformat(),
                  "verdict": "CONFIRM", "steps": {k: {"passed": True, "check_name": {"a":"ADVERSARIAL_PASS","b":"CONTRADICTION_CHECK","c":"SOURCE_AUDIT","d":"TAIL_RISK_CHECK","e":"RED_TEAM_SELF_REVIEW","f":"FULL_CHALLENGE_LEDGER_REVIEW","g":"GROUPTHINK_CHECK","h":"SIMILAR_REGIME_CALIBRATION","i":"ERROR_PROBABILITY_SCENARIO"}[k], "detail": "evidence checked", "evidence_refs": [f"ev-{k}"]} for k in "abcdefghi"},
                  "reasons_against": ["macro", "news", "correlation", "liquidity", "regime"], "tail_risk_probability": 0.01,
                  "tail_risk_scenarios": [{"scenario": "central bank shock", "probability": 0.01, "impact": "repricing", "evidence_refs": ["risk-1"]}],
@@ -86,7 +86,7 @@ def valid_permission_request(now):
             "within_high_impact_news_window": False,
             "risk_snapshot": {"risk_fraction": 0.003, "daily_loss_fraction": 0.004,
                               "drawdown_fraction": 0.02, "open_positions": 1,
-                              "correlated_open_positions": 0}}
+                              "correlated_open_positions": 0, "spread_points": 10.0}}
 
 def test_permission_gate_requires_human():
     now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
@@ -98,7 +98,7 @@ def test_permission_gate_requires_human():
              "rollover_block_utc": {"start": "20:55", "end": "21:10"},
              "blocked_around_news": True, "max_risk_per_trade_fraction": 0.005,
              "daily_loss_limit_fraction": 0.02, "max_drawdown_fraction": 0.10,
-             "max_positions": 5, "max_correlated_positions": 2}}
+             "max_positions": 5, "max_correlated_positions": 2, "max_spread_points": 20}}
     result = permission_gate(valid_permission_request(now), matrix, now=now)
     assert result["status"] == "REQUIRE_HUMAN"
     assert result["allowed"] is False
@@ -113,7 +113,7 @@ def test_live_never_passes_when_live_disabled():
              "rollover_block_utc": {"start": "20:55", "end": "21:10"},
              "blocked_around_news": True, "max_risk_per_trade_fraction": 0.005,
              "daily_loss_limit_fraction": 0.02, "max_drawdown_fraction": 0.10,
-             "max_positions": 5, "max_correlated_positions": 2}}
+             "max_positions": 5, "max_correlated_positions": 2, "max_spread_points": 20}}
     req = valid_permission_request(now); req["mode"] = "live"
     assert "LIVE_MODE_DISABLED" in permission_gate(req, matrix, now=now)["blockers"]
 
@@ -148,7 +148,7 @@ def test_permission_gate_blocks_news_window():
              "rollover_block_utc": {"start": "20:55", "end": "21:10"},
              "blocked_around_news": True, "max_risk_per_trade_fraction": 0.005,
              "daily_loss_limit_fraction": 0.02, "max_drawdown_fraction": 0.10,
-             "max_positions": 5, "max_correlated_positions": 2}}
+             "max_positions": 5, "max_correlated_positions": 2, "max_spread_points": 20}}
     req = valid_permission_request(now); req["within_high_impact_news_window"] = True
     assert "NEWS_WINDOW_ACTIVE_OR_UNKNOWN" in permission_gate(req, matrix, now=now)["blockers"]
 
@@ -161,7 +161,7 @@ def test_permission_gate_blocks_daily_loss_limit():
              "allowed_time_utc": {"start": "07:00", "end": "19:00"},
              "blocked_around_news": True, "max_risk_per_trade_fraction": 0.005,
              "daily_loss_limit_fraction": 0.02, "max_drawdown_fraction": 0.10,
-             "max_positions": 5, "max_correlated_positions": 2}}
+             "max_positions": 5, "max_correlated_positions": 2, "max_spread_points": 20}}
     req = valid_permission_request(now); req["risk_snapshot"]["daily_loss_fraction"] = 0.02
     assert "DAILY_LOSS_LIMIT_REACHED" in permission_gate(req, matrix, now=now)["blockers"]
 
@@ -174,7 +174,7 @@ def test_permission_gate_fails_closed_when_risk_snapshot_missing():
              "allowed_time_utc": {"start": "07:00", "end": "19:00"},
              "blocked_around_news": True, "max_risk_per_trade_fraction": 0.005,
              "daily_loss_limit_fraction": 0.02, "max_drawdown_fraction": 0.10,
-             "max_positions": 5, "max_correlated_positions": 2}}
+             "max_positions": 5, "max_correlated_positions": 2, "max_spread_points": 20}}
     req = valid_permission_request(now); req.pop("risk_snapshot")
     assert "RISK_SNAPSHOT_MISSING" in permission_gate(req, matrix, now=now)["blockers"]
 
@@ -254,7 +254,7 @@ def test_permission_gate_rejects_nan_size_and_fabricated_reward_risk():
              "allowed_time_utc": {"start": "07:00", "end": "19:00"},
              "blocked_around_news": True, "max_risk_per_trade_fraction": 0.005,
              "daily_loss_limit_fraction": 0.02, "max_drawdown_fraction": 0.10,
-             "max_positions": 5, "max_correlated_positions": 2}}
+             "max_positions": 5, "max_correlated_positions": 2, "max_spread_points": 20}}
     req = valid_permission_request(now)
     req["size"] = float("nan")
     req["expected_rr"] = 99.0
