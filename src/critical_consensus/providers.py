@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
+import ipaddress
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -69,19 +70,35 @@ class OpenAICompatibleAgent:
         self.timeout_seconds = float(timeout_seconds)
         self.ttl_seconds = int(ttl_seconds)
         self.role = str(role).strip().lower()
-        parsed = urlparse(self.base_url)
-        self.provider_origin = (parsed.hostname or "").lower()
+        try:
+            parsed = urlparse(self.base_url)
+            hostname = parsed.hostname or ""
+            parsed_port = parsed.port
+        except ValueError as exc:
+            raise ValueError("provider base_url is malformed") from exc
+        if (not parsed.netloc or not hostname or parsed.username or parsed.password
+                or parsed.query or parsed.fragment):
+            raise ValueError("provider base_url must not contain userinfo, query or fragment")
+        try:
+            normalized_host = hostname.encode("idna").decode("ascii").lower().rstrip(".")
+            ipaddress.ip_address(normalized_host)
+            is_ip_literal = True
+        except ValueError:
+            is_ip_literal = False
+        loopback = normalized_host in {"127.0.0.1", "localhost", "::1"}
+        if is_ip_literal and not loopback:
+            raise ValueError("provider endpoint IP literals are not allowed")
+        if parsed.scheme == "https":
+            if parsed_port not in (None, 443):
+                raise ValueError("HTTPS provider endpoint must use the default port 443")
+        elif not (parsed.scheme == "http" and loopback):
+            raise ValueError("provider endpoint must use HTTPS, except loopback development endpoints")
+        self.provider_origin = normalized_host
         self.provider_identity = self.provider_origin + "::" + self.model.lower()
         if not self.agent_id or not self.model or not self.api_key:
             raise ValueError("agent_id, model and api_key are required")
         if self.role not in {"analyst", "critic", "chief_review", "risk_review", "devil_advocate"}:
             raise ValueError("unsupported agent role")
-        if parsed.scheme != "https" and not (
-            parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
-        ):
-            raise ValueError("provider endpoint must use HTTPS, except loopback development endpoints")
-        if not parsed.netloc:
-            raise ValueError("provider base_url must include a hostname")
         if self.timeout_seconds <= 0 or self.timeout_seconds > 120:
             raise ValueError("timeout_seconds must be in (0,120]")
         if self.ttl_seconds < 1 or self.ttl_seconds > 3600:
@@ -154,13 +171,15 @@ class OpenAICompatibleAgent:
             for ref in (row.get("evidence_refs", []) if isinstance(row, Mapping) else [])
             if isinstance(ref, str) and str(ref).strip() in set(allowed)
         }
+        if not referenced:
+            raise ValueError("peer review needs at least one cited evidence reference")
         payload = {
             "target_verdict": dict(target),
             "other_anonymized_verdicts": [dict(item) for item in peers],
-            "allowed_evidence_refs": list(allowed),
+            "allowed_evidence_refs": sorted(referenced),
             "untrusted_source_documents": [
                 {"source_id": ref, "text": evidence_context[ref]}
-                for ref in sorted(evidence_context)
+                for ref in sorted(referenced) if ref in evidence_context
             ],
         }
         prompt = (
@@ -187,7 +206,7 @@ class OpenAICompatibleAgent:
         refs = result.get("evidence_refs")
         valid_types = {"DATA_CONTRADICTION", "SOURCE_WEAK", "STALE_DATA", "LOGIC_GAP",
                        "REGIME_MISMATCH", "CORRELATION_RISK"}
-        available_refs = set(evidence_context) if evidence_context else set(allowed)
+        available_refs = referenced
         if (stance not in {"CONFIRM", "CHALLENGE"} or not argument
                 or not isinstance(refs, list) or not refs
                 or any(not isinstance(ref, str) or ref not in available_refs for ref in refs)
@@ -226,10 +245,10 @@ class OpenAICompatibleAgent:
         }) if isinstance(challenge_refs, Sequence) and not isinstance(challenge_refs, (str, bytes)) else []
         payload = {
             "challenge": dict(challenge), "resolution_round": round_no,
-            "allowed_evidence_refs": list(allowed),
+            "allowed_evidence_refs": referenced,
             "untrusted_source_documents": [
                 {"source_id": ref, "text": evidence_context[ref]}
-                for ref in sorted(evidence_context)
+                for ref in referenced if ref in evidence_context
             ],
         }
         prompt = (
@@ -250,7 +269,7 @@ class OpenAICompatibleAgent:
         resolved = result.get("resolved")
         refs = result.get("evidence_refs")
         summary = str(result.get("summary", "")).strip()
-        available_refs = set(evidence_context) if evidence_context else set(allowed)
+        available_refs = set(referenced)
         if not isinstance(resolved, bool):
             raise RuntimeError("provider_challenge_resolution_invalid")
         if resolved and (not isinstance(refs, list) or not refs
