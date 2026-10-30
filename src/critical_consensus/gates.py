@@ -263,7 +263,35 @@ def challenge_resolution_loop(challenges: Sequence[Mapping[str, Any]],
     transcript: list[dict[str, Any]] = []
     resolved_challenges: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
+    stop_reason: str | None = None
     for original in challenges:
+        if stop_reason is not None:
+            if not isinstance(original, Mapping):
+                unresolved.append({
+                    "status": "OPEN",
+                    "resolution_error": "INVALID_CHALLENGE_RECORD",
+                    "resolution_pause_reason": stop_reason,
+                })
+                continue
+            pending_challenge = dict(original)
+            pending_refs = pending_challenge.get("resolution_evidence_refs")
+            if (str(pending_challenge.get("status", "")).upper() == "RESOLVED"
+                    and isinstance(pending_refs, Sequence)
+                    and not isinstance(pending_refs, (str, bytes))
+                    and bool(pending_refs)
+                    and all(isinstance(ref, str) and ref.strip() for ref in pending_refs)):
+                resolved_challenges.append(pending_challenge)
+                continue
+            pending_challenge["status"] = "OPEN"
+            pending_challenge["resolution_error"] = "RESOLUTION_PAUSED_AFTER_TIMEOUT"
+            pending_challenge["resolution_pause_reason"] = stop_reason
+            pending_challenge["last_resolution_attempt"] = {
+                "resolved": False,
+                "error_code": "RESOLVER_NOT_STARTED",
+                "blocked_by": stop_reason,
+            }
+            unresolved.append(pending_challenge)
+            continue
         if not isinstance(original, Mapping):
             unresolved.append({"status": "OPEN", "resolution_error": "INVALID_CHALLENGE_RECORD"})
             continue
@@ -327,7 +355,15 @@ def challenge_resolution_loop(challenges: Sequence[Mapping[str, Any]],
                 resolved = True
                 break
             challenge["last_resolution_attempt"] = response
-            if response.get("error_code") == "RESOLVER_CYCLE_TIMEOUT":
+            error_code = response.get("error_code")
+            if error_code in {
+                "RESOLVER_TIMEOUT",
+                "RESOLVER_CAPACITY_EXHAUSTED",
+                "RESOLVER_CYCLE_TIMEOUT",
+            }:
+                # A timed-out callback may still be running. Do not launch another
+                # round or another challenge resolver from this invocation.
+                stop_reason = str(error_code)
                 break
         if not resolved:
             challenge["status"] = "OPEN"
