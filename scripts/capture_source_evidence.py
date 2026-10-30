@@ -9,6 +9,8 @@ import ipaddress
 import json
 import socket
 import ssl
+import threading
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
@@ -47,12 +49,42 @@ def _safe_url(url: str, profile: dict) -> str:
     return host
 
 
-def _resolve_public_addresses(host: str) -> list[str]:
-    """Resolve once, reject every non-public answer, and pin HTTPS to a checked IP."""
+_DNS_RESOLUTION_SLOTS = threading.BoundedSemaphore(2)
+
+
+def _resolve_public_addresses(host: str, *, timeout: float = 5.0) -> list[str]:
+    """Resolve once with a hard caller deadline, reject private answers, and pin HTTPS."""
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout) or timeout <= 0 or timeout > 30):
+        raise ValueError("DNS timeout must be finite and in (0,30]")
+    if not _DNS_RESOLUTION_SLOTS.acquire(timeout=float(timeout)):
+        raise RuntimeError("publisher_dns_resolution_capacity_exhausted")
+    completed = threading.Event()
+    outcome = {}
+
+    def lookup():
+        try:
+            outcome["answers"] = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        except Exception as exc:
+            outcome["error"] = exc
+        finally:
+            _DNS_RESOLUTION_SLOTS.release()
+            completed.set()
+
+    worker = threading.Thread(target=lookup, name="cc-publisher-dns", daemon=True)
     try:
-        answers = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-    except socket.gaierror:
+        worker.start()
+    except Exception as exc:
+        _DNS_RESOLUTION_SLOTS.release()
+        raise RuntimeError("publisher_dns_worker_start_failed") from None
+    if not completed.wait(float(timeout)):
+        raise RuntimeError("publisher_dns_resolution_timeout")
+    error = outcome.get("error")
+    if isinstance(error, socket.gaierror):
         raise RuntimeError("publisher_dns_resolution_failed") from None
+    if error is not None:
+        raise RuntimeError("publisher_dns_resolution_failed") from None
+    answers = outcome.get("answers", [])
     addresses: list[str] = []
     for answer in answers:
         raw_ip = str(answer[4][0]).split("%", 1)[0]
@@ -155,6 +187,8 @@ def capture_manifest(manifest_path: Path, registry_path: Path, *, timeout: float
     entries = manifest.get("sources") if isinstance(manifest, dict) else None
     if not isinstance(entries, list) or not entries:
         raise ValueError("manifest must contain a non-empty 'sources' array")
+    if len(entries) > 13:
+        raise ValueError("manifest may contain at most 13 source records per capture batch")
     raw_max_bytes = registry.get("max_content_bytes", 512_000)
     if (isinstance(raw_max_bytes, bool) or not isinstance(raw_max_bytes, int)
             or not 1 <= raw_max_bytes <= 512_000):
