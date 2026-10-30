@@ -192,6 +192,12 @@ def validate_source_capture(
         blockers.append("SOURCE_CAPTURE_SIZE_INVALID")
     if str(record.get("capture_method", "")) != "https_fetch":
         blockers.append("SOURCE_CAPTURE_METHOD_NOT_VERIFIED")
+    content_type = str(record.get("response_content_type", "")).split(";", 1)[0].strip().lower()
+    supported_content_type = content_type.startswith("text/") or content_type in {
+        "application/json", "application/xml", "application/rss+xml", "application/atom+xml",
+    }
+    if not supported_content_type:
+        blockers.append("SOURCE_CONTENT_TYPE_UNSUPPORTED")
     registry_version = str(registry.get("version", "")).strip()
     if str(record.get("registry_version", "")).strip() != registry_version or not registry_version:
         blockers.append("SOURCE_REGISTRY_VERSION_MISMATCH")
