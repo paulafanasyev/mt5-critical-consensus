@@ -137,7 +137,7 @@ class PostgresRepository:
         required = (
             "source_id", "publisher_id", "publisher_domain", "source_url", "published_at",
             "retrieved_at", "independence_group", "credibility", "ttl_seconds",
-            "content_sha256", "content_bytes", "captured_content",
+            "content_sha256", "content_bytes", "captured_content", "response_content_type",
             "publication_time_attestation", "capture_method", "registry_version",
         )
         if any(key not in record for key in required):
@@ -163,21 +163,23 @@ class PostgresRepository:
         ttl = record.get("ttl_seconds")
         if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
             raise ValueError("ttl_seconds must be a positive integer")
+        response_content_type = str(record.get("response_content_type", "")).split(";", 1)[0].strip().lower()
 
         args = (
             source_id, str(record["publisher_id"]), str(record["publisher_domain"]),
             str(record["source_url"]), published, retrieved, str(record["independence_group"]),
             float(credibility), ttl, digest, len(content), content,
             str(record["publication_time_attestation"]), str(record["capture_method"]),
-            str(record["registry_version"]),
+            str(record["registry_version"]), response_content_type,
         )
         with self._connect() as conn:
             inserted = conn.execute(
                 """INSERT INTO source_evidence
                    (source_id, publisher_id, publisher_domain, source_url, published_at, retrieved_at,
                     independence_group, credibility, ttl_seconds, content_sha256, content_bytes,
-                    captured_content, publication_time_attestation, capture_method, registry_version)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    captured_content, publication_time_attestation, capture_method, registry_version,
+                    response_content_type)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (source_id) DO NOTHING RETURNING source_id""", args
             ).fetchone()
             if inserted:
@@ -186,7 +188,8 @@ class PostgresRepository:
             existing = conn.execute(
                 """SELECT publisher_id, publisher_domain, source_url, published_at, retrieved_at,
                           independence_group, credibility, ttl_seconds, content_sha256, content_bytes,
-                          captured_content, publication_time_attestation, capture_method, registry_version
+                          captured_content, publication_time_attestation, capture_method, registry_version,
+                          response_content_type
                    FROM source_evidence WHERE source_id=%s""", (source_id,)
             ).fetchone()
             if existing is None:
@@ -194,7 +197,8 @@ class PostgresRepository:
             actual = dict(zip(
                 ("publisher_id", "publisher_domain", "source_url", "published_at", "retrieved_at",
                  "independence_group", "credibility", "ttl_seconds", "content_sha256", "content_bytes",
-                 "captured_content", "publication_time_attestation", "capture_method", "registry_version"),
+                 "captured_content", "publication_time_attestation", "capture_method", "registry_version",
+                 "response_content_type"),
                 existing,
             ))
             # Compare by column name to avoid positional drift. retrieved_at is intentionally
@@ -213,6 +217,7 @@ class PostgresRepository:
                 and actual["publication_time_attestation"] == str(record["publication_time_attestation"])
                 and actual["capture_method"] == str(record["capture_method"])
                 and actual["registry_version"] == str(record["registry_version"])
+                and actual["response_content_type"] == response_content_type
             )
             if not equal:
                 raise ValueError("source_id already exists with different captured evidence")
@@ -234,14 +239,14 @@ class PostgresRepository:
                 """SELECT source_id, publisher_id, publisher_domain, source_url, published_at,
                           retrieved_at, independence_group, credibility, ttl_seconds, content_sha256,
                           content_bytes, captured_content, publication_time_attestation, capture_method,
-                          registry_version
+                          registry_version, response_content_type
                    FROM source_evidence WHERE source_id = ANY(%s)""", (ids,)
             ).fetchall()
         columns = (
             "source_id", "publisher_id", "publisher_domain", "source_url", "published_at",
             "retrieved_at", "independence_group", "credibility", "ttl_seconds", "content_sha256",
             "content_bytes", "captured_content", "publication_time_attestation", "capture_method",
-            "registry_version",
+            "registry_version", "response_content_type",
         )
         by_id = {str(row[0]): dict(zip(columns, row)) for row in rows}
         return [by_id[item] for item in ids if item in by_id]
