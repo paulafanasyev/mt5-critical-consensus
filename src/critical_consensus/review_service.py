@@ -25,11 +25,32 @@ async def run_peer_review_cycle(
     max_resolution_rounds: int = 3,
 ) -> dict[str, Any]:
     """Create anonymized reviews and resolve registered challenges without author self-review."""
-    allowed = {str(ref).strip() for ref in allowed_evidence_refs
-               if isinstance(ref, str) and str(ref).strip()}
-    if not allowed or len(allowed) != len(list(allowed_evidence_refs)):
+    if (not isinstance(allowed_evidence_refs, Sequence)
+            or isinstance(allowed_evidence_refs, (str, bytes))
+            or not allowed_evidence_refs
+            or any(not isinstance(ref, str) or not ref.strip() for ref in allowed_evidence_refs)):
         return {
             "status": "GATHER_MORE", "blockers": ["TRUSTED_EVIDENCE_REGISTRY_MISSING_OR_INVALID"],
+            "peer_reviews": [], "challenge_records": [], "open_challenges": [],
+            "challenge_resolution_status": "MISSING", "trade_allowed": False,
+        }
+    allowed_list = [ref.strip() for ref in allowed_evidence_refs]
+    if len(set(allowed_list)) != len(allowed_list):
+        return {
+            "status": "GATHER_MORE", "blockers": ["TRUSTED_EVIDENCE_REGISTRY_HAS_DUPLICATE_IDS"],
+            "peer_reviews": [], "challenge_records": [], "open_challenges": [],
+            "challenge_resolution_status": "MISSING", "trade_allowed": False,
+        }
+    allowed = set(allowed_list)
+    if not callable(resolver) or max_resolution_rounds < 1 or max_resolution_rounds > 3:
+        return {
+            "status": "GATHER_MORE", "blockers": ["CHALLENGE_RESOLVER_OR_ROUND_POLICY_INVALID"],
+            "peer_reviews": [], "challenge_records": [], "open_challenges": [],
+            "challenge_resolution_status": "MISSING", "trade_allowed": False,
+        }
+    if isinstance(min_reviewers_per_verdict, bool) or min_reviewers_per_verdict < 1:
+        return {
+            "status": "GATHER_MORE", "blockers": ["PEER_REVIEWER_POLICY_INVALID"],
             "peer_reviews": [], "challenge_records": [], "open_challenges": [],
             "challenge_resolution_status": "MISSING", "trade_allowed": False,
         }
