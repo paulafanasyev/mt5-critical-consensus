@@ -1,9 +1,9 @@
 """Fail-closed policy gates. Functions return decision records; they never execute trades."""
 from __future__ import annotations
 import asyncio
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import datetime, timezone
 import math
+import threading
 import re
 import uuid
 from typing import Any, Awaitable, Callable, Mapping, Sequence
@@ -11,11 +11,38 @@ from typing import Any, Awaitable, Callable, Mapping, Sequence
 from .audit import canonical_hash
 
 
-# A bounded shared pool prevents timed-out synchronous resolvers from spawning
-# unbounded worker threads. A running Python thread cannot be forcibly cancelled.
-_CHALLENGE_RESOLVER_EXECUTOR = ThreadPoolExecutor(
-    max_workers=4, thread_name_prefix="cc-challenge-resolver",
-)
+# Daemon workers bound resolver concurrency and cannot hold process shutdown open.
+# A running Python callback cannot be forcibly stopped, so timed-out workers keep
+# their slot until completion; this caps abandoned callbacks at four per process.
+_CHALLENGE_RESOLVER_SLOTS = threading.BoundedSemaphore(4)
+
+
+def _run_bounded_challenge_resolver(resolver, challenge, round_no, timeout_seconds):
+    if not _CHALLENGE_RESOLVER_SLOTS.acquire(timeout=timeout_seconds):
+        return None, "RESOLVER_CAPACITY_EXHAUSTED"
+    completed = threading.Event()
+    outcome = {}
+
+    def invoke():
+        try:
+            outcome["value"] = resolver(dict(challenge), round_no)
+        except Exception as exc:
+            outcome["error"] = type(exc).__name__
+        finally:
+            _CHALLENGE_RESOLVER_SLOTS.release()
+            completed.set()
+
+    worker = threading.Thread(target=invoke, name="cc-challenge-resolver", daemon=True)
+    try:
+        worker.start()
+    except Exception as exc:
+        _CHALLENGE_RESOLVER_SLOTS.release()
+        return None, f"RESOLVER_START_FAILED:{type(exc).__name__}"
+    if not completed.wait(timeout_seconds):
+        return None, "RESOLVER_TIMEOUT"
+    if "error" in outcome:
+        return None, f"RESOLVER_FAILED:{outcome['error']}"
+    return outcome.get("value"), None
 
 
 def _now_utc() -> datetime:
@@ -241,19 +268,15 @@ def challenge_resolution_loop(challenges: Sequence[Mapping[str, Any]],
 
         resolved = False
         for round_no in range(1, max_rounds + 1):
-            future = _CHALLENGE_RESOLVER_EXECUTOR.submit(resolver, dict(challenge), round_no)
-            try:
-                raw_response = future.result(timeout=float(resolver_timeout_seconds))
+            raw_response, resolver_error = _run_bounded_challenge_resolver(
+                resolver, challenge, round_no, float(resolver_timeout_seconds),
+            )
+            if resolver_error:
+                response = {"resolved": False, "error_code": resolver_error}
+            else:
                 response = dict(raw_response) if isinstance(raw_response, Mapping) else {
                     "resolved": False, "error_code": "INVALID_RESOLVER_RESPONSE"
                 }
-            except FutureTimeout:
-                # Cancels queued work; already-running callbacks may continue, but the
-                # orchestration caller is released and the challenge remains unresolved.
-                future.cancel()
-                response = {"resolved": False, "error_code": "RESOLVER_TIMEOUT"}
-            except Exception as exc:
-                response = {"resolved": False, "error_code": f"RESOLVER_FAILED:{type(exc).__name__}"}
             transcript.append({"challenge_id": challenge_id, "round": round_no, "response": response})
             response_refs = response.get("evidence_refs")
             valid_response_refs = (
