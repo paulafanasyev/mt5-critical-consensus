@@ -102,12 +102,16 @@ async def test_market_history_agents_forecast_calibration_audit_and_kill_switch(
     repo.record_mt5_risk_snapshot(persisted_snapshot)
     # Make the assertion independent of test order: the switch may be disabled elsewhere.
     repo.set_kill_switch(active=True, actor_id="ci-e2e", reason="assert emergency stop blocks")
-    blocked = risk_controlled_permission(
-        {"instrument": symbol, "mode": "demo"}, {"permission_matrix": {}},
-        kill_switch_state=repo.get_kill_switch_state(),
-        snapshot=repo.get_latest_mt5_risk_snapshot(symbol),
-    )
-    assert blocked["status"] == "DENY"
-    assert blocked["trade_allowed"] is False
-    assert "KILL_SWITCH_ACTIVE_OR_INVALID" in blocked["blockers"]
-    assert "MT5_RISK_COLLECTION_NOT_PASS" in blocked["blockers"]
+    try:
+        blocked = risk_controlled_permission(
+            {"instrument": symbol, "mode": "demo"}, {"permission_matrix": {}},
+            kill_switch_state=repo.get_kill_switch_state(),
+            snapshot=repo.get_latest_mt5_risk_snapshot(symbol),
+        )
+        assert blocked["status"] == "DENY"
+        assert blocked["trade_allowed"] is False
+        assert "KILL_SWITCH_ACTIVE_OR_INVALID" in blocked["blockers"]
+        assert "MT5_RISK_COLLECTION_NOT_PASS" in blocked["blockers"]
+    finally:
+        # Never leak a disabled emergency stop to later tests, even on failure.
+        repo.set_kill_switch(active=True, actor_id="ci-e2e", reason="test complete; stop re-enabled")

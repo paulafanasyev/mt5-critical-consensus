@@ -20,6 +20,13 @@ def test_yaml_configs_parse_to_objects():
         assert isinstance(data, dict), path.name
 
 
+def test_kill_switch_migration_defaults_to_active():
+    sql = (ROOT / "db" / "migrations" / "003_risk_controls.sql").read_text(encoding="utf-8")
+    # The safety property lives in the schema default, not only in bootstrap code.
+    assert "kill_switch_active BOOLEAN NOT NULL DEFAULT TRUE" in sql
+    assert "VALUES (TRUE, TRUE, 'system-bootstrap'" in sql
+
+
 def test_agent_verdict_abstain_requires_formal_reason():
     schema = json.loads((ROOT / "schemas" / "agent_verdict_v2.schema.json").read_text(encoding="utf-8"))
     validator = Draft202012Validator(schema)

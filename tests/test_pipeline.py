@@ -408,10 +408,12 @@ def _persisted_demo_risk_evidence(bundle, *, kill_switch_active=False, binding_o
     snapshot = {
         "status": "PASS", "observed_at": NOW.isoformat(), "account_mode": "demo",
         "symbol": request["instrument"], "symbol_group": "fx-major",
-        "account_equity": 10000.0, "day_start_equity": 10000.0,
+        "account_equity": 10000.0, "account_balance": 10000.0, "daily_pnl": 0.0,
+        "day_start_equity": 10000.0,
         "equity_high_watermark": 10000.0, "risk_fraction": 0.003,
         "risk_value_account_currency": 30.0,
         "risk_tick_size": 0.0001, "risk_tick_value_loss": 15.0,
+        "reference_price": request["expected_price"],
         "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0,
         "open_positions": 1, "correlated_open_positions": 0,
         "request_binding_sha256": binding_override or risk_request_binding_hash(request),

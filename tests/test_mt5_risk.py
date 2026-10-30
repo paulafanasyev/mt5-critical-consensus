@@ -196,3 +196,69 @@ def test_broker_server_clock_offset_is_applied_to_tick_freshness(monkeypatch):
     assert correct["quote_age_seconds"] == 0
     assert correct["server_utc_offset_seconds"] == 3 * 3600
     assert datetime.fromisoformat(correct["server_observed_at"]) == NOW + timedelta(hours=3)
+
+
+def test_collector_sizes_risk_at_the_worse_reference_price(monkeypatch):
+    fake = FakeMT5()
+    fake.tick.ask = 1.10015
+    monkeypatch.setitem(__import__("sys").modules, "MetaTrader5", fake)
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
+        proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        server_utc_offset_seconds=0,
+    )
+    assert result["status"] == "PASS"
+    assert result["risk_entry_price"] == 1.10015
+    assert result["risk_value_account_currency"] == pytest.approx(10.5)
+    assert result["risk_fraction"] == pytest.approx(10.5 / 10100.0)
+
+
+def test_collector_blocks_slippage_beyond_a_tenth_of_the_stop_distance(monkeypatch):
+    fake = FakeMT5()
+    fake.tick.ask = 1.1003  # 20 points: inside the point limit but 20% of the stop width
+    monkeypatch.setitem(__import__("sys").modules, "MetaTrader5", fake)
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
+        proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        server_utc_offset_seconds=0,
+    )
+    assert result["status"] == "DENY"
+    assert "PRICE_SLIPPAGE_EXCEEDS_STOP_DISTANCE_FRACTION" in result["blockers"]
+    assert "PRICE_SLIPPAGE_LIMIT_EXCEEDED" not in result["blockers"]
+
+
+def test_collector_blocks_a_reference_price_beyond_the_reward_side(monkeypatch):
+    fake = FakeMT5()
+    fake.tick.ask = 1.1030
+    monkeypatch.setitem(__import__("sys").modules, "MetaTrader5", fake)
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
+        proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        server_utc_offset_seconds=0,
+    )
+    assert result["status"] == "DENY"
+    assert "RISK_CONSERVATIVE_ENTRY_OUTSIDE_GEOMETRY" in result["blockers"]
+
+
+def test_collector_blocks_a_day_start_that_cannot_reconstruct_the_balance(monkeypatch):
+    fake = FakeMT5()
+    monkeypatch.setitem(__import__("sys").modules, "MetaTrader5", fake)
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=9000.0, equity_high_watermark=10200.0,
+        proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        server_utc_offset_seconds=0,
+    )
+    assert result["status"] == "DENY"
+    assert "DAY_START_EQUITY_BELOW_DAILY_PNL_IMPLIED_BALANCE" in result["blockers"]
+
+
+def test_collector_blocks_a_peak_below_the_day_start(monkeypatch):
+    fake = FakeMT5()
+    monkeypatch.setitem(__import__("sys").modules, "MetaTrader5", fake)
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=9500.0,
+        proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        server_utc_offset_seconds=0,
+    )
+    assert result["status"] == "DENY"
+    assert "EQUITY_HIGH_WATERMARK_BELOW_DAY_START" in result["blockers"]

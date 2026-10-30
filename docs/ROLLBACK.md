@@ -12,7 +12,7 @@ The persisted kill switch defaults to active. To activate it from the Windows br
 
 The script requires a successful persisted confirmation. Verify the current server state via authenticated GET /v1/risk/kill-switch. If the API/DB is unavailable, the EA fails closed and will not poll for commands.
 
-The EA itself checks the persisted kill-switch endpoint at initialization and again immediately before `OrderSend`; if the state is unavailable or active it aborts. EnableDemoExecution must remain false during compilation and smoke tests, and AllowLiveExecution must remain false. Remove the EA from the chart / disable Algo Trading while investigating. The endpoint and EA stop new command polling; **they do not cancel an already submitted broker order or close an open position**. A human must inspect MT5 Journal, Orders, Deals and Positions and reconcile any uncertain OrderSend result before taking further action.
+The EA itself checks the persisted kill-switch endpoint on every timer tick and again immediately before `OrderSend`; if the state is unavailable or active it aborts. EnableDemoExecution must remain false during compilation and smoke tests, and AllowLiveExecution must remain false. Remove the EA from the chart / disable Algo Trading while investigating. The endpoint and EA stop new command polling; **they do not cancel an already submitted broker order or close an open position**. A human must inspect MT5 Journal, Orders, Deals and Positions and reconcile any uncertain OrderSend result before taking further action.
 
 ## Revert software
 

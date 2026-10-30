@@ -259,5 +259,86 @@ def test_production_checker_and_self_test_cover_the_new_predicates():
     checker = _checker()
     assert checker.check_source(_ea_source())[0] == []
     assert checker.self_test(_ea_source()) == []
-    assert len(checker.MUTATIONS) >= 30
+    # Every mutation must be bound to the exact invariant expected to catch it.
+    assert set(checker.MUTATIONS) == set(checker.MUTATION_EXPECTATIONS)
+    for name in ("blocked branch keeps the message but drops the return",
+                 "early success injected into the command path",
+                 "early acceptance injected into the parser",
+                 "preprocessor macro injected",
+                 "second order send injected",
+                 "dead parser loop",
+                 "FNV multiply constant weakened",
+                 "identifier alphabet widened",
+                 "token alphabet widened",
+                 "URL leading-zero port guard removed",
+                 "required-key loop bound shrunk",
+                 "boolean prefix accepted"):
+        assert name in checker.MUTATIONS, name
+
+
+def test_checker_rejects_guard_body_and_right_extension_bypasses_outside_the_catalogue():
+    checker = _checker()
+    source = _ea_source()
+    bypasses = {
+        # Keep the message, drop the return: the guard would only log.
+        "guard return": (
+            '{ Print("BLOCKED: slippage guard triggered."); return false; }',
+            '{ Print("BLOCKED: slippage guard triggered."); }',
+        ),
+        # Extend a pinned threshold past its closing parenthesis.
+        "slippage extension": (
+            "MaxSlippagePoints * point)",
+            "MaxSlippagePoints * point * 50)",
+        ),
+        "volume extension": ("volume > MaxVolume ||", "volume > MaxVolume * 1000 ||"),
+        "ttl extension": ("now_epoch + MaxCommandTtlSeconds)", "now_epoch + MaxCommandTtlSeconds * 1000)"),
+        "stops extension": (
+            "< stops * point || MathAbs(tp - live_price) < stops * point)",
+            "< stops * point * 10 || MathAbs(tp - live_price) < stops * point)",
+        ),
+        # Prepend a success return so the whole function becomes a no-op.
+        "prepended success": (
+            "bool CheckKillSwitch()\n{",
+            "bool CheckKillSwitch()\n{ return true;",
+        ),
+        # A macro could redefine a limit the checks compare against.
+        "macro definition": ("#property strict", "#property strict\n#define MaxVolume 999.0"),
+    }
+    for label, (old, new) in bypasses.items():
+        weakened = source.replace(old, new, 1)
+        assert weakened != source, label
+        failures, _ = checker.check_source(weakened)
+        assert failures, f"checker accepted the {label} bypass"
+
+
+def test_parser_fixtures_are_bound_to_the_ea_parser_in_both_directions():
+    checker = _checker()
+    cases = json.loads(
+        (_root() / "config" / "mql5_flat_object_cases.json").read_text(encoding="utf-8")
+    )
+    assert checker._fixture_parser_parity(cases) == []
+    parser = re.search(
+        r"bool\s+ValidateFlatObject\s*\([^)]*\)\s*\{(?P<body>.*?)\n\}", _ea_source(), re.S
+    ).group("body")
+    # Every fixture reason must be a literal the EA parser can actually produce.
+    for case in cases["reject"]:
+        assert case["reason"] in parser, case["name"]
+    # Every reachable parser error literal must be exercised by a fixture.
+    reasons = {case["reason"] for case in cases["reject"]}
+    for literal in set(re.findall(r'error\s*=\s*"([^"]*)"', parser)):
+        normalized = literal.rstrip(": ")
+        if normalized in checker.SHADOWED_PARSER_ERRORS:
+            continue
+        assert any(normalized in reason for reason in reasons), literal
+    # The shadowing exemption is only valid while the brace-pair check stays pinned.
+    assert "StringGetCharacter(s,0) != '{'" in parser
+    assert "StringGetCharacter(s,n-1) != '}'" in parser
+
+
+def test_reference_model_trims_only_ascii_whitespace_like_the_ea():
+    checker = _checker()
+    for payload in ("\u00a0{}", "{}\u00a0", "\u000b{}", "{}\u000b"):
+        ok, error = checker.validate_flat_object_model(payload)
+        assert not ok, repr(payload)
+        assert error == "body must be exactly one JSON object"
 

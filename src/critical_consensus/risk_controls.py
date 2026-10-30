@@ -9,6 +9,12 @@ from typing import Any, Mapping
 
 from .gates import permission_gate
 
+# A fill further than this share of the stop distance from the reviewed entry means the
+# order no longer resembles what the human approved; sizing must not absorb the drift.
+_MAX_SLIPPAGE_FRACTION_OF_STOP = 0.10
+# Starting equity plus realised P/L must reconstruct the balance to within this share.
+_BASELINE_DRIFT_TOLERANCE = 0.01
+
 
 def _finite(value: Any) -> float | None:
     if isinstance(value, bool):
@@ -62,6 +68,28 @@ def risk_request_binding_hash(request: Mapping[str, Any]) -> str:
     payload = {"instrument": instrument, "direction": direction, **values}
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _adjusted_rr(request: Mapping[str, Any], snapshot: Mapping[str, Any]) -> float | None:
+    """Reward/risk at the worst plausible fill, matching how the snapshot sizes risk."""
+    direction = str(request.get("direction", "")).strip().upper()
+    if direction not in {"BUY", "SELL"}:
+        return None
+    sl_tp = request.get("sl_tp")
+    if not isinstance(sl_tp, Mapping):
+        return None
+    entry = _finite(request.get("expected_price"))
+    stop = _finite(sl_tp.get("sl"))
+    take = _finite(sl_tp.get("tp"))
+    reference = _finite(snapshot.get("reference_price"))
+    if entry is None or stop is None or take is None or reference is None:
+        return None
+    conservative_entry = max(entry, reference) if direction == "BUY" else min(entry, reference)
+    risk_distance = abs(conservative_entry - stop)
+    reward_distance = abs(take - conservative_entry)
+    if risk_distance <= 0 or reward_distance <= 0:
+        return None
+    return reward_distance / risk_distance
 
 
 def global_kill_switch_gate(state: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -134,6 +162,25 @@ def risk_snapshot_gate(
             blockers.append(f"{key.upper()}_MISSING_OR_INVALID")
     if not str(snapshot.get("symbol_group") or "").strip():
         blockers.append("SYMBOL_CORRELATION_GROUP_UNKNOWN")
+    balance = _finite(snapshot.get("account_balance"))
+    if balance is None or balance <= 0:
+        blockers.append("RISK_SNAPSHOT_ACCOUNT_BALANCE_MISSING_OR_INVALID")
+    daily_pnl = _finite(snapshot.get("daily_pnl"))
+    if daily_pnl is None:
+        blockers.append("RISK_SNAPSHOT_DAILY_PNL_MISSING_OR_INVALID")
+    if (values["equity_high_watermark"] is not None and values["day_start_equity"] is not None
+            and values["equity_high_watermark"] < values["day_start_equity"]):
+        # The intraday peak cannot sit below the equity the session started at; if it does,
+        # the drawdown buffer is fabricated and would mask a loss.
+        blockers.append("RISK_SNAPSHOT_EQUITY_HIGH_WATERMARK_BELOW_DAY_START")
+    if (balance is not None and balance > 0 and daily_pnl is not None
+            and values["day_start_equity"] is not None
+            and values["day_start_equity"] + daily_pnl
+            < balance * (1 - _BASELINE_DRIFT_TOLERANCE)):
+        # Starting equity plus realised P/L must reconstruct the current balance. An
+        # understated baseline loosens the daily-loss limit; cashflows must be adjusted
+        # explicitly by the operator instead of being silently absorbed here.
+        blockers.append("DAY_START_EQUITY_BELOW_DAILY_PNL_IMPLIED_BALANCE")
     binding = snapshot.get("request_binding_sha256")
     if not isinstance(binding, str) or len(binding) != 71 or not binding.startswith("sha256:") or any(ch not in "0123456789abcdef" for ch in binding[7:]):
         blockers.append("RISK_REQUEST_BINDING_MISSING_OR_INVALID")
@@ -160,20 +207,39 @@ def risk_snapshot_matches_order(
     if str(snapshot.get("symbol", "")).strip().upper() != instrument:
         blockers.append("RISK_SNAPSHOT_SYMBOL_MISMATCH")
     sl_tp = request.get("sl_tp")
+    direction = str(request.get("direction", "")).strip().upper()
     size = _finite(request.get("size"))
     entry = _finite(request.get("expected_price"))
     stop = _finite(sl_tp.get("sl")) if isinstance(sl_tp, Mapping) else None
+    take = _finite(sl_tp.get("tp")) if isinstance(sl_tp, Mapping) else None
     equity = _finite(snapshot.get("account_equity"))
     tick_size = _finite(snapshot.get("risk_tick_size"))
     tick_value_loss = _finite(snapshot.get("risk_tick_value_loss"))
-    if size is None or entry is None or stop is None:
+    reference = _finite(snapshot.get("reference_price"))
+    if (size is None or entry is None or stop is None or take is None
+            or direction not in {"BUY", "SELL"}):
         return sorted(set(blockers + ["RISK_REQUEST_FIELDS_INVALID"]))
     if equity is None or equity <= 0:
         return sorted(set(blockers + ["RISK_SNAPSHOT_ACCOUNT_EQUITY_MISSING_OR_INVALID"]))
     if tick_size is None or tick_size <= 0 or tick_value_loss is None or tick_value_loss <= 0:
         return sorted(set(blockers + ["RISK_SNAPSHOT_TICK_SPEC_MISSING_OR_INVALID"]))
+    if reference is None or reference <= 0:
+        return sorted(set(blockers + ["RISK_SNAPSHOT_REFERENCE_PRICE_MISSING_OR_INVALID"]))
+    stop_distance = abs(entry - stop)
+    if stop_distance <= 0:
+        return sorted(set(blockers + ["RISK_REQUEST_FIELDS_INVALID"]))
+    if abs(reference - entry) > stop_distance * _MAX_SLIPPAGE_FRACTION_OF_STOP:
+        blockers.append("RISK_SLIPPAGE_EXCEEDS_STOP_DISTANCE_FRACTION")
 
-    expected_value = abs(entry - stop) / tick_size * tick_value_loss * size
+    # Size the worst plausible fill, not the reviewed entry: a stop is only as wide as the
+    # price the order actually gets. Buying can fill at the higher reference, selling lower.
+    conservative_entry = max(entry, reference) if direction == "BUY" else min(entry, reference)
+    geometry_ok = (stop < conservative_entry < take) if direction == "BUY" else (
+        take < conservative_entry < stop)
+    if not geometry_ok:
+        blockers.append("RISK_CONSERVATIVE_ENTRY_OUTSIDE_GEOMETRY")
+
+    expected_value = abs(conservative_entry - stop) / tick_size * tick_value_loss * size
     expected_fraction = expected_value / equity
     reported_value = _finite(snapshot.get("risk_value_account_currency"))
     reported_fraction = _finite(snapshot.get("risk_fraction"))
@@ -231,6 +297,17 @@ def risk_controlled_permission(
         return {"status": "DENY", "allowed": False, "trade_allowed": False,
                 "blockers": reconciliation, "kill_switch": switch, "risk_snapshot": risk,
                 "risk_reconciliation": {"status": "FAILED", "blockers": reconciliation}}
+    policy = matrix.get("permission_matrix") if isinstance(matrix, Mapping) else None
+    if isinstance(policy, Mapping):
+        # The policy gate recomputes RR at the reviewed entry; a worse fill can leave that
+        # same order below the reward floor, so the conservative RR must clear it too.
+        min_rr = _finite(policy.get("min_expected_rr", 1.5))
+        adjusted_rr = _adjusted_rr(request, snapshot)
+        if min_rr is not None and min_rr >= 0 and (adjusted_rr is None or adjusted_rr + 1e-9 < min_rr):
+            return {"status": "DENY", "allowed": False, "trade_allowed": False,
+                    "blockers": ["RISK_ADJUSTED_RR_BELOW_MINIMUM"], "kill_switch": switch,
+                    "risk_snapshot": risk, "adjusted_expected_rr": adjusted_rr,
+                    "risk_reconciliation": {"status": "PASS", "blockers": []}}
     merged = dict(request)
     merged["risk_snapshot"] = {
         **dict(merged.get("risk_snapshot", {}) if isinstance(merged.get("risk_snapshot"), Mapping) else {}),

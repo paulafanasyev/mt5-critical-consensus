@@ -46,6 +46,11 @@
     {"name": "null value", "json": "{\"a\":null}", "reason": "unsupported value type"},
     {"name": "unterminated value", "json": "{\"a\":\"x}", "reason": "unterminated string value"},
     {"name": "empty body", "json": "", "reason": "body must be exactly one JSON object"},
-    {"name": "value followed by junk", "json": "{\"a\":1 x}", "reason": "unexpected character after value"}
+    {"name": "value followed by junk", "json": "{\"a\":1 x}", "reason": "unexpected character after value"},
+    {"name": "missing closing brace rejected up front", "json": "{\"a\":1", "reason": "body must be exactly one JSON object"},
+    {"name": "unterminated key", "json": "{\"a}", "reason": "unterminated object key"},
+    {"name": "closing brace where a value is required", "json": "{\"a\":}", "reason": "unsupported value type"},
+    {"name": "trailing non-breaking space", "json": "{\"a\":1}\u00a0", "reason": "body must be exactly one JSON object"},
+    {"name": "leading vertical tab", "json": "\u000b{\"a\":1}", "reason": "body must be exactly one JSON object"}
   ]
 }

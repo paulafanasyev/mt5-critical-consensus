@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 
 from critical_consensus.api import app
+from critical_consensus.audit import canonical_hash
 from critical_consensus.evidence import make_envelope
 from critical_consensus.governance import sign_attestation
 
@@ -11,8 +12,10 @@ client = TestClient(app)
 BRIDGE = "test-bridge-secret-that-is-long-enough"
 EVIDENCE_KEY = "k" * 64
 GOVERNANCE_KEY = "v" * 64
+OPERATOR_KEY = "o" * 64
 EVIDENCE_ISSUER = "test-ingress"
 GOVERNANCE_ISSUER = "calibration-service"
+OPERATOR_ISSUER = "operator-console"
 NOW = datetime.now(timezone.utc)
 
 
@@ -52,6 +55,8 @@ def configure(monkeypatch, *, bridge=BRIDGE, evidence_issuer=EVIDENCE_ISSUER,
     monkeypatch.setenv("MT5_EVIDENCE_ISSUER", evidence_issuer)
     monkeypatch.setenv("MT5_GOVERNANCE_HMAC_KEY", governance_key)
     monkeypatch.setenv("MT5_GOVERNANCE_ISSUER", governance_issuer)
+    monkeypatch.setenv("MT5_OPERATOR_HMAC_KEY", OPERATOR_KEY)
+    monkeypatch.setenv("MT5_OPERATOR_ISSUER", OPERATOR_ISSUER)
 
 
 def test_health_is_available_but_never_enables_execution(monkeypatch):
@@ -68,13 +73,28 @@ def test_health_reports_configured_authentication_without_secrets(monkeypatch):
     configure(monkeypatch)
     body = client.get("/health").json()
     assert body["authenticated_policy_endpoints"] is True
+    assert body["bridge_token_distinct_from_signing_keys"] is True
     assert body["evidence_verification_configured"] is True
     assert body["governance_verification_configured"] is True
+    assert body["operator_verification_configured"] is True
     assert body["signing_keys_distinct"] is True
     assert body["signing_issuers_distinct"] is True
     assert BRIDGE not in str(body)
     assert EVIDENCE_KEY not in str(body)
     assert GOVERNANCE_KEY not in str(body)
+
+
+def test_bridge_token_that_reuses_a_signing_key_is_rejected(monkeypatch):
+    configure(monkeypatch, bridge=EVIDENCE_KEY)
+    response = client.post(
+        "/v1/certainty/evaluate", headers={"X-Bridge-Key": EVIDENCE_KEY},
+        json={**signed_body({}), "governance_attestation": governance_attestation()},
+    )
+    assert response.status_code == 503
+    assert "MT5_EVIDENCE_HMAC_KEY" in response.json()["detail"]
+    body = client.get("/health").json()
+    assert body["bridge_token_distinct_from_signing_keys"] is False
+    assert body["authenticated_policy_endpoints"] is False
 
 
 def test_policy_endpoint_fails_closed_when_secret_is_not_configured(monkeypatch):
@@ -177,6 +197,58 @@ def test_api_replaces_self_declared_calibration_with_attestation(monkeypatch):
     assert response.status_code == 200
     blockers = response.json()["blockers"]
     assert not any("PlatformScoutAgent:CALIBRATION" in blocker for blocker in blockers)
+
+
+def _bound_metadata_payload():
+    signal_input = {"signal_id": "sig-1", "instrument": "EURUSD", "timeframe": "M15"}
+    digest = canonical_hash(signal_input)
+    return {
+        "signal_id": "sig-1", "signal_input": signal_input, "signal_input_hash": digest,
+        "verdicts": [{
+            "verdict_id": "v1", "signal_id": "sig-1", "agent_id": "PlatformScoutAgent",
+            "verdict": "APPROVE", "confidence": 0.5, "input_hash": digest,
+            "created_at": (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat(),
+            "ttl_seconds": 3600,
+        }],
+    }
+
+
+def _evaluate_bound(payload):
+    return client.post(
+        "/v1/certainty/evaluate", headers={"X-Bridge-Key": BRIDGE},
+        json={**signed_body(payload), "governance_attestation": governance_attestation()},
+    )
+
+
+def test_api_binds_every_verdict_to_the_signed_signal(monkeypatch):
+    configure(monkeypatch)
+    payload = _bound_metadata_payload()
+    payload["verdicts"][0]["signal_id"] = "sig-other"
+    response = _evaluate_bound(payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert any("VERDICT_0:VERDICT_SIGNAL_ID_MISMATCH" in blocker
+               for blocker in body["blockers"])
+    assert body["trade_allowed"] is False
+
+
+def test_api_rejects_a_verdict_measured_against_other_inputs(monkeypatch):
+    configure(monkeypatch)
+    payload = _bound_metadata_payload()
+    payload["verdicts"][0]["input_hash"] = "sha256:" + "a" * 64
+    body = _evaluate_bound(payload).json()
+    assert any("VERDICT_0:VERDICT_INPUT_HASH_DOES_NOT_MATCH_SIGNAL_INPUT" in blocker
+               for blocker in body["blockers"])
+
+
+def test_api_rejects_an_expired_verdict(monkeypatch):
+    configure(monkeypatch)
+    payload = _bound_metadata_payload()
+    payload["verdicts"][0]["created_at"] = (
+        datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    payload["verdicts"][0]["ttl_seconds"] = 60
+    body = _evaluate_bound(payload).json()
+    assert any("VERDICT_0:VERDICT_EXPIRED" in blocker for blocker in body["blockers"])
 
 
 def test_order_submission_endpoint_stays_disabled_even_with_bridge_key(monkeypatch):
@@ -286,6 +358,7 @@ def test_health_is_hermetic_when_no_secrets_are_configured(monkeypatch):
     assert body["authenticated_policy_endpoints"] is False
     assert body["evidence_verification_configured"] is False
     assert body["governance_verification_configured"] is False
+    assert body["operator_verification_configured"] is False
 
 
 def test_execution_endpoints_can_never_return_or_accept_an_order(monkeypatch):

@@ -142,6 +142,19 @@ def collect_mt5_risk_snapshot(
         slippage_points = abs(reference_price - expected_price) / point
         if slippage_points > max_slippage_points:
             blockers.append("PRICE_SLIPPAGE_LIMIT_EXCEEDED")
+        risk_entry_price = (max(expected_price, reference_price) if direction == "BUY"
+                            else min(expected_price, reference_price))
+        stop_distance = abs(expected_price - stop_loss)
+        if stop_distance <= 0 or abs(reference_price - expected_price) > stop_distance * 0.10:
+            # A fill more than a tenth of the stop width away is no longer the order the
+            # human approved, even when it is inside the broker's point-based limit.
+            blockers.append("PRICE_SLIPPAGE_EXCEEDS_STOP_DISTANCE_FRACTION")
+        if direction == "BUY":
+            geometry_ok = stop_loss < risk_entry_price < take_profit
+        else:
+            geometry_ok = take_profit < risk_entry_price < stop_loss
+        if not geometry_ok:
+            blockers.append("RISK_CONSERVATIVE_ENTRY_OUTSIDE_GEOMETRY")
 
         positions_raw = mt5.positions_get()
         if positions_raw is None:
@@ -167,11 +180,17 @@ def collect_mt5_risk_snapshot(
             return {"status": "DENY", "blockers": ["MT5_ACCOUNT_EQUITY_OR_BALANCE_INVALID"], "account_mode": mode, "trade_allowed": False}
         if equity_peak < equity:
             blockers.append("EQUITY_HIGH_WATERMARK_BELOW_CURRENT_EQUITY")
+        if equity_peak < day_start:
+            blockers.append("EQUITY_HIGH_WATERMARK_BELOW_DAY_START")
+        # Starting equity plus realised P/L must reconstruct the balance; otherwise the
+        # operator baseline (or an unrecorded cashflow) understates the daily loss.
+        if day_start + daily_pnl < balance * 0.99:
+            blockers.append("DAY_START_EQUITY_BELOW_DAILY_PNL_IMPLIED_BALANCE")
         # Equity movement includes open/unrealised losses. Adjust the manually verified baseline
         # for deposits/withdrawals before capture; the collector cannot reliably infer cashflows.
         daily_loss_fraction = max(0.0, (day_start - equity) / day_start)
         drawdown_fraction = max(0.0, (equity_peak - equity) / equity_peak)
-        risk_value_account_currency = abs(expected_price - stop_loss) / tick_size * tick_value_loss * size
+        risk_value_account_currency = abs(risk_entry_price - stop_loss) / tick_size * tick_value_loss * size
         risk_fraction = risk_value_account_currency / equity
         if not all(math.isfinite(v) and v >= 0 for v in (daily_pnl, daily_loss_fraction, drawdown_fraction, risk_value_account_currency, risk_fraction)):
             blockers.append("MT5_RISK_METRICS_NONFINITE")
@@ -197,6 +216,7 @@ def collect_mt5_risk_snapshot(
             "drawdown_fraction": drawdown_fraction, "risk_fraction": risk_fraction,
             "risk_value_account_currency": risk_value_account_currency,
             "risk_tick_size": tick_size, "risk_tick_value_loss": tick_value_loss,
+            "risk_entry_price": risk_entry_price,
             "request_binding_sha256": request_hash,
             "request_binding": {"instrument": symbol, "direction": direction, "size": size,
                                 "expected_price": expected_price, "sl_tp": {"sl": stop_loss, "tp": take_profit}},
@@ -210,7 +230,7 @@ def collect_mt5_risk_snapshot(
             "unknown_position_group_symbols": unknown_groups, "daily_deals_count": len(deals),
             "within_high_impact_news_window": None, "news_status": "NOT_CONNECTED_FAIL_CLOSED",
             "trade_allowed": False, "blockers": sorted(set(blockers)),
-            "evidence_limit": "Tick-value risk is an estimate before fees, slippage and gaps; proposed order fields are hash-bound. Day-start equity/high-water mark and cash-flow adjustment are operator inputs. News status is not connected.",
+            "evidence_limit": "Tick-value risk is an estimate before fees, slippage and gaps; proposed order fields are hash-bound and risk is sized at the worse of reviewed and reference price. Day-start equity/high-water mark and cash-flow adjustment are operator inputs. News status is not connected.",
         }
     except (TypeError, ValueError, OverflowError, AttributeError, KeyError):
         return {"status": "DENY", "blockers": ["MT5_RISK_SNAPSHOT_PARSE_FAILED"], "trade_allowed": False}

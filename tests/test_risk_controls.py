@@ -22,9 +22,11 @@ def good_request():
 def good_snapshot():
     return {"status": "PASS", "observed_at": NOW.isoformat(), "account_mode": "demo",
             "symbol": "EURUSD", "symbol_group": "fx-major", "account_equity": 10000.0,
+            "account_balance": 10000.0, "daily_pnl": 0.0,
             "day_start_equity": 10000.0, "equity_high_watermark": 10200.0,
             "risk_fraction": 0.002, "risk_value_account_currency": 20.0,
             "risk_tick_size": 0.0001, "risk_tick_value_loss": 20.0,
+            "reference_price": 1.1001,
             "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0196,
             "open_positions": 1, "correlated_open_positions": 1,
             "request_binding_sha256": risk_request_binding_hash(good_request()),
@@ -198,3 +200,103 @@ def test_risk_controlled_permission_reaches_human_review_only_when_every_gate_ag
     # A positive policy result still never authorizes execution.
     assert result["trade_allowed"] is False
     assert result["allowed"] is False
+
+
+def sell_request():
+    return {"instrument": "EURUSD", "direction": "SELL", "size": 0.1, "expected_price": 1.1001,
+            "sl_tp": {"sl": 1.1011, "tp": 1.0982}}
+
+
+def test_risk_value_is_sized_at_the_worse_of_reviewed_and_reference_price():
+    buy = good_snapshot()
+    buy["reference_price"] = 1.10015  # ask drifted up from the reviewed 1.1001
+    buy_value = abs(1.10015 - 1.0991) / 0.0001 * 20.0 * 0.1
+    buy["risk_value_account_currency"] = buy_value
+    buy["risk_fraction"] = buy_value / 10000.0
+    assert risk_snapshot_matches_order(good_request(), buy) == []
+    # Sizing at the reviewed entry understates money at risk once the fill can drift.
+    buy["risk_value_account_currency"] = 20.0
+    buy["risk_fraction"] = 0.002
+    assert "RISK_VALUE_DOES_NOT_MATCH_ORDER" in risk_snapshot_matches_order(good_request(), buy)
+
+    sell = good_snapshot()
+    sell["reference_price"] = 1.10005  # bid drifted down from the reviewed 1.1001
+    sell_value = abs(1.10005 - 1.1011) / 0.0001 * 20.0 * 0.1
+    sell["risk_value_account_currency"] = sell_value
+    sell["risk_fraction"] = sell_value / 10000.0
+    assert risk_snapshot_matches_order(sell_request(), sell) == []
+    sell["risk_value_account_currency"] = 20.0
+    sell["risk_fraction"] = 0.002
+    assert "RISK_VALUE_DOES_NOT_MATCH_ORDER" in risk_snapshot_matches_order(sell_request(), sell)
+
+
+def test_slippage_beyond_a_tenth_of_the_stop_distance_is_denied():
+    at_cap = good_snapshot()
+    at_cap["reference_price"] = 1.1002  # exactly 10% of the 0.0010 stop distance
+    at_cap["risk_value_account_currency"] = 22.0
+    at_cap["risk_fraction"] = 0.0022
+    assert risk_snapshot_matches_order(good_request(), at_cap) == []
+    snapshot = good_snapshot()
+    snapshot["reference_price"] = 1.1003
+    assert "RISK_SLIPPAGE_EXCEEDS_STOP_DISTANCE_FRACTION" in risk_snapshot_matches_order(
+        good_request(), snapshot)
+
+
+def test_reference_price_beyond_the_reward_side_is_denied():
+    snapshot = good_snapshot()
+    snapshot["reference_price"] = 1.1030  # above take profit: the fill erases the reward
+    blockers = risk_snapshot_matches_order(good_request(), snapshot)
+    assert "RISK_CONSERVATIVE_ENTRY_OUTSIDE_GEOMETRY" in blockers
+    assert "RISK_SLIPPAGE_EXCEEDS_STOP_DISTANCE_FRACTION" in blockers
+
+
+def test_missing_reference_price_blocks_reconciliation():
+    snapshot = good_snapshot()
+    del snapshot["reference_price"]
+    assert risk_snapshot_matches_order(good_request(), snapshot) == [
+        "RISK_SNAPSHOT_REFERENCE_PRICE_MISSING_OR_INVALID"]
+
+
+def test_adjusted_rr_below_floor_is_denied_even_when_reviewed_rr_passes():
+    request = {"instrument": "EURUSD", "direction": "BUY", "size": 0.1, "mode": "demo",
+               "expected_price": 1.1001, "sl_tp": {"sl": 1.0995, "tp": 1.1010}}
+    snapshot = good_snapshot()
+    snapshot["reference_price"] = 1.10016
+    value = abs(1.10016 - 1.0995) / 0.0001 * 20.0 * 0.1
+    snapshot["risk_value_account_currency"] = value
+    snapshot["risk_fraction"] = value / 10000.0
+    snapshot["request_binding_sha256"] = risk_request_binding_hash(request)
+    matrix = {"permission_matrix": {"min_expected_rr": 1.5}}
+    denied = risk_controlled_permission(
+        request, matrix, kill_switch_state=good_state(active=False), snapshot=snapshot, now=NOW,
+    )
+    assert denied["status"] == "DENY"
+    assert "RISK_ADJUSTED_RR_BELOW_MINIMUM" in denied["blockers"]
+    assert denied["trade_allowed"] is False
+    # At the reviewed price the same order still clears the reward floor.
+    snapshot["reference_price"] = 1.1001
+    value = abs(1.1001 - 1.0995) / 0.0001 * 20.0 * 0.1
+    snapshot["risk_value_account_currency"] = value
+    snapshot["risk_fraction"] = value / 10000.0
+    reviewed = risk_controlled_permission(
+        request, matrix, kill_switch_state=good_state(active=False), snapshot=snapshot, now=NOW,
+    )
+    assert "RISK_ADJUSTED_RR_BELOW_MINIMUM" not in reviewed["blockers"]
+
+
+def test_snapshot_baselines_must_agree_with_each_other_and_the_balance():
+    peak_below_start = good_snapshot()
+    peak_below_start["day_start_equity"] = 10400.0
+    assert "RISK_SNAPSHOT_EQUITY_HIGH_WATERMARK_BELOW_DAY_START" in risk_snapshot_gate(
+        peak_below_start, now=NOW)["blockers"]
+
+    understated_start = good_snapshot()
+    understated_start["day_start_equity"] = 9000.0
+    assert "DAY_START_EQUITY_BELOW_DAILY_PNL_IMPLIED_BALANCE" in risk_snapshot_gate(
+        understated_start, now=NOW)["blockers"]
+
+    for field, blocker in (("account_balance", "RISK_SNAPSHOT_ACCOUNT_BALANCE_MISSING_OR_INVALID"),
+                           ("daily_pnl", "RISK_SNAPSHOT_DAILY_PNL_MISSING_OR_INVALID")):
+        snapshot = good_snapshot()
+        snapshot.pop(field)
+        assert blocker in risk_snapshot_gate(snapshot, now=NOW)["blockers"], field

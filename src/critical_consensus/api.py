@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import hmac
 import os
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
+from .audit import canonical_hash
 from .evidence import verify_wrapper
 from .gates import (
     certainty_gate,
@@ -19,6 +21,7 @@ from .gates import (
 from .calibration import weighted_consensus
 from .governance import apply_attested_calibration, verify_governance_attestation
 from .persistence import PostgresRepository
+from .pipeline import _validate_verdict_metadata
 from .risk_controls import risk_controlled_permission
 
 ROOT = Path(os.getenv("POLICY_DIR", str(Path(__file__).resolve().parents[2] / "config")))
@@ -36,6 +39,18 @@ def _yaml(name: str) -> dict:
     return value
 
 
+SIGNING_KEY_ENV = ("MT5_EVIDENCE_HMAC_KEY", "MT5_GOVERNANCE_HMAC_KEY", "MT5_OPERATOR_HMAC_KEY")
+
+
+def _bridge_token_reuses_signing_key(token: str) -> str | None:
+    """Return the signing-domain env name that shares this token, if any."""
+    for name in SIGNING_KEY_ENV:
+        other = os.getenv(name, "")
+        if other and hmac.compare_digest(token.encode("utf-8"), other.encode("utf-8")):
+            return name
+    return None
+
+
 def require_bridge_key(x_bridge_key: str | None = Header(default=None, alias="X-Bridge-Key")) -> None:
     """Shared-secret transport gate for the localhost bridge; not a user-signature verifier."""
     expected = os.getenv("MT5_BRIDGE_TOKEN", "")
@@ -43,6 +58,12 @@ def require_bridge_key(x_bridge_key: str | None = Header(default=None, alias="X-
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Bridge authentication is not configured; protected API disabled",
+        )
+    reused = _bridge_token_reuses_signing_key(expected)
+    if reused:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"MT5_BRIDGE_TOKEN must not equal {reused}; configuration rejected",
         )
     if not x_bridge_key or not hmac.compare_digest(x_bridge_key.encode("utf-8"), expected.encode("utf-8")):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bridge credentials")
@@ -137,27 +158,72 @@ def _verified_payload(body: SignedPayload) -> dict[str, Any]:
 @app.get("/health")
 def health() -> dict[str, Any]:
     """Non-sensitive liveness endpoint; reports the execution state, never credentials."""
-    bridge_ready = len(os.getenv("MT5_BRIDGE_TOKEN", "")) >= 24
+    bridge_token = os.getenv("MT5_BRIDGE_TOKEN", "")
+    bridge_token_distinct = bool(bridge_token) and _bridge_token_reuses_signing_key(bridge_token) is None
+    bridge_ready = len(bridge_token) >= 24 and bridge_token_distinct
     evidence_key_ready = _key_configured("MT5_EVIDENCE_HMAC_KEY")
     governance_key_ready = _key_configured("MT5_GOVERNANCE_HMAC_KEY")
+    operator_key_ready = _key_configured("MT5_OPERATOR_HMAC_KEY")
     keys_distinct = (
         evidence_key_ready and governance_key_ready
         and os.getenv("MT5_EVIDENCE_HMAC_KEY") != os.getenv("MT5_GOVERNANCE_HMAC_KEY")
     )
     evidence_issuer = os.getenv("MT5_EVIDENCE_ISSUER", "").strip()
     governance_issuer = os.getenv("MT5_GOVERNANCE_ISSUER", "").strip()
+    operator_issuer = os.getenv("MT5_OPERATOR_ISSUER", "").strip()
     return {
         "status": "ok",
         "service": "policy-api",
         "execution_enabled": False,
         "live_enabled": False,
         "authenticated_policy_endpoints": bridge_ready,
+        "bridge_token_distinct_from_signing_keys": bridge_token_distinct,
         "evidence_verification_configured": evidence_key_ready and bool(evidence_issuer),
         "governance_verification_configured": governance_key_ready and bool(governance_issuer),
+        "operator_verification_configured": operator_key_ready and bool(operator_issuer),
         "signing_keys_distinct": keys_distinct,
         "signing_issuers_distinct": bool(evidence_issuer) and bool(governance_issuer)
                                    and evidence_issuer != governance_issuer,
     }
+
+
+def _verdict_metadata_blockers(payload: Mapping[str, Any]) -> list[str]:
+    """Bind every verdict to the signed signal and reject stale or unbound ones.
+
+    The pipeline performs the same checks; without them this endpoint would be a weaker
+    path where a verdict written for another signal, or an expired verdict, still
+    reaches the certainty gate.
+    """
+    current = datetime.now(timezone.utc)
+    signal_id = str(payload.get("signal_id", "")).strip()
+    blockers: list[str] = []
+    if not signal_id:
+        blockers.append("SIGNAL_ID_MISSING")
+    signal_input = payload.get("signal_input")
+    supplied_hash = payload.get("signal_input_hash")
+    expected_hash: str | None = None
+    if not isinstance(signal_input, Mapping) or not signal_id:
+        blockers.append("SIGNAL_INPUT_OR_HASH_MISSING")
+    else:
+        if str(signal_input.get("signal_id", "")).strip() != signal_id:
+            blockers.append("SIGNAL_INPUT_SIGNAL_ID_MISMATCH")
+        try:
+            expected_hash = canonical_hash(dict(signal_input))
+        except (TypeError, ValueError, OverflowError):
+            blockers.append("SIGNAL_INPUT_NOT_CANONICALLY_HASHABLE")
+        if expected_hash is not None and supplied_hash != expected_hash:
+            blockers.append("SIGNAL_INPUT_HASH_MISMATCH")
+    raw_verdicts = payload.get("verdicts")
+    verdicts = raw_verdicts if isinstance(raw_verdicts, list) else []
+    for index, verdict in enumerate(verdicts):
+        if not isinstance(verdict, Mapping):
+            blockers.append(f"VERDICT_{index}:VERDICT_RECORD_INVALID")
+            continue
+        blockers.extend(f"VERDICT_{index}:{blocker}"
+                        for blocker in _validate_verdict_metadata(verdict, signal_id, current))
+        if expected_hash is not None and verdict.get("input_hash") != expected_hash:
+            blockers.append(f"VERDICT_{index}:VERDICT_INPUT_HASH_DOES_NOT_MATCH_SIGNAL_INPUT")
+    return blockers
 
 
 @app.post("/v1/certainty/evaluate", dependencies=[Depends(require_bridge_key)])
@@ -188,6 +254,7 @@ def evaluate_certainty(body: CertaintyRequest) -> dict[str, Any]:
         if isinstance(thresholds.get("min_reviewers_per_verdict"), int) else 2,
     )
     evidence_blockers = list(review_evidence.get("blockers", []))
+    evidence_blockers.extend(_verdict_metadata_blockers(evaluated))
     verdicts_with_counts = []
     for verdict in evaluated["verdicts"]:
         if not isinstance(verdict, dict):

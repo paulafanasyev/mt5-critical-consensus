@@ -209,6 +209,33 @@ def test_valid_demo_approval_is_one_time_allow_not_order_execution():
     assert result["trade_allowed"] is False
 
 
+def test_authorization_nonce_is_one_time_per_operator_across_permissions():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    store = InMemoryNonceStore()
+
+    def permission(permission_id):
+        return {"status": "REQUIRE_HUMAN", "permission_id": permission_id, "mode": "demo",
+                "expires_at": (now + timedelta(minutes=5)).isoformat()}
+
+    def decision(permission_id, user_id):
+        return {"decision": "APPROVE", "user_id": user_id, "reason": "reviewed",
+                "permission_id": permission_id, "decision_id": "d-" + permission_id,
+                "nonce": "n" * 24, "timestamp": now.isoformat(), "ttl_seconds": 300}
+
+    first = user_authorization_gate(permission("p1"), decision("p1", "operator-1"),
+                                    now=now, nonce_store=store)
+    assert first["authorized"] is True
+    # The same nonce cannot be replayed against a second permission, even by the same operator.
+    replayed = user_authorization_gate(permission("p2"), decision("p2", "operator-1"),
+                                       now=now, nonce_store=store)
+    assert replayed["status"] == "DENY"
+    assert "AUTHORIZATION_NONCE_REPLAYED" in replayed["blockers"]
+    # A different operator cannot collide with another operator's nonce namespace.
+    other = user_authorization_gate(permission("p2"), decision("p2", "operator-2"),
+                                    now=now, nonce_store=store)
+    assert other["authorized"] is True
+
+
 def test_policy_owned_mandatory_agents_cannot_be_overridden_by_payload():
     payload = good_payload()
     payload["mandatory_agents"] = ["PlatformScoutAgent"]
@@ -506,6 +533,39 @@ def test_any_mnpi_legal_tag_variant_vetoes():
     result = certainty_gate(payload, POLICY, governance=GOVERNANCE)
     assert result["status"] == "VETO"
     assert "MNPI_SUSPECT_SOURCE_VETO" in result["blockers"]
+
+
+def test_relabelled_mnpi_legal_tag_still_vetoes():
+    for tag in ("mnpi_suspect", "MNPI-Alleged", " mnpi"):
+        payload = good_payload()
+        payload["key_sources"][0]["legal_tag"] = tag
+        result = certainty_gate(payload, POLICY, governance=GOVERNANCE)
+        assert result["status"] == "VETO", tag
+        assert "MNPI_SUSPECT_SOURCE_VETO" in result["blockers"], tag
+
+
+def test_mnpi_substring_risk_flag_is_vetoed_by_permission_gate():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    for flag in ("escalate_mnpi_review", "MNPI-SUSPECT", "mnpi_new"):
+        request = valid_permission_request(now)
+        request["risk_flags"] = [flag]
+        result = permission_gate(request, _permission_matrix(), now=now)
+        assert result["status"] == "DENY", flag
+        assert "MNPI_VETO" in result["blockers"], flag
+
+
+def test_non_integer_calibration_sample_floor_is_a_blocker():
+    policy = dict(POLICY, min_calibration_sample_size=29.5)
+    result = certainty_gate(good_payload(), policy, governance=GOVERNANCE)
+    assert result["status"] == "GATHER_MORE"
+    assert "INVALID_POLICY_VALUE:min_calibration_sample_size" in result["blockers"]
+
+
+def test_non_integer_dissent_sample_floor_is_a_blocker():
+    policy = dict(POLICY, min_dissent_samples=29.5)
+    result = certainty_gate(good_payload(), policy, governance=GOVERNANCE)
+    assert result["status"] == "GATHER_MORE"
+    assert "INVALID_POLICY_VALUE:min_dissent_samples" in result["blockers"]
 
 
 def test_chief_tail_risk_cannot_be_lower_than_a_scenario():

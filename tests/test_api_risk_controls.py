@@ -70,6 +70,41 @@ def test_disabling_kill_switch_requires_separate_admin_secret(monkeypatch):
     assert accepted.json()["kill_switch_active"] is False
 
 
+def test_risk_permission_route_refuses_caller_supplied_risk_aggregates(monkeypatch):
+    configure(monkeypatch)
+    response = client.post("/v1/permission/check", headers={"X-Bridge-Key": BRIDGE},
+                           json={"payload": {}})
+    assert response.status_code == 423
+
+
+class RaisingRepository:
+    def get_kill_switch_state(self):
+        raise RuntimeError("database unavailable")
+
+    def set_kill_switch(self, **kwargs):
+        raise RuntimeError("database unavailable")
+
+    def get_latest_mt5_risk_snapshot(self, symbol):
+        raise RuntimeError("database unavailable")
+
+
+def test_risk_endpoints_fail_closed_when_the_database_is_unavailable(monkeypatch):
+    monkeypatch.setattr(api, "PostgresRepository", lambda: RaisingRepository())
+    configure(monkeypatch)
+    monkeypatch.setenv("MT5_KILL_SWITCH_ADMIN_TOKEN", "a-different-admin-token-at-least-32-characters")
+    bridge = {"X-Bridge-Key": BRIDGE}
+    admin = {**bridge, "X-Kill-Switch-Admin": "a-different-admin-token-at-least-32-characters"}
+    assert client.get("/v1/risk/kill-switch", headers=bridge).status_code == 503
+    activate = client.post("/v1/risk/kill-switch", headers=admin,
+                           json={"active": True, "actor_id": "operator", "reason": "controlled test only"})
+    assert activate.status_code == 503
+    permission = client.post(
+        "/v1/risk/permission/check", headers=bridge,
+        json=signed_body({"instrument": "EURUSD", "mode": "demo"}),
+    )
+    assert permission.status_code == 503
+
+
 def test_risk_permission_route_denies_without_real_persisted_terminal_snapshot(monkeypatch):
     fake = FakeRepository()
     fake.state["kill_switch_active"] = False
@@ -131,9 +166,11 @@ def test_risk_permission_route_reaches_human_review_when_evidence_agrees(monkeyp
     snapshot = {
         "status": "PASS", "observed_at": now.isoformat(), "account_mode": "demo",
         "symbol": "EURUSD", "symbol_group": "fx-major", "account_equity": 10000.0,
+        "account_balance": 10000.0, "daily_pnl": 0.0,
         "day_start_equity": 10000.0, "equity_high_watermark": 10200.0,
         "risk_fraction": 0.002, "risk_value_account_currency": 20.0,
         "risk_tick_size": 0.0001, "risk_tick_value_loss": 20.0,
+        "reference_price": 1.1001,
         "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0196,
         "open_positions": 1, "correlated_open_positions": 1,
         "request_binding_sha256": risk_request_binding_hash(request),
@@ -161,5 +198,6 @@ def test_risk_permission_route_reaches_human_review_when_evidence_agrees(monkeyp
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "REQUIRE_HUMAN"
+    assert body["blockers"] == []
     assert body["risk_reconciliation"]["status"] == "PASS"
     assert body["trade_allowed"] is False

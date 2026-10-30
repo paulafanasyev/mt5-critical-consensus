@@ -136,7 +136,10 @@ def self_adversarial_pass(verdict: Mapping[str, Any], *, counterarguments: Seque
         normalized = "ABSTAIN" if not contradictions else "REJECT"
     else:
         normalized = supplied_verdict
-    if any(str(s.get("legal_tag", "")).upper() == "MNPI-SUSPECT" for s in sources if isinstance(s, Mapping)):
+    # Any tag in the MNPI family vetoes here too: the exact label "MNPI-SUSPECT" is not the
+    # only spelling an upstream feed may emit.
+    if any(str(s.get("legal_tag", "")).strip().upper().replace("_", "-").startswith("MNPI")
+           for s in sources if isinstance(s, Mapping)):
         normalized = "VETO"
         reasons.append("MNPI_SUSPECT_SOURCE_BLOCKED")
     return {
@@ -477,12 +480,20 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any], *,
             return default
         return value
 
+    def policy_count(key: str, default: int, *, lower: int, upper: int) -> int:
+        value = policy_number(key, default, lower=lower, upper=upper)
+        if not float(value).is_integer():
+            # int(29.9) would silently lower the sample-size floor to 29.
+            reasons.append(f"INVALID_POLICY_VALUE:{key}")
+            return int(math.ceil(value))
+        return int(value)
+
     near = policy_number("near_certainty_threshold", 0.98, lower=0.0, upper=1.0)
     consensus_threshold = policy_number("consensus_score_threshold", 0.98, lower=0.0, upper=1.0)
     brier_threshold = policy_number("brier_threshold", 0.12, lower=0.0, upper=1.0)
     source_floor = policy_number("source_credibility_threshold", 0.75, lower=0.0, upper=1.0)
     source_max_age = policy_number("source_max_age_seconds", 900, lower=0.001, upper=31_536_000)
-    min_calibration_samples = int(policy_number("min_calibration_sample_size", 30, lower=1, upper=10_000_000))
+    min_calibration_samples = policy_count("min_calibration_sample_size", 30, lower=1, upper=10_000_000)
     min_reviewers_raw = _finite_float(thresholds.get("min_reviewers_per_verdict", 2))
     if min_reviewers_raw is None or min_reviewers_raw < 1 or not min_reviewers_raw.is_integer():
         reasons.append("INVALID_POLICY_VALUE:min_reviewers_per_verdict")
@@ -498,7 +509,7 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any], *,
     # the exact hyphenated label would let a relabelled source bypass the veto.
     mnpi_suspect = any(
         isinstance(source, Mapping)
-        and str(source.get("legal_tag", "")).upper().replace("_", "-").startswith("MNPI")
+        and str(source.get("legal_tag", "")).strip().upper().replace("_", "-").startswith("MNPI")
         for source in pre_sources
     )
     if mnpi_suspect:
@@ -639,7 +650,7 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any], *,
         observed = _source_observed_at(source)
         age = (current - observed).total_seconds() if observed is not None else None
         ttl = _finite_float(source.get("ttl_seconds"))
-        tag = str(source.get("legal_tag", "")).upper().replace("_", "-")
+        tag = str(source.get("legal_tag", "")).strip().upper().replace("_", "-")
         if (not source_id or credibility is None or age is None or ttl is None or ttl <= 0
                 or age < -30 or credibility < source_floor
                 or age > min(source_max_age, ttl) or tag.startswith("MNPI")):
@@ -700,8 +711,16 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any], *,
         governance = {}
     dissent_floor = policy_number("dissent_rate_floor", 0.10, lower=0.0, upper=1.0)
     false_certainty_limit = policy_number("false_certainty_rate_max", 0.05, lower=0.0, upper=1.0)
-    min_dissent_samples = int(policy_number("min_dissent_samples", 30, lower=1, upper=10_000_000))
-    min_false_certainty_samples = int(policy_number("min_false_certainty_samples", 30, lower=1, upper=10_000_000))
+
+    def policy_count(key: str, default: int, *, lower: int, upper: int) -> int:
+        value = policy_number(key, default, lower=lower, upper=upper)
+        if not float(value).is_integer():
+            reasons.append(f"INVALID_POLICY_VALUE:{key}")
+            return int(math.ceil(value))
+        return int(value)
+
+    min_dissent_samples = policy_count("min_dissent_samples", 30, lower=1, upper=10_000_000)
+    min_false_certainty_samples = policy_count("min_false_certainty_samples", 30, lower=1, upper=10_000_000)
     dissent_rate = _finite_float(governance.get("dissent_rate"))
     dissent_sample_size = _finite_float(governance.get("dissent_sample_size"))
     dissent_ok = (dissent_rate is not None and 0 <= dissent_rate <= 1 and dissent_rate >= dissent_floor
@@ -929,9 +948,12 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
     flags = {str(x).strip().lower() for x in raw_flags if str(x).strip()}
     blocked = {str(x).strip().lower() for x in policy.get("blocked_flags", [])}
     if flags & blocked: blockers.append("BLOCKED_RISK_FLAGS:" + ",".join(sorted(flags & blocked)))
-    if "mnpi-suspect" in flags or "mnpi" in flags:
+    # Substring match on the normalised flag: "mnpi", "mnpi-suspect", "mnpi_new" and
+    # "escalate-mnpi-review" must all veto, not only the two exact spellings.
+    normalized_flags = {flag.replace("_", "-") for flag in flags}
+    if any("mnpi" in flag for flag in normalized_flags):
         blockers.append("MNPI_VETO")
-    if "kill_switch" in flags or "kill-switch" in flags:
+    if any(flag.startswith("kill-switch") for flag in normalized_flags):
         blockers.append("KILL_SWITCH_ACTIVE")
 
     # Session and rollover controls use UTC by design. Invalid policy blocks.
@@ -1039,7 +1061,8 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
                 if calculated_rr is None or rr is None or tolerance_fraction is None or not 0 <= tolerance_fraction <= 0.25:
                     blockers.append("EXPECTED_RR_RECALCULATION_FAILED")
                 else:
-                    if min_rr is None or calculated_rr < min_rr:
+                    # Binary float error must not turn an exactly-at-floor RR into a pass.
+                    if min_rr is None or calculated_rr + 1e-9 < min_rr:
                         blockers.append("EXPECTED_RR_BELOW_POLICY_AFTER_RECALCULATION")
                     if abs(rr - calculated_rr) > max(0.01, calculated_rr * tolerance_fraction):
                         blockers.append("EXPECTED_RR_DOES_NOT_MATCH_SL_TP")
@@ -1125,8 +1148,10 @@ def user_authorization_gate(permission_result: Mapping[str, Any], decision: Mapp
         return {"status": "DENY", "authorized": False,
                 "blockers": ["AUTHORIZATION_NONCE_STORE_REQUIRED"], "trade_allowed": False}
     try:
+        # The nonce is one-time per operator, not per permission/decision pair: scoping it to
+        # those fields would let the identical nonce be replayed against a second approval.
         consumed = store.consume(
-            scope=f"{permission_result.get('permission_id')}:{decision.get('decision_id')}:{decision.get('user_id')}",
+            scope=str(decision.get("user_id")).strip(),
             nonce=nonce,
             expires_at=permission_expires if permission_expires is not None else current,
             now=current,
