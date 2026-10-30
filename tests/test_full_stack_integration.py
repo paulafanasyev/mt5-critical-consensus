@@ -51,8 +51,12 @@ async def test_market_history_agents_forecast_calibration_audit_and_kill_switch(
 
     collected = await collect_agent_verdicts(
         {"signal_id": signal_id, "market_snapshot": snapshot},
-        [agent("analysis-a", "provider-a"), agent("analysis-b", "provider-b"), agent("risk-review", "provider-c")],
+        [AgentSpec("analysis-a", "provider-a", agent("analysis-a", "provider-a").run, role="analyst"),
+         AgentSpec("critic-b", "provider-b", agent("critic-b", "provider-b").run, role="critic"),
+         AgentSpec("chief-c", "provider-c", agent("chief-c", "provider-c").run, role="chief_review"),
+         AgentSpec("risk-review", "provider-d", agent("risk-review", "provider-d").run, role="risk_review")],
         now=now + timedelta(minutes=1),
+        required_roles=("analyst", "critic", "chief_review", "risk_review"),
     )
     assert collected["status"] == "READY_FOR_REVIEW"
     assert collected["trade_allowed"] is False
