@@ -308,3 +308,54 @@ def test_dns_resolution_rejects_invalid_timeout():
             assert False, "invalid DNS timeout must be rejected"
         except ValueError as exc:
             assert "DNS timeout" in str(exc)
+
+
+
+def test_fetch_enforces_absolute_response_deadline(monkeypatch):
+    calls = {}
+
+    class FakeSocket:
+        def settimeout(self, value):
+            calls["socket_timeout"] = value
+
+    class SlowResponse:
+        status = 200
+        def getheader(self, name, default=None):
+            return {"Content-Type": "application/json"}.get(name, default)
+        def read1(self, size):
+            raise TimeoutError("simulated slow publisher")
+        def close(self):
+            calls["response_closed"] = True
+
+    class FakeConnection:
+        def __init__(self, hostname, pinned_ip, *, timeout):
+            self.sock = FakeSocket()
+            calls["initial_timeout"] = timeout
+        def request(self, method, path, headers):
+            return None
+        def getresponse(self):
+            return SlowResponse()
+        def close(self):
+            calls["connection_closed"] = True
+
+    monkeypatch.setattr(CAPTURE, "_resolve_public_addresses", lambda host: ["93.184.216.34"])
+    monkeypatch.setattr(CAPTURE, "_PinnedHTTPSConnection", FakeConnection)
+    try:
+        CAPTURE._fetch("https://official-a.example/releases/item", max_bytes=512000, timeout=2)
+        assert False, "slow response must be rejected"
+    except RuntimeError as exc:
+        assert str(exc) == "publisher_network_or_tls_error"
+    assert 0 < calls["socket_timeout"] <= 2
+    assert calls["response_closed"] is True
+    assert calls["connection_closed"] is True
+
+
+def test_fetch_rejects_invalid_total_timeout_before_dns(monkeypatch):
+    monkeypatch.setattr(CAPTURE, "_resolve_public_addresses",
+                        lambda host: (_ for _ in ()).throw(AssertionError("DNS must not run")))
+    for invalid in (True, False, 0, -1, float("nan"), float("inf"), 31, "4"):
+        try:
+            CAPTURE._fetch("https://official-a.example/releases/item", max_bytes=512000, timeout=invalid)
+            assert False, "invalid total timeout must be rejected"
+        except ValueError as exc:
+            assert "timeout" in str(exc)
