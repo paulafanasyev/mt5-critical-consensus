@@ -34,7 +34,8 @@ async def test_market_snapshot_to_agent_collection_never_authorizes_trade():
         return AgentSpec(agent_id, group, run)
 
     result = await collect_agent_verdicts(
-        {"signal_id": signal_id, "market_snapshot": snapshot},
+        {"signal_id": signal_id, "market_snapshot": snapshot,
+         "available_evidence_refs": ["market-snapshot:snapshot-test-001"]},
         [make("macro", "macro-feed"), make("technical", "technical-model"), make("risk", "risk-model")],
         now=datetime(2026, 10, 2, 0, 1, tzinfo=timezone.utc),
     )
