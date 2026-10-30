@@ -20,7 +20,7 @@ from redis.asyncio import Redis
 from critical_consensus.persistence import PostgresRepository
 from critical_consensus.providers import canonical_signal_hash, load_agent_specs_from_env
 from critical_consensus.redis_streams import publish_event
-from critical_consensus.review_service import run_peer_review_cycle
+from critical_consensus.review_service import make_non_author_challenge_resolver, run_peer_review_cycle
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,14 +72,13 @@ async def run(args) -> int:
                 (spec.agent_id, spec.run.make_peer_reviewer(signal["available_evidence_refs"]))
                 for spec in agents if callable(getattr(spec.run, "make_peer_reviewer", None))
             ]
-            resolver_spec = next(
-                (spec for spec in agents if spec.role == "devil_advocate"
-                 and callable(getattr(spec.run, "make_challenge_resolver", None))),
-                None,
+            resolver_registry = [
+                (spec.agent_id, spec.run.make_challenge_resolver(signal["available_evidence_refs"]))
+                for spec in agents if callable(getattr(spec.run, "make_challenge_resolver", None))
+            ]
+            resolver = make_non_author_challenge_resolver(
+                result.get("verdicts", []), resolver_registry,
             )
-            if resolver_spec is None:
-                raise ValueError("trusted challenge resolver provider is not configured")
-            resolver = resolver_spec.run.make_challenge_resolver(signal["available_evidence_refs"])
             review_cycle = await run_peer_review_cycle(
                 result.get("verdicts", []), reviewer_registry,
                 allowed_evidence_refs=signal["available_evidence_refs"],
