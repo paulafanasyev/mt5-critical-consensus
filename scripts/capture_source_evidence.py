@@ -107,6 +107,20 @@ def _resolve_public_addresses(host: str, *, timeout: float = 5.0) -> list[str]:
             raise RuntimeError("publisher_dns_returned_invalid_address") from None
         if not parsed.is_global:
             raise ValueError("publisher DNS resolved to a non-public network address")
+        if isinstance(parsed, ipaddress.IPv6Address):
+            # Reject transition mechanisms that can conceal a non-public IPv4 target.
+            # In particular, the well-known NAT64 prefix can embed loopback/RFC1918 IPv4
+            # while the outer IPv6 address itself is classified as globally reachable.
+            transition_prefixes = (
+                ipaddress.ip_network("64:ff9b::/96"),
+                ipaddress.ip_network("64:ff9b:1::/48"),
+                ipaddress.ip_network("2002::/16"),
+                ipaddress.ip_network("2001::/32"),
+            )
+            mapped = parsed.ipv4_mapped
+            embedded_private = mapped is not None and not mapped.is_global
+            if embedded_private or any(parsed in prefix for prefix in transition_prefixes):
+                raise ValueError("publisher DNS resolved to an IPv6 transition address")
         normalized = parsed.compressed
         if normalized not in addresses:
             addresses.append(normalized)
