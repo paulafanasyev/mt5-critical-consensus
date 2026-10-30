@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import threading
 import urllib.error
@@ -111,8 +112,13 @@ class OpenAICompatibleAgent:
         self.model = str(model).strip()
         self.api_key = str(api_key)
         self.base_url = str(base_url).rstrip("/")
+        if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
+                or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 120):
+            raise ValueError("timeout_seconds must be finite and in (0,120]")
+        if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int) or not 1 <= ttl_seconds <= 3600:
+            raise ValueError("ttl_seconds must be an integer in [1,3600]")
         self.timeout_seconds = float(timeout_seconds)
-        self.ttl_seconds = int(ttl_seconds)
+        self.ttl_seconds = ttl_seconds
         self.role = str(role).strip().lower()
         try:
             parsed = urlparse(self.base_url)
@@ -458,8 +464,8 @@ def load_agent_specs_from_env():
         agent = OpenAICompatibleAgent(
             agent_id=agent_id, model=model, api_key=api_key,
             base_url=str(entry.get("base_url", "https://api.openai.com/v1")),
-            timeout_seconds=float(entry.get("timeout_seconds", 15)),
-            ttl_seconds=int(entry.get("ttl_seconds", 300)),
+            timeout_seconds=entry.get("timeout_seconds", 15),
+            ttl_seconds=entry.get("ttl_seconds", 300),
             role=str(entry.get("role", "analyst")),
         )
         specs.append(AgentSpec(agent_id, group, agent, role=agent.role,
