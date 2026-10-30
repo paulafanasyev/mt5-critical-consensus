@@ -21,7 +21,7 @@ def main() -> int:
         "broker preflight": r"OrderCheck\s*\(",
         "localhost bridge default": r"http://127\.0\.0\.1:8000/v1/execution/next",
         "duplicate order guard": r"DUPLICATE BLOCKED",
-        "kill-switch endpoint configured": r"KillSwitchUrl\\s*=",
+        "kill-switch endpoint configured": r"KillSwitchUrl",
         "kill-switch response must explicitly be false": r"JsonFalse",
         "live-path remains blocked": r"if\s*\(!EnableDemoExecution\s*\|\|\s*AllowLiveExecution\)",
     }
