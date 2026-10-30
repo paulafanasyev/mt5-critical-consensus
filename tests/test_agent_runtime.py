@@ -189,3 +189,32 @@ async def test_agent_runtime_requires_a_nonempty_signal_evidence_allowlist_befor
     assert result["status"] == "GATHER_MORE"
     assert result["blockers"] == ["SIGNAL_EVIDENCE_ALLOWLIST_MISSING_OR_INVALID"]
     assert called is False
+
+
+@pytest.mark.parametrize("timeout", [True, False, 0, -1, float("nan"), float("inf"), "15", None])
+async def test_agent_runtime_rejects_invalid_collection_policy_types(timeout):
+    result = await collect_agent_verdicts(
+        {"signal_id": "s1", "available_evidence_refs": ["source:1"]},
+        [AgentSpec("agent", "group", provider("agent"))],
+        timeout_seconds=timeout,
+        now=NOW,
+    )
+    assert result["status"] == "GATHER_MORE"
+    assert result["blockers"] == ["INVALID_COLLECTION_POLICY"]
+    assert result["trade_allowed"] is False
+
+
+@pytest.mark.parametrize("minimum_agents,minimum_groups", [
+    (True, 3), (1.5, 3), (0, 3), (3, True), (3, 1.5), (3, 0),
+])
+async def test_agent_runtime_requires_integer_positive_minimum_counts(minimum_agents, minimum_groups):
+    result = await collect_agent_verdicts(
+        {"signal_id": "s1", "available_evidence_refs": ["source:1"]},
+        [AgentSpec("agent", "group", provider("agent"))],
+        minimum_agents=minimum_agents,
+        minimum_independence_groups=minimum_groups,
+        now=NOW,
+    )
+    assert result["status"] == "GATHER_MORE"
+    assert result["blockers"] == ["INVALID_COLLECTION_POLICY"]
+    assert result["trade_allowed"] is False
