@@ -9,6 +9,9 @@ import json
 import os
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
 
 from critical_consensus.agent_runtime import collect_agent_verdicts
 from critical_consensus.market_data import build_market_snapshot
@@ -17,6 +20,9 @@ from redis.asyncio import Redis
 from critical_consensus.persistence import PostgresRepository
 from critical_consensus.providers import canonical_signal_hash, load_agent_specs_from_env
 from critical_consensus.redis_streams import publish_event
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 async def run(args) -> int:
@@ -35,6 +41,11 @@ async def run(args) -> int:
     }
     try:
         agents = load_agent_specs_from_env()
+        policy_path = ROOT / "config" / "certainty_thresholds.yaml"
+        certainty_policy = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
+        mandatory_agent_ids = certainty_policy.get("mandatory_agents", []) if isinstance(certainty_policy, dict) else []
+        if not isinstance(mandatory_agent_ids, list) or not mandatory_agent_ids:
+            raise ValueError("certainty policy has no mandatory agent registry")
         if not agents:
             result = {"signal_id": signal_id, "status": "GATHER_MORE", "verdicts": [],
                       "agent_errors": [], "blockers": ["AGENT_PROVIDER_REGISTRY_NOT_CONFIGURED"],
@@ -42,9 +53,10 @@ async def run(args) -> int:
         else:
             result = await collect_agent_verdicts(
                 signal, agents, timeout_seconds=args.timeout,
-                minimum_agents=args.minimum_agents,
+                minimum_agents=max(args.minimum_agents, len(mandatory_agent_ids)),
                 minimum_independence_groups=args.minimum_independence_groups,
-                required_roles=("analyst", "critic", "chief_review", "risk_review"),
+                required_roles=("analyst", "critic", "devil_advocate", "risk_review"),
+                required_agent_ids=mandatory_agent_ids,
             )
     except Exception as exc:
         # Do not print provider endpoint secrets or exception strings.
@@ -77,6 +89,8 @@ async def run(args) -> int:
         finally:
             await redis.aclose()
     print(json.dumps({"market_snapshot": snapshot, "collection": result,
+                      "pipeline_stage": "AGENT_COLLECTION_ONLY",
+                      "decision_gate_invoked": False,
                       "audit_event_id": event["event_id"], "redis_publication": redis_status},
                      indent=2, ensure_ascii=False))
     if result.get("status") != "READY_FOR_REVIEW":
