@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.0 — 2026-10-30
+
+- Added HMAC-SHA256 evidence envelopes (`evidence.py`): the pipeline verifies issuer, freshness, nonce, payload hash and signature over the canonical bundle body before any gate runs. `canonical_hash`, provider hashing and persistence no longer coerce arbitrary objects to strings or accept NaN/Infinity.
+- Added separately signed calibration-service governance attestations (`governance.py`). `certainty_gate` reads historical `dissent_rate`/`false_certainty_rate` only from a verified attestation, never from caller-supplied payload fields.
+- `mandatory_agents` and `compliance_agent_id` are policy-owned. `compliance_status` is derived from the `ComplianceAgent` verdict, and permission requests must match the signal's instrument and direction.
+- Authorization now requires a `decision_id` and an atomically consumed one-time nonce (`authorization.py`, `authorization_nonces` migration); replay returns `DENY`.
+- Challenge resolution requires genuinely new evidence from the trusted registry; peer reviews and challenge records require unique IDs and valid timestamps.
+- FastAPI policy endpoints require a signed `{"payload", "envelope"}` wrapper; `/health` reports configured verification honestly. Provider keys must use the `MT5_AGENT_KEY_*` environment namespace.
+- Evidence and governance envelopes sign separate domains; the pipeline, API and CLI reject a shared signing key or issuer, require both issuer pins, and `/health` reports distinctness without exposing secrets.
+- Calibration is attested rather than self-declared: governance attestations must include per-agent `agent_calibration`, and the verified rows overwrite any bundle-supplied `calibration_meta` before consensus is recomputed.
+- Any caller-supplied `user_decision` now requires `require_persisted_risk` evidence; peer reviews and challenge records are TTL-bounded, the contradiction lookback must match policy, `news_or_rumor` must be explicit, and source freshness uses absolute `observed_at`.
+- MT5 risk capture requires an explicit broker `server_utc_offset_seconds` and fails closed before initialization when it is missing or malformed; tick freshness and the broker-day deal window use that offset.
+- MQL5 EA v0.12 rejects non-exact loopback URLs (userinfo, query/fragment, whitespace, non-ASCII, non-numeric or out-of-range ports), validates a header-safe 16–256 character bridge token before use, and flushes the idempotency tombstone before `OrderSend`. The static checker now verifies 44 invariants.
+- Added a PostgreSQL nonce-store integration test, documented migration 005 tombstone retention, and ignored generated `*.egg-info`/`build`/`dist` artifacts.
+- Added `tzdata` for Windows and a UTC/`ZoneInfo` fallback for MT5 CSV timestamps.
+- Verification: local `pytest -q` — 201 passed, 9 skipped (all skips require `TEST_DATABASE_URL` and/or `TEST_REDIS_URL`). No PostgreSQL/Redis integration, broker, MetaEditor compilation, or live-market validation was performed.
+
 ## 0.2.0 — 2026-10-29
 
 - Made invalid/non-finite confidence, consensus, calibration, source and risk values fail closed; added explicit primary APPROVE confidence floors.
@@ -14,4 +31,4 @@
 
 ## Scope note
 
-This is a reference scaffold, not a complete trading product. It does not ingest real market data, prove calibrated probability of profit, persist the full pipeline in a running database, deploy agent workers, verify TOTP/signatures cryptographically, or place broker orders. MT5 integration remains uncompiled and unverified in MetaEditor.
+This is a reference scaffold, not a complete trading product. It does not ingest real market data, prove calibrated probability of profit, or demonstrate the persistence/worker code against a running deployment. It does not verify TOTP/signatures cryptographically or place broker orders. MT5 integration remains uncompiled and unverified in MetaEditor.

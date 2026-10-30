@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 import uuid
@@ -21,8 +22,11 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def canonical_signal_hash(signal: Mapping[str, Any]) -> str:
-    encoded = json.dumps(signal, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-                         allow_nan=False, default=str)
+    try:
+        encoded = json.dumps(signal, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                             allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("signal is not canonically serializable") from exc
     return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -210,8 +214,11 @@ class OpenAICompatibleAgent:
         if (not isinstance(available, Sequence) or isinstance(available, (str, bytes))
                 or not available or any(not str(ref).strip() for ref in available)):
             raise ValueError("available_evidence_refs must contain pre-validated evidence IDs")
-        signal_json = json.dumps(signal, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-                                  allow_nan=False, default=str)
+        try:
+            signal_json = json.dumps(signal, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                                      allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("signal is not canonically serializable") from exc
         if len(signal_json.encode("utf-8")) > 200_000:
             raise ValueError("signal payload exceeds 200 KB limit")
 
@@ -297,6 +304,9 @@ class OpenAICompatibleAgent:
         }
 
 
+_API_KEY_ENV_RE = re.compile(r"^MT5_AGENT_KEY_[A-Z0-9_]{1,64}$")
+
+
 def load_agent_specs_from_env():
     """Return AgentSpec records from MT5_AGENT_PROVIDERS JSON and named key env vars."""
     from .agent_runtime import AgentSpec
@@ -322,6 +332,8 @@ def load_agent_specs_from_env():
         api_key_env = str(entry.get("api_key_env", "")).strip()
         if not api_key_env or not agent_id or not group or not model:
             raise ValueError("agent_id, independence_group, model and api_key_env are required")
+        if _API_KEY_ENV_RE.fullmatch(api_key_env) is None:
+            raise ValueError("api_key_env must match MT5_AGENT_KEY_[A-Z0-9_]{1,64}")
         api_key = os.getenv(api_key_env, "")
         if not api_key:
             raise ValueError(f"required API key environment variable is not set: {api_key_env}")

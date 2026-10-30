@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from .gates import anonymized_peer_review, challenge_resolution_loop
@@ -154,8 +155,11 @@ async def run_peer_review_cycle(
             "challenge_id": "ch-" + uuid.uuid4().hex,
             "target_verdict_id": str(review["target_verdict_id"]),
             "challenge_type": str(review["challenge_type"]).upper(),
+            "argument": str(review["argument"]),
             "status": "OPEN",
             "evidence_refs": list(review["evidence_refs"]),
+            "rounds": [],
+            "created_at": str(review.get("created_at") or datetime.now(timezone.utc).isoformat()),
             "originating_review_id": review.get("review_id"),
             "originating_reviewer_alias": review.get("reviewer_alias"),
         })
@@ -172,6 +176,15 @@ async def run_peer_review_cycle(
     resolution = challenge_resolution_loop(
         challenges, resolver, max_rounds=max_resolution_rounds,
     )
+    rounds_by_challenge: dict[str, list[dict[str, Any]]] = {}
+    for entry in resolution.get("transcript", []):
+        if not isinstance(entry, Mapping):
+            continue
+        response = entry.get("response") if isinstance(entry.get("response"), Mapping) else {}
+        rounds_by_challenge.setdefault(str(entry.get("challenge_id", "")), []).append({
+            "round": entry.get("round"),
+            "resolved": response.get("resolved") is True,
+        })
     resolved: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
     for challenge in resolution.get("resolved_challenges", []):
@@ -179,10 +192,14 @@ async def run_peer_review_cycle(
         if (not isinstance(refs, Sequence) or isinstance(refs, (str, bytes))
                 or not refs or any(str(ref).strip() not in allowed for ref in refs)):
             unresolved.append({**dict(challenge), "status": "OPEN",
+                               "rounds": rounds_by_challenge.get(str(challenge.get("challenge_id", "")), []),
                                "resolution_error": "RESOLUTION_EVIDENCE_NOT_IN_TRUSTED_REGISTRY"})
         else:
-            resolved.append(dict(challenge))
-    unresolved.extend(dict(item) for item in resolution.get("open_challenges", []))
+            resolved.append({**dict(challenge),
+                             "rounds": rounds_by_challenge.get(str(challenge.get("challenge_id", "")), [])})
+    unresolved.extend({**dict(item),
+                       "rounds": rounds_by_challenge.get(str(item.get("challenge_id", "")), [])}
+                      for item in resolution.get("open_challenges", []))
     ledger = resolved + unresolved
     deadlock = bool(unresolved)
     return {

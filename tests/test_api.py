@@ -1,8 +1,57 @@
+from datetime import datetime, timedelta, timezone
+
 from fastapi.testclient import TestClient
 
 from critical_consensus.api import app
+from critical_consensus.evidence import make_envelope
+from critical_consensus.governance import sign_attestation
 
 client = TestClient(app)
+
+BRIDGE = "test-bridge-secret-that-is-long-enough"
+EVIDENCE_KEY = "k" * 64
+GOVERNANCE_KEY = "v" * 64
+EVIDENCE_ISSUER = "test-ingress"
+GOVERNANCE_ISSUER = "calibration-service"
+NOW = datetime.now(timezone.utc)
+
+
+def signed_body(payload, *, key=EVIDENCE_KEY, issuer=EVIDENCE_ISSUER):
+    return {"payload": payload,
+            "envelope": make_envelope(payload, key=key, issuer=issuer)}
+
+
+def governance_attestation(*, observed_at=NOW, key=GOVERNANCE_KEY,
+                           issuer=GOVERNANCE_ISSUER, domain=None):
+    payload = {
+        "source": "calibration-service",
+        "observed_at": observed_at.isoformat(),
+        "window_start": (observed_at - timedelta(days=7)).isoformat(),
+        "window_end": (observed_at - timedelta(minutes=5)).isoformat(),
+        "dissent_rate": 0.15, "dissent_sample_size": 100,
+        "false_certainty_rate": 0.02, "false_certainty_sample_size": 100,
+        "method_version": "brier-shrink-v1",
+        "agent_calibration": {
+            "PlatformScoutAgent": {"brier_score": 0.05, "sample_size": 100,
+                                    "calibration_status": "CALIBRATED"},
+        },
+    }
+    if domain is None:
+        return sign_attestation(payload, key=key, issuer=issuer)
+    return {"payload": payload,
+            "envelope": make_envelope(payload, key=key, issuer=issuer, domain=domain)}
+
+
+def configure(monkeypatch, *, bridge=BRIDGE, evidence_issuer=EVIDENCE_ISSUER,
+              governance_issuer=GOVERNANCE_ISSUER, governance_key=GOVERNANCE_KEY):
+    if bridge is None:
+        monkeypatch.delenv("MT5_BRIDGE_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("MT5_BRIDGE_TOKEN", bridge)
+    monkeypatch.setenv("MT5_EVIDENCE_HMAC_KEY", EVIDENCE_KEY)
+    monkeypatch.setenv("MT5_EVIDENCE_ISSUER", evidence_issuer)
+    monkeypatch.setenv("MT5_GOVERNANCE_HMAC_KEY", governance_key)
+    monkeypatch.setenv("MT5_GOVERNANCE_ISSUER", governance_issuer)
 
 
 def test_health_is_available_but_never_enables_execution():
@@ -11,44 +60,136 @@ def test_health_is_available_but_never_enables_execution():
     body = response.json()
     assert body["execution_enabled"] is False
     assert body["live_enabled"] is False
+    assert body["authenticated_policy_endpoints"] is False
+
+
+def test_health_reports_configured_authentication_without_secrets(monkeypatch):
+    configure(monkeypatch)
+    body = client.get("/health").json()
+    assert body["authenticated_policy_endpoints"] is True
+    assert body["evidence_verification_configured"] is True
+    assert body["governance_verification_configured"] is True
+    assert body["signing_keys_distinct"] is True
+    assert body["signing_issuers_distinct"] is True
+    assert BRIDGE not in str(body)
+    assert EVIDENCE_KEY not in str(body)
+    assert GOVERNANCE_KEY not in str(body)
 
 
 def test_policy_endpoint_fails_closed_when_secret_is_not_configured(monkeypatch):
-    monkeypatch.delenv("MT5_BRIDGE_TOKEN", raising=False)
-    response = client.post("/v1/certainty/evaluate", json={"payload": {}})
+    configure(monkeypatch, bridge=None)
+    response = client.post("/v1/certainty/evaluate",
+                           json={**signed_body({}), "governance_attestation": governance_attestation()})
     assert response.status_code == 503
 
 
+def test_policy_endpoint_fails_closed_without_issuer_pinning(monkeypatch):
+    configure(monkeypatch, evidence_issuer="")
+    response = client.post(
+        "/v1/certainty/evaluate", headers={"X-Bridge-Key": BRIDGE},
+        json={**signed_body({}), "governance_attestation": governance_attestation()},
+    )
+    assert response.status_code == 503
+    assert "MT5_EVIDENCE_ISSUER" in response.json()["detail"]
+
+
+def test_policy_endpoint_rejects_shared_signing_domains(monkeypatch):
+    configure(monkeypatch, governance_key=EVIDENCE_KEY)
+    response = client.post(
+        "/v1/certainty/evaluate", headers={"X-Bridge-Key": BRIDGE},
+        json={**signed_body({}), "governance_attestation": governance_attestation()},
+    )
+    assert response.status_code == 503
+    assert "must be different" in response.json()["detail"]
+
+
 def test_policy_endpoint_rejects_missing_or_wrong_bridge_key(monkeypatch):
-    monkeypatch.setenv("MT5_BRIDGE_TOKEN", "test-bridge-secret-that-is-long-enough")
-    missing = client.post("/v1/certainty/evaluate", json={"payload": {}})
-    wrong = client.post("/v1/certainty/evaluate", headers={"X-Bridge-Key": "wrong"}, json={"payload": {}})
+    configure(monkeypatch)
+    body = {**signed_body({}), "governance_attestation": governance_attestation()}
+    missing = client.post("/v1/certainty/evaluate", json=body)
+    wrong = client.post("/v1/certainty/evaluate", headers={"X-Bridge-Key": "wrong"}, json=body)
     assert missing.status_code == 401
     assert wrong.status_code == 401
 
 
-def test_policy_endpoint_accepts_correct_bridge_key(monkeypatch):
-    monkeypatch.setenv("MT5_BRIDGE_TOKEN", "test-bridge-secret-that-is-long-enough")
+def test_policy_endpoint_rejects_unsigned_or_tampered_payload(monkeypatch):
+    configure(monkeypatch)
+    headers = {"X-Bridge-Key": BRIDGE}
+    unsigned = client.post("/v1/certainty/evaluate", headers=headers, json={"payload": {}})
+    assert unsigned.status_code == 422
+    tampered = dict(signed_body({"a": 1}))
+    tampered["payload"] = {"a": 2}
     response = client.post("/v1/certainty/evaluate",
-                           headers={"X-Bridge-Key": "test-bridge-secret-that-is-long-enough"},
-                           json={"payload": {}})
+                           headers=headers,
+                           json={**tampered, "governance_attestation": governance_attestation()})
+    assert response.status_code == 403
+    assert "EVIDENCE_PAYLOAD_HASH_MISMATCH" in response.json()["detail"]["blockers"]
+
+
+def test_policy_endpoint_rejects_envelope_from_unexpected_issuer(monkeypatch):
+    configure(monkeypatch)
+    response = client.post(
+        "/v1/certainty/evaluate", headers={"X-Bridge-Key": BRIDGE},
+        json={**signed_body({}, issuer="rogue-ingress"),
+              "governance_attestation": governance_attestation()},
+    )
+    assert response.status_code == 403
+    assert "EVIDENCE_ISSUER_MISMATCH" in response.json()["detail"]["blockers"]
+
+
+def test_policy_endpoint_rejects_invalid_or_stale_governance(monkeypatch):
+    configure(monkeypatch)
+    headers = {"X-Bridge-Key": BRIDGE}
+    stale = auth_stale = governance_attestation(observed_at=NOW - timedelta(days=2))
+    cross_domain = governance_attestation(domain="evidence")
+    for attestation in (stale, cross_domain):
+        response = client.post(
+            "/v1/certainty/evaluate", headers=headers,
+            json={**signed_body({}), "governance_attestation": attestation},
+        )
+        assert response.status_code == 403
+        assert response.json()["detail"]["error"] == "governance_attestation_invalid"
+
+
+def test_policy_endpoint_accepts_correct_bridge_key(monkeypatch):
+    configure(monkeypatch)
+    response = client.post("/v1/certainty/evaluate",
+                           headers={"X-Bridge-Key": BRIDGE},
+                           json={**signed_body({}), "governance_attestation": governance_attestation()})
     assert response.status_code == 200
     assert response.json()["status"] == "GATHER_MORE"
     assert response.json()["trade_allowed"] is False
 
 
+def test_api_replaces_self_declared_calibration_with_attestation(monkeypatch):
+    configure(monkeypatch)
+    payload = {
+        "verdicts": [{"agent_id": "PlatformScoutAgent", "verdict": "APPROVE", "confidence": 0.99,
+                      "reviewer_count": 2,
+                      "calibration_meta": {"brier_score": 0.9, "sample_size": 1,
+                                            "calibration_status": "UNVERIFIED"}}],
+    }
+    response = client.post(
+        "/v1/certainty/evaluate", headers={"X-Bridge-Key": BRIDGE},
+        json={**signed_body(payload), "governance_attestation": governance_attestation()},
+    )
+    assert response.status_code == 200
+    blockers = response.json()["blockers"]
+    assert not any("PlatformScoutAgent:CALIBRATION" in blocker for blocker in blockers)
+
+
 def test_order_submission_endpoint_stays_disabled_even_with_bridge_key(monkeypatch):
-    monkeypatch.setenv("MT5_BRIDGE_TOKEN", "test-bridge-secret-that-is-long-enough")
-    response = client.post("/v1/execution/submit", headers={"X-Bridge-Key": "test-bridge-secret-that-is-long-enough"})
+    configure(monkeypatch)
+    response = client.post("/v1/execution/submit", headers={"X-Bridge-Key": BRIDGE})
     assert response.status_code == 423
     assert "no order was sent" in response.json()["detail"]
 
 
 def test_authorization_endpoint_does_not_trust_client_supplied_permission(monkeypatch):
-    monkeypatch.setenv("MT5_BRIDGE_TOKEN", "test-bridge-secret-that-is-long-enough")
+    configure(monkeypatch)
     response = client.post(
         "/v1/authorization/check",
-        headers={"X-Bridge-Key": "test-bridge-secret-that-is-long-enough"},
+        headers={"X-Bridge-Key": BRIDGE},
         json={"payload": {"permission_result": {"status": "REQUIRE_HUMAN", "permission_id": "forged"},
                          "decision": {"decision": "APPROVE", "user_id": "u", "reason": "ok"}}},
     )

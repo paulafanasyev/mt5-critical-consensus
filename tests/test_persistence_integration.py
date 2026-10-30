@@ -126,3 +126,21 @@ def test_pipeline_result_persistence_rejects_missing_or_forged_signal_hash():
               "audit_events": [event], "audit_chain_valid": True}
     with pytest.raises(ValueError, match="signal_input_sha256"):
         repo.persist_pipeline_result(result, signal_input_sha256="sha256:bad")
+
+
+def test_postgres_authorization_nonce_is_consumed_exactly_once():
+    from critical_consensus.authorization import PostgresNonceStore
+
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    store = PostgresNonceStore(repo)
+    scope = "perm:test-" + uuid.uuid4().hex
+    nonce = uuid.uuid4().hex
+    future = datetime.now(timezone.utc) + timedelta(minutes=5)
+    assert store.consume(scope=scope, nonce=nonce, expires_at=future) is True
+    assert store.consume(scope=scope, nonce=nonce, expires_at=future) is False
+    assert store.consume(scope=scope + ":other", nonce=nonce, expires_at=future) is True
+    expired = datetime.now(timezone.utc) - timedelta(seconds=1)
+    assert store.consume(scope=scope, nonce="expired-" + nonce, expires_at=expired) is False
+    with pytest.raises(ValueError, match="future"):
+        repo.consume_authorization_nonce(scope=scope, nonce="past-" + nonce, expires_at=expired)

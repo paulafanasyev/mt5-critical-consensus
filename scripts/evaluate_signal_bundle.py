@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,20 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return value
 
 
+def _required_env(name: str) -> str:
+    value = os.getenv(name, "")
+    if not 32 <= len(value.encode("utf-8")) <= 256:
+        raise ValueError(f"{name} must be configured with a 32..256 byte key")
+    return value
+
+
+def _required_issuer(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise ValueError(f"{name} must be configured; issuer pinning is required")
+    return value
+
+
 def run(bundle_path: Path, output_path: Path, *, persist: bool,
         policy_dir: Path = ROOT / "config") -> dict[str, Any]:
     bundle = _load_json(bundle_path)
@@ -50,6 +65,20 @@ def run(bundle_path: Path, output_path: Path, *, persist: bool,
             "this CLI does not accept or process human approval; remove user_decision "
             "and use the separately authenticated server-side authorization process"
         )
+    evidence_key = _required_env("MT5_EVIDENCE_HMAC_KEY")
+    governance_key = _required_env("MT5_GOVERNANCE_HMAC_KEY")
+    evidence_issuer = _required_issuer("MT5_EVIDENCE_ISSUER")
+    governance_issuer = _required_issuer("MT5_GOVERNANCE_ISSUER")
+    if evidence_key == governance_key:
+        raise ValueError("MT5_EVIDENCE_HMAC_KEY and MT5_GOVERNANCE_HMAC_KEY must be different")
+    if evidence_issuer == governance_issuer:
+        raise ValueError("MT5_EVIDENCE_ISSUER and MT5_GOVERNANCE_ISSUER must be different")
+    verify_args = {
+        "evidence_key": evidence_key,
+        "governance_key": governance_key,
+        "expected_evidence_issuer": evidence_issuer,
+        "expected_governance_issuer": governance_issuer,
+    }
 
     certainty_policy = _load_yaml(policy_dir / "certainty_thresholds.yaml")
     permission_matrix = _load_yaml(policy_dir / "permission_matrix.yaml")
@@ -79,6 +108,7 @@ def run(bundle_path: Path, output_path: Path, *, persist: bool,
             require_persisted_risk=True,
             kill_switch_state=kill_switch_state,
             terminal_risk_snapshot=terminal_risk_snapshot,
+            **verify_args,
         )
         report["persisted_risk_checked"] = True
         report["persistence"] = repo.persist_pipeline_result(
@@ -86,13 +116,13 @@ def run(bundle_path: Path, output_path: Path, *, persist: bool,
         )
     else:
         # Local/offline evaluation does not attest to the current terminal state.
-        result = evaluate_signal_bundle(bundle, certainty_policy, permission_matrix)
+        result = evaluate_signal_bundle(bundle, certainty_policy, permission_matrix, **verify_args)
 
     report["result"] = result
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
-        json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False, default=str) + "\n",
+        json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n",
         encoding="utf-8",
     )
     return report

@@ -19,13 +19,15 @@ def main() -> int:
     parser.add_argument("--stop-loss", type=float, required=True, help="exact stop-loss price")
     parser.add_argument("--take-profit", type=float, required=True, help="exact take-profit price")
     parser.add_argument("--day-start-equity", type=float, required=True,
-                        help="verified, cash-flow-adjusted equity at start of UTC day")
+                        help="verified, cash-flow-adjusted equity at broker server midnight")
     parser.add_argument("--equity-high-watermark", type=float, required=True,
                         help="verified intraday/high-water equity baseline")
     parser.add_argument("--symbol-groups", type=Path, required=True,
                         help="JSON object mapping every tradable/open-position symbol to an exposure group")
     parser.add_argument("--max-slippage-points", type=int, default=20)
     parser.add_argument("--max-quote-age-seconds", type=int, default=15)
+    parser.add_argument("--server-utc-offset-seconds", type=int, required=True,
+                        help="broker server UTC offset in whole minutes (e.g. 10800 for UTC+3)")
     parser.add_argument("--terminal-path", help="optional MT5 terminal executable path")
     args = parser.parse_args()
     try:
@@ -50,6 +52,7 @@ def main() -> int:
         proposed_request=proposed_request, symbol_groups=groups,
         terminal_path=args.terminal_path, max_slippage_points=args.max_slippage_points,
         max_quote_age_seconds=args.max_quote_age_seconds,
+        server_utc_offset_seconds=args.server_utc_offset_seconds,
     )
     persisted = repo.record_mt5_risk_snapshot(snapshot)
     print(json.dumps({"snapshot": snapshot, "persistence": persisted}, indent=2, ensure_ascii=False))

@@ -2,10 +2,13 @@
 from __future__ import annotations
 from datetime import datetime, timezone
 import math
+import re
 import uuid
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from .audit import canonical_hash
+
+_AUTH_NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 
 
 def _now_utc() -> datetime:
@@ -13,14 +16,24 @@ def _now_utc() -> datetime:
 
 
 def _finite_float(value: Any) -> float | None:
-    """Return a finite float or None; NaN/inf must never pass a policy comparison."""
-    if isinstance(value, bool):
+    """Return a finite float or None.
+
+    Numeric strings and booleans are rejected rather than coerced: a policy or
+    evidence field that is not a JSON number must fail closed, not be interpreted.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
+    number = float(value)
     return number if math.isfinite(number) else None
+
+
+def _policy_bool(policy: Mapping[str, Any], key: str, *, default: bool,
+                 blockers: list[str]) -> bool:
+    value = policy.get(key, default)
+    if not isinstance(value, bool):
+        blockers.append(f"INVALID_POLICY_BOOLEAN:{key}")
+        return default
+    return value
 
 
 def _current_utc(now: datetime | None) -> datetime:
@@ -41,12 +54,34 @@ def _parse_time(value: str | datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _source_observed_at(source: Mapping[str, Any]) -> datetime | None:
+    """Absolute observation time; caller-declared ages are not trusted."""
+    value = source.get("observed_at")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
 def self_adversarial_pass(verdict: Mapping[str, Any], *, counterarguments: Sequence[str],
                           contradictions: Sequence[Mapping[str, Any]],
                           sources: Sequence[Mapping[str, Any]], now: datetime | None = None,
                           required_independent_sources: int = 2,
-                          news_or_rumor: bool = False) -> dict[str, Any]:
-    """Validate self-critique, source freshness, independent evidence and MNPI flags."""
+                          news_or_rumor: bool = False,
+                          min_source_credibility: float = 0.75,
+                          source_max_age_seconds: float = 900) -> dict[str, Any]:
+    """Validate self-critique, source freshness, independent evidence and MNPI flags.
+
+    The credibility floor and freshness ceiling are caller-policy values. A source
+    record may not supply its own ``min_credibility`` or an inflated TTL: freshness is
+    computed from an absolute ``observed_at`` against ``now``, never from a
+    self-declared ``age_seconds``.
+    """
     if not isinstance(verdict, Mapping):
         verdict = {}
     reasons: list[str] = []
@@ -67,18 +102,21 @@ def self_adversarial_pass(verdict: Mapping[str, Any], *, counterarguments: Seque
             invalid_source_seen = True
             continue
         credibility = _finite_float(source.get("credibility"))
-        min_credibility = _finite_float(source.get("min_credibility", 0.75))
-        age = _finite_float(source.get("age_seconds"))
+        observed = _source_observed_at(source)
+        age = (current - observed).total_seconds() if observed is not None else None
         ttl = _finite_float(source.get("ttl_seconds"))
-        if (not source.get("source_id") or credibility is None or min_credibility is None or age is None or ttl is None
-                or age < 0 or ttl <= 0 or credibility < min_credibility or age > ttl):
+        if (not source.get("source_id") or credibility is None or observed is None or age is None or ttl is None
+                or age < -30 or ttl <= 0 or credibility < min_source_credibility
+                or age > min(source_max_age_seconds, ttl)):
             invalid_source_seen = True
             continue
         valid_sources.append(source)
     if invalid_source_seen or not valid_sources:
         reasons.append("SOURCE_STALE_LOW_CREDIBILITY_OR_INVALID")
 
-    if news_or_rumor and len({s.get("independence_group", s.get("source_id")) for s in valid_sources}) < required_independent_sources:
+    if news_or_rumor is not True and news_or_rumor is not False:
+        reasons.append("NEWS_OR_RUMOR_FLAG_MISSING_OR_INVALID")
+    if news_or_rumor is True and len({s.get("independence_group", s.get("source_id")) for s in valid_sources}) < required_independent_sources:
         reasons.append("INSUFFICIENT_INDEPENDENT_FRESH_SOURCES")
     raw_confidence = _finite_float(verdict.get("confidence", 0.0))
     confidence = raw_confidence if raw_confidence is not None and 0 <= raw_confidence <= 1 else 0.0
@@ -252,13 +290,29 @@ def challenge_resolution_loop(challenges: Sequence[Mapping[str, Any]],
     }
 
 
-def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, Any]:
-    """Conjunctive certainty checks. PASS forwards evidence to ChiefAgent only."""
+def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any], *,
+                   governance: Mapping[str, Any] | None = None,
+                   now: datetime | None = None) -> dict[str, Any]:
+    """Conjunctive certainty checks. PASS forwards evidence to ChiefAgent only.
+
+    ``mandatory_agents`` comes from policy, never from the payload. Historical
+    dissent/false-certainty metrics and per-agent calibration come from a verified
+    calibration-service attestation, never from caller-supplied payload fields. An
+    MNPI-SUSPECT source returns VETO regardless of every other check.
+    """
     if not isinstance(payload, Mapping):
         return {"status": "GATHER_MORE", "passed": False, "trade_allowed": False,
                 "blockers": ["INVALID_CERTAINTY_PAYLOAD"], "checks": {}}
     reasons: list[str] = []
     checks: dict[str, bool] = {}
+    try:
+        current = _current_utc(now)
+    except (ValueError, TypeError, OverflowError):
+        return {"status": "GATHER_MORE", "passed": False, "trade_allowed": False,
+                "blockers": ["INVALID_CURRENT_TIME"], "checks": {}}
+    governance_issuer = (
+        str(governance.get("issuer", "")).strip() if isinstance(governance, Mapping) else ""
+    )
     thresholds = policy.get("certainty_thresholds", policy) if isinstance(policy, Mapping) else {}
     if not isinstance(thresholds, Mapping):
         thresholds = {}
@@ -284,6 +338,21 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dic
     else:
         min_reviewers = int(min_reviewers_raw)
 
+    raw_source_rows = payload.get("key_sources", [])
+    pre_sources = (list(raw_source_rows)
+                   if isinstance(raw_source_rows, Sequence) and not isinstance(raw_source_rows, (str, bytes))
+                   else [])
+    mnpi_suspect = any(
+        isinstance(source, Mapping)
+        and str(source.get("legal_tag", "")).upper() == "MNPI-SUSPECT"
+        for source in pre_sources
+    )
+    if mnpi_suspect:
+        return {"status": "VETO", "passed": False, "trade_allowed": False,
+                "blockers": ["MNPI_SUSPECT_SOURCE_VETO"],
+                "checks": {"no_mnpi_suspect_sources": False},
+                "message": "An MNPI-SUSPECT source triggers an unconditional veto."}
+
     if payload.get("challenge_resolution_status") == "DEADLOCK":
         return {"status": "ESCALATE", "passed": False, "trade_allowed": False,
                 "blockers": ["CHALLENGE_DEADLOCK"], "checks": {"deadlock_clear": False}}
@@ -295,11 +364,9 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dic
         verdicts = [v for v in verdicts if isinstance(v, Mapping)]
 
     configured_mandatory = thresholds.get("mandatory_agents")
-    if configured_mandatory is None:
-        configured_mandatory = payload.get("mandatory_agents", [])
     if not isinstance(configured_mandatory, Sequence) or isinstance(configured_mandatory, (str, bytes)):
         configured_mandatory = []
-        reasons.append("MANDATORY_AGENT_POLICY_INVALID")
+        reasons.append("MANDATORY_AGENT_POLICY_MISSING_OR_INVALID")
     mandatory = {str(x).strip() for x in configured_mandatory if str(x).strip()}
     checks["mandatory_agent_policy_present"] = bool(mandatory)
     if not mandatory:
@@ -355,9 +422,11 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dic
         brier = _finite_float(calibration.get("brier_score"))
         sample_size = _finite_float(calibration.get("sample_size"))
         calibration_status = str(calibration.get("calibration_status", "")).upper()
+        calibration_source = str(calibration.get("source", "")).strip()
         if (brier is None or not 0 <= brier <= brier_threshold or sample_size is None
                 or sample_size < min_calibration_samples or not sample_size.is_integer()
-                or calibration_status != "CALIBRATED"):
+                or calibration_status != "CALIBRATED"
+                or not governance_issuer or calibration_source != governance_issuer):
             brier_ok = False
             reasons.append(f"{agent_id}:CALIBRATION_MISSING_UNVERIFIED_OR_OUT_OF_LIMIT")
 
@@ -392,7 +461,12 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dic
         reasons.append("CONTRADICTION_SCAN_RESULT_MISSING")
     else:
         contradiction_count = _finite_float(payload.get("contradictions_last_n_hours"))
-        clear = contradiction_count is not None and contradiction_count == 0 and contradiction_count.is_integer()
+        lookback_hours = policy_number("contradiction_lookback_hours", 6, lower=1, upper=168)
+        supplied_lookback = _finite_float(payload.get("contradiction_lookback_hours"))
+        window_ok = (supplied_lookback is not None and supplied_lookback.is_integer()
+                     and supplied_lookback == lookback_hours)
+        clear = (window_ok and contradiction_count is not None and contradiction_count == 0
+                 and contradiction_count.is_integer())
         checks["no_recent_contradictions"] = clear
         if not clear:
             reasons.append("RECENT_KNOWLEDGE_GRAPH_CONTRADICTIONS_OR_INVALID_COUNT")
@@ -408,11 +482,13 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dic
             continue
         source_id = str(source.get("source_id", "")).strip()
         credibility = _finite_float(source.get("credibility"))
-        age = _finite_float(source.get("age_seconds"))
+        observed = _source_observed_at(source)
+        age = (current - observed).total_seconds() if observed is not None else None
         ttl = _finite_float(source.get("ttl_seconds"))
         tag = str(source.get("legal_tag", "")).upper()
-        if (not source_id or credibility is None or age is None or ttl is None or ttl <= 0 or age < 0
-                or credibility < source_floor or age > min(source_max_age, ttl) or tag == "MNPI-SUSPECT"):
+        if (not source_id or credibility is None or age is None or ttl is None or ttl <= 0
+                or age < -30 or credibility < source_floor
+                or age > min(source_max_age, ttl) or tag == "MNPI-SUSPECT"):
             sources_ok = False
         if source_id:
             seen_source_ids.add(source_id)
@@ -420,15 +496,22 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dic
             if group:
                 independence_groups.add(group)
     checks["key_sources_fresh_and_credible"] = sources_ok
+    checks["no_mnpi_suspect_sources"] = True  # MNPI pre-check returns VETO before this point.
     if not sources_ok:
         reasons.append("KEY_SOURCE_MISSING_STALE_LOW_CREDIBILITY_OR_MNPI_SUSPECT")
-    if payload.get("news_or_rumor") is True:
-        min_independent_raw = _finite_float(thresholds.get("required_independent_sources_for_news_or_rumor", 2))
-        min_independent = int(min_independent_raw) if min_independent_raw is not None and min_independent_raw >= 1 else 2
-        independent_ok = len(independence_groups) >= min_independent and len(seen_source_ids) >= min_independent
-        checks["independent_sources_sufficient"] = independent_ok
-        if not independent_ok:
-            reasons.append("INSUFFICIENT_INDEPENDENT_SOURCES_FOR_NEWS_OR_RUMOR")
+    news_flag = payload.get("news_or_rumor")
+    if not isinstance(news_flag, bool):
+        checks["news_or_rumor_declared"] = False
+        reasons.append("NEWS_OR_RUMOR_FLAG_MISSING_OR_INVALID")
+    else:
+        checks["news_or_rumor_declared"] = True
+        if news_flag is True:
+            min_independent_raw = _finite_float(thresholds.get("required_independent_sources_for_news_or_rumor", 2))
+            min_independent = int(min_independent_raw) if min_independent_raw is not None and min_independent_raw >= 1 else 2
+            independent_ok = len(independence_groups) >= min_independent and len(seen_source_ids) >= min_independent
+            checks["independent_sources_sufficient"] = independent_ok
+            if not independent_ok:
+                reasons.append("INSUFFICIENT_INDEPENDENT_SOURCES_FOR_NEWS_OR_RUMOR")
 
     da = payload.get("devil_advocate_report")
     hypotheses = da.get("counter_hypotheses", []) if isinstance(da, Mapping) else []
@@ -450,20 +533,31 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dic
 
     # System-health guardrails: confidence thresholds cannot stay permissive when
     # historical false-certainty rises or adversarial disagreement becomes rare.
+    # Only a verified attestation counts; an unverified mapping is not evidence.
+    governance_ok = (
+        isinstance(governance, Mapping)
+        and governance.get("valid") is True
+        and not governance.get("blockers")
+        and bool(governance_issuer)
+    )
+    checks["governance_attestation_verified"] = governance_ok
+    if not governance_ok:
+        reasons.append("GOVERNANCE_ATTESTATION_MISSING_OR_INVALID")
+        governance = {}
     dissent_floor = policy_number("dissent_rate_floor", 0.10, lower=0.0, upper=1.0)
     false_certainty_limit = policy_number("false_certainty_rate_max", 0.05, lower=0.0, upper=1.0)
     min_dissent_samples = int(policy_number("min_dissent_samples", 30, lower=1, upper=10_000_000))
     min_false_certainty_samples = int(policy_number("min_false_certainty_samples", 30, lower=1, upper=10_000_000))
-    dissent_rate = _finite_float(payload.get("dissent_rate"))
-    dissent_sample_size = _finite_float(payload.get("dissent_sample_size"))
+    dissent_rate = _finite_float(governance.get("dissent_rate"))
+    dissent_sample_size = _finite_float(governance.get("dissent_sample_size"))
     dissent_ok = (dissent_rate is not None and 0 <= dissent_rate <= 1 and dissent_rate >= dissent_floor
                   and dissent_sample_size is not None and dissent_sample_size >= min_dissent_samples
                   and dissent_sample_size.is_integer())
     checks["groupthink_guard"] = dissent_ok
     if not dissent_ok:
         reasons.append("GROUPTHINK_ALARM_OR_DISSENT_METRIC_MISSING")
-    false_certainty_rate = _finite_float(payload.get("false_certainty_rate"))
-    false_certainty_samples = _finite_float(payload.get("false_certainty_sample_size"))
+    false_certainty_rate = _finite_float(governance.get("false_certainty_rate"))
+    false_certainty_samples = _finite_float(governance.get("false_certainty_sample_size"))
     false_certainty_ok = (false_certainty_rate is not None and 0 <= false_certainty_rate <= 1
                           and false_certainty_rate <= false_certainty_limit
                           and false_certainty_samples is not None
@@ -651,9 +745,9 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
     max_size = _finite_float(policy.get("max_size_per_trade"))
     if size is None or max_size is None or size <= 0 or max_size <= 0 or size > max_size:
         blockers.append("SIZE_INVALID_OR_OUT_OF_POLICY")
-    if mode == "live" and policy.get("live_enabled") is not True:
+    if mode == "live" and _policy_bool(policy, "live_enabled", default=False, blockers=blockers) is not True:
         blockers.append("LIVE_MODE_DISABLED")
-    if mode == "demo" and policy.get("demo_enabled") is not True:
+    if mode == "demo" and _policy_bool(policy, "demo_enabled", default=False, blockers=blockers) is not True:
         blockers.append("DEMO_MODE_DISABLED")
     if mode not in ("demo", "live"):
         blockers.append("INVALID_MODE")
@@ -694,7 +788,7 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
                     blockers.append("ROLLOVER_TIME_BLOCK")
             except (KeyError, ValueError, TypeError):
                 blockers.append("INVALID_ROLLOVER_POLICY")
-    if policy.get("blocked_around_news", True) is True:
+    if _policy_bool(policy, "blocked_around_news", default=True, blockers=blockers):
         if request.get("within_high_impact_news_window") is not False:
             blockers.append("NEWS_WINDOW_ACTIVE_OR_UNKNOWN")
 
@@ -742,8 +836,10 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
         blockers.append("SL_TP_INVALID")
     stop = _finite_float(sl.get("sl"))
     take = _finite_float(sl.get("tp"))
-    if policy.get("require_stop_loss", True) and stop is None: blockers.append("STOP_LOSS_REQUIRED_OR_INVALID")
-    if policy.get("require_take_profit", True) and take is None: blockers.append("TAKE_PROFIT_REQUIRED_OR_INVALID")
+    if _policy_bool(policy, "require_stop_loss", default=True, blockers=blockers) and stop is None:
+        blockers.append("STOP_LOSS_REQUIRED_OR_INVALID")
+    if _policy_bool(policy, "require_take_profit", default=True, blockers=blockers) and take is None:
+        blockers.append("TAKE_PROFIT_REQUIRED_OR_INVALID")
     if stop is not None and take is not None:
         entry = _finite_float(request.get("expected_price"))
         if entry is None or entry <= 0:
@@ -789,20 +885,31 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
 
 def user_authorization_gate(permission_result: Mapping[str, Any], decision: Mapping[str, Any], *,
                             now: datetime | None = None, max_ttl_seconds: int = 600,
-                            max_future_skew_seconds: int = 30) -> dict[str, Any]:
-    """Validate one-time authorization metadata; does not sign or dispatch an order."""
+                            max_future_skew_seconds: int = 30,
+                            nonce_store: Any | None = None) -> dict[str, Any]:
+    """Validate one-time authorization metadata; does not sign or dispatch an order.
+
+    The nonce is consumed atomically through ``nonce_store``. Without a store the
+    gate fails closed, because a client-supplied approval object cannot prove that
+    the permission was not already used.
+    """
     blockers: list[str] = []
     if not isinstance(permission_result, Mapping) or not isinstance(decision, Mapping):
         return {"status": "DENY", "authorized": False, "blockers": ["INVALID_AUTHORIZATION_PAYLOAD"], "trade_allowed": False}
     if permission_result.get("status") != "REQUIRE_HUMAN": blockers.append("PERMISSION_NOT_PENDING_HUMAN_APPROVAL")
     if str(decision.get("decision", "")).upper() != "APPROVE": blockers.append("USER_DID_NOT_APPROVE")
+    if not str(decision.get("decision_id", "")).strip(): blockers.append("DECISION_ID_MISSING")
     if not str(decision.get("user_id", "")).strip(): blockers.append("USER_ID_MISSING")
     if not str(decision.get("reason", "")).strip(): blockers.append("DECISION_REASON_MISSING")
+    nonce = decision.get("nonce")
+    if not isinstance(nonce, str) or _AUTH_NONCE_RE.fullmatch(nonce) is None:
+        blockers.append("AUTHORIZATION_NONCE_INVALID")
     if not permission_result.get("permission_id") or decision.get("permission_id") != permission_result.get("permission_id"):
         blockers.append("PERMISSION_ID_MISMATCH")
     mode = str(permission_result.get("mode", "")).lower()
     if mode not in ("demo", "live"):
         blockers.append("PERMISSION_MODE_MISSING_OR_INVALID")
+    permission_expires: datetime | None = None
     try:
         current = _current_utc(now)
         decision_at = _parse_time(decision.get("timestamp", ""))
@@ -827,8 +934,27 @@ def user_authorization_gate(permission_result: Mapping[str, Any], decision: Mapp
         if decision.get("signature_verified") is not True: blockers.append("LIVE_SIGNATURE_REQUIRED")
     if blockers:
         return {"status": "DENY", "authorized": False, "blockers": sorted(set(blockers)), "trade_allowed": False}
+
+    store = nonce_store if nonce_store is not None and callable(getattr(nonce_store, "consume", None)) else None
+    if store is None:
+        return {"status": "DENY", "authorized": False,
+                "blockers": ["AUTHORIZATION_NONCE_STORE_REQUIRED"], "trade_allowed": False}
+    try:
+        consumed = store.consume(
+            scope=f"{permission_result.get('permission_id')}:{decision.get('decision_id')}:{decision.get('user_id')}",
+            nonce=nonce,
+            expires_at=permission_expires if permission_expires is not None else current,
+            now=current,
+        )
+    except Exception:
+        return {"status": "DENY", "authorized": False,
+                "blockers": ["AUTHORIZATION_NONCE_STORE_UNAVAILABLE"], "trade_allowed": False}
+    if consumed is not True:
+        return {"status": "DENY", "authorized": False,
+                "blockers": ["AUTHORIZATION_NONCE_REPLAYED"], "trade_allowed": False}
     return {"status": "ALLOW_ONCE", "authorized": True, "blockers": [],
             "user_id": decision.get("user_id"), "timestamp": decision.get("timestamp"),
+            "decision_id": decision.get("decision_id"), "nonce_consumed": True,
             "permission_id": decision.get("permission_id"), "trade_allowed": False,
             "note": "One-time authorization metadata only; execution must revalidate signature, expiry, current price, SL/TP and idempotency."}
 

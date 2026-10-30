@@ -1,7 +1,8 @@
 """Read-only MetaTrader 5 account, market and proposed-order risk capture.
 
 This module never sends/places/modifies/cancels orders. It requires a verified
-UTC-day-start equity and equity high-water mark. Proposed risk is computed from the
+broker-server-day-start equity, equity high-water mark, and the broker server's UTC
+offset (MT5 timestamps are server wall-clock, not UTC). Proposed risk is computed from the
 terminal's tick size/loss value and the exact requested volume/entry/SL; no user-entered
 risk percentage is trusted as if it were a measured broker value.
 """
@@ -9,7 +10,7 @@ from __future__ import annotations
 
 import importlib
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from .risk_controls import risk_request_binding_hash
@@ -30,6 +31,7 @@ def collect_mt5_risk_snapshot(
     proposed_request: Mapping[str, Any] | None, symbol_groups: Mapping[str, str],
     now: datetime | None = None, terminal_path: str | None = None,
     max_positions: int = 1000, max_slippage_points: int = 20, max_quote_age_seconds: int = 15,
+    server_utc_offset_seconds: int | None = None,
 ) -> dict[str, Any]:
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None or current.utcoffset() is None:
@@ -37,6 +39,16 @@ def collect_mt5_risk_snapshot(
     current = current.astimezone(timezone.utc)
     symbol = str(symbol).strip().upper()
     blockers: list[str] = []
+    # MT5 returns broker-server wall-clock timestamps with no zone information. Quote age and
+    # midnight day boundaries cannot be derived without an explicit, validated server offset.
+    if (isinstance(server_utc_offset_seconds, bool)
+            or not isinstance(server_utc_offset_seconds, int)
+            or server_utc_offset_seconds % 60 != 0
+            or abs(server_utc_offset_seconds) > 14 * 3600):
+        blockers.append("MT5_SERVER_UTC_OFFSET_MISSING_OR_INVALID")
+        offset_seconds = 0
+    else:
+        offset_seconds = server_utc_offset_seconds
     if not symbol:
         blockers.append("SYMBOL_MISSING")
     day_start = _number(day_start_equity)
@@ -108,7 +120,8 @@ def collect_mt5_risk_snapshot(
             tick_timestamp = _number(getattr(tick, "time", None))
         if tick_timestamp is None or tick_timestamp <= 0:
             return {"status": "DENY", "blockers": ["MT5_TICK_TIMESTAMP_MISSING"], "account_mode": mode, "trade_allowed": False}
-        quote_age_seconds = current.timestamp() - tick_timestamp
+        quote_timestamp_utc = tick_timestamp - offset_seconds
+        quote_age_seconds = current.timestamp() - quote_timestamp_utc
         if quote_age_seconds < -5:
             return {"status": "DENY", "blockers": ["MT5_QUOTE_FROM_FUTURE"], "account_mode": mode, "trade_allowed": False}
         if quote_age_seconds > max_quote_age_seconds:
@@ -137,7 +150,9 @@ def collect_mt5_risk_snapshot(
         if len(positions) > max_positions:
             return {"status": "DENY", "blockers": ["MT5_POSITION_COUNT_IMPLAUSIBLE"], "account_mode": mode, "trade_allowed": False}
 
-        deals_raw = mt5.history_deals_get(current.replace(hour=0, minute=0, second=0, microsecond=0), current)
+        server_current = current + timedelta(seconds=offset_seconds)
+        deals_raw = mt5.history_deals_get(
+            server_current.replace(hour=0, minute=0, second=0, microsecond=0), server_current)
         if deals_raw is None:
             return {"status": "DENY", "blockers": ["MT5_DAILY_HISTORY_UNAVAILABLE"], "account_mode": mode, "trade_allowed": False}
         deals = list(deals_raw)
@@ -186,6 +201,9 @@ def collect_mt5_risk_snapshot(
             "request_binding": {"instrument": symbol, "direction": direction, "size": size,
                                 "expected_price": expected_price, "sl_tp": {"sl": stop_loss, "tp": take_profit}},
             "reference_price": reference_price, "quote_age_seconds": quote_age_seconds,
+            "quote_utc": datetime.fromtimestamp(quote_timestamp_utc, tz=timezone.utc).isoformat(),
+            "server_utc_offset_seconds": offset_seconds,
+            "server_observed_at": server_current.isoformat(),
             "max_quote_age_seconds": max_quote_age_seconds, "slippage_points_at_capture": slippage_points,
             "max_slippage_points": max_slippage_points, "open_positions": len(positions),
             "correlated_open_positions": correlated, "position_symbols": position_symbols,

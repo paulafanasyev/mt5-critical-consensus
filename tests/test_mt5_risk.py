@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -69,6 +69,7 @@ def test_read_only_demo_risk_snapshot_computes_broker_tick_value_risk(monkeypatc
     result = collect_mt5_risk_snapshot(
         symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
         proposed_request=request, symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        server_utc_offset_seconds=0,
     )
     assert result["status"] == "PASS"
     assert result["account_mode"] == "demo"
@@ -88,6 +89,7 @@ def test_real_account_and_missing_server_snapshot_fail_closed(monkeypatch):
     result = collect_mt5_risk_snapshot(
         symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
         proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        server_utc_offset_seconds=0,
     )
     assert result["status"] == "DENY"
     assert "MT5_ACCOUNT_NOT_DEMO" in result["blockers"]
@@ -95,6 +97,7 @@ def test_real_account_and_missing_server_snapshot_fail_closed(monkeypatch):
     result = collect_mt5_risk_snapshot(
         symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
         proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        server_utc_offset_seconds=0,
     )
     assert result["status"] == "DENY"
     assert "MT5_POSITIONS_UNAVAILABLE" in result["blockers"]
@@ -106,6 +109,7 @@ def test_missing_equity_baselines_blocks_before_mt5_initializes(monkeypatch):
     result = collect_mt5_risk_snapshot(
         symbol="EURUSD", day_start_equity=None, equity_high_watermark=None,
         proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"},
+        server_utc_offset_seconds=0,
     )
     assert result["status"] == "DENY"
     assert "DAY_START_EQUITY_MISSING_OR_INVALID" in result["blockers"]
@@ -120,6 +124,7 @@ def test_daily_loss_uses_equity_change_and_includes_open_position_loss(monkeypat
     result = collect_mt5_risk_snapshot(
         symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
         proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        server_utc_offset_seconds=0,
     )
     # Realised P/L is positive in the fixture but equity is down 5%; the equity-loss signal wins.
     assert result["daily_pnl"] == 100.0
@@ -132,6 +137,7 @@ def test_missing_group_for_an_open_position_blocks_snapshot(monkeypatch):
     result = collect_mt5_risk_snapshot(
         symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
         proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        server_utc_offset_seconds=0,
     )
     assert result["status"] == "DENY"
     assert "OPEN_POSITION_GROUP_UNKNOWN" in result["blockers"]
@@ -143,6 +149,50 @@ def test_stale_mt5_tick_blocks_risk_snapshot(monkeypatch):
     result = collect_mt5_risk_snapshot(
         symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
         proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        server_utc_offset_seconds=0,
     )
     assert result["status"] == "DENY"
     assert "MT5_QUOTE_STALE" in result["blockers"]
+
+
+def test_missing_server_utc_offset_fails_closed_before_initializing(monkeypatch):
+    fake = FakeMT5()
+    monkeypatch.setitem(__import__("sys").modules, "MetaTrader5", fake)
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
+        proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+    )
+    assert result["status"] == "DENY"
+    assert "MT5_SERVER_UTC_OFFSET_MISSING_OR_INVALID" in result["blockers"]
+    assert result["trade_allowed"] is False
+    assert not fake.shutdown_called
+
+
+def test_invalid_server_utc_offset_is_rejected(monkeypatch):
+    fake = FakeMT5()
+    monkeypatch.setitem(__import__("sys").modules, "MetaTrader5", fake)
+    for invalid in (True, 90, 15 * 3600):
+        result = collect_mt5_risk_snapshot(
+            symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
+            proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+            server_utc_offset_seconds=invalid,
+        )
+        assert result["status"] == "DENY"
+        assert "MT5_SERVER_UTC_OFFSET_MISSING_OR_INVALID" in result["blockers"]
+
+
+def test_broker_server_clock_offset_is_applied_to_tick_freshness(monkeypatch):
+    fake = FakeMT5()
+    fake.tick.time = int(NOW.timestamp()) + 3 * 3600
+    monkeypatch.setitem(__import__("sys").modules, "MetaTrader5", fake)
+    kwargs = dict(symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
+                  proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"},
+                  now=NOW)
+    naive = collect_mt5_risk_snapshot(**kwargs, server_utc_offset_seconds=0)
+    assert naive["status"] == "DENY"
+    assert "MT5_QUOTE_FROM_FUTURE" in naive["blockers"]
+    correct = collect_mt5_risk_snapshot(**kwargs, server_utc_offset_seconds=3 * 3600)
+    assert correct["status"] == "PASS"
+    assert correct["quote_age_seconds"] == 0
+    assert correct["server_utc_offset_seconds"] == 3 * 3600
+    assert datetime.fromisoformat(correct["server_observed_at"]) == NOW + timedelta(hours=3)

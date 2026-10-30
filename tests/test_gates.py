@@ -1,7 +1,9 @@
 from datetime import datetime, timezone, timedelta
+from critical_consensus.authorization import InMemoryNonceStore
 from critical_consensus.gates import certainty_gate, chief_skeptic_pass, permission_gate, user_authorization_gate
 from critical_consensus.audit import canonical_hash
 
+AGENTS = ["PlatformScoutAgent", "TechnicalAnalystAgent", "RiskManagerAgent", "ComplianceAgent"]
 POLICY = {
     "near_certainty_threshold": 0.98, "consensus_score_threshold": 0.98,
     "min_reviewers_per_verdict": 2, "brier_threshold": 0.12,
@@ -9,35 +11,47 @@ POLICY = {
     "min_calibration_sample_size": 30,
     "dissent_rate_floor": 0.10, "min_dissent_samples": 30,
     "false_certainty_rate_max": 0.05, "min_false_certainty_samples": 30,
+    "mandatory_agents": AGENTS, "compliance_agent_id": "ComplianceAgent",
 }
+GOVERNANCE = {"valid": True, "blockers": [], "issuer": "calibration-service",
+              "method_version": "brier-shrink-v1",
+              "dissent_rate": 0.15, "dissent_sample_size": 100,
+              "false_certainty_rate": 0.02, "false_certainty_sample_size": 100}
 
 def good_payload():
-    agents = ["PlatformScoutAgent", "TechnicalAnalystAgent", "RiskManagerAgent", "ComplianceAgent"]
+    agents = list(AGENTS)
+    now = datetime.now(timezone.utc)
     return {
         "mandatory_agents": agents,
         "verdicts": [{"agent_id": a, "verdict": "APPROVE", "confidence": 0.99,
-                      "reviewer_count": 2, "calibration_meta": {"brier_score": 0.08, "sample_size": 100, "calibration_status": "CALIBRATED"}}
+                      "reviewer_count": 2, "calibration_meta": {
+                          "brier_score": 0.08, "sample_size": 100, "calibration_status": "CALIBRATED",
+                          "source": "calibration-service"}}
                      for a in agents],
-        "consensus_score": 0.99, "open_challenges": [], "challenge_resolution_status": "RESOLVED", "contradictions_last_n_hours": 0,
+        "consensus_score": 0.99, "open_challenges": [], "challenge_resolution_status": "RESOLVED",
+        "contradictions_last_n_hours": 0, "contradiction_lookback_hours": 6,
+        "news_or_rumor": False,
         "devil_advocate_report": {"status": "PASS", "counter_hypotheses": [
             {"hypothesis": "h1", "evidence_refs": ["e1"]},
             {"hypothesis": "h2", "evidence_refs": ["e2"]},
             {"hypothesis": "h3", "evidence_refs": ["e3"]}]},
-        "key_sources": [{"source_id": "s1", "credibility": 0.90, "age_seconds": 20, "ttl_seconds": 900},
-                        {"source_id": "s2", "credibility": 0.88, "age_seconds": 50, "ttl_seconds": 900}],
+        "key_sources": [{"source_id": "s1", "credibility": 0.90, "ttl_seconds": 900,
+                         "observed_at": (now - timedelta(seconds=20)).isoformat()},
+                        {"source_id": "s2", "credibility": 0.88, "ttl_seconds": 900,
+                         "observed_at": (now - timedelta(seconds=50)).isoformat()}],
         "risk_flags": [], "dissent_rate": 0.15, "dissent_sample_size": 100,
         "false_certainty_rate": 0.02, "false_certainty_sample_size": 100,
     }
 
 def test_certainty_pass_is_not_trade_authorization():
-    result = certainty_gate(good_payload(), POLICY)
+    result = certainty_gate(good_payload(), POLICY, governance=GOVERNANCE)
     assert result["status"] == "PASS"
     assert result["trade_allowed"] is False
 
 def test_single_reject_blocks_certainty_gate():
     payload = good_payload()
     payload["verdicts"][0]["verdict"] = "REJECT"
-    result = certainty_gate(payload, POLICY)
+    result = certainty_gate(payload, POLICY, governance=GOVERNANCE)
     assert result["status"] == "GATHER_MORE"
     assert result["trade_allowed"] is False
 
@@ -45,14 +59,14 @@ def test_open_devil_challenge_blocks_gate():
     payload = good_payload()
     payload["open_challenges"] = [{"challenge_id": "da-1", "status": "OPEN", "source": "DevilAdvocateAgent"}]
     payload["challenge_resolution_status"] = "OPEN"
-    result = certainty_gate(payload, POLICY)
+    result = certainty_gate(payload, POLICY, governance=GOVERNANCE)
     assert result["status"] == "GATHER_MORE"
     assert not result["passed"]
 
 def test_deadlock_escalates_without_trade():
     payload = good_payload()
     payload["challenge_resolution_status"] = "DEADLOCK"
-    result = certainty_gate(payload, POLICY)
+    result = certainty_gate(payload, POLICY, governance=GOVERNANCE)
     assert result["status"] == "ESCALATE"
     assert result["trade_allowed"] is False
 
@@ -60,7 +74,7 @@ def test_abstain_without_reason_blocks():
     payload = good_payload()
     payload["verdicts"][0]["verdict"] = "ABSTAIN"
     payload["verdicts"][0]["abstain_reason"] = ""
-    assert certainty_gate(payload, POLICY)["status"] == "GATHER_MORE"
+    assert certainty_gate(payload, POLICY, governance=GOVERNANCE)["status"] == "GATHER_MORE"
 
 def test_missing_chief_step_cannot_confirm():
     steps = {k: {"passed": True, "detail": "checked", "evidence_refs": [f"ev-{k}"]} for k in "abcdefgh"}
@@ -183,8 +197,10 @@ def test_valid_demo_approval_is_one_time_allow_not_order_execution():
     now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
     permission = {"status": "REQUIRE_HUMAN", "permission_id": "p2", "mode": "demo", "expires_at": (now + timedelta(minutes=5)).isoformat()}
     decision = {"decision": "APPROVE", "user_id": "operator-1", "reason": "reviewed dissent and tail risk",
-                "permission_id": "p2", "timestamp": now.isoformat(), "ttl_seconds": 300}
-    result = user_authorization_gate(permission, decision, now=now)
+                "permission_id": "p2", "decision_id": "decision-2", "nonce": "n" * 24,
+                "timestamp": now.isoformat(), "ttl_seconds": 300}
+    result = user_authorization_gate(permission, decision, now=now,
+                                     nonce_store=InMemoryNonceStore())
     assert result["status"] == "ALLOW_ONCE"
     assert result["authorized"] is True
     assert result["trade_allowed"] is False
@@ -193,27 +209,23 @@ def test_valid_demo_approval_is_one_time_allow_not_order_execution():
 def test_policy_owned_mandatory_agents_cannot_be_overridden_by_payload():
     payload = good_payload()
     payload["mandatory_agents"] = ["PlatformScoutAgent"]
-    policy = dict(POLICY, mandatory_agents=["PlatformScoutAgent", "ComplianceAgent", "ChiefAgent"] )
-    result = certainty_gate(payload, policy)
+    policy = dict(POLICY, mandatory_agents=["PlatformScoutAgent", "ComplianceAgent", "ChiefAgent"])
+    result = certainty_gate(payload, policy, governance=GOVERNANCE)
     assert result["status"] == "GATHER_MORE"
     assert "MISSING_MANDATORY_AGENTS:ChiefAgent" in result["blockers"]
 
 
 def test_certainty_gate_blocks_groupthink_and_high_false_certainty():
-    payload = good_payload()
-    payload["dissent_rate"] = 0.02
-    payload["false_certainty_rate"] = 0.09
-    result = certainty_gate(payload, POLICY)
+    result = certainty_gate(good_payload(), POLICY, governance={
+        **GOVERNANCE, "dissent_rate": 0.02, "false_certainty_rate": 0.09})
     assert result["status"] == "GATHER_MORE"
     assert "GROUPTHINK_ALARM_OR_DISSENT_METRIC_MISSING" in result["blockers"]
     assert "FALSE_CERTAINTY_RATE_HIGH_OR_METRIC_UNVERIFIED" in result["blockers"]
 
 
 def test_certainty_gate_requires_verified_health_metric_sample_sizes():
-    payload = good_payload()
-    payload["dissent_sample_size"] = 1
-    payload["false_certainty_sample_size"] = 1
-    result = certainty_gate(payload, POLICY)
+    result = certainty_gate(good_payload(), POLICY, governance={
+        **GOVERNANCE, "dissent_sample_size": 1, "false_certainty_sample_size": 1})
     assert result["status"] == "GATHER_MORE"
     assert "GROUPTHINK_ALARM_OR_DISSENT_METRIC_MISSING" in result["blockers"]
     assert "FALSE_CERTAINTY_RATE_HIGH_OR_METRIC_UNVERIFIED" in result["blockers"]
@@ -238,7 +250,7 @@ def test_certainty_gate_rejects_nan_confidence_consensus_and_calibration():
     payload["verdicts"][0]["confidence"] = float("nan")
     payload["verdicts"][1]["calibration_meta"]["brier_score"] = float("nan")
     payload["consensus_score"] = float("nan")
-    result = certainty_gate(payload, POLICY)
+    result = certainty_gate(payload, POLICY, governance=GOVERNANCE)
     assert result["status"] == "GATHER_MORE"
     assert "PlatformScoutAgent:INVALID_CONFIDENCE" in result["blockers"]
     assert "TechnicalAnalystAgent:CALIBRATION_MISSING_UNVERIFIED_OR_OUT_OF_LIMIT" in result["blockers"]
@@ -265,7 +277,7 @@ def test_permission_gate_rejects_nan_size_and_fabricated_reward_risk():
 
 
 def test_certainty_gate_malformed_top_level_payload_fails_closed():
-    result = certainty_gate(None, POLICY)
+    result = certainty_gate(None, POLICY, governance=GOVERNANCE)
     assert result["status"] == "GATHER_MORE"
     assert result["trade_allowed"] is False
     assert "INVALID_CERTAINTY_PAYLOAD" in result["blockers"]
@@ -280,7 +292,9 @@ def test_permission_gate_malformed_top_level_request_fails_closed():
 
 def test_self_adversarial_pass_does_not_approve_low_confidence():
     from critical_consensus.gates import self_adversarial_pass
-    sources = [{"source_id": "s1", "credibility": 0.9, "min_credibility": 0.75, "age_seconds": 5, "ttl_seconds": 60}]
+    now = datetime.now(timezone.utc)
+    sources = [{"source_id": "s1", "credibility": 0.9, "ttl_seconds": 60,
+                "observed_at": (now - timedelta(seconds=5)).isoformat()}]
     abstain = self_adversarial_pass({"verdict": "APPROVE", "confidence": 0.72, "verdict_id": "v1"},
                                     counterarguments=["x", "y", "z"], contradictions=[], sources=sources)
     assert abstain["verdict"] == "ABSTAIN"
@@ -289,3 +303,58 @@ def test_self_adversarial_pass_does_not_approve_low_confidence():
                                    counterarguments=["x", "y", "z"], contradictions=[], sources=sources)
     assert reject["verdict"] == "REJECT"
     assert "CONFIDENCE_BELOW_REJECTION_FLOOR" in reject["blockers"]
+
+
+def test_self_adversarial_source_cannot_self_declare_low_floor_or_freshness():
+    from critical_consensus.gates import self_adversarial_pass
+    now = datetime.now(timezone.utc)
+    forged = [{"source_id": "s1", "credibility": 0.01, "min_credibility": 0.0,
+               "age_seconds": 0, "ttl_seconds": 10**9,
+               "observed_at": (now - timedelta(hours=5)).isoformat()}]
+    result = self_adversarial_pass({"verdict": "APPROVE", "confidence": 0.99, "verdict_id": "v1"},
+                                   counterarguments=["x", "y", "z"], contradictions=[], sources=forged)
+    assert result["verdict"] != "APPROVE"
+    assert "SOURCE_STALE_LOW_CREDIBILITY_OR_INVALID" in result["blockers"]
+
+
+def test_certainty_gate_requires_absolute_source_timestamps():
+    payload = good_payload()
+    payload["key_sources"][0].pop("observed_at")
+    payload["key_sources"][0]["age_seconds"] = 1
+    result = certainty_gate(payload, POLICY, governance=GOVERNANCE)
+    assert result["status"] == "GATHER_MORE"
+    assert "KEY_SOURCE_MISSING_STALE_LOW_CREDIBILITY_OR_MNPI_SUSPECT" in result["blockers"]
+
+
+def test_certainty_gate_rejects_unverified_governance_mapping():
+    result = certainty_gate(good_payload(), POLICY, governance={
+        "dissent_rate": 0.15, "dissent_sample_size": 100,
+        "false_certainty_rate": 0.02, "false_certainty_sample_size": 100,
+        "issuer": "calibration-service"})
+    assert result["status"] == "GATHER_MORE"
+    assert "GOVERNANCE_ATTESTATION_MISSING_OR_INVALID" in result["blockers"]
+    assert result["checks"]["governance_attestation_verified"] is False
+
+
+def test_certainty_gate_requires_explicit_news_flag_and_lookback_window():
+    payload = good_payload()
+    payload.pop("news_or_rumor")
+    payload["contradiction_lookback_hours"] = 1
+    result = certainty_gate(payload, POLICY, governance=GOVERNANCE)
+    assert result["status"] == "GATHER_MORE"
+    assert "NEWS_OR_RUMOR_FLAG_MISSING_OR_INVALID" in result["blockers"]
+    assert "RECENT_KNOWLEDGE_GRAPH_CONTRADICTIONS_OR_INVALID_COUNT" in result["blockers"]
+
+
+def test_authorization_requires_nonce_store_and_rejects_expired_permission():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    permission = {"status": "REQUIRE_HUMAN", "permission_id": "p3", "mode": "demo",
+                  "expires_at": (now + timedelta(minutes=5)).isoformat()}
+    decision = {"decision": "APPROVE", "user_id": "u1", "reason": "reviewed",
+                "permission_id": "p3", "decision_id": "d3", "nonce": "n" * 24,
+                "timestamp": now.isoformat(), "ttl_seconds": 300}
+    assert "AUTHORIZATION_NONCE_STORE_REQUIRED" in user_authorization_gate(
+        permission, decision, now=now)["blockers"]
+    expired = {**permission, "expires_at": (now - timedelta(seconds=1)).isoformat()}
+    assert "PERMISSION_EXPIRED" in user_authorization_gate(
+        expired, decision, now=now, nonce_store=InMemoryNonceStore())["blockers"]

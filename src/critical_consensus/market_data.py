@@ -123,6 +123,22 @@ def _find(row: Mapping[str, str], names: Sequence[str], *, required: bool = True
     return None
 
 
+def _source_zone(source_timezone: str | tzinfo) -> tzinfo:
+    if isinstance(source_timezone, tzinfo):
+        return source_timezone
+    if not isinstance(source_timezone, str) or not source_timezone.strip():
+        raise ValueError("source_timezone must be a timezone name or tzinfo")
+    name = source_timezone.strip()
+    if name.upper() in {"UTC", "ETC/UTC", "GMT", "Z"}:
+        return UTC
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(
+            f"unknown source timezone: {name}; install the 'tzdata' package or pass a tzinfo object"
+        ) from exc
+
+
 def _parse_datetime(raw: str, source_timezone: str | tzinfo | None) -> datetime:
     value = raw.strip()
     parsed: datetime | None = None
@@ -146,13 +162,7 @@ def _parse_datetime(raw: str, source_timezone: str | tzinfo | None) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         if source_timezone is None:
             raise ValueError("naive MT5 export timestamps require an explicit source_timezone")
-        try:
-            zone = ZoneInfo(source_timezone) if isinstance(source_timezone, str) else source_timezone
-        except ZoneInfoNotFoundError as exc:
-            raise ValueError(f"unknown source timezone: {source_timezone}") from exc
-        if zone is None:
-            raise ValueError("source_timezone must be a timezone name or tzinfo")
-        parsed = parsed.replace(tzinfo=zone)
+        parsed = parsed.replace(tzinfo=_source_zone(source_timezone))
     return parsed.astimezone(UTC)
 
 

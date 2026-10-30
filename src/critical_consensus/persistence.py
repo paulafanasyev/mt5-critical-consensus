@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-                      allow_nan=False, default=str)
+                      allow_nan=False)
 
 
 def _sha256(value: str) -> str:
@@ -234,6 +234,27 @@ class PostgresRepository:
                     "reason": "Missing risk-control row; fail closed", "updated_at": None}
         return {"kill_switch_active": bool(row[0]), "status": "PERSISTED",
                 "updated_at": row[1].isoformat(), "updated_by": str(row[2]), "reason": str(row[3])}
+
+    def consume_authorization_nonce(self, *, scope: str, nonce: str, expires_at: datetime) -> bool:
+        """Atomically consume a one-time authorization nonce; True only for the first use."""
+        scope_value = str(scope).strip()
+        nonce_value = str(nonce).strip()
+        if not scope_value or not nonce_value:
+            raise ValueError("scope and nonce are required")
+        expires = expires_at if isinstance(expires_at, datetime) else _timestamp(expires_at, "expires_at")
+        if expires.tzinfo is None or expires.utcoffset() is None:
+            raise ValueError("expires_at must include a timezone")
+        expires = expires.astimezone(timezone.utc)
+        if expires <= datetime.now(timezone.utc):
+            raise ValueError("expires_at must be in the future")
+        with self._connect() as conn:
+            row = conn.execute(
+                """INSERT INTO authorization_nonces (scope, nonce, expires_at)
+                   VALUES (%s,%s,%s) ON CONFLICT (scope, nonce) DO NOTHING
+                   RETURNING nonce""",
+                (scope_value, nonce_value, expires),
+            ).fetchone()
+        return row is not None
 
     def set_kill_switch(self, *, active: bool, actor_id: str, reason: str) -> dict[str, Any]:
         """Persist emergency-stop state and append a hash-chained event in one transaction."""

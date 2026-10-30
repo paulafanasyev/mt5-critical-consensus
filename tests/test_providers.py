@@ -48,9 +48,9 @@ def test_openai_compatible_agent_binds_local_identity_and_rejects_unavailable_ev
 def test_provider_config_requires_key_from_environment_not_inline(monkeypatch):
     monkeypatch.setenv("MT5_AGENT_PROVIDERS", json.dumps([{
         "agent_id": "a", "independence_group": "provider-a", "model": "model-a",
-        "api_key_env": "A_API_KEY",
+        "api_key_env": "MT5_AGENT_KEY_A",
     }]))
-    monkeypatch.setenv("A_API_KEY", "secret-for-test")
+    monkeypatch.setenv("MT5_AGENT_KEY_A", "secret-for-test")
     specs = load_agent_specs_from_env()
     assert len(specs) == 1
     assert specs[0].agent_id == "a"
@@ -62,6 +62,14 @@ def test_provider_config_requires_key_from_environment_not_inline(monkeypatch):
         "agent_id": "a", "independence_group": "g", "model": "m", "api_key": "inline-secret",
     }]))
     with pytest.raises(ValueError, match="not inline JSON"):
+        load_agent_specs_from_env()
+
+    monkeypatch.delenv("MT5_AGENT_PROVIDERS", raising=False)
+    monkeypatch.setenv("MT5_AGENT_PROVIDERS", json.dumps([{
+        "agent_id": "a", "independence_group": "g", "model": "m",
+        "api_key_env": "AWS_SECRET_ACCESS_KEY",
+    }]))
+    with pytest.raises(ValueError, match="MT5_AGENT_KEY_"):
         load_agent_specs_from_env()
 
 

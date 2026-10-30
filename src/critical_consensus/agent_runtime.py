@@ -111,7 +111,7 @@ async def collect_agent_verdicts(
         return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["SIGNAL_ID_MISSING"], "trade_allowed": False}
     try:
         canonical_signal = json.dumps(signal, sort_keys=True, separators=(",", ":"),
-                                      ensure_ascii=False, allow_nan=False, default=str)
+                                      ensure_ascii=False, allow_nan=False)
         expected_input_hash = "sha256:" + hashlib.sha256(canonical_signal.encode("utf-8")).hexdigest()
     except (TypeError, ValueError, OverflowError):
         return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["SIGNAL_INPUT_NOT_CANONICALLY_HASHABLE"],
@@ -205,6 +205,10 @@ async def collect_agent_verdicts(
     errors: list[dict[str, str]] = []
     for spec, result, error in results:
         if result is not None:
+            # Calibration is attested by the calibration service, never self-declared
+            # by an agent or provider response.
+            result.pop("calibration_meta", None)
+            result.pop("calibration_source", None)
             result["declared_independence_group"] = spec.independence_group
             result["provider_origin"] = spec.provider_origin
             result["provider_identity"] = spec.provider_identity

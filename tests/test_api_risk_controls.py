@@ -3,15 +3,30 @@ from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 
 from critical_consensus import api
+from critical_consensus.evidence import make_envelope
 
 
 client = TestClient(api.app)
+BRIDGE = "a-valid-bridge-token-longer-than-24"
+EVIDENCE_KEY = "k" * 64
+
+
+def signed_body(payload):
+    return {"payload": payload,
+            "envelope": make_envelope(payload, key=EVIDENCE_KEY, issuer="test-ingress")}
+
+
+def configure(monkeypatch):
+    monkeypatch.setenv("MT5_BRIDGE_TOKEN", BRIDGE)
+    monkeypatch.setenv("MT5_EVIDENCE_HMAC_KEY", EVIDENCE_KEY)
+    monkeypatch.setenv("MT5_EVIDENCE_ISSUER", "test-ingress")
 
 
 class FakeRepository:
-    state = {"kill_switch_active": True, "status": "PERSISTED",
-             "updated_at": datetime.now(timezone.utc).isoformat(),
-             "updated_by": "bootstrap", "reason": "active by default"}
+    def __init__(self):
+        self.state = {"kill_switch_active": True, "status": "PERSISTED",
+                      "updated_at": datetime.now(timezone.utc).isoformat(),
+                      "updated_by": "bootstrap", "reason": "active by default"}
 
     def get_kill_switch_state(self):
         return dict(self.state)
@@ -29,8 +44,8 @@ class FakeRepository:
 def test_global_kill_switch_default_is_visible_and_persisted(monkeypatch):
     fake = FakeRepository()
     monkeypatch.setattr(api, "PostgresRepository", lambda: fake)
-    monkeypatch.setenv("MT5_BRIDGE_TOKEN", "a-valid-bridge-token-longer-than-24")
-    response = client.get("/v1/risk/kill-switch", headers={"X-Bridge-Key": "a-valid-bridge-token-longer-than-24"})
+    configure(monkeypatch)
+    response = client.get("/v1/risk/kill-switch", headers={"X-Bridge-Key": BRIDGE})
     assert response.status_code == 200
     assert response.json()["kill_switch_active"] is True
 
@@ -38,9 +53,9 @@ def test_global_kill_switch_default_is_visible_and_persisted(monkeypatch):
 def test_disabling_kill_switch_requires_separate_admin_secret(monkeypatch):
     fake = FakeRepository()
     monkeypatch.setattr(api, "PostgresRepository", lambda: fake)
-    monkeypatch.setenv("MT5_BRIDGE_TOKEN", "a-valid-bridge-token-longer-than-24")
+    configure(monkeypatch)
     monkeypatch.setenv("MT5_KILL_SWITCH_ADMIN_TOKEN", "a-different-admin-token-at-least-32-characters")
-    bridge = {"X-Bridge-Key": "a-valid-bridge-token-longer-than-24"}
+    bridge = {"X-Bridge-Key": BRIDGE}
     body = {"active": False, "actor_id": "operator", "reason": "controlled test only"}
 
     denied = client.post("/v1/risk/kill-switch", headers=bridge, json=body)
@@ -59,10 +74,10 @@ def test_risk_permission_route_denies_without_real_persisted_terminal_snapshot(m
     fake = FakeRepository()
     fake.state["kill_switch_active"] = False
     monkeypatch.setattr(api, "PostgresRepository", lambda: fake)
-    monkeypatch.setenv("MT5_BRIDGE_TOKEN", "a-valid-bridge-token-longer-than-24")
+    configure(monkeypatch)
     response = client.post(
-        "/v1/risk/permission/check", headers={"X-Bridge-Key": "a-valid-bridge-token-longer-than-24"},
-        json={"payload": {"instrument": "EURUSD", "mode": "demo"}},
+        "/v1/risk/permission/check", headers={"X-Bridge-Key": BRIDGE},
+        json=signed_body({"instrument": "EURUSD", "mode": "demo"}),
     )
     assert response.status_code == 200
     assert response.json()["status"] == "DENY"

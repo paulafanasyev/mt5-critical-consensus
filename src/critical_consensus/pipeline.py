@@ -13,17 +13,53 @@ from typing import Any, Mapping, Sequence
 
 from .audit import canonical_hash, make_audit_event, verify_audit_chain
 from .calibration import weighted_consensus
+from .evidence import EvidenceError, key_bytes, verify_bundle
 from .gates import certainty_gate, chief_skeptic_pass, permission_gate, user_authorization_gate
+from .governance import apply_attested_calibration, verify_governance_attestation
 from .risk_controls import risk_controlled_permission
 
 _VERDICT_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _VERDICT_FUTURE_SKEW_SECONDS = 30
+_DEFAULT_MAX_EVIDENCE_AGE_SECONDS = 3600
+
+
+def _is_timestamp(value: Any, current: datetime, *, future_skew_seconds: int = 30,
+                  max_age_seconds: float | None = None) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return False
+    age = (current - parsed.astimezone(timezone.utc)).total_seconds()
+    if age < -future_skew_seconds:
+        return False
+    return max_age_seconds is None or age <= max_age_seconds
+
+
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def _as_records(value: Any) -> list[Mapping[str, Any]]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         return []
     return [item for item in value if isinstance(item, Mapping)]
+
+
+def _policy_seconds(policy: Mapping[str, Any], key: str,
+                    default: float = _DEFAULT_MAX_EVIDENCE_AGE_SECONDS) -> float:
+    thresholds = policy.get("certainty_thresholds", policy) if isinstance(policy, Mapping) else {}
+    raw = thresholds.get(key, default) if isinstance(thresholds, Mapping) else default
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return default
+    value = float(raw)
+    return value if math.isfinite(value) and value > 0 else default
 
 
 def _validate_verdict_metadata(
@@ -80,12 +116,20 @@ def evaluate_signal_bundle(
     require_persisted_risk: bool = False,
     kill_switch_state: Mapping[str, Any] | None = None,
     terminal_risk_snapshot: Mapping[str, Any] | None = None,
+    evidence_key: str | bytes | bytearray | None = None,
+    governance_key: str | bytes | bytearray | None = None,
+    expected_evidence_issuer: str | None = None,
+    expected_governance_issuer: str = "calibration-service",
+    authorization_store: Any | None = None,
 ) -> dict[str, Any]:
     """Evaluate certainty → ChiefAgent → Permission → user authorization, fail-closed.
 
     The function returns no OrderCommand and always sets ``trade_allowed`` to false.
-    Peer-review inputs are expected to come from the trusted internal review service;
-    the bridge API must not accept user-supplied review records as authoritative evidence.
+    The bundle must carry an HMAC evidence envelope produced by the trusted ingress;
+    historical governance metrics must carry a separately signed calibration-service
+    attestation. Peer-review inputs are expected to come from the trusted internal
+    review service; the bridge API must not accept user-supplied review records as
+    authoritative evidence.
     """
     if not isinstance(bundle, Mapping):
         return {"status": "GATHER_MORE", "trade_allowed": False, "blockers": ["INVALID_SIGNAL_BUNDLE"], "audit_events": []}
@@ -127,12 +171,55 @@ def evaluate_signal_bundle(
 
     emit("SIGNAL_RECEIVED", {"signal_id": signal_id or "unknown", "bundle_hash": bundle_hash})
 
+    config_blockers: list[str] = []
+    if not isinstance(expected_evidence_issuer, str) or not expected_evidence_issuer.strip():
+        config_blockers.append("EVIDENCE_EXPECTED_ISSUER_NOT_CONFIGURED")
+    if not isinstance(expected_governance_issuer, str) or not expected_governance_issuer.strip():
+        config_blockers.append("GOVERNANCE_EXPECTED_ISSUER_NOT_CONFIGURED")
+    elif (isinstance(expected_evidence_issuer, str) and expected_evidence_issuer.strip()
+          and expected_evidence_issuer.strip() == expected_governance_issuer.strip()):
+        config_blockers.append("GOVERNANCE_ISSUER_NOT_DISTINCT_FROM_EVIDENCE_ISSUER")
+    try:
+        if key_bytes(evidence_key) == key_bytes(governance_key):
+            config_blockers.append("GOVERNANCE_KEY_NOT_DISTINCT_FROM_EVIDENCE_KEY")
+    except EvidenceError:
+        pass  # unusable keys are reported by envelope verification below
+    if config_blockers:
+        return finish("GATHER_MORE", config_blockers)
+
+    envelope_check = verify_bundle(
+        bundle, key=evidence_key, expected_issuer=expected_evidence_issuer, now=current,
+    )
+    emit("EVIDENCE_ENVELOPE", {
+        "signal_id": signal_id or "unknown",
+        "valid": envelope_check.get("valid") is True,
+        "issuer": envelope_check.get("issuer"),
+        "payload_sha256": envelope_check.get("payload_sha256"),
+        "blockers": list(envelope_check.get("blockers", [])),
+    })
+    if envelope_check.get("valid") is not True:
+        return finish("GATHER_MORE", list(envelope_check.get("blockers", [])),
+                      evidence_envelope=envelope_check)
+
     signal_input = bundle.get("signal_input")
     supplied_signal_hash = bundle.get("signal_input_hash")
     if not isinstance(signal_input, Mapping) or not signal_id:
         emit("SIGNAL_INPUT_BINDING", {"signal_id": signal_id or "unknown", "status": "FAILED",
                                       "reason": "SIGNAL_INPUT_OR_HASH_MISSING"})
         return finish("GATHER_MORE", ["SIGNAL_INPUT_OR_HASH_MISSING"])
+    binding_blockers: list[str] = []
+    if str(signal_input.get("signal_id", "")).strip() != signal_id:
+        binding_blockers.append("SIGNAL_INPUT_SIGNAL_ID_MISMATCH")
+    signal_instrument = str(signal_input.get("instrument", "")).strip().upper()
+    signal_direction = str(signal_input.get("direction", "")).strip().upper()
+    if not signal_instrument:
+        binding_blockers.append("SIGNAL_INPUT_INSTRUMENT_MISSING")
+    if signal_direction not in {"BUY", "SELL"}:
+        binding_blockers.append("SIGNAL_INPUT_DIRECTION_INVALID")
+    if binding_blockers:
+        emit("SIGNAL_INPUT_BINDING", {"signal_id": signal_id, "status": "FAILED",
+                                      "blockers": sorted(set(binding_blockers))})
+        return finish("GATHER_MORE", binding_blockers)
     try:
         expected_signal_hash = canonical_hash(signal_input)
     except (TypeError, ValueError, OverflowError):
@@ -186,12 +273,16 @@ def evaluate_signal_bundle(
     emit("VERDICT_METADATA_VALIDATION", {"signal_id": signal_id, "status": "PASSED",
                                            "verdict_count": len(verdicts)})
 
+    max_review_age = _policy_seconds(certainty_policy, "max_review_age_seconds")
+    max_challenge_age = _policy_seconds(certainty_policy, "max_challenge_age_seconds")
     reviews = _as_records(bundle.get("peer_reviews"))
     review_index: dict[str, set[str]] = {}
     review_blockers: list[str] = []
     challenge_blockers: list[str] = []
     challenge_reviews: list[Mapping[str, Any]] = []
+    seen_review_ids: set[str] = set()
     for review in reviews:
+        review_id = str(review.get("review_id", "")).strip()
         target_id = str(review.get("target_verdict_id", "")).strip()
         reviewer_alias = str(review.get("reviewer_alias", "")).strip()
         stance = str(review.get("stance", "")).upper()
@@ -203,7 +294,14 @@ def evaluate_signal_bundle(
         challenge_type = str(review.get("challenge_type", "")).upper()
         valid_challenge_types = {"DATA_CONTRADICTION", "SOURCE_WEAK", "STALE_DATA", "LOGIC_GAP", "REGIME_MISMATCH", "CORRELATION_RISK"}
         challenge_type_ok = stance != "CHALLENGE" or challenge_type in valid_challenge_types
-        if review.get("status") != "VALIDATED" or not target_id or not reviewer_alias or stance not in {"CONFIRM", "CHALLENGE"} or not evidence_ok or not argument or not challenge_type_ok:
+        created_ok = _is_timestamp(review.get("created_at"), current, max_age_seconds=max_review_age)
+        if not review_id or review_id in seen_review_ids:
+            review_blockers.append("MISSING_OR_DUPLICATE_REVIEW_ID")
+            continue
+        seen_review_ids.add(review_id)
+        if (review.get("status") != "VALIDATED" or not target_id or not reviewer_alias
+                or stance not in {"CONFIRM", "CHALLENGE"} or not evidence_ok or not argument
+                or not challenge_type_ok or not created_ok):
             review_blockers.append("INVALID_PEER_REVIEW_RECORD")
             continue
         target_set = review_index.setdefault(target_id, set())
@@ -236,7 +334,24 @@ def evaluate_signal_bundle(
         challenge_records = _as_records(raw_challenge_records)
         if len(challenge_records) != len(raw_challenge_records):
             challenge_blockers.append("CHALLENGE_LEDGER_HAS_INVALID_RECORDS")
+    seen_challenge_ids: set[str] = set()
     for challenge_index, challenge in enumerate(challenge_records):
+        challenge_id = str(challenge.get("challenge_id", "")).strip()
+        if not challenge_id or challenge_id in seen_challenge_ids:
+            challenge_blockers.append(f"CHALLENGE_{challenge_index}_ID_MISSING_OR_DUPLICATE")
+        else:
+            seen_challenge_ids.add(challenge_id)
+        if not str(challenge.get("target_verdict_id", "")).strip():
+            challenge_blockers.append(f"CHALLENGE_{challenge_index}_TARGET_MISSING")
+        if not str(challenge.get("argument", "")).strip():
+            challenge_blockers.append(f"CHALLENGE_{challenge_index}_ARGUMENT_MISSING")
+        rounds = challenge.get("rounds")
+        if (not isinstance(rounds, Sequence) or isinstance(rounds, (str, bytes)) or len(rounds) > 3):
+            challenge_blockers.append(f"CHALLENGE_{challenge_index}_ROUNDS_INVALID")
+        if not _is_timestamp(challenge.get("created_at"), current, max_age_seconds=max_challenge_age):
+            challenge_blockers.append(f"CHALLENGE_{challenge_index}_CREATED_AT_INVALID")
+        if str(challenge.get("status", "OPEN")).upper() not in {"OPEN", "RESOLVED", "ESCALATED"}:
+            challenge_blockers.append(f"CHALLENGE_{challenge_index}_STATUS_INVALID")
         refs = challenge.get("evidence_refs", [])
         resolution_refs = challenge.get("resolution_evidence_refs", [])
         if (not isinstance(refs, Sequence) or isinstance(refs, (str, bytes))
@@ -256,9 +371,19 @@ def evaluate_signal_bundle(
     for challenge in challenge_records:
         status_value = str(challenge.get("status", "OPEN")).upper()
         if status_value == "RESOLVED":
-            resolution_refs = challenge.get("resolution_evidence_refs", challenge.get("evidence_refs", []))
-            if not isinstance(resolution_refs, Sequence) or isinstance(resolution_refs, (str, bytes)) or not resolution_refs:
-                challenge_blockers.append("CHALLENGE_RESOLUTION_MISSING_EVIDENCE")
+            resolution_refs = challenge.get("resolution_evidence_refs")
+            initial_refs = challenge.get("evidence_refs")
+            resolution_ok = (
+                isinstance(resolution_refs, Sequence) and not isinstance(resolution_refs, (str, bytes))
+                and bool(resolution_refs)
+                and all(str(ref).strip() in allowed_evidence_refs for ref in resolution_refs)
+            )
+            initial_set = ({str(ref).strip() for ref in initial_refs}
+                           if isinstance(initial_refs, Sequence) and not isinstance(initial_refs, (str, bytes))
+                           else set())
+            new_evidence = resolution_ok and bool({str(ref).strip() for ref in resolution_refs} - initial_set)
+            if not resolution_ok or not new_evidence:
+                challenge_blockers.append("CHALLENGE_RESOLUTION_MISSING_NEW_EVIDENCE")
                 open_challenges.append({**dict(challenge), "status": "OPEN"})
         else:
             open_challenges.append(dict(challenge))
@@ -315,22 +440,52 @@ def evaluate_signal_bundle(
                         or any(str(ref).strip() not in allowed_evidence_refs for ref in refs)):
                     all_risk_flags.append(f"DEVIL_ADVOCATE_HYPOTHESIS_{hypothesis_index}_EVIDENCE_NOT_IN_SIGNAL_REGISTRY")
 
+    governance_check = verify_governance_attestation(
+        bundle.get("governance_attestation"),
+        key=governance_key,
+        expected_issuer=expected_governance_issuer,
+        now=current,
+    )
+    emit("GOVERNANCE_ATTESTATION", {
+        "signal_id": signal_id,
+        "valid": governance_check.get("valid") is True,
+        "issuer": governance_check.get("issuer"),
+        "observed_at": governance_check.get("observed_at"),
+        "blockers": list(governance_check.get("blockers", [])),
+    })
+    if governance_check.get("valid") is not True:
+        return finish("GATHER_MORE", list(governance_check.get("blockers", [])),
+                      governance_attestation=governance_check)
+
+    attested_verdicts = apply_attested_calibration(
+        verdicts, governance_check, issuer=str(expected_governance_issuer).strip(),
+    )
+    verdicts = [dict(row) if isinstance(row, Mapping) else row for row in attested_verdicts]
+    emit("GOVERNANCE_CALIBRATION", {
+        "signal_id": signal_id,
+        "attested_agents": len(governance_check.get("agent_calibration") or {}),
+        "method_version": governance_check.get("method_version"),
+    })
+    try:
+        consensus_score = weighted_consensus(verdicts)
+    except (TypeError, ValueError, KeyError, OverflowError):
+        consensus_score = 0.0
+        all_risk_flags.append("CALIBRATED_CONSENSUS_COULD_NOT_BE_COMPUTED")
+
     certainty_input = {
         "verdicts": verdicts,
         "consensus_score": consensus_score,
         "open_challenges": open_challenges,
         "challenge_resolution_status": resolution_status,
         "contradictions_last_n_hours": bundle.get("contradictions_last_n_hours"),
+        "contradiction_lookback_hours": bundle.get("contradiction_lookback_hours"),
         "key_sources": bundle.get("key_sources", []),
-        "news_or_rumor": bundle.get("news_or_rumor", False),
+        "news_or_rumor": bundle.get("news_or_rumor"),
         "devil_advocate_report": bundle.get("devil_advocate_report"),
-        "dissent_rate": bundle.get("dissent_rate"),
-        "dissent_sample_size": bundle.get("dissent_sample_size"),
-        "false_certainty_rate": bundle.get("false_certainty_rate"),
-        "false_certainty_sample_size": bundle.get("false_certainty_sample_size"),
         "risk_flags": all_risk_flags,
     }
-    certainty = certainty_gate(certainty_input, certainty_policy)
+    certainty = certainty_gate(certainty_input, certainty_policy, governance=governance_check,
+                               now=current)
     emit("CERTAINTY_GATE", {"signal_id": signal_id, "status": certainty.get("status"),
                              "blockers": certainty.get("blockers", []), "consensus_score": consensus_score})
     if certainty.get("status") == "ESCALATE":
@@ -347,16 +502,27 @@ def evaluate_signal_bundle(
         emit("CHIEF_REVIEW", {"signal_id": signal_id, "status": "HOLD", "reason": "CHIEF_SIGNAL_ID_MISMATCH"})
         return finish("HOLD", ["CHIEF_SIGNAL_ID_MISMATCH"], certainty=certainty)
     actual_challenge_snapshot = sorted((dict(ch) for ch in challenge_records), key=lambda row: str(row.get("challenge_id", "")))
-    if canonical_hash(chief_input.get("challenge_ledger_snapshot", [])) != canonical_hash(actual_challenge_snapshot):
+    try:
+        snapshot_hash = canonical_hash(chief_input.get("challenge_ledger_snapshot", []))
+        actual_snapshot_hash = canonical_hash(actual_challenge_snapshot)
+    except (TypeError, ValueError, OverflowError):
+        emit("CHIEF_REVIEW", {"signal_id": signal_id, "status": "HOLD",
+                              "reason": "CHIEF_CHALLENGE_LEDGER_SNAPSHOT_INVALID"})
+        return finish("HOLD", ["CHIEF_CHALLENGE_LEDGER_SNAPSHOT_INVALID"], certainty=certainty)
+    if snapshot_hash != actual_snapshot_hash:
         emit("CHIEF_REVIEW", {"signal_id": signal_id, "status": "HOLD", "reason": "CHIEF_CHALLENGE_LEDGER_SNAPSHOT_MISMATCH"})
         return finish("HOLD", ["CHIEF_CHALLENGE_LEDGER_SNAPSHOT_MISMATCH"], certainty=certainty)
     supplied_reasoning_hash = chief_input.get("reasoning_hash")
     unsigned_chief = dict(chief_input)
     unsigned_chief.pop("reasoning_hash", None)
-    expected_hash = canonical_hash(unsigned_chief)
-    if supplied_reasoning_hash is None:
-        chief_input["reasoning_hash"] = expected_hash
-    elif supplied_reasoning_hash != expected_hash:
+    try:
+        expected_hash = canonical_hash(unsigned_chief)
+    except (TypeError, ValueError, OverflowError):
+        return finish("HOLD", ["CHIEF_REASONING_NOT_CANONICALLY_HASHABLE"], certainty=certainty)
+    if not isinstance(supplied_reasoning_hash, str) or not supplied_reasoning_hash.strip():
+        emit("CHIEF_REVIEW", {"signal_id": signal_id, "status": "HOLD", "reason": "CHIEF_REASONING_HASH_MISSING"})
+        return finish("HOLD", ["CHIEF_REASONING_HASH_MISSING"], certainty=certainty)
+    if supplied_reasoning_hash != expected_hash:
         emit("CHIEF_REVIEW", {"signal_id": signal_id, "status": "HOLD", "reason": "CHIEF_REASONING_HASH_MISMATCH"})
         return finish("HOLD", ["CHIEF_REASONING_HASH_MISMATCH"], certainty=certainty)
     chief_evidence_blockers: list[str] = []
@@ -400,6 +566,10 @@ def evaluate_signal_bundle(
     metadata_blockers: list[str] = []
     if str(req.get("signal_id", "")) != signal_id:
         metadata_blockers.append("PERMISSION_SIGNAL_ID_MISMATCH")
+    if str(req.get("instrument", "")).strip().upper() != signal_instrument:
+        metadata_blockers.append("PERMISSION_INSTRUMENT_SIGNAL_MISMATCH")
+    if str(req.get("direction", "")).strip().upper() != signal_direction:
+        metadata_blockers.append("PERMISSION_DIRECTION_SIGNAL_MISMATCH")
     if req.get("chief_reasoning_hash") != chief.get("reasoning_hash"):
         metadata_blockers.append("PERMISSION_CHIEF_REASONING_HASH_MISMATCH")
     try:
@@ -453,11 +623,31 @@ def evaluate_signal_bundle(
         return finish("DENY", metadata_blockers, certainty=certainty, chief=chief,
                       message="Permission request does not match the reviewed signal; no order was created.")
 
+    compliance_agent_id = str(certainty_policy.get("compliance_agent_id", "ComplianceAgent")).strip()
+    compliance_rows = [v for v in verdicts if str(v.get("agent_id", "")).strip() == compliance_agent_id]
+    compliance_status = (
+        "PASS" if len(compliance_rows) == 1 and compliance_rows[0].get("verdict") == "APPROVE" else "BLOCKED"
+    )
+    emit("COMPLIANCE_VERDICT", {
+        "signal_id": signal_id,
+        "status": compliance_status,
+        "compliance_agent_id": compliance_agent_id,
+        "verdict_count": len(compliance_rows),
+        "blockers": [] if compliance_status == "PASS" else ["COMPLIANCE_VERDICT_NOT_APPROVED"],
+    })
     req["chief_verdict"] = chief.get("verdict")
     req["certainty_status"] = certainty.get("status")
-    req["compliance_status"] = bundle.get("compliance_status")
+    req["compliance_status"] = compliance_status
     req["risk_flags"] = all_risk_flags
-    if require_persisted_risk:
+    user_decision = bundle.get("user_decision")
+    if user_decision is not None and require_persisted_risk is not True:
+        # A client-supplied approval must never bypass the persisted kill switch and
+        # fresh terminal risk snapshot. Authorization therefore requires this path.
+        emit("USER_AUTHORIZATION", {"signal_id": signal_id, "status": "DENY",
+                                    "reason": "PERSISTED_RISK_REQUIRED_FOR_AUTHORIZATION"})
+        return finish("DENY", ["PERSISTED_RISK_REQUIRED_FOR_AUTHORIZATION"],
+                      certainty=certainty, chief=chief)
+    if require_persisted_risk is True:
         permission = risk_controlled_permission(
             req, permission_matrix,
             kill_switch_state=kill_switch_state,
@@ -490,12 +680,13 @@ def evaluate_signal_bundle(
             "instrument", "direction", "size", "expected_price", "sl_tp", "expected_rr", "consensus_score", "mode", "expires_at"
         )},
     }
-    user_decision = bundle.get("user_decision")
     if user_decision is None:
         return finish("REQUIRE_HUMAN", [], certainty=certainty, chief=chief, permission=permission,
                       human_review_packet=human_review_packet,
                       message="Human review is required; no order command has been created.")
-    authorization = user_authorization_gate(permission, user_decision, now=current)
+    authorization = user_authorization_gate(
+        permission, user_decision, now=current, nonce_store=authorization_store,
+    )
     emit("USER_AUTHORIZATION", {"signal_id": signal_id, "status": authorization.get("status"),
                                  "permission_id": authorization.get("permission_id"),
                                  "blockers": authorization.get("blockers", [])})

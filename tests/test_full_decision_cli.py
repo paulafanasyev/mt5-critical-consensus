@@ -1,24 +1,32 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 from critical_consensus.audit import canonical_hash
+from critical_consensus.evidence import sign_bundle
 
 
 ROOT = Path(__file__).resolve().parents[1]
+EVIDENCE_ENV = {
+    "MT5_EVIDENCE_HMAC_KEY": "e" * 64,
+    "MT5_EVIDENCE_ISSUER": "test-ingress",
+    "MT5_GOVERNANCE_HMAC_KEY": "g" * 64,
+    "MT5_GOVERNANCE_ISSUER": "calibration-service",
+}
 
 
 def test_full_decision_cli_fails_closed_and_writes_auditable_result(tmp_path):
     signal_input = {"signal_id": "cli-smoke-001", "instrument": "EURUSD"}
-    bundle = {
+    bundle = sign_bundle({
         "signal_id": signal_input["signal_id"],
         "signal_input": signal_input,
         "signal_input_hash": canonical_hash(signal_input),
         "verdicts": [],
-    }
+    }, key=EVIDENCE_ENV["MT5_EVIDENCE_HMAC_KEY"], issuer="test-ingress")
     bundle_path = tmp_path / "bundle.json"
     output_path = tmp_path / "result.json"
     bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
@@ -26,6 +34,7 @@ def test_full_decision_cli_fails_closed_and_writes_auditable_result(tmp_path):
         [sys.executable, str(ROOT / "scripts" / "evaluate_signal_bundle.py"),
          str(bundle_path), "--output", str(output_path)],
         cwd=ROOT, capture_output=True, text=True, check=False,
+        env={**os.environ, **EVIDENCE_ENV},
     )
     assert result.returncode == 2
     report = json.loads(output_path.read_text(encoding="utf-8"))

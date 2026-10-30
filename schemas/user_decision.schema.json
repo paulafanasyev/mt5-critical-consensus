@@ -12,7 +12,8 @@
     "decision",
     "timestamp",
     "reason",
-    "ttl_seconds"
+    "ttl_seconds",
+    "nonce"
   ],
   "properties": {
     "decision_id": {
@@ -41,6 +42,11 @@
       "type": "integer",
       "minimum": 1,
       "maximum": 600
+    },
+    "nonce": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{16,128}$",
+      "description": "One-time value consumed atomically by the authorization nonce store."
     },
     "two_fa_verified": {
       "type": "boolean"

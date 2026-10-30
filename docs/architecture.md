@@ -23,7 +23,9 @@ flowchart TB
   subgraph A[3. ANALYTICS / GOVERNANCE / EXECUTION]
     HUB --> TA[Technical / Features / Quant]
     TA --> RM[Portfolio + Risk]
-    CR --> CG[Certainty Gate: all predicates]
+    CR --> EV[Signed evidence envelope<br/>HMAC-SHA256, canonical JSON]
+    EV --> CG[Certainty Gate: all predicates]
+    CAL[Calibration service<br/>walk-forward Platt + health metrics] -.->|signed governance attestation<br/>separate key + issuer| CG
     RM --> CG
     CG -->|FAIL| GM[GATHER_MORE -> Intelligence]
     CG -->|DEADLOCK| ESC[ESCALATE user, no trade]
@@ -32,7 +34,7 @@ flowchart TB
     PG -->|DENY| STOP[No order]
     PG -->|REQUIRE_HUMAN| UA[Human approval + live 2FA/signature]
     UA -->|reject/expired| STOP
-    UA -->|one-time allow| EX[Planned execution bridge / MQL5 EA — disabled in scaffold]
+    UA -->|one-time allow, nonce consumed| EX[Planned execution bridge / MQL5 EA — disabled in scaffold]
     EX --> RECON[Fill + positions reconciliation]
     RECON --> AUD[(Append-only audit + immutable object storage)]
     CG --> AUD
@@ -51,10 +53,13 @@ flowchart TB
 ## Реализация в текущем каркасе
 
 - Реализованы Python policy gates и `evaluate_signal_bundle`; каждый verdict привязывается к каноническому hash точного `signal_input`. Внутренний CLI `scripts/evaluate_signal_bundle.py` запускает полный детерминированный путь и не принимает переданное клиентом human approval.
-- `PermissionRequest` привязывается к сигналу, exact `ChiefReasoning` hash, рассчитанному consensus и сводкам проверенных источников; расхождение блокирует переход к human gate.
+- Пакет доказательств принимается только в подписанном HMAC-SHA256 конверте (`MT5_EVIDENCE_HMAC_KEY`, ожидаемый issuer `MT5_EVIDENCE_ISSUER`). Подпись покрывает канонический JSON без `user_decision`, поэтому любая правка после подписания даёт `EVIDENCE_*` blocker и `GATHER_MORE`.
+- Калибровочные метрики (dissent rate, false-certainty rate, sample size) берутся только из отдельной governance-аттестации, подписанной другим ключом (`MT5_GOVERNANCE_HMAC_KEY`) и другим issuer (`MT5_GOVERNANCE_ISSUER`, по умолчанию `calibration-service`). Значения из самого bundle для гейта не используются.
+- `mandatory_agents` и `compliance_agent_id` принадлежат policy-конфигу; `compliance_status` вычисляется из verdict `ComplianceAgent`, а не принимается из bundle.
+- `PermissionRequest` привязывается к сигналу (instrument, direction), exact `ChiefReasoning` hash, рассчитанному consensus и сводкам проверенных источников; расхождение блокирует переход к human gate.
 - Human review packet содержит все peer reviews, dissenting opinions, полный challenge ledger, ChiefReasoning, source reports, risk snapshot и tail-risk fields.
 - API endpoint проверки authorization отключён (HTTP 423), пока отсутствуют persistent server-side permission state и настоящий криптографический 2FA/signature verifier.
-- PostgreSQL persistence now stores immutable market history, forecast labels, risk/kill-switch snapshots and full decision/audit runs. The Redis worker script persists events before ACK, but a production-managed worker service is not deployed. Real nine-agent provider configuration, trusted source ingestion/registry, automated peer review and challenge resolution, historical calibration/health datasets, TOTP/signature provider, broker order dispatcher and MetaEditor/MT5 forward testing remain unimplemented or unverified.
+- PostgreSQL persistence stores immutable market history, forecast labels, risk/kill-switch snapshots and full decision/audit runs. The Redis worker script persists events before ACK, but a production-managed worker service is not deployed. The provider-backed anonymized peer-review and challenge-resolution runner exists and is unit-tested, but it has not been exercised against real independent provider endpoints and its confidence values remain uncalibrated. Trusted source ingestion/registry, historical calibration/health datasets, TOTP/signature provider, broker order dispatcher and MetaEditor/MT5 forward testing remain unimplemented or unverified.
 - Execution-related endpoints intentionally cannot publish, fetch or send an order command. The diagram includes the future production boundary, not an enabled path.
 
 ## Invariants
@@ -62,6 +67,7 @@ flowchart TB
 - Любое решение вычисляется как conjunction обязательных условий, не по большинству голосов.
 - `PASS` у CertaintyGate означает только передачу на ChiefAgent; `CONFIRM` ChiefAgent означает только разрешение перейти к PermissionGate.
 - PermissionGate возвращает `REQUIRE_HUMAN`; authorization формирует одноразовое разрешение, но не создаёт ордер.
+- Каждый `nonce` авторизации расходуется ровно один раз через `authorization_store` (`InMemoryNonceStore` или append-only `PostgresNonceStore`); повтор того же nonce получает `AUTHORIZATION_NONCE_REPLAYED`. Без store authorization не выдаётся.
 - Исполнительный мост перепроверяет TTL, client_order_id, slippage, SL/TP, состояние счёта и текущие позиции непосредственно перед операцией.
 - При неопределённом результате вызова брокера не выполняется слепой retry; запускается reconcile.
 
