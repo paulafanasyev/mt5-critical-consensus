@@ -41,7 +41,7 @@ def record(publisher_id="central-bank-a", url="https://cb-a.example/releases/1",
     cfg = registry()["publishers"][publisher_id]
     digest = "sha256:" + hashlib.sha256(body).hexdigest()
     return {
-        "source_id": source_id_for_capture(publisher_id, url, digest),
+        "source_id": source_id_for_capture(publisher_id, url, digest, registry_version="1",\n                                          published_at=(published_at or (NOW - timedelta(minutes=2)).isoformat()),\n                                          publication_time_attestation="operator_attested"),
         "publisher_id": publisher_id,
         "publisher_domain": url.split("/")[2],
         "source_url": url,
