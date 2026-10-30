@@ -163,3 +163,108 @@ def test_wide_live_spread_blocks_risk_snapshot(monkeypatch):
     assert result["status"] == "DENY"
     assert "MT5_SPREAD_LIMIT_EXCEEDED" in result["blockers"]
     assert result["spread_points"] == pytest.approx(100.0)
+
+
+# Persistence readback integrity: DB metadata and JSON payload must remain bound.
+import hashlib
+import json
+
+from critical_consensus.persistence import PostgresRepository
+
+
+def _snapshot_digest(snapshot):
+    encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False, allow_nan=False, default=str)
+    return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+class _RiskSnapshotCursor:
+    def __init__(self, row):
+        self.row = row
+
+    def fetchone(self):
+        return self.row
+
+
+class _RiskSnapshotConnection:
+    def __init__(self, row):
+        self.row = row
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def execute(self, query, args=None):
+        assert "FROM mt5_risk_snapshots" in query
+        assert args == ("EURUSD",)
+        return _RiskSnapshotCursor(self.row)
+
+
+def _risk_snapshot_repository(row):
+    return PostgresRepository(
+        "postgresql://unused",
+        connect_fn=lambda _dsn: _RiskSnapshotConnection(row),
+    )
+
+
+def _risk_snapshot_payload():
+    return {
+        "observed_at": "2026-10-30T10:30:00+00:00",
+        "account_mode": "demo",
+        "symbol": "EURUSD",
+        "status": "DENY",
+        "trade_allowed": False,
+        "blockers": ["TEST_FIXTURE"],
+    }
+
+
+def test_latest_risk_snapshot_verifies_hash_and_database_columns():
+    snapshot = _risk_snapshot_payload()
+    digest = _snapshot_digest(snapshot)
+    row = (datetime(2026, 10, 30, 10, 30, tzinfo=timezone.utc),
+           "demo", "EURUSD", digest, snapshot)
+
+    result = _risk_snapshot_repository(row).get_latest_mt5_risk_snapshot("eurusd")
+
+    assert result["snapshot_sha256"] == digest
+    assert result["status"] == "DENY"
+    assert result["trade_allowed"] is False
+
+
+def test_latest_risk_snapshot_rejects_tampered_json_payload():
+    snapshot = _risk_snapshot_payload()
+    digest = _snapshot_digest(snapshot)
+    tampered = dict(snapshot, trade_allowed=True)
+    row = (datetime(2026, 10, 30, 10, 30, tzinfo=timezone.utc),
+           "demo", "EURUSD", digest, tampered)
+
+    with pytest.raises(RuntimeError, match="hash mismatch"):
+        _risk_snapshot_repository(row).get_latest_mt5_risk_snapshot("EURUSD")
+
+
+@pytest.mark.parametrize(
+    "column_patch, expected_error",
+    [
+        ({"account_mode": "real"}, "account-mode column mismatch"),
+        ({"symbol": "GBPUSD"}, "symbol column mismatch"),
+        ({"observed_at": "2026-10-30T10:31:00+00:00"}, "timestamp column mismatch"),
+    ],
+)
+def test_latest_risk_snapshot_rejects_json_database_column_divergence(column_patch, expected_error):
+    snapshot = _risk_snapshot_payload()
+    patched = dict(snapshot, **column_patch)
+    row = (datetime(2026, 10, 30, 10, 30, tzinfo=timezone.utc),
+           "demo", "EURUSD", _snapshot_digest(patched), patched)
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        _risk_snapshot_repository(row).get_latest_mt5_risk_snapshot("EURUSD")
+
+
+def test_latest_risk_snapshot_rejects_non_object_json_payload():
+    row = (datetime(2026, 10, 30, 10, 30, tzinfo=timezone.utc),
+           "demo", "EURUSD", _snapshot_digest([]), [])
+
+    with pytest.raises(RuntimeError, match="not a JSON object"):
+        _risk_snapshot_repository(row).get_latest_mt5_risk_snapshot("EURUSD")
