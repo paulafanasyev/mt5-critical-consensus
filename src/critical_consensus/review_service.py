@@ -6,6 +6,7 @@ must never be used as reviewer callbacks or as authoritative review evidence.
 from __future__ import annotations
 
 import hashlib
+import math
 import uuid
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
@@ -92,21 +93,28 @@ async def run_peer_review_cycle(
         ("review_cycle_timeout_seconds", review_cycle_timeout_seconds),
         ("challenge_cycle_timeout_seconds", challenge_cycle_timeout_seconds),
     ):
-        if (isinstance(timeout_value, bool) or not isinstance(timeout_value, (int, float))
-                or not float(timeout_value) > 0 or float(timeout_value) > 600
-                or not __import__("math").isfinite(float(timeout_value))):
+        try:
+            numeric_timeout = float(timeout_value) if not isinstance(timeout_value, bool) else float("nan")
+        except (TypeError, ValueError, OverflowError):
+            numeric_timeout = float("nan")
+        if (not math.isfinite(numeric_timeout) or numeric_timeout <= 0
+                or numeric_timeout > 600):
             return {
                 "status": "GATHER_MORE", "blockers": [f"{timeout_name.upper()}_INVALID"],
                 "peer_reviews": [], "challenge_records": [], "open_challenges": [],
                 "challenge_resolution_status": "MISSING", "trade_allowed": False,
             }
-    if not callable(resolver) or max_resolution_rounds < 1 or max_resolution_rounds > 3:
+    if (not callable(resolver) or isinstance(max_resolution_rounds, bool)
+            or not isinstance(max_resolution_rounds, int)
+            or max_resolution_rounds < 1 or max_resolution_rounds > 3):
         return {
             "status": "GATHER_MORE", "blockers": ["CHALLENGE_RESOLVER_OR_ROUND_POLICY_INVALID"],
             "peer_reviews": [], "challenge_records": [], "open_challenges": [],
             "challenge_resolution_status": "MISSING", "trade_allowed": False,
         }
-    if isinstance(min_reviewers_per_verdict, bool) or min_reviewers_per_verdict < 1:
+    if (isinstance(min_reviewers_per_verdict, bool)
+            or not isinstance(min_reviewers_per_verdict, int)
+            or min_reviewers_per_verdict < 1):
         return {
             "status": "GATHER_MORE", "blockers": ["PEER_REVIEWER_POLICY_INVALID"],
             "peer_reviews": [], "challenge_records": [], "open_challenges": [],
