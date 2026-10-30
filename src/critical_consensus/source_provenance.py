@@ -51,9 +51,11 @@ def source_id_for_capture(
     registry_version: str = "", published_at: str = "", publication_time_attestation: str = "",
 ) -> str:
     """Derive an immutable ID from publisher, bytes, policy version and date attestation."""
+    published_stamp = _stamp(published_at)
+    canonical_published_at = published_stamp.isoformat() if published_stamp is not None else str(published_at)
     payload = json.dumps(
         {"publisher_id": publisher_id, "url": url, "content_sha256": content_sha256,
-         "registry_version": registry_version, "published_at": published_at,
+         "registry_version": registry_version, "published_at": canonical_published_at,
          "publication_time_attestation": publication_time_attestation},
         sort_keys=True, separators=(",", ":"), ensure_ascii=False,
     )
