@@ -75,7 +75,7 @@ Then run:
 python scripts/capture_source_evidence.py source-manifest.json
 ```
 
-The fetcher refuses non-HTTPS URLs, redirects, unapproved domains, IP literals, credential-bearing query strings, unsupported response types and oversized documents. It stores the exact response bytes, SHA-256, retrieval time and registry-derived metadata in append-only `source_evidence`. Publication timestamps are still explicitly attested according to the configured basis; the generic fetcher does not parse every publisher's page format or independently prove that a date is accurate. A persisted decision also requires at least two configured independence groups. Keep the registry empty rather than promoting guessed domains or scores.
+The generic fetcher accepts only the explicit `operator_attested` publication-time basis; it does not pretend to extract or verify publisher timestamps automatically. It refuses non-HTTPS URLs, redirects, unapproved domains, IP literals, unapproved or credential-like query parameters, unsupported response types and oversized documents. It stores exact response bytes, SHA-256, retrieval time and registry-derived metadata in append-only `source_evidence`. An operator must inspect the publication date and attest it; that attestation remains an operator assertion, not cryptographic proof. A persisted decision also requires at least two configured independence groups. Keep the registry empty rather than promoting guessed domains or scores.
 
 
 
