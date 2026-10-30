@@ -52,6 +52,13 @@ redis.call('DEL', KEYS[3])
 return dlq_id
 """
 
+_ATTEMPT_LUA = """
+-- CC_INCREMENT_ATTEMPT_V1: increment and refresh the expiry atomically.
+local attempt = redis.call('INCR', KEYS[1])
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+return attempt
+"""
+
 
 def _decode(value: Any) -> Any:
     if isinstance(value, bytes):
@@ -189,8 +196,9 @@ async def process_message_batch(
         message_id = str(_decode(raw_message_id))
         event, parse_error, raw = _message_event(fields)
         attempt_key = f"cc:attempts:{stream}:{group}:{message_id}"
-        attempt = int(await redis_client.incr(attempt_key))
-        await redis_client.expire(attempt_key, 7 * 24 * 60 * 60)
+        attempt = int(await redis_client.eval(
+            _ATTEMPT_LUA, 1, attempt_key, 7 * 24 * 60 * 60,
+        ))
         if parse_error:
             await _dead_letter(redis_client, stream=stream, group=group, message_id=message_id,
                                event=None, raw=raw, error_code=parse_error, attempts=attempt)
