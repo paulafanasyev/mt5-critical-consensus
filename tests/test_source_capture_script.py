@@ -110,7 +110,7 @@ def test_fetch_uses_the_prevalidated_ip_and_does_not_follow_redirects(monkeypatc
     class FakeResponse:
         status = 200
         def getheader(self, name, default=None):
-            return {"Content-Type": "application/json", "Content-Length": "32"}.get(name, default)
+            return {"Content-Type": "application/json", "Content-Length": "31"}.get(name, default)
         def read(self, size):
             return b'{"headline":"approved content"}'
         def close(self):
