@@ -9,6 +9,7 @@ input bool EnableDemoExecution = false;
 input bool AllowLiveExecution = false; // Template intentionally does not permit live execution even if set true.
 input int PollSeconds = 3;
 input int MaxSlippagePoints = 20;
+input int MaxSpreadPoints = 20;
 input long MagicNumber = 8172026;
 input double MaxVolume = 0.20;
 
@@ -179,6 +180,10 @@ bool ExecuteDemoCommand(const string body)
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    if(point <= 0) { Print("BLOCKED: invalid symbol point."); return false; }
+   if(tick.bid <= 0 || tick.ask <= 0 || tick.ask < tick.bid)
+   { Print("BLOCKED: invalid bid/ask quote."); return false; }
+   if(MaxSpreadPoints < 0 || (tick.ask - tick.bid) / point > MaxSpreadPoints)
+   { Print("BLOCKED: live spread exceeds MaxSpreadPoints."); return false; }
    double live_price = (direction=="BUY") ? tick.ask : tick.bid;
    if(MathAbs(live_price - expected_price) > MaxSlippagePoints * point)
    { Print("BLOCKED: slippage guard triggered."); return false; }
