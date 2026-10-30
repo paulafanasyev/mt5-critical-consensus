@@ -85,14 +85,15 @@ CREATE INDEX IF NOT EXISTS idx_calibration_reports_dataset
   ON calibration_reports(dataset_sha256, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS system_events (
-  event_id TEXT PRIMARY KEY,
+  event_id TEXT NOT NULL,
   consumer_name TEXT NOT NULL,
   event_type TEXT NOT NULL,
   schema_version INTEGER NOT NULL CHECK (schema_version >= 1),
   occurred_at TIMESTAMPTZ NOT NULL,
   payload_sha256 TEXT NOT NULL CHECK (payload_sha256 ~ '^sha256:[0-9a-f]{64}$'),
   event JSONB NOT NULL,
-  inserted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  inserted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (consumer_name, event_id)
 );
 CREATE INDEX IF NOT EXISTS idx_system_events_type_time
   ON system_events(event_type, occurred_at DESC);
