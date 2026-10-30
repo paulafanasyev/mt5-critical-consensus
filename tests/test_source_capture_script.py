@@ -36,7 +36,7 @@ def policy():
 
 def test_capture_manifest_adds_content_type_before_provenance_validation(tmp_path, monkeypatch):
     body = b'{"headline":"Central bank statement","body":"Policy rate remains unchanged"}'
-    monkeypatch.setattr(CAPTURE, "_fetch", lambda url, max_bytes, timeout: (body, "application/json"))
+    monkeypatch.setattr(CAPTURE, "_fetch", lambda url, **kwargs: (body, "application/json"))
     registry_path = tmp_path / "registry.yaml"
     manifest_path = tmp_path / "manifest.json"
     registry_path.write_text(yaml.safe_dump(policy()), encoding="utf-8")
@@ -58,7 +58,7 @@ def test_capture_manifest_adds_content_type_before_provenance_validation(tmp_pat
 
 def test_capture_manifest_rejects_unapproved_query_and_non_operator_date_basis(tmp_path, monkeypatch):
     body = b'{"headline":"Official statement","body":"Details from publisher"}'
-    monkeypatch.setattr(CAPTURE, "_fetch", lambda url, max_bytes, timeout: (body, "application/json"))
+    monkeypatch.setattr(CAPTURE, "_fetch", lambda url, **kwargs: (body, "application/json"))
     registry_path = tmp_path / "registry.yaml"
     registry_path.write_text(yaml.safe_dump(policy()), encoding="utf-8")
 
@@ -129,7 +129,8 @@ def test_fetch_uses_the_prevalidated_ip_and_does_not_follow_redirects(monkeypatc
     monkeypatch.setattr(CAPTURE, "_resolve_public_addresses", lambda host: ["93.184.216.34"])
     monkeypatch.setattr(CAPTURE, "_PinnedHTTPSConnection", FakeConnection)
     body, content_type = CAPTURE._fetch(
-        "https://official-a.example/releases/item?id=42", max_bytes=512000, timeout=4,
+        "https://official-a.example/releases/item?id=42", profile=policy()["publishers"]["official-a"],
+        max_bytes=512000, timeout=4,
     )
     assert calls["hostname"] == "official-a.example"
     assert calls["pinned_ip"] == "93.184.216.34"
@@ -176,7 +177,8 @@ def test_fetch_rejects_redirect_without_following_location(monkeypatch):
     monkeypatch.setattr(CAPTURE, "_resolve_public_addresses", lambda host: ["93.184.216.34"])
     monkeypatch.setattr(CAPTURE, "_PinnedHTTPSConnection", FakeConnection)
     try:
-        CAPTURE._fetch("https://official-a.example/releases/item", max_bytes=512000, timeout=3)
+        CAPTURE._fetch("https://official-a.example/releases/item", profile=policy()["publishers"]["official-a"],
+                       max_bytes=512000, timeout=3)
         assert False, "redirect must be rejected"
     except RuntimeError as exc:
         assert str(exc) == "publisher_http_error:302"
@@ -190,7 +192,7 @@ def test_fetch_rejects_unbounded_or_invalid_response_size_policy():
         try:
             CAPTURE._fetch(
                 "https://official-a.example/releases/item",
-                max_bytes=invalid, timeout=3,
+                profile=policy()["publishers"]["official-a"], max_bytes=invalid, timeout=3,
             )
             assert False, "invalid max_bytes must be rejected before DNS or network calls"
         except ValueError as exc:
@@ -223,7 +225,7 @@ def test_capture_manifest_extracts_publication_timestamp_from_configured_json_po
         "headline": "Official policy update",
         "body": "The publisher exposes an explicit publication timestamp field.",
     }).encode("utf-8")
-    monkeypatch.setattr(CAPTURE, "_fetch", lambda url, max_bytes, timeout: (body, "application/json"))
+    monkeypatch.setattr(CAPTURE, "_fetch", lambda url, **kwargs: (body, "application/json"))
     configured = policy()
     profile = configured["publishers"]["official-a"]
     profile["published_at_json_pointer"] = "/metadata/publishedAt"
@@ -246,7 +248,7 @@ def test_capture_manifest_extracts_publication_timestamp_from_configured_json_po
 
 def test_capture_manifest_rejects_api_timestamp_pointer_when_field_missing(tmp_path, monkeypatch):
     body = b'{"metadata":{"published":"not-the-configured-field"}}'
-    monkeypatch.setattr(CAPTURE, "_fetch", lambda url, max_bytes, timeout: (body, "application/json"))
+    monkeypatch.setattr(CAPTURE, "_fetch", lambda url, **kwargs: (body, "application/json"))
     configured = policy()
     profile = configured["publishers"]["official-a"]
     profile["published_at_json_pointer"] = "/metadata/publishedAt"
@@ -341,7 +343,8 @@ def test_fetch_enforces_absolute_response_deadline(monkeypatch):
     monkeypatch.setattr(CAPTURE, "_resolve_public_addresses", lambda host: ["93.184.216.34"])
     monkeypatch.setattr(CAPTURE, "_PinnedHTTPSConnection", FakeConnection)
     try:
-        CAPTURE._fetch("https://official-a.example/releases/item", max_bytes=512000, timeout=2)
+        CAPTURE._fetch("https://official-a.example/releases/item", profile=policy()["publishers"]["official-a"],
+                       max_bytes=512000, timeout=2)
         assert False, "slow response must be rejected"
     except RuntimeError as exc:
         assert str(exc) == "publisher_network_or_tls_error"
@@ -355,7 +358,41 @@ def test_fetch_rejects_invalid_total_timeout_before_dns(monkeypatch):
                         lambda host: (_ for _ in ()).throw(AssertionError("DNS must not run")))
     for invalid in (True, False, 0, -1, float("nan"), float("inf"), 31, "4"):
         try:
-            CAPTURE._fetch("https://official-a.example/releases/item", max_bytes=512000, timeout=invalid)
+            CAPTURE._fetch("https://official-a.example/releases/item", profile=policy()["publishers"]["official-a"],
+                           max_bytes=512000, timeout=invalid)
             assert False, "invalid total timeout must be rejected"
         except ValueError as exc:
             assert "timeout" in str(exc)
+
+def test_safe_url_rejects_ambiguous_or_unbounded_urls():
+    profile = policy()["publishers"]["official-a"]
+    invalid_urls = [
+        "https://93.184.216.34/releases/item",
+        "https://unapproved.example/releases/item",
+        "https://official-a.example/releases/item\\\r\\\nInjected: yes",
+        "https://official-a.example\\\\@attacker.example/releases/item",
+        "https://official-a.example/releases/item?" + "&".join(f"p{i}=1" for i in range(33)),
+        "https://official-a.example/" + "a" * 4100,
+    ]
+    for url in invalid_urls:
+        try:
+            CAPTURE._safe_url(url, profile)
+            assert False, f"unsafe URL should be rejected: {url[:80]}"
+        except ValueError:
+            pass
+
+
+def test_fetch_revalidates_publisher_allowlist_before_dns(monkeypatch):
+    def dns_must_not_run(_host):
+        raise AssertionError("DNS must not run for a URL outside the publisher allowlist")
+
+    monkeypatch.setattr(CAPTURE, "_resolve_public_addresses", dns_must_not_run)
+    try:
+        CAPTURE._fetch(
+            "https://93.184.216.34/releases/item",
+            profile=policy()["publishers"]["official-a"], max_bytes=512000, timeout=3,
+        )
+        assert False, "IP-literal publisher URL must be rejected"
+    except ValueError as exc:
+        assert "allowlisted HTTPS publisher URL" in str(exc)
+
