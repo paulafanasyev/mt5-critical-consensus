@@ -18,11 +18,18 @@ AgentCallable = Callable[[Mapping[str, Any]], Awaitable[Mapping[str, Any]]]
 class AgentSpec:
     ALLOWED_ROLES = {"analyst", "critic", "chief_review", "risk_review", "devil_advocate"}
 
-    def __init__(self, agent_id: str, independence_group: str, run: AgentCallable, *, role: str = "analyst"):
+    def __init__(
+        self, agent_id: str, independence_group: str, run: AgentCallable, *,
+        role: str = "analyst", provider_identity: str | None = None, provider_origin: str | None = None,
+    ):
         self.agent_id = str(agent_id).strip()
         self.independence_group = str(independence_group).strip()
         self.role = str(role).strip().lower()
         self.run = run
+        identity = provider_identity or getattr(run, "provider_identity", "")
+        origin = provider_origin or getattr(run, "provider_origin", "")
+        self.provider_identity = str(identity).strip().lower()
+        self.provider_origin = str(origin).strip().lower().rstrip("/")
         if not self.agent_id or not self.independence_group or not callable(run):
             raise ValueError("agent_id, independence_group and run callable are required")
         if self.role not in self.ALLOWED_ROLES:
@@ -108,6 +115,46 @@ async def collect_agent_verdicts(
     if len(set(ids)) != len(ids):
         return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["DUPLICATE_AGENT_ID"], "trade_allowed": False}
 
+    if minimum_independence_groups > 1:
+        missing_identity = [agent.agent_id for agent in agents if not agent.provider_identity]
+        missing_origin = [agent.agent_id for agent in agents if not agent.provider_origin]
+        if missing_identity or missing_origin:
+            blockers = []
+            if missing_identity:
+                blockers.append("PROVIDER_MODEL_IDENTITY_MISSING")
+            if missing_origin:
+                blockers.append("PROVIDER_ORIGIN_MISSING")
+            return {
+                "signal_id": signal_id, "status": "GATHER_MORE", "verdicts": [],
+                "agent_errors": [{"agent_id": agent_id, "code": "PROVIDER_METADATA_MISSING"}
+                                 for agent_id in sorted(set(missing_identity + missing_origin))],
+                "valid_agent_count": 0, "declared_independence_group_count": 0,
+                "provider_origin_count": len({agent.provider_origin for agent in agents if agent.provider_origin}),
+                "provider_identity_count": len({agent.provider_identity for agent in agents if agent.provider_identity}),
+                "independence_evidence": "CONFIGURATION_CHECKED_STATISTICAL_INDEPENDENCE_NOT_VERIFIED",
+                "blockers": blockers, "trade_allowed": False,
+            }
+        origins = [agent.provider_origin for agent in agents]
+        identities = [agent.provider_identity for agent in agents]
+        duplicate_origins = sorted({origin for origin in origins if origins.count(origin) > 1})
+        duplicate_identities = sorted({identity for identity in identities if identities.count(identity) > 1})
+        if duplicate_origins or duplicate_identities:
+            blockers = []
+            if duplicate_origins:
+                blockers.append("PROVIDER_ORIGIN_REUSED")
+            if duplicate_identities:
+                blockers.append("PROVIDER_MODEL_IDENTITY_REUSED")
+            return {
+                "signal_id": signal_id, "status": "GATHER_MORE", "verdicts": [],
+                "agent_errors": [], "valid_agent_count": 0,
+                "declared_independence_group_count": len({agent.independence_group for agent in agents}),
+                "provider_origin_count": len(set(origins)), "provider_identity_count": len(set(identities)),
+                "duplicate_provider_origins": duplicate_origins,
+                "duplicate_provider_identities": duplicate_identities,
+                "independence_evidence": "CONFIGURATION_CHECKED_STATISTICAL_INDEPENDENCE_NOT_VERIFIED",
+                "blockers": blockers, "trade_allowed": False,
+            }
+
     async def one(spec: AgentSpec) -> tuple[AgentSpec, Mapping[str, Any] | None, str | None]:
         try:
             result = await asyncio.wait_for(spec.run(signal), timeout=timeout_seconds)
@@ -129,6 +176,8 @@ async def collect_agent_verdicts(
     for spec, result, error in results:
         if result is not None:
             result["declared_independence_group"] = spec.independence_group
+            result["provider_origin"] = spec.provider_origin
+            result["provider_identity"] = spec.provider_identity
             result["role"] = spec.role
             result["confidence_kind"] = "UNCALIBRATED_SUBJECTIVE"
             verdicts.append(result)
@@ -155,6 +204,8 @@ async def collect_agent_verdicts(
                         for role in sorted(AgentSpec.ALLOWED_ROLES)},
         "required_roles": sorted(required_role_set),
         "missing_roles": missing_roles,
-        "independence_evidence": "DECLARED_ONLY_NOT_VERIFIED",
+        "provider_origin_count": len({agent.provider_origin for agent in agents if agent.provider_origin}),
+        "provider_identity_count": len({agent.provider_identity for agent in agents if agent.provider_identity}),
+        "independence_evidence": "CONFIGURATION_CHECKED_STATISTICAL_INDEPENDENCE_NOT_VERIFIED",
         "blockers": blockers, "trade_allowed": False,
     }
