@@ -10,6 +10,7 @@
     "permission_id",
     "signal_id",
     "chief_reasoning_hash",
+    "permission_request_sha256",
     "user_id",
     "decision",
     "timestamp",
@@ -33,6 +34,11 @@
       "type": "string",
       "minLength": 1,
       "description": "Exact ChiefReasoning hash reviewed by the human; the pipeline rejects a mismatch."
+    },
+    "permission_request_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "Canonical hash of the exact permission_request (size, prices, SL/TP, mode, expiry); the pipeline rejects a mismatch."
     },
     "user_id": {
       "type": "string"

@@ -155,6 +155,10 @@ def sign_operator_approval(bundle, *, now=NOW, key=OPERATOR_KEY, issuer=OPERATOR
     decision.setdefault("signal_id", bundle.get("signal_id"))
     decision.setdefault("chief_reasoning_hash",
                         (bundle.get("chief_reasoning") or {}).get("reasoning_hash"))
+    permission_request = bundle.get("permission_request")
+    decision.setdefault("permission_request_sha256",
+                        canonical_hash(dict(permission_request))
+                        if isinstance(permission_request, dict) else None)
     signed["user_decision"] = decision
     signed["user_decision_envelope"] = sign_decision(
         decision, key=key, issuer=issuer, issued_at=now,
@@ -724,3 +728,28 @@ def test_risk_snapshot_with_forged_aggregates_is_denied_at_authorization():
                           authorization_store=InMemoryNonceStore())
     assert result["status"] == "DENY"
     assert "RISK_FRACTION_DOES_NOT_MATCH_ORDER" in result["blockers"]
+
+
+def test_operator_approval_is_bound_to_the_exact_order_parameters():
+    bundle = make_bundle()
+    bundle["user_decision"] = {"decision": "APPROVE", "user_id": "operator-1",
+                               "reason": "Reviewed dissent and tail risk", "permission_id": "perm-1",
+                               "decision_id": "decision-1", "nonce": "n" * 24,
+                               "timestamp": NOW.isoformat(), "ttl_seconds": 300}
+    approved = sign_operator_approval(bundle)
+    # An evidence-key holder redirects the approval to a different permission after signing.
+    approved["permission_request"] = {**approved["permission_request"], "permission_id": "perm-2"}
+    state, snapshot = _persisted_demo_risk_evidence(approved)
+    body = sign_bundle({**approved, "governance_attestation": make_governance_attestation()},
+                       key=EVIDENCE_KEY, issuer=EVIDENCE_ISSUER, issued_at=NOW)
+    result = evaluate_signal_bundle(
+        body, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
+        evidence_key=EVIDENCE_KEY, governance_key=GOVERNANCE_KEY,
+        expected_evidence_issuer=EVIDENCE_ISSUER, operator_key=OPERATOR_KEY,
+        expected_operator_issuer=OPERATOR_ISSUER, require_persisted_risk=True,
+        kill_switch_state=state, terminal_risk_snapshot=snapshot,
+        authorization_store=InMemoryNonceStore(),
+    )
+    assert result["status"] == "DENY"
+    assert "USER_DECISION_PERMISSION_HASH_MISMATCH" in result["blockers"]
+    assert result["trade_allowed"] is False

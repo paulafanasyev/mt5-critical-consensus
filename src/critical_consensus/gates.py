@@ -317,6 +317,7 @@ def revalidate_review_evidence(payload: Mapping[str, Any], verdicts: Sequence[Ma
                 "reviewer_counts": {}, "open_challenges": None}
 
     verdict_ids: set[str] = set()
+    verdict_authors: dict[str, str] = {}
     for verdict in verdicts:
         if not isinstance(verdict, Mapping):
             blockers.append("VERDICT_RECORD_INVALID")
@@ -326,8 +327,12 @@ def revalidate_review_evidence(payload: Mapping[str, Any], verdicts: Sequence[Ma
             blockers.append("MISSING_OR_DUPLICATE_VERDICT_ID")
         else:
             verdict_ids.add(verdict_id)
+            author = str(verdict.get("agent_id", "")).strip()
+            if author:
+                verdict_authors[verdict_id] = author
 
     reviewer_sets: dict[str, set[str]] = {verdict_id: set() for verdict_id in verdict_ids}
+    challenge_review_keys: set[tuple[str, str]] = set()
     raw_reviews = payload.get("peer_reviews")
     if not isinstance(raw_reviews, Sequence) or isinstance(raw_reviews, (str, bytes)) or not raw_reviews:
         blockers.append("PEER_REVIEWS_MISSING_OR_INVALID")
@@ -339,20 +344,26 @@ def revalidate_review_evidence(payload: Mapping[str, Any], verdicts: Sequence[Ma
             target = str(review.get("target_verdict_id", "")).strip()
             alias = str(review.get("reviewer_alias", "")).strip()
             stance = str(review.get("stance", "")).upper()
+            challenge_type = str(review.get("challenge_type", "")).upper()
             refs = review.get("evidence_refs")
             refs_ok = (isinstance(refs, Sequence) and not isinstance(refs, (str, bytes))
                        and bool(refs) and all(str(ref).strip() for ref in refs))
             if (target not in reviewer_sets or not alias or stance not in {"CONFIRM", "CHALLENGE"}
                     or review.get("status") != "VALIDATED"
                     or not str(review.get("argument", "")).strip() or not refs_ok
-                    or (stance == "CHALLENGE"
-                        and str(review.get("challenge_type", "")).upper() not in _VALID_CHALLENGE_TYPES)):
+                    or (stance == "CHALLENGE" and challenge_type not in _VALID_CHALLENGE_TYPES)):
                 blockers.append("INVALID_PEER_REVIEW_RECORD")
                 continue
             if alias in reviewer_sets[target]:
                 blockers.append("DUPLICATE_PEER_REVIEWER_FOR_VERDICT")
                 continue
+            # A verdict author is never an independent reviewer of its own verdict.
+            if verdict_authors.get(target) == alias:
+                blockers.append(f"PEER_REVIEWER_IS_VERDICT_AUTHOR:{target}")
+                continue
             reviewer_sets[target].add(alias)
+            if stance == "CHALLENGE":
+                challenge_review_keys.add((target, challenge_type))
 
     reviewer_counts: dict[str, int] = {}
     for verdict_id, aliases in reviewer_sets.items():
@@ -369,6 +380,7 @@ def revalidate_review_evidence(payload: Mapping[str, Any], verdicts: Sequence[Ma
                 blockers.append(f"REVIEWER_COUNT_DOES_NOT_MATCH_RECORDS:{verdict_id}")
 
     open_challenges: list[str] | None = None
+    registered_challenges: set[tuple[str, str]] = set()
     raw_ledger = payload.get("challenge_records")
     if not isinstance(raw_ledger, Sequence) or isinstance(raw_ledger, (str, bytes)):
         blockers.append("CHALLENGE_LEDGER_MISSING_OR_INVALID")
@@ -381,6 +393,7 @@ def revalidate_review_evidence(payload: Mapping[str, Any], verdicts: Sequence[Ma
                 continue
             challenge_id = str(challenge.get("challenge_id", "")).strip()
             target = str(challenge.get("target_verdict_id", "")).strip()
+            challenge_type = str(challenge.get("challenge_type", "")).upper()
             status = str(challenge.get("status", "OPEN")).upper()
             rounds = challenge.get("rounds")
             refs = challenge.get("evidence_refs", [])
@@ -393,15 +406,29 @@ def revalidate_review_evidence(payload: Mapping[str, Any], verdicts: Sequence[Ma
                 blockers.append("CHALLENGE_LEDGER_HAS_INVALID_RECORDS")
                 continue
             seen_challenge_ids.add(challenge_id)
+            registered_challenges.add((target, challenge_type))
             resolution_refs = challenge.get("resolution_evidence_refs")
-            if status == "RESOLVED" and not (
+            if status == "RESOLVED":
+                resolution_ok = (
                     isinstance(resolution_refs, Sequence) and not isinstance(resolution_refs, (str, bytes))
-                    and bool(resolution_refs)):
-                blockers.append("CHALLENGE_RESOLUTION_MISSING_RESOLUTION_EVIDENCE")
-                status = "OPEN"
+                    and bool(resolution_refs) and all(str(ref).strip() for ref in resolution_refs)
+                )
+                initial_refs = ({str(ref).strip() for ref in refs}
+                                if isinstance(refs, Sequence) else set())
+                new_evidence = resolution_ok and bool(
+                    {str(ref).strip() for ref in resolution_refs} - initial_refs)
+                if not resolution_ok:
+                    blockers.append("CHALLENGE_RESOLUTION_MISSING_RESOLUTION_EVIDENCE")
+                    status = "OPEN"
+                elif not new_evidence:
+                    blockers.append("CHALLENGE_RESOLUTION_MISSING_NEW_EVIDENCE")
+                    status = "OPEN"
             if status != "RESOLVED":
                 derived_open.append(challenge_id)
         open_challenges = derived_open
+    for target, challenge_type in challenge_review_keys:
+        if (target, challenge_type) not in registered_challenges:
+            blockers.append("PEER_CHALLENGE_NOT_REGISTERED_IN_CHALLENGE_LEDGER")
 
     supplied_open = payload.get("open_challenges")
     if not isinstance(supplied_open, Sequence) or isinstance(supplied_open, (str, bytes)):
@@ -467,9 +494,11 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any], *,
     pre_sources = (list(raw_source_rows)
                    if isinstance(raw_source_rows, Sequence) and not isinstance(raw_source_rows, (str, bytes))
                    else [])
+    # Any tag in the MNPI family (MNPI, MNPI-SUSPECT, ...) is treated as suspect; matching only
+    # the exact hyphenated label would let a relabelled source bypass the veto.
     mnpi_suspect = any(
         isinstance(source, Mapping)
-        and str(source.get("legal_tag", "")).upper() == "MNPI-SUSPECT"
+        and str(source.get("legal_tag", "")).upper().replace("_", "-").startswith("MNPI")
         for source in pre_sources
     )
     if mnpi_suspect:
@@ -610,10 +639,10 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any], *,
         observed = _source_observed_at(source)
         age = (current - observed).total_seconds() if observed is not None else None
         ttl = _finite_float(source.get("ttl_seconds"))
-        tag = str(source.get("legal_tag", "")).upper()
+        tag = str(source.get("legal_tag", "")).upper().replace("_", "-")
         if (not source_id or credibility is None or age is None or ttl is None or ttl <= 0
                 or age < -30 or credibility < source_floor
-                or age > min(source_max_age, ttl) or tag == "MNPI-SUSPECT"):
+                or age > min(source_max_age, ttl) or tag.startswith("MNPI")):
             sources_ok = False
         if source_id:
             seen_source_ids.add(source_id)
@@ -814,6 +843,10 @@ def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probabilit
             blockers.append("CHIEF_CHALLENGE_LEDGER_HASH_MISMATCH")
     if not tail_risk_valid or raw_tail_risk > max_tail_risk:
         blockers.append("TAIL_RISK_MISSING_INVALID_OR_TOO_HIGH")
+    scenario_max = max((_finite_float(s.get("probability")) or 0.0 for s in valid_scenarios), default=0.0)
+    if not tail_risk_valid or raw_tail_risk + 1e-12 < scenario_max:
+        # The aggregate cannot be smaller than any single scenario it summarizes.
+        blockers.append("TAIL_RISK_BELOW_SCENARIO_PROBABILITY")
     reasoning_hash = str(reasoning.get("reasoning_hash", "")).strip()
     unsigned_reasoning = dict(reasoning)
     unsigned_reasoning.pop("reasoning_hash", None)
@@ -949,6 +982,18 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
             blockers.append("DAILY_LOSS_LIMIT_REACHED")
         if risk_values["drawdown_fraction"] is not None and risk_limits["drawdown_fraction"] is not None and risk_values["drawdown_fraction"] >= risk_limits["drawdown_fraction"]:
             blockers.append("MAX_DRAWDOWN_REACHED")
+        # Caps are prospective: a trade that would breach the limit if its stop is hit
+        # must not be admitted just because the loss has not been realized yet.
+        proposed_risk = risk_values["risk_fraction"]
+        if proposed_risk is not None and proposed_risk >= 0:
+            if (risk_values["daily_loss_fraction"] is not None
+                    and risk_limits["daily_loss_fraction"] is not None
+                    and risk_values["daily_loss_fraction"] + proposed_risk > risk_limits["daily_loss_fraction"]):
+                blockers.append("PROJECTED_DAILY_LOSS_EXCEEDS_LIMIT")
+            if (risk_values["drawdown_fraction"] is not None
+                    and risk_limits["drawdown_fraction"] is not None
+                    and risk_values["drawdown_fraction"] + proposed_risk > risk_limits["drawdown_fraction"]):
+                blockers.append("PROJECTED_DRAWDOWN_EXCEEDS_LIMIT")
         for key, limit_key, message in (("open_positions", "max_positions", "MAX_OPEN_POSITIONS_REACHED"),
                                         ("correlated_open_positions", "max_correlated_positions", "CORRELATED_EXPOSURE_LIMIT_REACHED")):
             count = _finite_float(risk.get(key))
@@ -990,11 +1035,14 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
                 risk_distance = abs(entry - stop)
                 reward_distance = abs(take - entry)
                 calculated_rr = reward_distance / risk_distance if risk_distance > 0 else None
-                tolerance_fraction = _finite_float(policy.get("expected_rr_tolerance_fraction", 0.10))
+                tolerance_fraction = _finite_float(policy.get("expected_rr_tolerance_fraction", 0.01))
                 if calculated_rr is None or rr is None or tolerance_fraction is None or not 0 <= tolerance_fraction <= 0.25:
                     blockers.append("EXPECTED_RR_RECALCULATION_FAILED")
-                elif abs(rr - calculated_rr) > max(0.01, calculated_rr * tolerance_fraction):
-                    blockers.append("EXPECTED_RR_DOES_NOT_MATCH_SL_TP")
+                else:
+                    if min_rr is None or calculated_rr < min_rr:
+                        blockers.append("EXPECTED_RR_BELOW_POLICY_AFTER_RECALCULATION")
+                    if abs(rr - calculated_rr) > max(0.01, calculated_rr * tolerance_fraction):
+                        blockers.append("EXPECTED_RR_DOES_NOT_MATCH_SL_TP")
 
     expiry = request.get("expires_at")
     if not expiry:

@@ -22,7 +22,7 @@ permission_matrix:
   demo_enabled: true
   blocked_flags: [sanctions, MNPI, mnpi_suspect, technical_halt, liquidity, kill_switch]
   min_expected_rr: 1.5
-  expected_rr_tolerance_fraction: 0.10
+  expected_rr_tolerance_fraction: 0.01
   require_stop_loss: true
   require_take_profit: true
   max_command_ttl_seconds: 600

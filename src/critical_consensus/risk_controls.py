@@ -71,6 +71,8 @@ def global_kill_switch_gate(state: Mapping[str, Any] | None) -> dict[str, Any]:
     active = state.get("kill_switch_active")
     if active is not False:
         return {"status": "DENY", "trade_allowed": False, "blockers": ["KILL_SWITCH_ACTIVE_OR_INVALID"]}
+    if state.get("status") != "PERSISTED":
+        return {"status": "DENY", "trade_allowed": False, "blockers": ["KILL_SWITCH_STATE_NOT_PERSISTED"]}
     if not str(state.get("updated_by", "")).strip() or not str(state.get("reason", "")).strip():
         return {"status": "DENY", "trade_allowed": False, "blockers": ["KILL_SWITCH_AUDIT_METADATA_MISSING"]}
     updated = _stamp(state.get("updated_at"))
@@ -96,7 +98,9 @@ def risk_snapshot_gate(
         blockers.append("RISK_SNAPSHOT_TIMESTAMP_INVALID")
     else:
         age = (current - stamp).total_seconds()
-        if age < -30:
+        # A small clock skew is tolerable, but a timestamp further in the future than the
+        # freshness budget must not extend how long a stale snapshot is accepted.
+        if age < -min(5.0, float(max_age_seconds)):
             blockers.append("RISK_SNAPSHOT_FROM_FUTURE")
         elif age > max_age_seconds:
             blockers.append("RISK_SNAPSHOT_STALE")
@@ -111,6 +115,10 @@ def risk_snapshot_gate(
     for key, value in values.items():
         if value is None or value <= 0:
             blockers.append(f"RISK_SNAPSHOT_{key.upper()}_MISSING_OR_INVALID")
+    if (values["equity_high_watermark"] is not None and values["account_equity"] is not None
+            and values["equity_high_watermark"] < values["account_equity"]):
+        # A peak below current equity would silently zero out the drawdown calculation.
+        blockers.append("RISK_SNAPSHOT_EQUITY_HIGH_WATERMARK_BELOW_EQUITY")
     risk_fraction = _finite(snapshot.get("risk_fraction"))
     daily_loss = _finite(snapshot.get("daily_loss_fraction"))
     drawdown = _finite(snapshot.get("drawdown_fraction"))
@@ -124,7 +132,7 @@ def risk_snapshot_gate(
         count = _finite(snapshot.get(key))
         if count is None or count < 0 or not count.is_integer():
             blockers.append(f"{key.upper()}_MISSING_OR_INVALID")
-    if snapshot.get("symbol_group") is None:
+    if not str(snapshot.get("symbol_group") or "").strip():
         blockers.append("SYMBOL_CORRELATION_GROUP_UNKNOWN")
     binding = snapshot.get("request_binding_sha256")
     if not isinstance(binding, str) or len(binding) != 71 or not binding.startswith("sha256:") or any(ch not in "0123456789abcdef" for ch in binding[7:]):
@@ -175,7 +183,9 @@ def risk_snapshot_matches_order(
             blockers.append(name)
 
     disagrees(reported_fraction, expected_fraction, "RISK_FRACTION_DOES_NOT_MATCH_ORDER")
-    if reported_value is not None:
+    if reported_value is None:
+        blockers.append("RISK_VALUE_MISSING_OR_INVALID")
+    else:
         disagrees(reported_value, expected_value, "RISK_VALUE_DOES_NOT_MATCH_ORDER")
 
     day_start = _finite(snapshot.get("day_start_equity"))

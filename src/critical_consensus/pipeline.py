@@ -286,6 +286,8 @@ def evaluate_signal_bundle(
     challenge_blockers: list[str] = []
     challenge_reviews: list[Mapping[str, Any]] = []
     seen_review_ids: set[str] = set()
+    verdict_authors = {str(verdict.get("verdict_id", "")).strip(): str(verdict.get("agent_id", "")).strip()
+                       for verdict in verdicts}
     for review in reviews:
         review_id = str(review.get("review_id", "")).strip()
         target_id = str(review.get("target_verdict_id", "")).strip()
@@ -312,6 +314,9 @@ def evaluate_signal_bundle(
         target_set = review_index.setdefault(target_id, set())
         if reviewer_alias in target_set:
             review_blockers.append("DUPLICATE_PEER_REVIEWER_FOR_VERDICT")
+            continue
+        if verdict_authors.get(target_id) == reviewer_alias:
+            review_blockers.append(f"PEER_REVIEWER_IS_VERDICT_AUTHOR:{target_id}")
             continue
         target_set.add(reviewer_alias)
         if stance == "CHALLENGE":
@@ -715,12 +720,21 @@ def evaluate_signal_bundle(
         return finish("DENY", list(permission.get("blockers", [])), certainty=certainty, chief=chief, permission=permission)
 
     if user_decision is not None:
-        # The signed approval must name this signal and the exact Chief reasoning reviewed.
+        # The signed approval must name this signal, the exact Chief reasoning reviewed and
+        # the exact order parameters; otherwise an evidence signer could resize the trade
+        # after the human approved a different one.
         decision_binding_blockers: list[str] = []
         if str(user_decision.get("signal_id", "")).strip() != signal_id:
             decision_binding_blockers.append("USER_DECISION_SIGNAL_ID_MISMATCH")
         if user_decision.get("chief_reasoning_hash") != chief.get("reasoning_hash"):
             decision_binding_blockers.append("USER_DECISION_CHIEF_HASH_MISMATCH")
+        try:
+            approved_permission_hash = canonical_hash(dict(permission_request))
+        except (TypeError, ValueError):
+            approved_permission_hash = None
+        if (approved_permission_hash is None
+                or user_decision.get("permission_request_sha256") != approved_permission_hash):
+            decision_binding_blockers.append("USER_DECISION_PERMISSION_HASH_MISMATCH")
         if decision_binding_blockers:
             emit("USER_AUTHORIZATION", {"signal_id": signal_id, "status": "DENY",
                                         "blockers": decision_binding_blockers})

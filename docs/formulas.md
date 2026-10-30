@@ -54,7 +54,7 @@ Score не заменяет обязательные проверки каждо
 
 `drawdown_fraction_expected = max(0, equity_high_watermark - account_equity) / equity_high_watermark`
 
-Snapshot принимается, только если symbol совпадает, `request_binding_sha256` совпадает с заказом, tick size/value положительны, а `risk_value`, `risk_fraction`, `daily_loss_fraction` и `drawdown_fraction` отличаются от пересчитанных не более чем на 1% (`RISK_*_DOES_NOT_MATCH_*`). Отсутствующая tick-спецификация или нулевая equity-база — DENY, а не допуск. Комиссии, спред и гэп-риск в эту оценку не входят; их должен проверять исполнительный слой.
+Snapshot принимается, только если symbol совпадает, `request_binding_sha256` совпадает с заказом, tick size/value положительны, equity high-water mark не ниже текущей equity, а `risk_value`, `risk_fraction`, `daily_loss_fraction` и `drawdown_fraction` отличаются от пересчитанных не более чем на 1% (`RISK_*_DOES_NOT_MATCH_*`). Отсутствующая tick-спецификация, пустая symbol group или нулевая equity-база — DENY, а не допуск. Лимиты применяются проспективно: `daily_loss_fraction + risk_fraction` не должен превышать дневной лимит, а `drawdown_fraction + risk_fraction` — лимит просадки. RR-порог проверяется по пересчитанному из SL/TP значению с допуском 1% к заявленному. Комиссии, спред и гэп-риск в эту оценку не входят; их должен проверять исполнительный слой.
 
 ## False certainty rate
 

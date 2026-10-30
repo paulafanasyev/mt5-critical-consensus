@@ -422,3 +422,106 @@ def test_review_counts_and_open_challenges_are_recomputed_from_records():
                                         min_reviewers_per_verdict=2)
     assert result["blockers"] == []
     assert result["open_challenges"] == ["c1"]
+
+
+def test_verdict_author_cannot_review_its_own_verdict():
+    verdicts = [{"verdict_id": "v1", "agent_id": "PlatformScoutAgent"}]
+    payload = {"peer_reviews": [
+        {"target_verdict_id": "v1", "reviewer_alias": "PlatformScoutAgent", "stance": "CONFIRM",
+         "argument": "self review", "evidence_refs": ["e1"], "status": "VALIDATED"},
+        {"target_verdict_id": "v1", "reviewer_alias": "a2", "stance": "CONFIRM",
+         "argument": "independent", "evidence_refs": ["e2"], "status": "VALIDATED"},
+    ], "challenge_records": [], "open_challenges": []}
+    result = revalidate_review_evidence(payload, verdicts, min_reviewers_per_verdict=2)
+    assert "PEER_REVIEWER_IS_VERDICT_AUTHOR:v1" in result["blockers"]
+    assert result["reviewer_counts"] == {"v1": 1}
+
+
+def test_challenge_review_must_be_registered_and_resolved_with_new_evidence():
+    verdicts = [{"verdict_id": "v1", "agent_id": "PlatformScoutAgent"}]
+    payload = {"peer_reviews": [
+        {"target_verdict_id": "v1", "reviewer_alias": "a1", "stance": "CONFIRM",
+         "argument": "ok", "evidence_refs": ["e1"], "status": "VALIDATED"},
+        {"target_verdict_id": "v1", "reviewer_alias": "a2", "stance": "CHALLENGE",
+         "challenge_type": "SOURCE_WEAK", "argument": "weak", "evidence_refs": ["e2"],
+         "status": "VALIDATED"},
+    ], "challenge_records": [], "open_challenges": []}
+    result = revalidate_review_evidence(payload, verdicts, min_reviewers_per_verdict=2)
+    assert "PEER_CHALLENGE_NOT_REGISTERED_IN_CHALLENGE_LEDGER" in result["blockers"]
+
+    payload["challenge_records"] = [{
+        "challenge_id": "c1", "target_verdict_id": "v1", "challenge_type": "SOURCE_WEAK",
+        "argument": "weak", "status": "RESOLVED", "rounds": [],
+        "evidence_refs": ["e2"], "resolution_evidence_refs": ["e2"],
+    }]
+    result = revalidate_review_evidence(payload, verdicts, min_reviewers_per_verdict=2)
+    assert "CHALLENGE_RESOLUTION_MISSING_NEW_EVIDENCE" in result["blockers"]
+    assert result["open_challenges"] == ["c1"]
+
+
+def _permission_matrix(**overrides):
+    matrix = {"instruments": ["EURUSD"], "max_size_per_trade": 0.2,
+              "allowed_directions": ["BUY", "SELL"], "demo_enabled": True, "live_enabled": False,
+              "blocked_flags": [], "min_expected_rr": 1.5,
+              "expected_rr_tolerance_fraction": 0.01,
+              "require_stop_loss": True, "require_take_profit": True,
+              "max_command_ttl_seconds": 600,
+              "allowed_time_utc": {"start": "07:00", "end": "19:00"},
+              "blocked_around_news": True, "max_risk_per_trade_fraction": 0.005,
+              "daily_loss_limit_fraction": 0.02, "max_drawdown_fraction": 0.10,
+              "max_positions": 5, "max_correlated_positions": 2}
+    matrix.update(overrides)
+    return {"permission_matrix": matrix}
+
+
+def test_permission_gate_limits_include_the_proposed_trade():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    request = valid_permission_request(now)
+    request["risk_snapshot"] = {"risk_fraction": 0.004, "daily_loss_fraction": 0.018,
+                                "drawdown_fraction": 0.02, "open_positions": 1,
+                                "correlated_open_positions": 0}
+    result = permission_gate(request, _permission_matrix(), now=now)
+    assert "PROJECTED_DAILY_LOSS_EXCEEDS_LIMIT" in result["blockers"]
+
+    request["risk_snapshot"] = {"risk_fraction": 0.004, "daily_loss_fraction": 0.004,
+                                "drawdown_fraction": 0.098, "open_positions": 1,
+                                "correlated_open_positions": 0}
+    result = permission_gate(request, _permission_matrix(), now=now)
+    assert "PROJECTED_DRAWDOWN_EXCEEDS_LIMIT" in result["blockers"]
+
+
+def test_permission_gate_recalculates_reward_risk_against_the_floor():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    request = valid_permission_request(now)
+    request.update({"expected_price": 1.1000, "sl_tp": {"sl": 1.0980, "tp": 1.10276},
+                    "expected_rr": 1.5})
+    result = permission_gate(request, _permission_matrix(), now=now)
+    assert result["status"] == "DENY"
+    assert "EXPECTED_RR_BELOW_POLICY_AFTER_RECALCULATION" in result["blockers"]
+
+
+def test_any_mnpi_legal_tag_variant_vetoes():
+    payload = good_payload()
+    payload["key_sources"][0]["legal_tag"] = "MNPI"
+    result = certainty_gate(payload, POLICY, governance=GOVERNANCE)
+    assert result["status"] == "VETO"
+    assert "MNPI_SUSPECT_SOURCE_VETO" in result["blockers"]
+
+
+def test_chief_tail_risk_cannot_be_lower_than_a_scenario():
+    reasoning = {
+        "reasoning_id": "chief-r-2", "signal_id": "sig-2",
+        "created_at": datetime.now(timezone.utc).isoformat(), "verdict": "CONFIRM",
+        "steps": {k: {"passed": True, "detail": "evidence checked", "evidence_refs": [f"ev-{k}"]}
+                  for k in "abcdefghi"},
+        "reasons_against": ["macro", "news", "correlation", "liquidity", "regime"],
+        "tail_risk_probability": 0.01,
+        "tail_risk_scenarios": [{"scenario": "flash crash", "probability": 0.95,
+                                 "impact": "catastrophic", "evidence_refs": ["risk-1"]}],
+        "open_challenges": [], "all_challenges_read": True, "challenge_ledger_snapshot": [],
+        "challenge_ledger_hash": canonical_hash([]), "reviewed_challenge_ids": [],
+    }
+    reasoning["reasoning_hash"] = canonical_hash(reasoning)
+    result = chief_skeptic_pass(reasoning)
+    assert result["verdict"] == "HOLD"
+    assert "TAIL_RISK_BELOW_SCENARIO_PROBABILITY" in result["blockers"]

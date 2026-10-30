@@ -122,3 +122,20 @@ def test_risk_controlled_permission_denies_a_reconciled_mismatch_before_policy()
     assert result["status"] == "DENY"
     assert "RISK_FRACTION_DOES_NOT_MATCH_ORDER" in result["blockers"]
     assert result["trade_allowed"] is False
+
+
+def test_kill_switch_must_be_explicitly_persisted():
+    state = good_state()
+    state["status"] = "UNKNOWN"
+    result = global_kill_switch_gate(state)
+    assert result["status"] == "DENY"
+    assert "KILL_SWITCH_STATE_NOT_PERSISTED" in result["blockers"]
+
+
+def test_snapshot_rejects_peak_below_equity_and_empty_group():
+    snapshot = good_snapshot()
+    snapshot["equity_high_watermark"] = snapshot["account_equity"] - 1.0
+    assert "RISK_SNAPSHOT_EQUITY_HIGH_WATERMARK_BELOW_EQUITY" in risk_snapshot_gate(snapshot, now=NOW)["blockers"]
+    snapshot = good_snapshot()
+    snapshot["symbol_group"] = "   "
+    assert "SYMBOL_CORRELATION_GROUP_UNKNOWN" in risk_snapshot_gate(snapshot, now=NOW)["blockers"]
