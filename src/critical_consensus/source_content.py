@@ -65,7 +65,8 @@ def _normalise_text(value: str, max_chars: int) -> tuple[str, bool]:
 
 def extract_source_text(record: Mapping[str, Any], *, max_chars: int = 6000) -> dict[str, Any]:
     """Extract visible text from exact previously captured bytes; never fetches a URL."""
-    if not isinstance(record, Mapping) or isinstance(max_chars, bool) or max_chars < 1:
+    if (not isinstance(record, Mapping) or isinstance(max_chars, bool)
+            or not isinstance(max_chars, int) or not 1 <= max_chars <= 100_000):
         return {"status": "DENY", "blockers": ["SOURCE_EXTRACTION_INPUT_INVALID"]}
     body = record.get("captured_content")
     digest = str(record.get("content_sha256", ""))
