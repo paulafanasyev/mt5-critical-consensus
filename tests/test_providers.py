@@ -176,7 +176,7 @@ async def test_provider_call_timeout_does_not_wait_for_blocking_thread_shutdown(
     time.sleep(0.32)
 
 
-@pytest.mark.parametrize("timeout", [True, False, 0, -1, float("nan"), float("inf"), -float("inf"), 121, "15", None])
+@pytest.mark.parametrize("timeout", [True, False, 0, -1, float("nan"), float("inf"), -float("inf"), 121, "15", None, 10 ** 1000])
 def test_provider_rejects_invalid_timeout_types_and_bounds(timeout):
     with pytest.raises(ValueError, match="timeout_seconds"):
         OpenAICompatibleAgent(
