@@ -62,7 +62,7 @@ bool JsonBooleanValue(const string json, const string key, const string expected
    while(p < StringLen(json))
    {
       ushort c = StringGetCharacter(json,p);
-      if(c!=' ' && c!='\\t' && c!='\\r' && c!='\\n') break;
+      if(c!=' ' && c!=9 && c!=13 && c!=10) break;
       p++;
    }
    if(StringSubstr(json,p,StringLen(expected)) != expected) return false;
@@ -70,7 +70,7 @@ bool JsonBooleanValue(const string json, const string key, const string expected
    while(p < StringLen(json))
    {
       ushort c = StringGetCharacter(json,p);
-      if(c!=' ' && c!='\\t' && c!='\\r' && c!='\\n') break;
+      if(c!=' ' && c!=9 && c!=13 && c!=10) break;
       p++;
    }
    if(p >= StringLen(json)) return false;
