@@ -26,6 +26,35 @@ def _canonical(value: Any) -> str:
                       allow_nan=False, default=str)
 
 
+def _validate_event_json_value(value: Any, *, depth: int = 0) -> None:
+    """Validate JSON-native inbox payloads without lossy default=str coercion."""
+    if depth > 32:
+        raise ValueError("event JSON nesting exceeds 32 levels")
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, str):
+        value.encode("utf-8")
+        return
+    if isinstance(value, int):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("event JSON numbers must be finite")
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError("event JSON object keys must be strings")
+            key.encode("utf-8")
+            _validate_event_json_value(item, depth=depth + 1)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _validate_event_json_value(item, depth=depth + 1)
+        return
+    raise ValueError("event must contain only JSON-native values")
+
+
 def _sha256(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -559,17 +588,35 @@ class PostgresRepository:
         """Commit processed-event marker and event evidence atomically before Redis ACK."""
         if not isinstance(event, Mapping):
             raise ValueError("event must be an object")
-        event_id = str(event.get("event_id", "")).strip()
-        event_type = str(event.get("event_type", "")).strip()
+        event_id = event.get("event_id")
+        event_type = event.get("event_type")
         version = event.get("schema_version")
-        if not event_id or not event_type:
-            raise ValueError("event_id and event_type are required")
+        if not isinstance(event_id, str) or not event_id.strip() or len(event_id) > 256:
+            raise ValueError("event_id must be a non-empty string of at most 256 characters")
+        if not isinstance(event_type, str) or not event_type.strip() or len(event_type) > 128:
+            raise ValueError("event_type must be a non-empty string of at most 128 characters")
         if isinstance(version, bool) or not isinstance(version, int) or version < 1:
             raise ValueError("schema_version must be a positive integer")
-        occurred_at = _timestamp(event.get("created_at", ""), "created_at")
-        if not str(consumer_name).strip():
-            raise ValueError("consumer_name is required")
-        encoded = _canonical(dict(event))
+        if not isinstance(event.get("payload"), Mapping):
+            raise ValueError("payload must be an object")
+        raw_created_at = event.get("created_at")
+        if not isinstance(raw_created_at, str) or not raw_created_at.strip():
+            raise ValueError("created_at must be an ISO-8601 string")
+        occurred_at = _timestamp(raw_created_at, "created_at")
+        if (not isinstance(consumer_name, str) or not consumer_name.strip()
+                or len(consumer_name) > 256):
+            raise ValueError("consumer_name must be a non-empty string of at most 256 characters")
+        try:
+            _validate_event_json_value(event)
+            encoded = json.dumps(
+                dict(event), sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False, allow_nan=False,
+            )
+            encoded_size = len(encoded.encode("utf-8"))
+        except (TypeError, ValueError, OverflowError, RecursionError, UnicodeError) as exc:
+            raise ValueError("event must contain finite JSON-native values with string keys and depth <= 32") from exc
+        if encoded_size > 256_000:
+            raise ValueError("event payload exceeds 256 KB limit")
         digest = _sha256(encoded)
         with self._connect() as conn:
             inserted = conn.execute(
