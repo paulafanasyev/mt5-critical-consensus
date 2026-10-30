@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import pytest
 
 from critical_consensus.review_service import make_non_author_challenge_resolver, run_peer_review_cycle
@@ -143,3 +144,50 @@ def test_challenge_resolution_without_non_author_resolver_fails_closed():
     assert result["resolved"] is False
     assert result["error_code"] == "NO_NON_AUTHOR_CHALLENGE_RESOLVER"
     assert result["evidence_refs"] == []
+
+
+
+@pytest.mark.asyncio
+async def test_peer_review_timeout_fails_closed_instead_of_hanging_pipeline():
+    async def slow_reviewer(target, peers):
+        await asyncio.sleep(0.05)
+        return {
+            "stance": "CONFIRM", "challenge_type": "NONE",
+            "argument": "review completed too late",
+            "evidence_refs": ["review:evidence:1"],
+        }
+
+    result = await run_peer_review_cycle(
+        VERDICTS,
+        [("review-provider-a", slow_reviewer),
+         ("review-provider-b", slow_reviewer),
+         ("review-provider-c", slow_reviewer)],
+        allowed_evidence_refs=ALLOWED,
+        resolver=lambda challenge, round_no: {"resolved": False, "evidence_refs": []},
+        min_reviewers_per_verdict=2,
+        review_timeout_seconds=0.001,
+    )
+    assert result["status"] == "GATHER_MORE"
+    assert "REVIEWER_TIMEOUT" in result["blockers"]
+    assert result["trade_allowed"] is False
+    assert result["challenge_records"] == []
+
+
+@pytest.mark.asyncio
+async def test_peer_review_rejects_invalid_timeout_policy():
+    async def reviewer(target, peers):
+        return {
+            "stance": "CONFIRM", "challenge_type": "NONE",
+            "argument": "review", "evidence_refs": ["review:evidence:1"],
+        }
+
+    with pytest.raises(ValueError, match="review_timeout_seconds"):
+        await run_peer_review_cycle(
+            VERDICTS,
+            [("review-provider-a", reviewer),
+             ("review-provider-b", reviewer),
+             ("review-provider-c", reviewer)],
+            allowed_evidence_refs=ALLOWED,
+            resolver=lambda challenge, round_no: {"resolved": False},
+            review_timeout_seconds=float("inf"),
+        )
