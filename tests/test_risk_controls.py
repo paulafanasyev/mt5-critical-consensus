@@ -144,6 +144,7 @@ def test_risk_snapshot_rejects_missing_future_or_unbounded_quote_age_policy():
     for patch in (
         {"quote_age_seconds": None},
         {"quote_age_seconds": -6.0},
+        {"quote_age_seconds": 10 ** 500},
         {"max_quote_age_seconds": 16},
         {"max_quote_age_seconds": True},
         {"max_quote_age_seconds": "15"},
