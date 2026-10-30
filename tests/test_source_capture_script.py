@@ -140,3 +140,46 @@ def test_fetch_uses_the_prevalidated_ip_and_does_not_follow_redirects(monkeypatc
     assert calls["connection_closed"] is True
     assert body == b'{"headline":"approved content"}'
     assert content_type == "application/json"
+
+
+def test_dns_resolution_rejects_mixed_public_and_private_answers(monkeypatch):
+    public_answer = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+    metadata_answer = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", 443))
+    monkeypatch.setattr(
+        CAPTURE.socket, "getaddrinfo",
+        lambda *args, **kwargs: [public_answer, metadata_answer],
+    )
+    try:
+        CAPTURE._resolve_public_addresses("official-a.example")
+        assert False, "mixed public/private DNS answers must be rejected"
+    except ValueError as exc:
+        assert "non-public" in str(exc)
+
+
+def test_fetch_rejects_redirect_without_following_location(monkeypatch):
+    calls = {"closed": False}
+    class RedirectResponse:
+        status = 302
+        def close(self):
+            calls["closed"] = True
+
+    class FakeConnection:
+        def __init__(self, hostname, pinned_ip, *, timeout):
+            calls["hostname"] = hostname
+        def request(self, method, path, headers):
+            calls["method"] = method
+        def getresponse(self):
+            return RedirectResponse()
+        def close(self):
+            calls["connection_closed"] = True
+
+    monkeypatch.setattr(CAPTURE, "_resolve_public_addresses", lambda host: ["93.184.216.34"])
+    monkeypatch.setattr(CAPTURE, "_PinnedHTTPSConnection", FakeConnection)
+    try:
+        CAPTURE._fetch("https://official-a.example/releases/item", max_bytes=512000, timeout=3)
+        assert False, "redirect must be rejected"
+    except RuntimeError as exc:
+        assert str(exc) == "publisher_http_error:302"
+    assert calls["closed"] is True
+    assert calls["connection_closed"] is True
+    assert calls["method"] == "GET"
