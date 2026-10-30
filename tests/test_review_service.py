@@ -211,8 +211,10 @@ async def test_peer_review_cycle_applies_review_timeout_to_sync_challenge_resolv
     assert result["status"] == "ESCALATE"
     assert result["challenge_resolution_status"] == "DEADLOCK"
     assert len(result["open_challenges"]) == 2
-    assert all(challenge["last_resolution_attempt"]["error_code"] == "RESOLVER_TIMEOUT"
-               for challenge in result["open_challenges"])
+    assert result["open_challenges"][0]["last_resolution_attempt"]["error_code"] == "RESOLVER_TIMEOUT"
+    assert result["open_challenges"][1]["resolution_error"] == "RESOLUTION_PAUSED_AFTER_TIMEOUT"
+    assert result["open_challenges"][1]["last_resolution_attempt"]["error_code"] == "RESOLVER_NOT_STARTED"
+    assert result["open_challenges"][1]["resolution_pause_reason"] == "RESOLVER_TIMEOUT"
     assert result["trade_allowed"] is False
 
 
