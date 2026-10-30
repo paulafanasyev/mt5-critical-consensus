@@ -7,6 +7,8 @@ declared metadata and must be audited separately.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import math
 import re
 from datetime import datetime, timezone
@@ -49,7 +51,7 @@ def _valid_stamp(value: Any) -> datetime | None:
 
 
 def _validate_result(
-    result: Mapping[str, Any], spec: AgentSpec, signal_id: str,
+    result: Mapping[str, Any], spec: AgentSpec, signal_id: str, expected_input_hash: str,
     *, now: datetime, max_future_skew_seconds: int = 30,
 ) -> list[str]:
     blockers: list[str] = []
@@ -59,8 +61,11 @@ def _validate_result(
         blockers.append("SIGNAL_ID_MISMATCH")
     if not str(result.get("verdict_id", "")).strip():
         blockers.append("VERDICT_ID_MISSING")
-    if re.fullmatch(r"sha256:[0-9a-f]{64}", str(result.get("input_hash", ""))) is None:
+    supplied_hash = str(result.get("input_hash", ""))
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", supplied_hash) is None:
         blockers.append("INPUT_HASH_INVALID")
+    elif supplied_hash != expected_input_hash:
+        blockers.append("INPUT_HASH_DOES_NOT_MATCH_COLLECTED_SIGNAL")
     confidence = result.get("confidence")
     if isinstance(confidence, bool):
         confidence = None
@@ -103,6 +108,13 @@ async def collect_agent_verdicts(
     signal_id = str(signal.get("signal_id", "")).strip() if isinstance(signal, Mapping) else ""
     if not signal_id:
         return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["SIGNAL_ID_MISSING"], "trade_allowed": False}
+    try:
+        canonical_signal = json.dumps(signal, sort_keys=True, separators=(",", ":"),
+                                      ensure_ascii=False, allow_nan=False, default=str)
+        expected_input_hash = "sha256:" + hashlib.sha256(canonical_signal.encode("utf-8")).hexdigest()
+    except (TypeError, ValueError, OverflowError):
+        return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["SIGNAL_INPUT_NOT_CANONICALLY_HASHABLE"],
+                "trade_allowed": False}
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0 or minimum_agents < 1 or minimum_independence_groups < 1:
         return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["INVALID_COLLECTION_POLICY"], "trade_allowed": False}
     if not isinstance(agents, Sequence) or not agents or any(not isinstance(agent, AgentSpec) for agent in agents):
@@ -160,7 +172,7 @@ async def collect_agent_verdicts(
             result = await asyncio.wait_for(spec.run(signal), timeout=timeout_seconds)
             if not isinstance(result, Mapping):
                 return spec, None, "AGENT_RESULT_NOT_OBJECT"
-            reasons = _validate_result(result, spec, signal_id, now=current)
+            reasons = _validate_result(result, spec, signal_id, expected_input_hash, now=current)
             if reasons:
                 return spec, None, ",".join(sorted(set(reasons)))
             return spec, dict(result), None
