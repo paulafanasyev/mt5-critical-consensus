@@ -69,6 +69,21 @@ The evaluator fits Platt scaling only on earlier forecasts whose outcomes were a
 
 This is probability calibration, not a strategy/backtest profitability test. A calibrated probability does not prove positive expectancy, execution quality or future profit.
 
+## 5. Full deterministic Chief Gate
+
+Once the upstream services have produced a trusted evidence packet, evaluate the entire deterministic path (verdict metadata → peer review → challenge ledger → Certainty Gate → nine-step ChiefAgent → Permission Gate → human-review packet):
+
+```powershell
+$env:DATABASE_URL = "postgresql://USER:PASSWORD@DB_HOST:5432/mt5cc"
+python scripts/evaluate_signal_bundle.py .\trusted-decision-bundle.json --output .\decision-result.json --persist
+```
+
+The bundle must include the exact immutable `signal_input` object, its `signal_input_hash`, the nine policy-mandatory agent verdicts, two validated peer reviews per verdict, a registered/resolved challenge ledger, at least three evidence-backed counter-hypotheses, fresh credible source records, verified historical dissent/false-certainty metrics, all nine Chief reasoning steps, tail-risk scenarios and a permission request bound to the Chief reasoning hash. The pipeline independently checks each verdict's input hash against the same signal snapshot. Missing data remains `GATHER_MORE`, a challenge deadlock escalates, and failed Chief/Permission checks remain HOLD/DENY.
+
+The CLI will not accept or process a supplied `user_decision`; it only evaluates the policy path and emits a human-review packet. `--persist` stores the verified hash-chain events and the resulting decision in append-only PostgreSQL tables. It does not submit, queue, authorize or create an order. A `REQUIRE_HUMAN` result means only that the packet is ready for a separately authenticated operator review.
+
+Do not fill missing fields with synthetic scores, fabricated source credibility, guessed reviewer records or hand-entered calibration labels. Synthetic fixtures are allowed only inside tests and must remain explicitly marked as test data.
+
 ## 5. MQL5 EA and demo forward
 
 Run `python scripts/check_mql5_safety.py` for static source guard checks. They verify fail-closed defaults, demo-account validation, expiry, SL/TP, slippage and preflight checks. They do **not** compile the EA.
