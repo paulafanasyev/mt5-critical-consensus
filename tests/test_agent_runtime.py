@@ -3,6 +3,7 @@ from datetime import datetime, timezone, timedelta
 import pytest
 
 from critical_consensus.agent_runtime import AgentSpec, collect_agent_verdicts
+from critical_consensus.audit import canonical_hash
 
 
 NOW = datetime(2026, 10, 30, 0, 0, tzinfo=timezone.utc)
@@ -12,7 +13,7 @@ def provider(agent_id, *, signal_id="s1", confidence=0.8, ttl=300, created=None)
     async def run(signal):
         return {
             "agent_id": agent_id, "signal_id": signal_id, "verdict_id": f"v-{agent_id}",
-            "input_hash": "sha256:" + "a" * 64, "confidence": confidence,
+            "input_hash": canonical_hash(signal), "confidence": confidence,
             "verdict": "APPROVE", "ttl_seconds": ttl,
             "created_at": (created or NOW).isoformat(), "evidence_refs": ["source:1"],
         }
@@ -112,3 +113,22 @@ async def test_missing_provider_origin_fails_closed_before_calling_agents():
     assert "PROVIDER_MODEL_IDENTITY_MISSING" in result["blockers"]
     assert "PROVIDER_ORIGIN_MISSING" in result["blockers"]
     assert called is False
+
+
+@pytest.mark.asyncio
+async def test_agent_runtime_rejects_verdict_hash_for_a_different_signal():
+    async def wrong_hash(signal):
+        return {
+            "agent_id": "agent-a", "signal_id": signal["signal_id"], "verdict_id": "v-a",
+            "input_hash": "sha256:" + "0" * 64, "confidence": 0.8, "verdict": "APPROVE",
+            "ttl_seconds": 300, "created_at": NOW.isoformat(), "evidence_refs": ["source:1"],
+        }
+    wrong_hash.provider_origin = "provider-a.example"
+    wrong_hash.provider_identity = "provider-a.example::model-a"
+    result = await collect_agent_verdicts(
+        {"signal_id": "s1", "market_snapshot": {"close": 1.1}},
+        [AgentSpec("agent-a", "provider-a", wrong_hash)], now=NOW,
+    )
+    assert result["status"] == "GATHER_MORE"
+    assert result["agent_errors"][0]["code"].find("INPUT_HASH_DOES_NOT_MATCH_COLLECTED_SIGNAL") >= 0
+    assert result["trade_allowed"] is False
