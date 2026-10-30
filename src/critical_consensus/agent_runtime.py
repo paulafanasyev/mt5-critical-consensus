@@ -16,12 +16,17 @@ AgentCallable = Callable[[Mapping[str, Any]], Awaitable[Mapping[str, Any]]]
 
 
 class AgentSpec:
-    def __init__(self, agent_id: str, independence_group: str, run: AgentCallable):
+    ALLOWED_ROLES = {"analyst", "critic", "chief_review", "risk_review", "devil_advocate"}
+
+    def __init__(self, agent_id: str, independence_group: str, run: AgentCallable, *, role: str = "analyst"):
         self.agent_id = str(agent_id).strip()
         self.independence_group = str(independence_group).strip()
+        self.role = str(role).strip().lower()
         self.run = run
         if not self.agent_id or not self.independence_group or not callable(run):
             raise ValueError("agent_id, independence_group and run callable are required")
+        if self.role not in self.ALLOWED_ROLES:
+            raise ValueError("unsupported agent role")
 
 
 def _valid_stamp(value: Any) -> datetime | None:
@@ -81,7 +86,7 @@ def _validate_result(
 async def collect_agent_verdicts(
     signal: Mapping[str, Any], agents: Sequence[AgentSpec], *,
     timeout_seconds: float = 15.0, minimum_agents: int = 3, minimum_independence_groups: int = 3,
-    now: datetime | None = None,
+    required_roles: Sequence[str] = (), now: datetime | None = None,
 ) -> dict[str, Any]:
     """Collect verdicts concurrently and fail closed on timeouts, malformed output or insufficient coverage."""
     current = now or datetime.now(timezone.utc)
@@ -95,6 +100,10 @@ async def collect_agent_verdicts(
         return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["INVALID_COLLECTION_POLICY"], "trade_allowed": False}
     if not isinstance(agents, Sequence) or not agents or any(not isinstance(agent, AgentSpec) for agent in agents):
         return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["AGENT_REGISTRY_INVALID"], "trade_allowed": False}
+    if (not isinstance(required_roles, Sequence) or isinstance(required_roles, (str, bytes))
+            or any(str(role).strip().lower() not in AgentSpec.ALLOWED_ROLES for role in required_roles)):
+        return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["REQUIRED_AGENT_ROLES_POLICY_INVALID"], "trade_allowed": False}
+    required_role_set = {str(role).strip().lower() for role in required_roles}
     ids = [agent.agent_id for agent in agents]
     if len(set(ids)) != len(ids):
         return {"status": "GATHER_MORE", "verdicts": [], "blockers": ["DUPLICATE_AGENT_ID"], "trade_allowed": False}
@@ -120,6 +129,8 @@ async def collect_agent_verdicts(
     for spec, result, error in results:
         if result is not None:
             result["declared_independence_group"] = spec.independence_group
+            result["role"] = spec.role
+            result["confidence_kind"] = "UNCALIBRATED_SUBJECTIVE"
             verdicts.append(result)
         else:
             errors.append({"agent_id": spec.agent_id, "code": error or "AGENT_RESULT_INVALID"})
@@ -131,11 +142,19 @@ async def collect_agent_verdicts(
         blockers.append("INSUFFICIENT_DECLARED_INDEPENDENCE_GROUPS")
     if errors:
         blockers.append("ONE_OR_MORE_AGENTS_FAILED")
+    present_roles = {str(v.get("role", "analyst")) for v in verdicts}
+    missing_roles = sorted(required_role_set - present_roles)
+    if missing_roles:
+        blockers.append("REQUIRED_AGENT_ROLES_MISSING:" + ",".join(missing_roles))
     return {
         "signal_id": signal_id,
         "status": "READY_FOR_REVIEW" if not blockers else "GATHER_MORE",
         "verdicts": verdicts, "agent_errors": errors, "valid_agent_count": len(verdicts),
         "declared_independence_group_count": len(groups),
+        "agent_roles": {role: sum(1 for verdict in verdicts if verdict.get("role") == role)
+                        for role in sorted(AgentSpec.ALLOWED_ROLES)},
+        "required_roles": sorted(required_role_set),
+        "missing_roles": missing_roles,
         "independence_evidence": "DECLARED_ONLY_NOT_VERIFIED",
         "blockers": blockers, "trade_allowed": False,
     }
