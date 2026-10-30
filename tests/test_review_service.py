@@ -1,0 +1,116 @@
+from __future__ import annotations
+
+import pytest
+
+from critical_consensus.review_service import run_peer_review_cycle
+
+
+VERDICTS = [
+    {"verdict_id": "v0", "agent_id": "agent-0", "verdict": "APPROVE", "confidence": 0.8,
+     "reasoning_summary": "base thesis", "evidence_refs": ["market:evidence:0"]},
+    {"verdict_id": "v1", "agent_id": "agent-1", "verdict": "APPROVE", "confidence": 0.8,
+     "reasoning_summary": "supporting thesis", "evidence_refs": ["market:evidence:0"]},
+    {"verdict_id": "v2", "agent_id": "agent-2", "verdict": "APPROVE", "confidence": 0.8,
+     "reasoning_summary": "risk review", "evidence_refs": ["market:evidence:0"]},
+]
+ALLOWED = ["market:evidence:0", "review:evidence:1", "resolution:evidence:1"]
+
+
+def reviewers_for(stance_for_v0="CHALLENGE", evidence_ref="review:evidence:1"):
+    async def reviewer(target, peers):
+        assert target["verdict_id"] in {"v0", "v1", "v2"}
+        assert len(peers) == 2
+        stance = stance_for_v0 if target["verdict_id"] == "v0" else "CONFIRM"
+        return {
+            "stance": stance,
+            "challenge_type": "LOGIC_GAP" if stance == "CHALLENGE" else "NONE",
+            "argument": "Check the evidence linkage and counterexample",
+            "evidence_refs": [evidence_ref],
+        }
+    return [("review-provider-a", reviewer),
+            ("review-provider-b", reviewer),
+            ("review-provider-c", reviewer)]
+
+
+@pytest.mark.asyncio
+async def test_peer_review_cycle_returns_complete_evidence_backed_resolved_ledger():
+    resolver_calls = []
+
+    def resolver(challenge, round_no):
+        resolver_calls.append((challenge["challenge_id"], round_no))
+        return {
+            "resolved": True, "evidence_refs": ["resolution:evidence:1"],
+            "summary": "Counterexample checked against the trusted source snapshot",
+        }
+
+    result = await run_peer_review_cycle(
+        VERDICTS, reviewers_for(), allowed_evidence_refs=ALLOWED, resolver=resolver,
+        min_reviewers_per_verdict=2, max_resolution_rounds=3,
+    )
+    assert result["status"] == "READY_FOR_CHIEF"
+    assert result["trade_allowed"] is False
+    assert len(result["peer_reviews"]) == 6
+    assert result["review_counts"] == {"v0": 2, "v1": 2, "v2": 2}
+    assert len(result["challenge_records"]) == 2
+    assert all(challenge["status"] == "RESOLVED" for challenge in result["challenge_records"])
+    assert all(challenge["resolution_evidence_refs"] == ["resolution:evidence:1"]
+               for challenge in result["challenge_records"])
+    assert result["open_challenges"] == []
+    assert result["challenge_resolution_status"] == "RESOLVED"
+    assert len(resolver_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_peer_review_cycle_escalates_after_three_unresolved_rounds():
+    resolver_calls = []
+
+    def resolver(challenge, round_no):
+        resolver_calls.append(round_no)
+        return {"resolved": False, "evidence_refs": [], "summary": "insufficient"}
+    result = await run_peer_review_cycle(
+        VERDICTS, reviewers_for(), allowed_evidence_refs=ALLOWED, resolver=resolver,
+        min_reviewers_per_verdict=2, max_resolution_rounds=3,
+    )
+    assert result["status"] == "ESCALATE"
+    assert result["blockers"] == ["CHALLENGE_DEADLOCK"]
+    assert result["trade_allowed"] is False
+    assert len(result["open_challenges"]) == 2
+    assert all(item["status"] == "OPEN" for item in result["open_challenges"])
+    assert result["challenge_resolution_status"] == "DEADLOCK"
+    assert resolver_calls == [1, 2, 3, 1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_peer_review_cycle_rejects_review_evidence_outside_trusted_registry():
+    result = await run_peer_review_cycle(
+        VERDICTS, reviewers_for(evidence_ref="fabricated:reference"),
+        allowed_evidence_refs=ALLOWED, resolver=lambda challenge, round_no: {"resolved": False},
+    )
+    assert result["status"] == "GATHER_MORE"
+    assert "PEER_REVIEW_EVIDENCE_NOT_IN_TRUSTED_REGISTRY" in result["blockers"]
+    assert result["trade_allowed"] is False
+    assert result["challenge_records"] == []
+
+
+@pytest.mark.asyncio
+async def test_peer_review_cycle_rejects_duplicate_and_missing_evidence_registry():
+    resolver = lambda challenge, round_no: {"resolved": False}
+    for registry in ([], ["e1", "e1"], ["e1", ""]):
+        result = await run_peer_review_cycle(
+            VERDICTS, reviewers_for(), allowed_evidence_refs=registry, resolver=resolver,
+        )
+        assert result["status"] == "GATHER_MORE"
+        assert result["trade_allowed"] is False
+
+
+@pytest.mark.asyncio
+async def test_peer_review_cycle_without_challenges_is_ready_for_chief_not_trade():
+    result = await run_peer_review_cycle(
+        VERDICTS, reviewers_for(stance_for_v0="CONFIRM"),
+        allowed_evidence_refs=ALLOWED,
+        resolver=lambda challenge, round_no: {"resolved": False},
+    )
+    assert result["status"] == "READY_FOR_CHIEF"
+    assert result["challenge_resolution_status"] == "NONE"
+    assert result["challenge_records"] == []
+    assert result["trade_allowed"] is False
