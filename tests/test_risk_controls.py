@@ -24,6 +24,7 @@ def good_snapshot():
             "day_start_equity": 10000.0, "equity_high_watermark": 10200.0,
             "risk_fraction": 0.002, "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0196,
             "open_positions": 1, "correlated_open_positions": 1,
+            "spread_points": 10.0, "max_spread_points": 20.0,
             "request_binding_sha256": risk_request_binding_hash(good_request()),
             "within_high_impact_news_window": None}
 
@@ -105,3 +106,12 @@ def test_risk_snapshot_rejects_impossible_correlated_position_count():
     result = risk_snapshot_gate(snapshot, now=NOW)
     assert result["status"] == "DENY"
     assert "CORRELATED_POSITION_COUNT_EXCEEDS_OPEN_POSITIONS" in result["blockers"]
+
+
+
+def test_risk_snapshot_rejects_spread_above_capture_policy():
+    snapshot = good_snapshot()
+    snapshot["spread_points"] = 25.0
+    result = risk_snapshot_gate(snapshot, now=NOW)
+    assert result["status"] == "DENY"
+    assert "RISK_SNAPSHOT_SPREAD_LIMIT_EXCEEDED" in result["blockers"]
