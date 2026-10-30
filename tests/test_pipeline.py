@@ -5,6 +5,7 @@ from pathlib import Path
 from critical_consensus.audit import canonical_hash, verify_audit_chain
 from critical_consensus.calibration import weighted_consensus
 from critical_consensus.pipeline import evaluate_signal_bundle
+from critical_consensus.risk_controls import risk_request_binding_hash
 from jsonschema import Draft202012Validator
 
 NOW = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
@@ -316,4 +317,76 @@ def test_pipeline_rejects_nonfinite_bundle_before_creating_an_invalid_audit_hash
     assert result["status"] == "GATHER_MORE"
     assert result["blockers"] == ["SIGNAL_BUNDLE_NOT_CANONICALLY_HASHABLE"]
     assert result["audit_events"] == []
+    assert result["trade_allowed"] is False
+
+def _persisted_demo_risk_evidence(bundle, *, kill_switch_active=False, binding_override=None):
+    request = bundle["permission_request"]
+    state = {
+        "kill_switch_active": kill_switch_active,
+        "updated_at": NOW.isoformat(),
+        "updated_by": "pytest-operator",
+        "reason": "controlled integration fixture",
+        "status": "PERSISTED",
+    }
+    snapshot = {
+        "status": "PASS", "observed_at": NOW.isoformat(), "account_mode": "demo",
+        "symbol": request["instrument"], "symbol_group": "fx-major",
+        "account_equity": 10000.0, "day_start_equity": 10000.0,
+        "equity_high_watermark": 10000.0, "risk_fraction": 0.003,
+        "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0,
+        "open_positions": 1, "correlated_open_positions": 0,
+        "request_binding_sha256": binding_override or risk_request_binding_hash(request),
+        "within_high_impact_news_window": False,
+    }
+    return state, snapshot
+
+
+def test_persisted_pipeline_permission_requires_global_kill_switch_inactive():
+    bundle = make_bundle()
+    state, snapshot = _persisted_demo_risk_evidence(bundle, kill_switch_active=True)
+    result = evaluate_signal_bundle(
+        bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
+        require_persisted_risk=True, kill_switch_state=state, terminal_risk_snapshot=snapshot,
+    )
+    assert result["status"] == "DENY"
+    assert "KILL_SWITCH_ACTIVE_OR_INVALID" in result["blockers"]
+    assert result["trade_allowed"] is False
+
+
+def test_persisted_pipeline_permission_requires_exact_order_bound_fresh_risk_snapshot():
+    bundle = make_bundle()
+    state, snapshot = _persisted_demo_risk_evidence(bundle)
+    result = evaluate_signal_bundle(
+        bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
+        require_persisted_risk=True, kill_switch_state=state, terminal_risk_snapshot=snapshot,
+    )
+    assert result["status"] == "REQUIRE_HUMAN"
+    permission = result["details"]["permission"]
+    assert permission["risk_snapshot_validation"]["status"] == "PASS"
+    assert result["trade_allowed"] is False
+
+
+def test_persisted_pipeline_permission_rejects_snapshot_bound_to_another_order():
+    bundle = make_bundle()
+    state, snapshot = _persisted_demo_risk_evidence(
+        bundle, binding_override="sha256:" + "0" * 64,
+    )
+    result = evaluate_signal_bundle(
+        bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
+        require_persisted_risk=True, kill_switch_state=state, terminal_risk_snapshot=snapshot,
+    )
+    assert result["status"] == "DENY"
+    assert "RISK_REQUEST_BINDING_MISMATCH" in result["blockers"]
+    assert result["trade_allowed"] is False
+
+
+def test_persisted_pipeline_permission_fails_closed_when_risk_snapshot_missing():
+    bundle = make_bundle()
+    state, _snapshot = _persisted_demo_risk_evidence(bundle)
+    result = evaluate_signal_bundle(
+        bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
+        require_persisted_risk=True, kill_switch_state=state, terminal_risk_snapshot=None,
+    )
+    assert result["status"] == "DENY"
+    assert "RISK_SNAPSHOT_MISSING" in result["blockers"]
     assert result["trade_allowed"] is False
