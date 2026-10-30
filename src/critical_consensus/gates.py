@@ -273,15 +273,9 @@ def challenge_resolution_loop(challenges: Sequence[Mapping[str, Any]],
                     "resolution_pause_reason": stop_reason,
                 })
                 continue
+            # The record has not passed this loop's normal identity/evidence checks.
+            # After a timeout, never trust a pre-set RESOLVED label from an unprocessed item.
             pending_challenge = dict(original)
-            pending_refs = pending_challenge.get("resolution_evidence_refs")
-            if (str(pending_challenge.get("status", "")).upper() == "RESOLVED"
-                    and isinstance(pending_refs, Sequence)
-                    and not isinstance(pending_refs, (str, bytes))
-                    and bool(pending_refs)
-                    and all(isinstance(ref, str) and ref.strip() for ref in pending_refs)):
-                resolved_challenges.append(pending_challenge)
-                continue
             pending_challenge["status"] = "OPEN"
             pending_challenge["resolution_error"] = "RESOLUTION_PAUSED_AFTER_TIMEOUT"
             pending_challenge["resolution_pause_reason"] = stop_reason
