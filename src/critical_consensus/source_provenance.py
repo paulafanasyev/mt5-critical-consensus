@@ -13,7 +13,7 @@ import math
 import re
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -72,7 +72,9 @@ def _host_allowed(host: str, domains: Sequence[str]) -> bool:
         if not isinstance(domain, str) or not domain.strip():
             continue
         normalized = domain.strip().lower().rstrip(".")
-        if host == normalized or host.endswith("." + normalized):
+        # Trust only explicitly listed DNS names. A child hostname may be delegated
+        # to a third party and must be added separately after operator review.
+        if host == normalized:
             return True
     return False
 
@@ -130,8 +132,23 @@ def validate_source_capture(
             is_ip_literal = False
         if (parsed.scheme != "https" or not host or parsed.username or parsed.password
                 or parsed.fragment or parsed.port not in (None, 443) or is_ip_literal
-                or not _host_allowed(host, domains)):
+                or not parsed.path or parsed.path == "/" or not _host_allowed(host, domains)):
             blockers.append("SOURCE_URL_NOT_HTTPS_OR_PUBLISHER_HOST_MISMATCH")
+        allowed_query_parameters = profile.get("allowed_query_parameters", [])
+        forbidden_query_names = {
+            "token", "access_token", "api_key", "apikey", "password", "secret",
+            "signature", "authorization", "client_secret",
+        }
+        if (not isinstance(allowed_query_parameters, Sequence)
+                or isinstance(allowed_query_parameters, (str, bytes))
+                or any(not isinstance(name, str) or not name.strip()
+                       for name in allowed_query_parameters)):
+            blockers.append("SOURCE_QUERY_PARAMETER_POLICY_INVALID")
+        else:
+            query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+            if (any(name.lower() in forbidden_query_names for name, _ in query_pairs)
+                    or any(name not in allowed_query_parameters for name, _ in query_pairs)):
+                blockers.append("SOURCE_QUERY_PARAMETER_NOT_ALLOWLISTED")
     except ValueError:
         host = ""
         blockers.append("SOURCE_URL_INVALID")
