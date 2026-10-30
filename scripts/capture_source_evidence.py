@@ -17,7 +17,7 @@ import yaml
 
 from critical_consensus.persistence import PostgresRepository
 from critical_consensus.source_provenance import (
-    _host_allowed, source_id_for_capture, validate_source_capture,
+    _host_allowed, _json_pointer_value, _stamp, source_id_for_capture, validate_source_capture,
 )
 
 
@@ -172,17 +172,47 @@ def capture_manifest(manifest_path: Path, registry_path: Path, *, timeout: float
             raise ValueError(f"source entry {index} references a publisher not in source_registry.yaml")
         url = str(item.get("url", "")).strip()
         host = _safe_url(url, profile)
-        published_at = item.get("published_at")
-        attestation = str(item.get("publication_time_attestation", "")).strip()
-        allowed_attestations = profile.get("allowed_publication_time_attestations", [])
-        if (not isinstance(allowed_attestations, list)
-                or attestation != "operator_attested" or attestation not in allowed_attestations):
-            raise ValueError(f"source entry {index} has no allowed publication-time attestation")
         body, content_type = _fetch(url, max_bytes=max_bytes, timeout=timeout)
+        configured_pointer = profile.get("published_at_json_pointer")
+        if isinstance(configured_pointer, str) and configured_pointer.strip():
+            publication_time_field = configured_pointer.strip()
+            if content_type != "application/json":
+                raise ValueError(f"source entry {index} JSON timestamp pointer requires application/json")
+            try:
+                document = json.loads(body.decode("utf-8-sig"))
+                pointer_value = _json_pointer_value(document, publication_time_field)
+                pointer_stamp = _stamp(pointer_value)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+                raise ValueError(f"source entry {index} has an invalid publisher JSON timestamp field") from None
+            if pointer_stamp is None:
+                raise ValueError(f"source entry {index} publisher JSON timestamp is not timezone-aware ISO-8601")
+            published_at = pointer_stamp.isoformat()
+            provided_published_at = item.get("published_at")
+            if provided_published_at is not None:
+                provided_stamp = _stamp(provided_published_at)
+                if provided_stamp is None or provided_stamp != pointer_stamp:
+                    raise ValueError(f"source entry {index} manifest date does not match publisher JSON timestamp")
+            attestation = "publisher_json_pointer"
+        else:
+            publication_time_field = ""
+            published_at = item.get("published_at")
+            attestation = str(item.get("publication_time_attestation", "")).strip()
+            if attestation != "operator_attested":
+                raise ValueError(f"source entry {index} requires operator_attested publication time")
+        allowed_attestations = profile.get("allowed_publication_time_attestations", [])
+        if not isinstance(allowed_attestations, list) or attestation not in allowed_attestations:
+            raise ValueError(f"source entry {index} has no allowed publication-time attestation")
+        if _stamp(published_at) is None:
+            raise ValueError(f"source entry {index} publication time must be timezone-aware ISO-8601")
         digest = "sha256:" + hashlib.sha256(body).hexdigest()
         record = {
-            "source_id": source_id_for_capture(publisher_id, url, digest, registry_version=str(registry.get("version", "")),
-                                           published_at=str(published_at), publication_time_attestation=attestation),
+            "source_id": source_id_for_capture(
+                publisher_id, url, digest,
+                registry_version=str(registry.get("version", "")),
+                published_at=str(published_at),
+                publication_time_attestation=attestation,
+                publication_time_field=publication_time_field,
+            ),
             "publisher_id": publisher_id,
             "publisher_domain": host,
             "source_url": url,
@@ -196,6 +226,7 @@ def capture_manifest(manifest_path: Path, registry_path: Path, *, timeout: float
             "captured_content": body,
             "response_content_type": content_type,
             "publication_time_attestation": attestation,
+            "publication_time_field": publication_time_field,
             "capture_method": "https_fetch",
             "registry_version": str(registry.get("version", "")),
         }
