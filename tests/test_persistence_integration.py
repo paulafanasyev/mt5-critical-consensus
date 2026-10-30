@@ -144,7 +144,7 @@ def test_publisher_source_capture_is_immutable_and_retrieved_by_exact_id():
         "publishers": {"publisher-a": {
             "domains": ["publisher-a.example"], "independence_group": "publisher-a",
             "credibility": 0.95, "ttl_seconds": 900,
-            "allowed_publication_time_attestations": ["publisher_api_field"],
+            "allowed_publication_time_attestations": ["operator_attested"],
         }},
     }
     record = {
@@ -154,7 +154,7 @@ def test_publisher_source_capture_is_immutable_and_retrieved_by_exact_id():
         "retrieved_at": (now - timedelta(seconds=1)).isoformat(),
         "independence_group": "publisher-a", "credibility": 0.95, "ttl_seconds": 900,
         "content_sha256": digest, "content_bytes": len(body), "captured_content": body,
-        "publication_time_attestation": "publisher_api_field",
+        "publication_time_attestation": "operator_attested",
         "capture_method": "https_fetch", "registry_version": "1",
     }
     first = repo.record_source_evidence(record, registry=registry)
