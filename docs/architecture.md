@@ -50,11 +50,11 @@ flowchart TB
 
 ## Реализация в текущем каркасе
 
-- Реализованы Python policy gates, `evaluate_signal_bundle`, HTTP bridge-key authentication, Redis Streams helper functions and hash-chain verification.
+- Реализованы Python policy gates и `evaluate_signal_bundle`; каждый verdict привязывается к каноническому hash точного `signal_input`. Внутренний CLI `scripts/evaluate_signal_bundle.py` запускает полный детерминированный путь и не принимает переданное клиентом human approval.
 - `PermissionRequest` привязывается к сигналу, exact `ChiefReasoning` hash, рассчитанному consensus и сводкам проверенных источников; расхождение блокирует переход к human gate.
 - Human review packet содержит все peer reviews, dissenting opinions, полный challenge ledger, ChiefReasoning, source reports, risk snapshot и tail-risk fields.
 - API endpoint проверки authorization отключён (HTTP 423), пока отсутствуют persistent server-side permission state и настоящий криптографический 2FA/signature verifier.
-- Подключение ingestion agents, permanent DB repository, actual worker service, TOTP/signature provider, order dispatcher and MQL5 compilation are not yet implemented/verified.
+- PostgreSQL persistence now stores immutable market history, forecast labels, risk/kill-switch snapshots and full decision/audit runs. The Redis worker script persists events before ACK, but a production-managed worker service is not deployed. Real nine-agent provider configuration, trusted source ingestion/registry, automated peer review and challenge resolution, historical calibration/health datasets, TOTP/signature provider, broker order dispatcher and MetaEditor/MT5 forward testing remain unimplemented or unverified.
 - Execution-related endpoints intentionally cannot publish, fetch or send an order command. The diagram includes the future production boundary, not an enabled path.
 
 ## Invariants

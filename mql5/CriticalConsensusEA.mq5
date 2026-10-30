@@ -3,16 +3,21 @@
 #property description "Demo-only reference bridge. Disabled by default; live execution is blocked."
 
 input string BridgeUrl = "http://127.0.0.1:8000/v1/execution/next";
+input string KillSwitchUrl = "http://127.0.0.1:8000/v1/risk/kill-switch";
 input string BridgeToken = ""; // For local testing only; use a proper secret manager/short-lived signing in production.
 input bool EnableDemoExecution = false;
 input bool AllowLiveExecution = false; // Template intentionally does not permit live execution even if set true.
 input int PollSeconds = 3;
 input int MaxSlippagePoints = 20;
+input int MaxSpreadPoints = 20;
 input long MagicNumber = 8172026;
 input double MaxVolume = 0.20;
 
 // This deliberately small parser supports only flat, trusted scalar JSON emitted by a schema-validated
 // localhost bridge. It is NOT a general JSON parser. Production must replace it with a vetted MQL5 JSON library.
+// Per-account client_order_id markers serialize attempts across EAs in this terminal. They are local
+// terminal state only and expire after four weeks of inactivity; they are NOT a durable cross-terminal
+// idempotency guarantee. A production deployment must enforce the same idempotency key in PostgreSQL.
 string JsonString(const string json, const string key)
 {
    string needle = "\"" + key + "\"";
@@ -49,25 +54,159 @@ double JsonNumber(const string json, const string key)
    return StringToDouble(StringSubstr(json,p,e-p));
 }
 
-bool JsonTrue(const string json, const string key)
+bool JsonBooleanValue(const string json, const string key, const string expected)
 {
    string needle = "\"" + key + "\"";
    int p = StringFind(json, needle);
    if(p < 0) return false;
    p = StringFind(json, ":", p + StringLen(needle));
    if(p < 0) return false;
-   string tail = StringSubstr(json, p+1, 12);
-   StringTrimLeft(tail); StringTrimRight(tail);
-   return StringFind(tail, "true") == 0;
+   p++;
+   while(p < StringLen(json))
+   {
+      ushort c = StringGetCharacter(json,p);
+      if(c!=' ' && c!=9 && c!=13 && c!=10) break;
+      p++;
+   }
+   if(StringSubstr(json,p,StringLen(expected)) != expected) return false;
+   p += StringLen(expected);
+   while(p < StringLen(json))
+   {
+      ushort c = StringGetCharacter(json,p);
+      if(c!=' ' && c!=9 && c!=13 && c!=10) break;
+      p++;
+   }
+   if(p >= StringLen(json)) return false;
+   ushort tail = StringGetCharacter(json,p);
+   return tail==',' || tail=='}';
 }
 
-string SafeGlobalKey(string command_id)
+bool JsonTrue(const string json, const string key)
 {
-   StringReplace(command_id, "-", "_");
-   StringReplace(command_id, ":", "_");
-   StringReplace(command_id, ".", "_");
-   if(StringLen(command_id) > 48) command_id = StringSubstr(command_id,0,48);
-   return "CC_TRIED_" + command_id;
+   return JsonBooleanValue(json, key, "true");
+}
+
+string SafeGlobalKey(string order_id)
+{
+   // Terminal global variable names are limited to 63 characters. The account
+   // login is part of the key so two MT5 accounts in one terminal cannot collide.
+   if(StringLen(order_id) <= 0 || StringLen(order_id) > 38)
+      return "";
+
+   string safe_id = "";
+   for(int i=0; i<StringLen(order_id); i++)
+   {
+      ushort ch = StringGetCharacter(order_id, i);
+      bool allowed = ((ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) ||
+                      (ch >= 97 && ch <= 122) || ch == 95 || ch == 45);
+      // Preserve the ID exactly (including UUID hyphens); reject unsafe characters
+      // rather than normalizing different IDs into a colliding terminal key.
+      if(!allowed)
+         return "";
+      safe_id += StringSubstr(order_id, i, 1);
+   }
+
+   string account_id = IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
+   string key = "CCO_" + account_id + "_" + safe_id;
+   if(StringLen(key) > 63)
+      return "";
+   return key;
+}
+
+string LegacyGlobalKey(string order_id)
+{
+   // Preserve the prior EA marker format during upgrades so an order attempted
+   // by the previous version remains blocked after this version is installed.
+   StringReplace(order_id, "-", "_");
+   StringReplace(order_id, ":", "_");
+   StringReplace(order_id, ".", "_");
+   if(StringLen(order_id) > 48)
+      order_id = StringSubstr(order_id, 0, 48);
+   return "CC_TRIED_" + order_id;
+}
+
+string ExecutionLockKey()
+{
+   return "CCLOCK_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
+}
+
+bool AcquireExecutionLock(const string lock_key, double &lease_value)
+{
+   if(!GlobalVariableCheck(lock_key))
+   {
+      ResetLastError();
+      if(!GlobalVariableTemp(lock_key) && !GlobalVariableCheck(lock_key))
+      {
+         Print("BLOCKED: cannot create account execution lock; error=", GetLastError());
+         return false;
+      }
+   }
+
+   ResetLastError();
+   double observed = GlobalVariableGet(lock_key);
+   if(GetLastError() != 0)
+   {
+      Print("BLOCKED: cannot read account execution lock; error=", GetLastError());
+      return false;
+   }
+
+   double now_value = (double)TimeGMT();
+   if(observed > now_value)
+   {
+      Print("BLOCKED: another EA instance holds the account execution lock.");
+      return false;
+   }
+
+   // A 120-second lease is far above the configured HTTP timeout. The critical
+   // section contains only local global-variable operations, never OrderSend.
+   lease_value = now_value + 120.0;
+   ResetLastError();
+   if(!GlobalVariableSetOnCondition(lock_key, lease_value, observed))
+   {
+      Print("BLOCKED: account execution lock was acquired by another EA instance; error=", GetLastError());
+      return false;
+   }
+   return true;
+}
+
+void ReleaseExecutionLock(const string lock_key, const double lease_value)
+{
+   ResetLastError();
+   if(!GlobalVariableSetOnCondition(lock_key, 0.0, lease_value))
+      Print("WARNING: account execution lock lease could not be released; error=", GetLastError());
+}
+
+bool JsonFalse(const string json, const string key)
+{
+   return JsonBooleanValue(json, key, "false");
+}
+
+bool CheckKillSwitch()
+{
+   if(StringLen(BridgeToken)==0 || StringLen(KillSwitchUrl)==0)
+   {
+      Print("BLOCKED: bridge token or kill-switch URL is empty.");
+      return false;
+   }
+   char data[];
+   char result[];
+   string result_headers = "";
+   string headers = "Accept: application/json\r\n";
+   headers += "X-Bridge-Key: " + BridgeToken + "\r\n";
+   ResetLastError();
+   int code = WebRequest("GET", KillSwitchUrl, headers, 3000, data, result, result_headers);
+   if(code != 200)
+   {
+      Print("BLOCKED: kill-switch state unavailable; HTTP ", code, ", error=", GetLastError());
+      return false;
+   }
+   string response = CharArrayToString(result, 0, -1, CP_UTF8);
+   if(!JsonFalse(response, "kill_switch_active"))
+   {
+      Print("BLOCKED: kill switch is active or state is invalid.");
+      return false;
+   }
+   return true;
 }
 
 bool FetchCommand(string &body)
@@ -112,32 +251,58 @@ bool ExecuteDemoCommand(const string body)
    double sl = JsonNumber(body, "sl");
    double tp = JsonNumber(body, "tp");
    double expected_price = JsonNumber(body, "expected_price");
-   long expires_at = (long)JsonNumber(body, "expires_at_epoch");
+   double expires_at_value = JsonNumber(body, "expires_at_epoch");
+   long expires_at = 0;
    bool user_approved = JsonTrue(body, "user_approved");
+   string permission_id = JsonString(body, "permission_id");
+   string signal_id = JsonString(body, "signal_id");
+   string user_decision_id = JsonString(body, "user_decision_id");
+   string payload_hash = JsonString(body, "payload_hash");
+   string created_at = JsonString(body, "created_at");
 
-   if(command_id=="" || order_id=="" || symbol=="" || direction=="" || mode=="" || decision=="")
-   { Print("BLOCKED: required OrderCommand field missing."); return false; }
+   if(command_id=="" || order_id=="" || permission_id=="" || signal_id=="" ||
+      symbol=="" || direction=="" || mode=="" || decision=="" ||
+      user_decision_id=="" || payload_hash=="" || created_at=="")
+   { Print("BLOCKED: required OrderCommand audit/integrity field missing."); return false; }
    if(mode != "demo" || decision != "APPROVE" || !user_approved)
    { Print("BLOCKED: demo mode and explicit user approval are required."); return false; }
    if(AccountInfoInteger(ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO)
    { Print("BLOCKED: account is not demo. This EA does not execute live trades."); return false; }
    if(!EnableDemoExecution || AllowLiveExecution)
    { Print("BLOCKED: demo execution is disabled, or live mode was requested."); return false; }
-   if(expires_at <= (long)TimeGMT())
+   if(!MathIsValidNumber(volume) || !MathIsValidNumber(sl) ||
+      !MathIsValidNumber(tp) || !MathIsValidNumber(expected_price) ||
+      !MathIsValidNumber(expires_at_value) || !MathIsValidNumber(MaxVolume) ||
+      MaxVolume <= 0 || MaxSlippagePoints < 0 || MaxSpreadPoints < 0)
+   { Print("BLOCKED: non-finite command number or invalid EA risk input."); return false; }
+   long current_time = (long)TimeGMT();
+   // Reject fractional/overflowing expiries and commands whose lifetime exceeds five minutes.
+   if(expires_at_value < 1.0 || MathFloor(expires_at_value) != expires_at_value ||
+      expires_at_value > (double)current_time + 300.0)
+   { Print("BLOCKED: invalid command expiry or TTL exceeds 300 seconds."); return false; }
+   expires_at = (long)expires_at_value;
+   if(expires_at <= current_time)
    { Print("BLOCKED: command expired."); return false; }
    if(volume <= 0 || volume > MaxVolume || sl <= 0 || tp <= 0 || expected_price <= 0)
    { Print("BLOCKED: invalid volume/SL/TP/expected price."); return false; }
 
    string global_key = SafeGlobalKey(order_id);
-   if(GlobalVariableCheck(global_key))
-   { Print("DUPLICATE BLOCKED: client_order_id already attempted: ", order_id); return false; }
+   string legacy_global_key = LegacyGlobalKey(order_id);
+   if(global_key=="")
+   { Print("BLOCKED: client_order_id is invalid or cannot be represented without key collision."); return false; }
 
    if(!SymbolSelect(symbol, true)) { Print("BLOCKED: SymbolSelect failed for ",symbol); return false; }
    MqlTick tick;
    if(!SymbolInfoTick(symbol, tick)) { Print("BLOCKED: no current tick."); return false; }
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-   if(point <= 0) { Print("BLOCKED: invalid symbol point."); return false; }
+   if(!MathIsValidNumber(tick.bid) || !MathIsValidNumber(tick.ask) ||
+      !MathIsValidNumber(point) || point <= 0)
+   { Print("BLOCKED: non-finite or invalid market quote."); return false; }
+   if(tick.bid <= 0 || tick.ask <= 0 || tick.ask < tick.bid)
+   { Print("BLOCKED: invalid bid/ask quote."); return false; }
+   if(MaxSpreadPoints < 0 || (tick.ask - tick.bid) / point > MaxSpreadPoints)
+   { Print("BLOCKED: live spread exceeds MaxSpreadPoints."); return false; }
    double live_price = (direction=="BUY") ? tick.ask : tick.bid;
    if(MathAbs(live_price - expected_price) > MaxSlippagePoints * point)
    { Print("BLOCKED: slippage guard triggered."); return false; }
@@ -150,8 +315,13 @@ bool ExecuteDemoCommand(const string body)
    double step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
    double minvol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
    double maxvol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
-   if(step <= 0 || volume < minvol || volume > maxvol || MathAbs(volume/step - MathRound(volume/step)) > 0.000001)
-   { Print("BLOCKED: broker volume constraints not satisfied."); return false; }
+   if(!MathIsValidNumber(step) || !MathIsValidNumber(minvol) || !MathIsValidNumber(maxvol) ||
+      step <= 0 || minvol <= 0 || maxvol < minvol || volume < minvol || volume > maxvol)
+   { Print("BLOCKED: broker volume constraints invalid or unsatisfied."); return false; }
+   double volume_steps = volume / step;
+   if(!MathIsValidNumber(volume_steps) ||
+      MathAbs(volume_steps - MathRound(volume_steps)) > 0.000001)
+   { Print("BLOCKED: invalid broker volume step."); return false; }
 
    MqlTradeRequest request = {};
    MqlTradeCheckResult check = {};
@@ -171,9 +341,42 @@ bool ExecuteDemoCommand(const string body)
    if(!OrderCheck(request, check))
    { Print("BLOCKED: OrderCheck failed; retcode=",check.retcode," ",check.comment); return false; }
 
-   // At-most-once: record attempt before network operation. A timeout/uncertain result needs reconciliation,
-   // never blind retry. A production bridge must persist the same idempotency key in PostgreSQL too.
-   GlobalVariableSet(global_key, (double)TimeGMT());
+   // Recheck after potentially expensive preflight and immediately before recording/sending the attempt.
+   // This narrows (but cannot atomically eliminate) the race with a remotely activated kill switch.
+   if(!CheckKillSwitch())
+   { Print("BLOCKED: kill switch changed before order submission."); return false; }
+
+   // Serialize order-attempt creation across all charts/EAs in this terminal account.
+   // Set the durable attempt marker under the account lock, flush it, then release the lock
+   // before OrderSend. A crash after this marker but before sending requires reconciliation,
+   // never blind retry. Terminal global variables expire after four weeks of inactivity;
+   // production therefore also requires a durable server-side PostgreSQL idempotency ledger.
+   string lock_key = ExecutionLockKey();
+   double lock_lease = 0.0;
+   if(!AcquireExecutionLock(lock_key, lock_lease))
+      return false;
+
+   // Check both the account-bound key and the legacy key used by prior EA builds.
+   // This intentionally preserves conservative duplicate blocking during upgrades.
+   if(GlobalVariableCheck(global_key) || GlobalVariableCheck(legacy_global_key))
+   {
+      ReleaseExecutionLock(lock_key, lock_lease);
+      Print("DUPLICATE BLOCKED: client_order_id already attempted for this account: ", order_id);
+      return false;
+   }
+
+   ResetLastError();
+   datetime marker_written = GlobalVariableSet(global_key, (double)TimeGMT());
+   if(marker_written == 0)
+   {
+      int marker_error = GetLastError();
+      ReleaseExecutionLock(lock_key, lock_lease);
+      Print("BLOCKED: durable order-attempt marker could not be created; error=", marker_error);
+      return false;
+   }
+   GlobalVariablesFlush();
+   ReleaseExecutionLock(lock_key, lock_lease);
+
    ResetLastError();
    bool sent = OrderSend(request, result);
    if(!sent || (result.retcode != TRADE_RETCODE_DONE && result.retcode != TRADE_RETCODE_DONE_PARTIAL && result.retcode != TRADE_RETCODE_PLACED))
@@ -191,6 +394,8 @@ void OnInit()
 {
    if(StringFind(BridgeUrl, "http://127.0.0.1:") != 0 && StringFind(BridgeUrl, "http://localhost:") != 0)
       Print("WARNING: Bridge URL is not localhost. Production must use authenticated/TLS network policy.");
+   if(StringFind(KillSwitchUrl, "http://127.0.0.1:") != 0 && StringFind(KillSwitchUrl, "http://localhost:") != 0)
+      Print("WARNING: Kill-switch URL is not localhost. Verify the authenticated network policy.");
    EventSetTimer(MathMax(1, PollSeconds));
    Print("CriticalConsensusEA initialized. Demo execution default is disabled. Add bridge URL to MT5 WebRequest allowlist.");
 }
@@ -199,6 +404,8 @@ void OnDeinit(const int reason) { EventKillTimer(); }
 
 void OnTimer()
 {
+   // Before each command poll, require a fresh explicit false from the persisted stop endpoint.
+   if(!CheckKillSwitch()) return;
    string body = "";
    if(!FetchCommand(body)) return;
    ExecuteDemoCommand(body);

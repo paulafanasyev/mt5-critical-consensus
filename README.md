@@ -13,16 +13,17 @@
 ## Состав
 
 - `src/critical_consensus/gates.py` — self-adversarial checks, peer-review validation, challenge loop, fail-closed certainty/chief/permission/authorization gates.
-- `src/critical_consensus/pipeline.py` — orchestration of existing agent outputs through Certainty → Chief → Permission → human approval; it never creates an order.
-- `src/critical_consensus/calibration.py` — Brier score, shrinkage penalty, weighted consensus; явные ограничения эвристики.
+- `src/critical_consensus/pipeline.py` — deterministic Certainty → nine-step Chief → Permission → human-review path with an immutable `signal_input` hash bound to every verdict; `scripts/evaluate_signal_bundle.py` evaluates trusted evidence packets without accepting client-supplied human approval; `--persist` additionally requires an inactive persisted kill switch and a fresh MT5 risk snapshot bound to the exact requested order parameters.
+- `src/critical_consensus/calibration.py` — Brier score, shrinkage penalty, weighted consensus; `calibration_eval.py` — chronological walk-forward Platt calibration and sample-aware reliability report.
 - `src/critical_consensus/api.py` — FastAPI policy endpoints; authorization and order submission endpoints deliberately disabled until durable permission state and a real 2FA/signature verifier exist.
-- `src/critical_consensus/redis_streams.py` — idempotent event publishing, consumer-group helpers, retry handling and DLQ (at-least-once; worker deployment is not included).
+- `src/critical_consensus/market_data.py` — read-only MT5 history + CSV adapter and OHLC validation; `providers.py` / `agent_runtime.py` — configurable OpenAI-compatible research agents, exact input-hash binding, TTL checks, unique provider-origin checks and fail-closed collection. `scripts/run_agent_analysis.py` requires all nine mandatory policy-agent IDs, then runs provider-backed anonymized peer review (two reviewers per verdict) and up to three evidence-bound challenge-resolution rounds. `READY_FOR_CHIEF` only means this review ledger is complete; it does not run Certainty Gate or authorize trading. `source_provenance.py`, `source_content.py` and `scripts/capture_source_evidence.py` enforce publisher allowlists, HTTPS capture with public-IP DNS pinning, exact-content SHA-256, freshness and registry-derived independence groups; timestamps can be operator-attested or re-derived from an operator-configured official JSON API pointer. Source text is extracted from the immutable capture and passed to agents/reviewers as untrusted data.
+- `src/critical_consensus/redis_streams.py` — idempotent event publishing, consumer groups, retry/DLQ and pending-message recovery; `scripts/run_worker.py` durably writes events to PostgreSQL before ACK. This worker archives events; it does not dispatch orders.
 - `schemas/` — JSON Schema Draft 2020-12 для 11 контрактов.
 - `config/` — deny-by-default policy thresholds и permissions.
-- `mql5/CriticalConsensusEA.mq5` — демонстрационный EA: demo account only, disabled by default, TTL/SL/TP/slippage/idempotency checks.
-- `db/postgres_schema.sql`, `neo4j/schema.cypher` — минимальные схемы хранения и графа.
+- `mql5/CriticalConsensusEA.mq5` — демонстрационный EA: demo account only, disabled by default, TTL/SL/TP/slippage guards, account-scoped atomic attempt lock, pre-send persistent marker and legacy marker compatibility. The terminal marker is local to one MT5 terminal and expires after four weeks of inactivity; cross-terminal idempotency still requires the not-yet-implemented server-side PostgreSQL execution ledger.
+- `src/critical_consensus/persistence.py` — PostgreSQL repository for immutable market bars, pre-outcome forecasts, one-time labels, allowlisted publisher captures, kill-switch/risk evidence, Redis inbox events and full pipeline decision/audit persistence. `db/postgres_schema.sql` + `db/migrations/` — base and append-only evidence schemas; `neo4j/schema.cypher` — graph schema.
 - `tests/` — adversarial unit tests.
-- `.github/workflows/security-audit.yml` — checks installed Python dependencies for known advisories on push, pull request, and weekly schedule.
+- `.github/workflows/security-audit.yml` and `.github/workflows/validation-suite.yml` — dependency/source security scans, unit contracts and PostgreSQL/Redis integration checks.
 - `docs/` — архитектура, формулы, пример trace и недельный roadmap.
 
 ## Быстрый запуск (Linux, Python 3.11+)
@@ -41,7 +42,7 @@ uvicorn critical_consensus.api:app --host 127.0.0.1 --port 8000
 
 ## Опциональный локальный слой данных
 
-`docker-compose.yml` поднимает PostgreSQL/TimescaleDB, Redis и Neo4j только на loopback. Схемы и helpers есть, но полноценный repository adapter и worker service пока не подключены.
+`docker-compose.yml` поднимает PostgreSQL/TimescaleDB, Redis и Neo4j только на loopback. PostgreSQL repository, append-only migrations и durable Redis event-writer script реализованы; постоянно развёрнутый production worker/API сервис и broker execution не настроены.
 
 ```bash
 cp .env.example .env
@@ -67,7 +68,7 @@ assert result["trade_allowed"] is False
 
 ## Где ещё нет production-функций
 
-Это не готовая торговая система: не реализованы реальные коннекторы новостей/бирж, запущенный worker service для Redis Streams, production DB repository/persistence adapter, TOTP-провайдер, проверка санкций, калибровка на размеченных out-of-sample результатах, проверенный парсер JSON для MQL5 и реальная диспетчеризация ордеров. Redis helpers используют at-least-once модель; реальный handler обязан фиксировать `processed_events` вместе со своими эффектами в одной транзакции. Они представлены интерфейсами/схемами, но не объявляются готовыми. Не подключайте реальный счёт к этому каркасу. MQL5-файл не проверен компиляцией в MetaEditor в этой среде; встроенный парсер рассчитан на строго ограниченный flat JSON и перед использованием должен быть заменён на проверенный JSON-парсер и подписанный payload.
+Это не готовая торговая система. Нет настроенных реальных API-ключей/моделей для девяти обязательных агентов и записей издателей в `config/source_registry.yaml`. Механизм allowlist-проверки, HTTPS-захвата, SHA-256-хранения и извлечения текста источников реализован, но сам реестр намеренно пуст: пока оператор не подтвердит домены, группы независимости, оценку доверия и срок свежести, persisted-source gate и запуск агентов закрыты. Runner требует от двух до двенадцати сохранённых source ID из разных зарегистрированных групп и передаёт содержимое моделям только как недоверенные данные. Независимость источников не доказывается только разными доменами. Нет подтверждённых dissent/false-certainty метрик и размеченной out-of-sample калибровки. Walk-forward evaluator и хранение прогнозов реализованы, но реальные калибровочные результаты не получены. CLI полного Chief Gate принимает только внутренний evidence packet; он не создаёт reviews/challenges, не подделывает source credibility и не принимает human approval. Отдельный TOTP/signature verifier, production-развёртывание worker/API и реальная диспетчеризация ордеров отсутствуют. Не подключайте реальный счёт. MQL5 не подтверждён компиляцией MetaEditor или демосчётом; статические проверки не заменяют эти испытания.
 
 ## Нормативные invariants
 
@@ -82,10 +83,12 @@ assert result["trade_allowed"] is False
 
 ## Проверка текущего каркаса
 
-- Локальная проверка исходников: `pytest -q` — **78 тестов PASS**. Последний проверенный GitHub Actions прогон: **84 passed in 0.81s**, Python 3.12, без pytest warnings: [тесты](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40849840096). Отдельный аудит зависимостей: [PASS](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40849840095), `pip-audit` сообщил `No known vulnerabilities found`; зафиксировано требование `pytest>=9.0.3` после исправления `PYSEC-2026-1845`. CI использует `ubuntu-22.04`, `actions/checkout@v7`, `actions/setup-python@v7` и `httpx2` для TestClient. Это синтетические тесты функций/API, а не брокерные испытания.
+- Последний полностью подтверждённый GitHub Actions прогон PR #8 на 2026-10-30, HEAD `2e584c9f07628cd6e6f2368048eac4e3ac6b4196`: **278 passed, 10 skipped** в pytest и unit/static; **10 passed** в PostgreSQL/Redis integration; **38 статических инвариантов EA**; `pip-audit`, Bandit и dependency-audit — PASS. Runs: [pytest](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/41041045450), [validation-suite](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/41041045343), [dependency-audit](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/41041045209). Эти проверки подтверждают тестируемое поведение кода и контейнерных интеграций; они не заменяют MetaEditor compile, MT5 Strategy Tester, broker demo-forward или проверку прибыльности.
 - Проверяются fail-closed gates, integrity binding между ChiefReasoning/consensus/source summary и PermissionRequest, выдача полного human review packet, hash chain, API key gate и Redis Streams helpers.
 - Проверка зелёных тестов доказывает поведение локальных функций на синтетических входах, но не проверяет брокер, MQL5-компиляцию, реальную очередь, рыночные данные или доходность.
-- ChiefReasoning hash вычисляется по каноническому JSON без поля `reasoning_hash`; изменение любого шага делает hash невалидным.
+- ChiefReasoning должен содержать точный `signal_input_hash`, совпадающий с неизменяемым снимком сигнала; отсутствующий или чужой hash приводит к HOLD. `reasoning_hash` должен быть заранее вычислен по каноническому JSON без самого поля hash — runtime не синтезирует его за вызывающую сторону.
+- Redis worker восстанавливает idle pending-записи через `XAUTOCLAIM`, повторно проводит их через тот же PostgreSQL-idempotent handler и ACK только после успешного сохранения. Доставка остаётся at-least-once, а не exactly-once.
+- MT5 live-risk collector измеряет spread из bid/ask; collector и Permission Gate блокируют значение выше `max_spread_points: 20`. MQL5 EA имеет аналогичный локальный guard. Предел 20 points — начальная demo policy, а не проверенная broker-specific оптимальная настройка.
 
 ## Официальные точки интеграции
 

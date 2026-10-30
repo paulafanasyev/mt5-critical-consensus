@@ -132,7 +132,8 @@
         "daily_loss_fraction",
         "drawdown_fraction",
         "open_positions",
-        "correlated_open_positions"
+        "correlated_open_positions",
+        "spread_points"
       ],
       "properties": {
         "risk_fraction": {
@@ -156,6 +157,10 @@
         },
         "correlated_open_positions": {
           "type": "integer",
+          "minimum": 0
+        },
+        "spread_points": {
+          "type": "number",
           "minimum": 0
         }
       },

@@ -4,6 +4,7 @@ permission_matrix:
   max_size_per_trade: 0.20
   max_positions: 5
   max_correlated_positions: 2
+  max_spread_points: 20
   max_risk_per_trade_fraction: 0.005
   daily_loss_limit_fraction: 0.02
   max_drawdown_fraction: 0.10

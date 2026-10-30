@@ -1,11 +1,49 @@
 """Fail-closed policy gates. Functions return decision records; they never execute trades."""
 from __future__ import annotations
+import asyncio
 from datetime import datetime, timezone
 import math
+import threading
+import time
+import re
 import uuid
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from .audit import canonical_hash
+
+
+# Daemon workers bound resolver concurrency and cannot hold process shutdown open.
+# A running Python callback cannot be forcibly stopped, so timed-out workers keep
+# their slot until completion; this caps abandoned callbacks at four per process.
+_CHALLENGE_RESOLVER_SLOTS = threading.BoundedSemaphore(4)
+
+
+def _run_bounded_challenge_resolver(resolver, challenge, round_no, timeout_seconds):
+    if not _CHALLENGE_RESOLVER_SLOTS.acquire(timeout=timeout_seconds):
+        return None, "RESOLVER_CAPACITY_EXHAUSTED"
+    completed = threading.Event()
+    outcome = {}
+
+    def invoke():
+        try:
+            outcome["value"] = resolver(dict(challenge), round_no)
+        except Exception as exc:
+            outcome["error"] = type(exc).__name__
+        finally:
+            _CHALLENGE_RESOLVER_SLOTS.release()
+            completed.set()
+
+    worker = threading.Thread(target=invoke, name="cc-challenge-resolver", daemon=True)
+    try:
+        worker.start()
+    except Exception as exc:
+        _CHALLENGE_RESOLVER_SLOTS.release()
+        return None, f"RESOLVER_START_FAILED:{type(exc).__name__}"
+    if not completed.wait(timeout_seconds):
+        return None, "RESOLVER_TIMEOUT"
+    if "error" in outcome:
+        return None, f"RESOLVER_FAILED:{outcome['error']}"
+    return outcome.get("value"), None
 
 
 def _now_utc() -> datetime:
@@ -116,12 +154,25 @@ def self_adversarial_pass(verdict: Mapping[str, Any], *, counterarguments: Seque
 async def anonymized_peer_review(
     verdicts: Sequence[Mapping[str, Any]],
     reviewers: Sequence[tuple[str, Callable[[dict[str, Any], list[dict[str, Any]]], Awaitable[dict[str, Any]]]]],
-    *, min_reviewers_per_verdict: int = 2,
+    *, min_reviewers_per_verdict: int = 2, review_timeout_seconds: float = 30.0,
+    overall_timeout_seconds: float = 120.0,
 ) -> list[dict[str, Any]]:
     """Obtain anonymized peer reviews and reject malformed or evidence-free reviews."""
     output: list[dict[str, Any]] = []
-    if min_reviewers_per_verdict < 1:
-        raise ValueError("min_reviewers_per_verdict must be >= 1")
+    if (isinstance(min_reviewers_per_verdict, bool)
+            or not isinstance(min_reviewers_per_verdict, int)
+            or min_reviewers_per_verdict < 1):
+        raise ValueError("min_reviewers_per_verdict must be a positive integer")
+    if (isinstance(review_timeout_seconds, bool) or not isinstance(review_timeout_seconds, (int, float))
+            or not math.isfinite(review_timeout_seconds) or review_timeout_seconds <= 0
+            or review_timeout_seconds > 120):
+        raise ValueError("review_timeout_seconds must be finite and in (0,120]")
+    if (not isinstance(overall_timeout_seconds, (int, float))
+            or isinstance(overall_timeout_seconds, bool)
+            or not math.isfinite(overall_timeout_seconds)
+            or overall_timeout_seconds <= 0 or overall_timeout_seconds > 600):
+        raise ValueError("overall_timeout_seconds must be finite and in (0,600]")
+    review_deadline = time.monotonic() + float(overall_timeout_seconds)
     if not verdicts or any(not isinstance(v, Mapping) for v in verdicts):
         return [{"status": "BLOCKED", "reason": "INVALID_OR_EMPTY_VERDICTS"}]
     if any(not isinstance(item, tuple) or len(item) != 2 or not str(item[0]).strip() or not callable(item[1]) for item in reviewers):
@@ -140,8 +191,24 @@ async def anonymized_peer_review(
             continue
         peers = [dict(v) for j, v in enumerate(public) if j != target_idx]
         for i, (_private_reviewer_id, review_fn) in enumerate(possible[:min_reviewers_per_verdict], start=1):
+            remaining = review_deadline - time.monotonic()
+            if remaining <= 0:
+                output.append({"target_verdict_id": target.get("verdict_id"), "status": "BLOCKED",
+                               "reason": "REVIEW_CYCLE_TIMEOUT", "reviewer_alias": f"reviewer-{i:02d}"})
+                break
+            overall_limited = remaining < float(review_timeout_seconds)
             try:
-                review = await review_fn(dict(target), [dict(x) for x in peers])
+                review = await asyncio.wait_for(
+                    review_fn(dict(target), [dict(x) for x in peers]),
+                    timeout=min(float(review_timeout_seconds), remaining),
+                )
+            except asyncio.TimeoutError:
+                output.append({"target_verdict_id": target.get("verdict_id"), "status": "BLOCKED",
+                               "reason": "REVIEW_CYCLE_TIMEOUT" if overall_limited else "REVIEWER_TIMEOUT",
+                               "reviewer_alias": f"reviewer-{i:02d}"})
+                if overall_limited:
+                    break
+                continue
             except Exception as exc:  # fail closed; do not include potentially sensitive exception text
                 output.append({"target_verdict_id": target.get("verdict_id"), "status": "BLOCKED",
                                "reason": "REVIEWER_CALLBACK_FAILED", "reviewer_alias": f"reviewer-{i:02d}"})
@@ -176,36 +243,135 @@ async def anonymized_peer_review(
 
 def challenge_resolution_loop(challenges: Sequence[Mapping[str, Any]],
                               resolver: Callable[[dict[str, Any], int], Mapping[str, Any]],
-                              *, max_rounds: int = 3) -> dict[str, Any]:
-    """Resolve each challenge with bounded rounds; unresolved at the limit escalates."""
-    if max_rounds < 1 or max_rounds > 3:
-        raise ValueError("max_rounds must be 1..3")
+                              *, max_rounds: int = 3,
+                              resolver_timeout_seconds: float = 30.0,
+                              overall_timeout_seconds: float = 120.0) -> dict[str, Any]:
+    """Resolve challenges with bounded waits; timeouts leave the challenge open."""
+    if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or max_rounds < 1 or max_rounds > 3:
+        raise ValueError("max_rounds must be an integer from 1 to 3")
+    if (isinstance(resolver_timeout_seconds, bool)
+            or not isinstance(resolver_timeout_seconds, (int, float))
+            or not math.isfinite(resolver_timeout_seconds)
+            or resolver_timeout_seconds <= 0 or resolver_timeout_seconds > 120):
+        raise ValueError("resolver_timeout_seconds must be finite and in (0,120]")
+    if (isinstance(overall_timeout_seconds, bool)
+            or not isinstance(overall_timeout_seconds, (int, float))
+            or not math.isfinite(overall_timeout_seconds)
+            or overall_timeout_seconds <= 0 or overall_timeout_seconds > 600):
+        raise ValueError("overall_timeout_seconds must be finite and in (0,600]")
+    resolution_deadline = time.monotonic() + float(overall_timeout_seconds)
     transcript: list[dict[str, Any]] = []
+    resolved_challenges: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
+    stop_reason: str | None = None
     for original in challenges:
-        challenge = dict(original)
-        if challenge.get("status") in ("RESOLVED", "CLOSED"):
+        if stop_reason is not None:
+            if not isinstance(original, Mapping):
+                unresolved.append({
+                    "status": "OPEN",
+                    "resolution_error": "INVALID_CHALLENGE_RECORD",
+                    "resolution_pause_reason": stop_reason,
+                })
+                continue
+            # The record has not passed this loop's normal identity/evidence checks.
+            # After a timeout, never trust a pre-set RESOLVED label from an unprocessed item.
+            pending_challenge = dict(original)
+            pending_challenge["status"] = "OPEN"
+            pending_challenge["resolution_error"] = "RESOLUTION_PAUSED_AFTER_TIMEOUT"
+            pending_challenge["resolution_pause_reason"] = stop_reason
+            pending_challenge["last_resolution_attempt"] = {
+                "resolved": False,
+                "error_code": "RESOLVER_NOT_STARTED",
+                "blocked_by": stop_reason,
+            }
+            unresolved.append(pending_challenge)
             continue
+        if not isinstance(original, Mapping):
+            unresolved.append({"status": "OPEN", "resolution_error": "INVALID_CHALLENGE_RECORD"})
+            continue
+        challenge = dict(original)
+        challenge_id = str(challenge.get("challenge_id", "")).strip()
+        target_verdict_id = str(challenge.get("target_verdict_id", "")).strip()
+        challenge_type = str(challenge.get("challenge_type", "")).strip().upper()
+        refs = challenge.get("evidence_refs")
+        refs_valid = (
+            isinstance(refs, Sequence) and not isinstance(refs, (str, bytes))
+            and bool(refs) and all(isinstance(ref, str) and ref.strip() for ref in refs)
+        )
+        if not challenge_id or not target_verdict_id or not challenge_type or not refs_valid:
+            challenge["status"] = "OPEN"
+            challenge["resolution_error"] = "CHALLENGE_ID_TARGET_TYPE_OR_EVIDENCE_INVALID"
+            unresolved.append(challenge)
+            continue
+        if str(challenge.get("status", "")).upper() == "RESOLVED":
+            resolution_refs = challenge.get("resolution_evidence_refs")
+            if (isinstance(resolution_refs, Sequence) and not isinstance(resolution_refs, (str, bytes))
+                    and bool(resolution_refs) and all(isinstance(ref, str) and ref.strip() for ref in resolution_refs)):
+                resolved_challenges.append(challenge)
+            else:
+                challenge["status"] = "OPEN"
+                challenge["resolution_error"] = "PRE_RESOLVED_CHALLENGE_MISSING_RESOLUTION_EVIDENCE"
+                unresolved.append(challenge)
+            continue
+
         resolved = False
         for round_no in range(1, max_rounds + 1):
-            try:
-                raw_response = resolver(dict(challenge), round_no)
-                response = dict(raw_response) if isinstance(raw_response, Mapping) else {"resolved": False, "error_code": "INVALID_RESOLVER_RESPONSE"}
-            except Exception as exc:
-                response = {"resolved": False, "error_code": f"RESOLVER_FAILED:{type(exc).__name__}"}
-            transcript.append({"challenge_id": challenge.get("challenge_id"), "round": round_no,
-                               "response": response})
-            if response.get("resolved") is True and response.get("evidence_refs"):
+            remaining = resolution_deadline - time.monotonic()
+            if remaining <= 0:
+                response = {"resolved": False, "error_code": "RESOLVER_CYCLE_TIMEOUT"}
+            else:
+                overall_limited = remaining < float(resolver_timeout_seconds)
+                raw_response, resolver_error = _run_bounded_challenge_resolver(
+                    resolver, challenge, round_no,
+                    min(float(resolver_timeout_seconds), remaining),
+                )
+                if resolver_error and overall_limited and resolver_error == "RESOLVER_TIMEOUT":
+                    response = {"resolved": False, "error_code": "RESOLVER_CYCLE_TIMEOUT"}
+                elif resolver_error:
+                    response = {"resolved": False, "error_code": resolver_error}
+                else:
+                    response = dict(raw_response) if isinstance(raw_response, Mapping) else {
+                        "resolved": False, "error_code": "INVALID_RESOLVER_RESPONSE"
+                    }
+            transcript.append({"challenge_id": challenge_id, "round": round_no, "response": response})
+            response_refs = response.get("evidence_refs")
+            valid_response_refs = (
+                isinstance(response_refs, Sequence) and not isinstance(response_refs, (str, bytes))
+                and bool(response_refs) and all(isinstance(ref, str) and ref.strip() for ref in response_refs)
+            )
+            if response.get("resolved") is True and valid_response_refs:
+                resolved_challenges.append({
+                    **challenge, "status": "RESOLVED",
+                    "resolution_evidence_refs": [str(ref) for ref in response_refs],
+                    "resolution_round": round_no,
+                    "resolution_summary": str(response.get("summary", "")).strip()[:2000],
+                })
                 resolved = True
                 break
             challenge["last_resolution_attempt"] = response
+            error_code = response.get("error_code")
+            if error_code in {
+                "RESOLVER_TIMEOUT",
+                "RESOLVER_CAPACITY_EXHAUSTED",
+                "RESOLVER_CYCLE_TIMEOUT",
+            }:
+                # A timed-out callback may still be running. Do not launch another
+                # round or another challenge resolver from this invocation.
+                stop_reason = str(error_code)
+                break
         if not resolved:
             challenge["status"] = "OPEN"
             unresolved.append(challenge)
+
     deadlock = bool(unresolved)
-    return {"status": "ESCALATE" if deadlock else "RESOLVED",
-            "open_challenges": unresolved, "transcript": transcript,
-            "max_rounds": max_rounds, "trade_allowed": False if deadlock else None}
+    return {
+        "status": "ESCALATE" if deadlock else "RESOLVED",
+        "resolved_challenges": resolved_challenges,
+        "open_challenges": unresolved,
+        "transcript": transcript,
+        "max_rounds": max_rounds,
+        "trade_allowed": False,
+    }
 
 
 def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, Any]:
@@ -465,6 +631,9 @@ def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probabilit
         blockers_identity = []
     if not str(reasoning.get("signal_id", "")).strip():
         blockers_identity.append("CHIEF_SIGNAL_ID_MISSING")
+    signal_input_hash = reasoning.get("signal_input_hash")
+    if not isinstance(signal_input_hash, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", signal_input_hash) is None:
+        blockers_identity.append("CHIEF_SIGNAL_INPUT_HASH_MISSING_OR_INVALID")
     created_at = reasoning.get("created_at")
     if not created_at:
         blockers_identity.append("CHIEF_CREATED_AT_MISSING")
@@ -491,6 +660,17 @@ def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probabilit
                 valid_scenarios.append(scenario)
     if not valid_scenarios:
         blockers_identity.append("CHIEF_TAIL_RISK_SCENARIOS_MISSING_OR_INVALID")
+    required_step_names = {
+        "a": "ADVERSARIAL_PASS",
+        "b": "CONTRADICTION_CHECK",
+        "c": "SOURCE_AUDIT",
+        "d": "TAIL_RISK_CHECK",
+        "e": "RED_TEAM_SELF_REVIEW",
+        "f": "FULL_CHALLENGE_LEDGER_REVIEW",
+        "g": "GROUPTHINK_CHECK",
+        "h": "SIMILAR_REGIME_CALIBRATION",
+        "i": "ERROR_PROBABILITY_SCENARIO",
+    }
     steps = reasoning.get("steps", {})
     if not isinstance(steps, Mapping):
         steps = {}
@@ -502,6 +682,8 @@ def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probabilit
             continue
         evidence = item.get("evidence_refs")
         has_evidence = isinstance(evidence, Sequence) and not isinstance(evidence, (str, bytes)) and bool(evidence) and all(str(x).strip() for x in evidence)
+        if item.get("check_name") != required_step_names[step]:
+            failed.append(step + ":CHECK_NAME_MISMATCH")
         if item.get("passed") is not True or not str(item.get("detail", "")).strip() or not has_evidence:
             failed.append(step)
     blockers: list[str] = list(blockers_identity)
@@ -658,7 +840,8 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
     if not isinstance(risk, Mapping):
         blockers.append("RISK_SNAPSHOT_MISSING")
         risk = {}
-    required_risk_fields = ("risk_fraction", "daily_loss_fraction", "drawdown_fraction", "open_positions", "correlated_open_positions")
+    required_risk_fields = ("risk_fraction", "daily_loss_fraction", "drawdown_fraction",
+                            "open_positions", "correlated_open_positions", "spread_points")
     missing_risk = [key for key in required_risk_fields if risk.get(key) is None]
     if missing_risk:
         blockers.append("RISK_SNAPSHOT_FIELDS_MISSING:" + ",".join(missing_risk))
@@ -678,6 +861,12 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
             blockers.append("DAILY_LOSS_LIMIT_REACHED")
         if risk_values["drawdown_fraction"] is not None and risk_limits["drawdown_fraction"] is not None and risk_values["drawdown_fraction"] >= risk_limits["drawdown_fraction"]:
             blockers.append("MAX_DRAWDOWN_REACHED")
+        spread_points = _finite_float(risk.get("spread_points"))
+        max_spread = _finite_float(policy.get("max_spread_points"))
+        if spread_points is None or spread_points < 0 or max_spread is None or max_spread < 0:
+            blockers.append("INVALID_SPREAD_VALUE_OR_LIMIT")
+        elif spread_points > max_spread:
+            blockers.append("SPREAD_LIMIT_EXCEEDED")
         for key, limit_key, message in (("open_positions", "max_positions", "MAX_OPEN_POSITIONS_REACHED"),
                                         ("correlated_open_positions", "max_correlated_positions", "CORRELATED_EXPOSURE_LIMIT_REACHED")):
             count = _finite_float(risk.get(key))

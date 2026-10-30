@@ -5,6 +5,7 @@ from pathlib import Path
 from critical_consensus.audit import canonical_hash, verify_audit_chain
 from critical_consensus.calibration import weighted_consensus
 from critical_consensus.pipeline import evaluate_signal_bundle
+from critical_consensus.risk_controls import risk_request_binding_hash
 from jsonschema import Draft202012Validator
 
 NOW = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
@@ -25,7 +26,7 @@ CERTAINTY_POLICY = {
 PERMISSION_MATRIX = {
     "permission_matrix": {
         "instruments": ["EURUSD"], "max_size_per_trade": 0.2, "max_positions": 5,
-        "max_correlated_positions": 2, "max_risk_per_trade_fraction": 0.005,
+        "max_correlated_positions": 2, "max_spread_points": 20, "max_risk_per_trade_fraction": 0.005,
         "daily_loss_limit_fraction": 0.02, "max_drawdown_fraction": 0.10,
         "allowed_directions": ["BUY", "SELL"], "allowed_time_utc": {"start": "07:00", "end": "19:00"},
         "rollover_block_utc": {"start": "20:55", "end": "21:10"}, "blocked_around_news": True,
@@ -40,11 +41,15 @@ PERMISSION_MATRIX = {
 
 def make_bundle():
     agents = ["PlatformScoutAgent", "TechnicalAnalystAgent", "RiskManagerAgent", "ComplianceAgent"]
+    signal_input = {"signal_id": "sig-100", "instrument": "EURUSD",
+                    "market_snapshot_hash": "sha256:" + "c" * 64,
+                    "available_evidence_refs": ["market-bars:EURUSD:H1","s1","s2","review-evidence-0-0","review-evidence-0-1","review-evidence-1-0","review-evidence-1-1","review-evidence-2-0","review-evidence-2-1","review-evidence-3-0","review-evidence-3-1","resolved-calculation-1","e1","e2","e3","stress-model-1","chief-a","chief-b","chief-c","chief-d","chief-e","chief-f","chief-g","chief-h","chief-i"]}
+    signal_input_hash = canonical_hash(signal_input)
     verdicts = [
         {"verdict_id": f"v-{i}", "signal_id": "sig-100", "agent_id": agent,
          "verdict": "APPROVE", "confidence": 0.99,
          "reviewer_count": 999, "created_at": NOW.isoformat(), "ttl_seconds": 300,
-         "input_hash": "sha256:" + "a" * 64,
+         "input_hash": signal_input_hash, "evidence_refs": ["market-bars:EURUSD:H1"],
          "calibration_meta": {"brier_score": 0.05, "sample_size": 100,
                                "calibration_status": "CALIBRATED"}}
         for i, agent in enumerate(agents)
@@ -63,7 +68,8 @@ def make_bundle():
                           "resolution_evidence_refs": ["resolved-calculation-1"]}
     challenge_snapshot = [resolved_challenge]
     bundle = {
-        "signal_id": "sig-100", "verdicts": verdicts, "peer_reviews": reviews,
+        "signal_id": "sig-100", "signal_input": signal_input,
+        "signal_input_hash": signal_input_hash, "verdicts": verdicts, "peer_reviews": reviews,
         "open_challenges": [], "challenge_records": challenge_snapshot, "challenge_resolution_status": "RESOLVED",
         "contradictions_last_n_hours": 0,
         "key_sources": [
@@ -79,9 +85,10 @@ def make_bundle():
         "dissent_rate": 0.125, "dissent_sample_size": 80,
         "false_certainty_rate": 0.02, "false_certainty_sample_size": 80,
         "chief_reasoning": {
-            "reasoning_id": "chief-r-100", "signal_id": "sig-100", "created_at": NOW.isoformat(),
+            "reasoning_id": "chief-r-100", "signal_id": "sig-100",
+            "signal_input_hash": signal_input_hash, "created_at": NOW.isoformat(),
             "verdict": "CONFIRM",
-            "steps": {step: {"passed": True, "detail": f"checked {step}", "evidence_refs": [f"chief-{step}"]}
+            "steps": {step: {"passed": True, "check_name": {"a":"ADVERSARIAL_PASS","b":"CONTRADICTION_CHECK","c":"SOURCE_AUDIT","d":"TAIL_RISK_CHECK","e":"RED_TEAM_SELF_REVIEW","f":"FULL_CHALLENGE_LEDGER_REVIEW","g":"GROUPTHINK_CHECK","h":"SIMILAR_REGIME_CALIBRATION","i":"ERROR_PROBABILITY_SCENARIO"}[step], "detail": f"checked {step}", "evidence_refs": [f"chief-{step}"]}
                       for step in "abcdefghi"},
             "reasons_against": ["macro risk", "news risk", "correlation risk", "liquidity risk", "regime mismatch"],
             "tail_risk_probability": 0.01,
@@ -99,7 +106,7 @@ def make_bundle():
             "sources": [{"id": "s1", "credibility": 0.95, "age_seconds": 20}, {"id": "s2", "credibility": 0.94, "age_seconds": 40}],
             "expires_at": (NOW + timedelta(minutes=5)).isoformat(), "within_high_impact_news_window": False,
             "risk_snapshot": {"risk_fraction": 0.003, "daily_loss_fraction": 0.004, "drawdown_fraction": 0.02,
-                              "open_positions": 1, "correlated_open_positions": 0},
+                              "open_positions": 1, "correlated_open_positions": 0, "spread_points": 10.0},
         },
     }
     bundle["chief_reasoning"]["reasoning_hash"] = canonical_hash(bundle["chief_reasoning"])
@@ -143,7 +150,7 @@ def test_pipeline_open_challenge_blocks_certainty_gate():
     bundle = make_bundle()
     bundle["peer_reviews"][0] = {"target_verdict_id": "v-0", "reviewer_alias": "reviewer-1",
         "stance": "CHALLENGE", "challenge_type": "LOGIC_GAP", "argument": "The calculation is inconsistent",
-        "evidence_refs": ["calc-contradiction"], "status": "VALIDATED"}
+        "evidence_refs": ["review-evidence-0-0"], "status": "VALIDATED"}
     bundle["challenge_records"] = [{"challenge_id": "ch-1", "target_verdict_id": "v-0", "challenge_type": "LOGIC_GAP",
                                      "status": "OPEN", "evidence_refs": ["calc-contradiction"]}]
     result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
@@ -283,3 +290,172 @@ def test_verdict_at_exact_ttl_boundary_is_accepted():
     assert result["details"]["certainty"]["status"] == "PASS"
     assert result["trade_allowed"] is False
     assert "order_command" not in result
+
+
+def test_pipeline_rejects_tampered_signal_input_hash_before_consensus():
+    bundle = make_bundle()
+    bundle["signal_input_hash"] = "sha256:" + "0" * 64
+    result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
+    assert result["status"] == "GATHER_MORE"
+    assert result["blockers"] == ["SIGNAL_INPUT_HASH_MISMATCH"]
+    assert "certainty" not in result["details"]
+    assert result["audit_chain_valid"] is True
+
+
+def test_pipeline_binds_every_agent_verdict_to_the_same_input_snapshot():
+    bundle = make_bundle()
+    bundle["verdicts"][0]["input_hash"] = "sha256:" + "f" * 64
+    result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
+    assert result["status"] == "GATHER_MORE"
+    assert "VERDICT_0:VERDICT_INPUT_HASH_DOES_NOT_MATCH_SIGNAL_INPUT" in result["blockers"]
+    assert "certainty" not in result["details"]
+
+
+def test_pipeline_rejects_nonfinite_bundle_before_creating_an_invalid_audit_hash():
+    bundle = make_bundle()
+    bundle["signal_input"]["nonfinite"] = float("nan")
+    result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
+    assert result["status"] == "GATHER_MORE"
+    assert result["blockers"] == ["SIGNAL_BUNDLE_NOT_CANONICALLY_HASHABLE"]
+    assert result["audit_events"] == []
+    assert result["trade_allowed"] is False
+
+def _persisted_demo_risk_evidence(bundle, *, kill_switch_active=False, binding_override=None):
+    request = bundle["permission_request"]
+    state = {
+        "kill_switch_active": kill_switch_active,
+        "updated_at": NOW.isoformat(),
+        "updated_by": "pytest-operator",
+        "reason": "controlled integration fixture",
+        "status": "PERSISTED",
+    }
+    snapshot = {
+        "status": "PASS", "observed_at": NOW.isoformat(), "account_mode": "demo",
+        "symbol": request["instrument"], "symbol_group": "fx-major",
+        "account_equity": 10000.0, "day_start_equity": 10000.0,
+        "equity_high_watermark": 10000.0, "risk_fraction": 0.003,
+        "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0,
+        "open_positions": 1, "correlated_open_positions": 0,
+        "spread_points": 10.0, "max_spread_points": 20,
+        "quote_age_seconds": 1.0, "max_quote_age_seconds": 15,
+        "request_binding_sha256": binding_override or risk_request_binding_hash(request),
+        "within_high_impact_news_window": False,
+    }
+    return state, snapshot
+
+
+def test_persisted_pipeline_permission_requires_global_kill_switch_inactive():
+    bundle = make_bundle()
+    state, snapshot = _persisted_demo_risk_evidence(bundle, kill_switch_active=True)
+    result = evaluate_signal_bundle(
+        bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
+        require_persisted_risk=True, kill_switch_state=state, terminal_risk_snapshot=snapshot,
+    )
+    assert result["status"] == "DENY"
+    assert "KILL_SWITCH_ACTIVE_OR_INVALID" in result["blockers"]
+    assert result["trade_allowed"] is False
+
+
+def test_persisted_pipeline_permission_requires_exact_order_bound_fresh_risk_snapshot():
+    bundle = make_bundle()
+    state, snapshot = _persisted_demo_risk_evidence(bundle)
+    result = evaluate_signal_bundle(
+        bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
+        require_persisted_risk=True, kill_switch_state=state, terminal_risk_snapshot=snapshot,
+    )
+    assert result["status"] == "REQUIRE_HUMAN"
+    permission = result["details"]["permission"]
+    assert permission["risk_snapshot_validation"]["status"] == "PASS"
+    assert result["trade_allowed"] is False
+
+
+def test_persisted_pipeline_permission_rejects_stale_terminal_quote():
+    bundle = make_bundle()
+    state, snapshot = _persisted_demo_risk_evidence(bundle)
+    snapshot["quote_age_seconds"] = 45.0
+    result = evaluate_signal_bundle(
+        bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
+        require_persisted_risk=True, kill_switch_state=state, terminal_risk_snapshot=snapshot,
+    )
+    assert result["status"] == "DENY"
+    assert "MT5_QUOTE_STALE" in result["blockers"]
+    assert result["trade_allowed"] is False
+
+
+def test_persisted_pipeline_permission_rejects_snapshot_bound_to_another_order():
+    bundle = make_bundle()
+    state, snapshot = _persisted_demo_risk_evidence(
+        bundle, binding_override="sha256:" + "0" * 64,
+    )
+    result = evaluate_signal_bundle(
+        bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
+        require_persisted_risk=True, kill_switch_state=state, terminal_risk_snapshot=snapshot,
+    )
+    assert result["status"] == "DENY"
+    assert "RISK_REQUEST_BINDING_MISMATCH" in result["blockers"]
+    assert result["trade_allowed"] is False
+
+
+def test_persisted_pipeline_permission_fails_closed_when_risk_snapshot_missing():
+    bundle = make_bundle()
+    state, _snapshot = _persisted_demo_risk_evidence(bundle)
+    result = evaluate_signal_bundle(
+        bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
+        require_persisted_risk=True, kill_switch_state=state, terminal_risk_snapshot=None,
+    )
+    assert result["status"] == "DENY"
+    assert "RISK_SNAPSHOT_MISSING" in result["blockers"]
+    assert result["trade_allowed"] is False
+
+
+def test_persisted_pipeline_requires_database_backed_source_provenance_before_certainty():
+    bundle = make_bundle()
+    result = evaluate_signal_bundle(
+        bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
+        require_persisted_sources=True, source_evidence_records=[], source_registry={"publishers": {}},
+    )
+    assert result["status"] == "GATHER_MORE"
+    assert "PERSISTED_SOURCE_PROVENANCE_NOT_VERIFIED" in result["blockers"]
+    assert "certainty" not in result["details"]
+    assert result["audit_chain_valid"] is True
+    assert result["trade_allowed"] is False
+
+
+def test_persisted_pipeline_requires_database_backed_source_provenance_before_certainty():
+    bundle = make_bundle()
+    result = evaluate_signal_bundle(
+        bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
+        require_persisted_sources=True, source_evidence_records=[],
+        source_registry={"version": "1", "publishers": {}},
+    )
+    assert result["status"] == "GATHER_MORE"
+    assert "PERSISTED_SOURCE_PROVENANCE_NOT_VERIFIED" in result["blockers"]
+    assert "certainty" not in result["details"]
+    assert result["audit_chain_valid"] is True
+    assert result["trade_allowed"] is False
+
+
+def test_pipeline_rejects_chief_reasoning_bound_to_another_signal_input():
+    bundle = make_bundle()
+    bundle["chief_reasoning"]["signal_input_hash"] = "sha256:" + "f" * 64
+    unsigned = dict(bundle["chief_reasoning"])
+    unsigned.pop("reasoning_hash")
+    bundle["chief_reasoning"]["reasoning_hash"] = canonical_hash(unsigned)
+    bundle["permission_request"]["chief_reasoning_hash"] = bundle["chief_reasoning"]["reasoning_hash"]
+
+    result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
+
+    assert result["status"] == "HOLD"
+    assert "CHIEF_SIGNAL_INPUT_HASH_MISMATCH" in result["blockers"]
+    assert result["trade_allowed"] is False
+
+
+def test_pipeline_rejects_chief_reasoning_without_precomputed_hash():
+    bundle = make_bundle()
+    bundle["chief_reasoning"].pop("reasoning_hash")
+
+    result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
+
+    assert result["status"] == "HOLD"
+    assert "CHIEF_REASONING_HASH_MISSING" in result["blockers"]
+    assert result["trade_allowed"] is False

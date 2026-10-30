@@ -2,15 +2,17 @@ import asyncio
 from critical_consensus.gates import challenge_resolution_loop, devil_advocate_pass, anonymized_peer_review, self_adversarial_pass
 
 def test_challenge_deadlock_escalates():
-    result = challenge_resolution_loop([{"challenge_id": "c1", "status": "OPEN"}],
+    result = challenge_resolution_loop([{"challenge_id": "c1", "target_verdict_id": "v1", "challenge_type": "LOGIC_GAP", "status": "OPEN", "evidence_refs": ["ev-0"]}],
         lambda challenge, round_no: {"resolved": False, "evidence_refs": []}, max_rounds=3)
     assert result["status"] == "ESCALATE"
     assert len(result["transcript"]) == 3
 
 def test_challenge_resolution_requires_evidence():
-    result = challenge_resolution_loop([{"challenge_id": "c1", "status": "OPEN"}],
+    result = challenge_resolution_loop([{"challenge_id": "c1", "target_verdict_id": "v1", "challenge_type": "LOGIC_GAP", "status": "OPEN", "evidence_refs": ["ev-0"]}],
         lambda challenge, round_no: {"resolved": True, "evidence_refs": ["ev-1"]}, max_rounds=3)
     assert result["status"] == "RESOLVED"
+    assert len(result["resolved_challenges"]) == 1
+    assert result["resolved_challenges"][0]["resolution_evidence_refs"] == ["ev-1"]
 
 def test_devil_advocate_needs_three_evidence_backed_hypotheses():
     report = devil_advocate_pass({"signal_id": "s1"}, [
@@ -50,6 +52,53 @@ def test_mnpi_suspect_is_unconditional_veto():
 def test_challenge_resolver_exception_escalates_without_crashing():
     def broken_resolver(_challenge, _round_no):
         raise RuntimeError("sensitive internals not to be copied")
-    result = challenge_resolution_loop([{"challenge_id": "c-fail", "status": "OPEN"}], broken_resolver, max_rounds=2)
+    result = challenge_resolution_loop([{"challenge_id": "c-fail", "target_verdict_id": "v-fail", "challenge_type": "LOGIC_GAP", "status": "OPEN", "evidence_refs": ["ev-0"]}], broken_resolver, max_rounds=2)
     assert result["status"] == "ESCALATE"
     assert all("sensitive internals" not in str(item) for item in result["transcript"])
+
+
+def test_challenge_resolver_timeout_fails_closed_without_retrying_or_starting_next_challenge():
+    import time
+
+    calls = []
+
+    def slow_resolver(challenge, _round_no):
+        calls.append(challenge["challenge_id"])
+        if challenge["challenge_id"] == "slow-1":
+            time.sleep(0.5)
+            return {"resolved": True, "evidence_refs": ["ev-1"]}
+        return {"resolved": True, "evidence_refs": ["ev-2"]}
+
+    started = time.monotonic()
+    result = challenge_resolution_loop(
+        [
+            {"challenge_id": "slow-1", "target_verdict_id": "v-1",
+             "challenge_type": "LOGIC_GAP", "status": "OPEN", "evidence_refs": ["ev-0"]},
+            {"challenge_id": "slow-2", "target_verdict_id": "v-2",
+             "challenge_type": "DATA_CONTRADICTION", "status": "OPEN", "evidence_refs": ["ev-2"]},
+            {"status": "RESOLVED", "resolution_evidence_refs": ["untrusted-pre-resolved-ref"]},
+        ],
+        slow_resolver, max_rounds=3, resolver_timeout_seconds=0.05,
+        overall_timeout_seconds=1,
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.3
+    assert calls == ["slow-1"]
+    assert result["status"] == "ESCALATE"
+    assert len(result["transcript"]) == 1
+    assert result["open_challenges"][0]["last_resolution_attempt"]["error_code"] == "RESOLVER_TIMEOUT"
+    assert result["open_challenges"][1]["resolution_error"] == "RESOLUTION_PAUSED_AFTER_TIMEOUT"
+    assert result["open_challenges"][1]["resolution_pause_reason"] == "RESOLVER_TIMEOUT"
+    assert result["open_challenges"][2]["status"] == "OPEN"
+    assert result["open_challenges"][2]["resolution_error"] == "RESOLUTION_PAUSED_AFTER_TIMEOUT"
+    assert result["resolved_challenges"] == []
+    assert result["trade_allowed"] is False
+
+
+def test_challenge_resolver_rejects_invalid_timeout():
+    import pytest
+
+    challenge = [{"challenge_id": "c-1", "target_verdict_id": "v-1",
+                  "challenge_type": "LOGIC_GAP", "status": "OPEN", "evidence_refs": ["ev-0"]}]
+    with pytest.raises(ValueError, match="resolver_timeout_seconds"):
+        challenge_resolution_loop(challenge, lambda *_: {}, resolver_timeout_seconds=float("inf"))
