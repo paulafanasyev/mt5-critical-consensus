@@ -13,12 +13,18 @@ from critical_consensus.redis_streams import (
 class FakeRedis:
     def __init__(self):
         self.values = {}
+        self.expiries = {}
         self.streams = {}
         self.acks = []
         self.groups = set()
         self.counter = 0
 
     async def eval(self, script, numkeys, *parts):
+        if "CC_INCREMENT_ATTEMPT_V1" in script:
+            attempt_key, ttl = parts
+            self.values[attempt_key] = int(self.values.get(attempt_key, 0)) + 1
+            self.expiries[attempt_key] = ttl
+            return self.values[attempt_key]
         if "CC_PUBLISH_EVENT_V2" in script:
             dedupe_key, stream, serialized, ttl, payload_hash = parts
             existing = self.values.get(dedupe_key)
@@ -189,3 +195,20 @@ async def test_publish_event_rejects_legacy_unhashed_dedupe_entry():
     with pytest.raises(RuntimeError, match="EVENT_ID_DEDUPE_RECORD_LEGACY_OR_CORRUPT"):
         await publish_event(redis, "cc:signals:v1", event())
     assert not redis.streams.get("cc:signals:v1")
+
+
+@pytest.mark.asyncio
+async def test_retry_counter_ttl_is_set_atomically_with_increment():
+    redis = FakeRedis()
+    message = ("33-0", {"event": json.dumps(event())})
+
+    async def retryable_failure(_event):
+        raise RuntimeError("temporary")
+
+    stats = await process_message_batch(
+        redis, "cc:signals:v1", "workers", [message], retryable_failure, max_attempts=3,
+    )
+    attempt_key = "cc:attempts:cc:signals:v1:workers:33-0"
+    assert stats["retried"] == 1
+    assert redis.values[attempt_key] == 1
+    assert redis.expiries[attempt_key] == 7 * 24 * 60 * 60
