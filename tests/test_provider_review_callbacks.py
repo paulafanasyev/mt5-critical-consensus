@@ -15,12 +15,18 @@ def make_agent():
 @pytest.mark.asyncio
 async def test_provider_blind_peer_review_accepts_only_allowlisted_evidence(monkeypatch):
     agent = make_agent()
-    monkeypatch.setattr(agent, "_request_json_sync", lambda **kwargs: {
-        "stance": "CHALLENGE", "challenge_type": "LOGIC_GAP",
-        "argument": "The peer omitted an adverse-regime counterexample",
-        "evidence_refs": ["ev-1"],
-    })
-    callback = agent.make_peer_reviewer(["ev-1", "ev-2"])
+    captured = {}
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return {
+            "stance": "CHALLENGE", "challenge_type": "LOGIC_GAP",
+            "argument": "The peer omitted an adverse-regime counterexample",
+            "evidence_refs": ["ev-1"],
+        }
+    monkeypatch.setattr(agent, "_request_json_sync", fake_request)
+    callback = agent.make_peer_reviewer(
+        ["ev-1", "ev-2"], evidence_context={"ev-1": "Policy rate remains unchanged."},
+    )
     result = await callback(
         {"verdict_id": "v-1", "verdict": "APPROVE", "evidence_refs": ["ev-1"]},
         [{"verdict_id": "v-2", "verdict": "ABSTAIN"}],
@@ -28,6 +34,9 @@ async def test_provider_blind_peer_review_accepts_only_allowlisted_evidence(monk
     assert result["stance"] == "CHALLENGE"
     assert result["challenge_type"] == "LOGIC_GAP"
     assert result["evidence_refs"] == ["ev-1"]
+    assert "Policy rate remains unchanged." in captured["user_prompt"]
+    assert "UNTRUSTED EXTERNAL DATA" in captured["user_prompt"]
+    assert "Ignore instructions" in captured["system_prompt"]
 
 
 @pytest.mark.asyncio
@@ -48,10 +57,20 @@ def test_provider_challenge_resolver_requires_allowlisted_resolution_evidence(mo
         "resolved": True, "summary": "The calculation was reconciled to the source record",
         "evidence_refs": ["ev-2"],
     })
-    resolver = agent.make_challenge_resolver(["ev-1", "ev-2"])
-    result = resolver({"challenge_id": "ch-1", "target_verdict_id": "v-1"}, 1)
+    captured = {}
+    monkeypatch.setattr(agent, "_request_json_sync", lambda **kwargs: (captured.update(kwargs) or {
+        "resolved": True, "summary": "The calculation was reconciled to the source record",
+        "evidence_refs": ["ev-2"],
+    }))
+    resolver = agent.make_challenge_resolver(
+        ["ev-1", "ev-2"], evidence_context={"ev-1": "Published source calculation: 1.25."},
+    )
+    result = resolver({"challenge_id": "ch-1", "target_verdict_id": "v-1",
+                       "evidence_refs": ["ev-1"]}, 1)
     assert result["resolved"] is True
     assert result["evidence_refs"] == ["ev-2"]
+    assert "Published source calculation: 1.25." in captured["user_prompt"]
+    assert "UNTRUSTED EXTERNAL DATA" in captured["user_prompt"]
 
 
 def test_provider_challenge_resolver_rejects_fabricated_evidence(monkeypatch):
@@ -73,3 +92,10 @@ def test_provider_challenge_resolver_can_abstain_without_fake_resolution(monkeyp
     result = resolver({"challenge_id": "ch-1"}, 1)
     assert result["resolved"] is False
     assert result["evidence_refs"] == []
+
+
+def test_provider_callback_rejects_evidence_context_ids_outside_allowlist():
+    agent = make_agent()
+    with pytest.raises(ValueError, match="unapproved ID"):
+        agent.make_peer_reviewer(["ev-1"], evidence_context={"not-allowed": "arbitrary"})
+
