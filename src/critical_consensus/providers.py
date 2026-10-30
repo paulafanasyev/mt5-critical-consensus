@@ -36,7 +36,7 @@ class OpenAICompatibleAgent:
 
     def __init__(
         self, *, agent_id: str, model: str, api_key: str, base_url: str = "https://api.openai.com/v1",
-        timeout_seconds: float = 15.0, ttl_seconds: int = 300,
+        timeout_seconds: float = 15.0, ttl_seconds: int = 300, role: str = "analyst",
     ):
         self.agent_id = str(agent_id).strip()
         self.model = str(model).strip()
@@ -44,9 +44,12 @@ class OpenAICompatibleAgent:
         self.base_url = str(base_url).rstrip("/")
         self.timeout_seconds = float(timeout_seconds)
         self.ttl_seconds = int(ttl_seconds)
+        self.role = str(role).strip().lower()
         parsed = urlparse(self.base_url)
         if not self.agent_id or not self.model or not self.api_key:
             raise ValueError("agent_id, model and api_key are required")
+        if self.role not in {"analyst", "critic", "chief_review", "risk_review", "devil_advocate"}:
+            raise ValueError("unsupported agent role")
         if parsed.scheme != "https" and not (
             parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
         ):
@@ -76,11 +79,19 @@ class OpenAICompatibleAgent:
         if len(signal_json.encode("utf-8")) > 200_000:
             raise ValueError("signal payload exceeds 200 KB limit")
 
+        role_guidance = {
+            "analyst": "Analyse only supported market facts and state what evidence is missing.",
+            "critic": "Act adversarially: seek counter-evidence, hidden assumptions, stale data and reasons the thesis may be wrong.",
+            "chief_review": "Perform an independent senior review of the analysis; do not echo a consensus without checking evidence and objections. This review is not the deterministic ChiefAgent nine-step gate.",
+            "risk_review": "Focus on downside, risk-data completeness, invalidating conditions and whether the supplied evidence is enough to assess a proposed risk.",
+            "devil_advocate": "Construct plausible counter-hypotheses and challenge the apparent leading interpretation.",
+        }[self.role]
         prompt = (
-            "You are one skeptical trading-research agent. Assess only the supplied evidence. "
-            "Do not invent prices, news, citations or source IDs. Return one JSON object with exactly "
-            "these fields: verdict (APPROVE, ABSTAIN, REJECT, VETO), confidence (number 0..1), "
-            "evidence_refs (non-empty array chosen only from available_evidence_refs), "
+            "Role: " + self.role + ". " + role_guidance + " Assess only supplied evidence. "
+            "Do not invent prices, news, citations or source IDs. The confidence number is subjective and "
+            "UNCALIBRATED; it must not be presented as a proven probability until evaluated out-of-sample. "
+            "Return one JSON object with exactly these fields: verdict (APPROVE, ABSTAIN, REJECT, VETO), "
+            "confidence (number 0..1), evidence_refs (non-empty array chosen only from available_evidence_refs), "
             "abstain_reason (string), rationale (short factual summary), risks (array of short strings). "
             "APPROVE is not a trade authorization. Prefer ABSTAIN if evidence is insufficient. "
             "Do not output a trade command. Input follows:\n" + signal_json
@@ -134,6 +145,7 @@ class OpenAICompatibleAgent:
             raise RuntimeError("provider_verdict_or_evidence_invalid")
         return {
             "agent_id": self.agent_id,
+            "role": self.role,
             "signal_id": signal_id,
             "verdict_id": "v-" + uuid.uuid4().hex,
             "input_hash": canonical_signal_hash(signal),
@@ -182,6 +194,7 @@ def load_agent_specs_from_env():
             base_url=str(entry.get("base_url", "https://api.openai.com/v1")),
             timeout_seconds=float(entry.get("timeout_seconds", 15)),
             ttl_seconds=int(entry.get("ttl_seconds", 300)),
+            role=str(entry.get("role", "analyst")),
         )
-        specs.append(AgentSpec(agent_id, group, agent))
+        specs.append(AgentSpec(agent_id, group, agent, role=agent.role))
     return specs
