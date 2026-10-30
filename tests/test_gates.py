@@ -69,7 +69,7 @@ def test_missing_chief_step_cannot_confirm():
 
 def test_chief_confirm_requires_all_a_to_i():
     reasoning = {"reasoning_id": "chief-r-1", "signal_id": "sig-1", "created_at": datetime.now(timezone.utc).isoformat(),
-                 "verdict": "CONFIRM", "steps": {k: {"passed": True, "detail": "evidence checked", "evidence_refs": [f"ev-{k}"]} for k in "abcdefghi"},
+                 "verdict": "CONFIRM", "steps": {k: {"passed": True, "check_name": {"a":"ADVERSARIAL_PASS","b":"CONTRADICTION_CHECK","c":"SOURCE_AUDIT","d":"TAIL_RISK_CHECK","e":"RED_TEAM_SELF_REVIEW","f":"FULL_CHALLENGE_LEDGER_REVIEW","g":"GROUPTHINK_CHECK","h":"SIMILAR_REGIME_CALIBRATION","i":"ERROR_PROBABILITY_SCENARIO"}[k], "detail": "evidence checked", "evidence_refs": [f"ev-{k}"]} for k in "abcdefghi"},
                  "reasons_against": ["macro", "news", "correlation", "liquidity", "regime"], "tail_risk_probability": 0.01,
                  "tail_risk_scenarios": [{"scenario": "central bank shock", "probability": 0.01, "impact": "repricing", "evidence_refs": ["risk-1"]}],
                  "open_challenges": [], "all_challenges_read": True, "challenge_ledger_snapshot": [], "challenge_ledger_hash": canonical_hash([]), "reviewed_challenge_ids": []}
@@ -222,7 +222,7 @@ def test_certainty_gate_requires_verified_health_metric_sample_sizes():
 def test_chief_cannot_confirm_when_open_challenge_is_hidden_in_ledger():
     ledger = [{"challenge_id": "ch-1", "status": "OPEN"}]
     reasoning = {"reasoning_id": "chief-r-2", "signal_id": "sig-2", "created_at": datetime.now(timezone.utc).isoformat(),
-                 "verdict": "CONFIRM", "steps": {k: {"passed": True, "detail": "evidence checked", "evidence_refs": [f"ev-{k}"]} for k in "abcdefghi"},
+                 "verdict": "CONFIRM", "steps": {k: {"passed": True, "check_name": {"a":"ADVERSARIAL_PASS","b":"CONTRADICTION_CHECK","c":"SOURCE_AUDIT","d":"TAIL_RISK_CHECK","e":"RED_TEAM_SELF_REVIEW","f":"FULL_CHALLENGE_LEDGER_REVIEW","g":"GROUPTHINK_CHECK","h":"SIMILAR_REGIME_CALIBRATION","i":"ERROR_PROBABILITY_SCENARIO"}[k], "detail": "evidence checked", "evidence_refs": [f"ev-{k}"]} for k in "abcdefghi"},
                  "reasons_against": ["macro", "news", "correlation", "liquidity", "regime"], "tail_risk_probability": 0.01,
                  "tail_risk_scenarios": [{"scenario": "central bank shock", "probability": 0.01, "impact": "repricing", "evidence_refs": ["risk-1"]}],
                  "open_challenges": [], "all_challenges_read": True, "challenge_ledger_snapshot": ledger,
