@@ -66,6 +66,7 @@ async def run_peer_review_cycle(
     resolver: ChallengeResolver,
     min_reviewers_per_verdict: int = 2,
     max_resolution_rounds: int = 3,
+    review_timeout_seconds: float = 30.0,
 ) -> dict[str, Any]:
     """Create anonymized reviews and resolve registered challenges without author self-review."""
     if (not isinstance(allowed_evidence_refs, Sequence)
@@ -116,6 +117,7 @@ async def run_peer_review_cycle(
 
     reviews = await anonymized_peer_review(
         verdicts, reviewers, min_reviewers_per_verdict=min_reviewers_per_verdict,
+        review_timeout_seconds=review_timeout_seconds,
     )
     blockers: list[str] = []
     review_counts = {verdict_id: 0 for verdict_id in verdict_ids}
