@@ -289,3 +289,30 @@ def test_self_adversarial_pass_does_not_approve_low_confidence():
                                    counterarguments=["x", "y", "z"], contradictions=[], sources=sources)
     assert reject["verdict"] == "REJECT"
     assert "CONFIDENCE_BELOW_REJECTION_FLOOR" in reject["blockers"]
+
+def test_chief_rejects_generic_or_mislabelled_nine_step_reasoning():
+    names = {
+        "a": "ADVERSARIAL_PASS", "b": "CONTRADICTION_CHECK", "c": "SOURCE_AUDIT",
+        "d": "TAIL_RISK_CHECK", "e": "RED_TEAM_SELF_REVIEW",
+        "f": "FULL_CHALLENGE_LEDGER_REVIEW", "g": "GROUPTHINK_CHECK",
+        "h": "SIMILAR_REGIME_CALIBRATION", "i": "ERROR_PROBABILITY_SCENARIO",
+    }
+    reasoning = {
+        "reasoning_id": "chief-r-2", "signal_id": "sig-2",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "verdict": "CONFIRM",
+        "steps": {key: {"passed": True, "check_name": name, "detail": "reviewed with cited evidence",
+                        "evidence_refs": [f"ev-{key}"]} for key, name in names.items()},
+        "reasons_against": ["macro", "news", "correlation", "liquidity", "regime"],
+        "tail_risk_probability": 0.01,
+        "tail_risk_scenarios": [{"scenario": "shock", "probability": 0.01,
+                                 "impact": "repricing", "evidence_refs": ["risk-1"]}],
+        "open_challenges": [], "all_challenges_read": True,
+        "challenge_ledger_snapshot": [], "challenge_ledger_hash": canonical_hash([]),
+        "reviewed_challenge_ids": [],
+    }
+    reasoning["steps"]["c"]["check_name"] = "GENERIC_CHECK"
+    reasoning["reasoning_hash"] = canonical_hash(reasoning)
+    result = chief_skeptic_pass(reasoning)
+    assert result["verdict"] == "HOLD"
+    assert "CHIEF_STEPS_FAILED_OR_EVIDENCE_MISSING:c:CHECK_NAME_MISMATCH" in result["blockers"]
