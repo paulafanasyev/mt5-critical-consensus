@@ -28,6 +28,8 @@ def main() -> int:
         "persistent marker flushed before send": r"GlobalVariablesFlush\s*\(\)",
         "order key bound to account login": r"AccountInfoInteger\(ACCOUNT_LOGIN\)",
         "order key rejects values that could be truncated": r"StringLen\(order_id\)\s*>\s*38",
+        "order key rejects ambiguous characters": r"if\s*\(!allowed\)\s*return\s*\"\";",
+        "order key enforces terminal name limit": r"StringLen\(key\)\s*>\s*63",
         "persistent marker write failure is checked": r"marker_written\s*==\s*0",
         "idempotency expiry limitation documented": r"four weeks of inactivity",
         "server ledger requirement documented": r"PostgreSQL idempotency ledger",
