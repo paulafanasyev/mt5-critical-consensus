@@ -120,6 +120,14 @@ def risk_snapshot_gate(
         blockers.append("DAILY_LOSS_MISSING_OR_INVALID")
     if drawdown is None or not 0 <= drawdown <= 1:
         blockers.append("DRAWDOWN_MISSING_OR_INVALID")
+    spread_points = _finite(snapshot.get("spread_points"))
+    max_spread_points = _finite(snapshot.get("max_spread_points"))
+    if spread_points is None or spread_points < 0:
+        blockers.append("SPREAD_POINTS_MISSING_OR_INVALID")
+    if max_spread_points is None or max_spread_points < 0:
+        blockers.append("MAX_SPREAD_POLICY_MISSING_OR_INVALID")
+    elif spread_points is not None and spread_points > max_spread_points:
+        blockers.append("RISK_SNAPSHOT_SPREAD_LIMIT_EXCEEDED")
     position_counts: dict[str, float | None] = {}
     for key in ("open_positions", "correlated_open_positions"):
         count = _finite(snapshot.get(key))
@@ -176,6 +184,7 @@ def risk_controlled_permission(
         "drawdown_fraction": snapshot["drawdown_fraction"],
         "open_positions": snapshot["open_positions"],
         "correlated_open_positions": snapshot["correlated_open_positions"],
+        "spread_points": snapshot["spread_points"],
     }
     if snapshot.get("within_high_impact_news_window") is not False:
         merged["within_high_impact_news_window"] = None
