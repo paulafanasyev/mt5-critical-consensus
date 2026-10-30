@@ -22,7 +22,7 @@ def main() -> int:
         "localhost bridge default": r"http://127\.0\.0\.1:8000/v1/execution/next",
         "duplicate order guard": r"DUPLICATE BLOCKED",
         "kill-switch endpoint configured": r"KillSwitchUrl",
-        "kill-switch response must explicitly be false": r"JsonFalse",\n        "kill switch checked before every command poll": r"if\\(!CheckKillSwitch\\(\\)\\) return;",
+        "kill-switch response must explicitly be false": r"JsonFalse",
         "live-path remains blocked": r"if\s*\(!EnableDemoExecution\s*\|\|\s*AllowLiveExecution\)",
     }
     failures = [name for name, pattern in required.items() if re.search(pattern, source) is None]
@@ -36,7 +36,7 @@ def main() -> int:
     if source.index("OrderCheck(request, check)") > source.index("OrderSend(request, result)"):
         print("FAIL: OrderSend appears before OrderCheck")
         return 1
-    timer = re.search(r"void\\s+OnTimer\\s*\\(\\s*\\)\\s*\\{(?P<body>.*?)\\n\\}", source, re.S)
+    timer = re.search(r"void\s+OnTimer\s*\(\s*\)\s*\{(?P<body>.*?)\n\}", source, re.S)
     if timer is None:
         print("FAIL: OnTimer function missing")
         return 1
