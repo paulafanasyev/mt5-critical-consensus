@@ -108,3 +108,12 @@ def test_build_source_context_requires_two_registered_independence_groups():
     )
     assert single_group["status"] == "GATHER_MORE"
     assert "INSUFFICIENT_INDEPENDENT_PUBLISHER_GROUPS" in single_group["blockers"]
+
+
+
+def test_source_extraction_rejects_invalid_max_chars():
+    item = make_record()
+    for invalid in (True, False, 1.5, "6000", None, 0, -1, 100001):
+        result = extract_source_text(item, max_chars=invalid)
+        assert result["status"] == "DENY"
+        assert result["blockers"] == ["SOURCE_EXTRACTION_INPUT_INVALID"]
