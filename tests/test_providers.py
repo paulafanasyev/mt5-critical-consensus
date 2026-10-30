@@ -53,7 +53,7 @@ def test_provider_config_requires_key_from_environment_not_inline(monkeypatch):
     monkeypatch.setenv("A_API_KEY", "secret-for-test")
     specs = load_agent_specs_from_env()
     assert len(specs) == 1
-    assert specs[0].agent_id == "a"
+    assert specs[0].agent_id == "a"\n    assert specs[0].role == "analyst"
 
     monkeypatch.setenv("MT5_AGENT_PROVIDERS", json.dumps([{
         "agent_id": "a", "independence_group": "g", "model": "m", "api_key": "inline-secret",
