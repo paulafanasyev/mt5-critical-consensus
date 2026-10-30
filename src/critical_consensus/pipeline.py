@@ -369,6 +369,10 @@ def evaluate_signal_bundle(
     if str(chief_input.get("signal_id", "")) != signal_id:
         emit("CHIEF_REVIEW", {"signal_id": signal_id, "status": "HOLD", "reason": "CHIEF_SIGNAL_ID_MISMATCH"})
         return finish("HOLD", ["CHIEF_SIGNAL_ID_MISMATCH"], certainty=certainty)
+    if chief_input.get("signal_input_hash") != expected_signal_hash:
+        emit("CHIEF_REVIEW", {"signal_id": signal_id, "status": "HOLD",
+                              "reason": "CHIEF_SIGNAL_INPUT_HASH_MISMATCH"})
+        return finish("HOLD", ["CHIEF_SIGNAL_INPUT_HASH_MISMATCH"], certainty=certainty)
     actual_challenge_snapshot = sorted((dict(ch) for ch in challenge_records), key=lambda row: str(row.get("challenge_id", "")))
     if canonical_hash(chief_input.get("challenge_ledger_snapshot", [])) != canonical_hash(actual_challenge_snapshot):
         emit("CHIEF_REVIEW", {"signal_id": signal_id, "status": "HOLD", "reason": "CHIEF_CHALLENGE_LEDGER_SNAPSHOT_MISMATCH"})
@@ -378,8 +382,9 @@ def evaluate_signal_bundle(
     unsigned_chief.pop("reasoning_hash", None)
     expected_hash = canonical_hash(unsigned_chief)
     if supplied_reasoning_hash is None:
-        chief_input["reasoning_hash"] = expected_hash
-    elif supplied_reasoning_hash != expected_hash:
+        emit("CHIEF_REVIEW", {"signal_id": signal_id, "status": "HOLD", "reason": "CHIEF_REASONING_HASH_MISSING"})
+        return finish("HOLD", ["CHIEF_REASONING_HASH_MISSING"], certainty=certainty)
+    if supplied_reasoning_hash != expected_hash:
         emit("CHIEF_REVIEW", {"signal_id": signal_id, "status": "HOLD", "reason": "CHIEF_REASONING_HASH_MISMATCH"})
         return finish("HOLD", ["CHIEF_REASONING_HASH_MISMATCH"], certainty=certainty)
     chief_evidence_blockers: list[str] = []
