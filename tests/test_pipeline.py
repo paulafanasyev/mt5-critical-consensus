@@ -85,7 +85,8 @@ def make_bundle():
         "dissent_rate": 0.125, "dissent_sample_size": 80,
         "false_certainty_rate": 0.02, "false_certainty_sample_size": 80,
         "chief_reasoning": {
-            "reasoning_id": "chief-r-100", "signal_id": "sig-100", "created_at": NOW.isoformat(),
+            "reasoning_id": "chief-r-100", "signal_id": "sig-100",
+            "signal_input_hash": signal_input_hash, "created_at": NOW.isoformat(),
             "verdict": "CONFIRM",
             "steps": {step: {"passed": True, "check_name": {"a":"ADVERSARIAL_PASS","b":"CONTRADICTION_CHECK","c":"SOURCE_AUDIT","d":"TAIL_RISK_CHECK","e":"RED_TEAM_SELF_REVIEW","f":"FULL_CHALLENGE_LEDGER_REVIEW","g":"GROUPTHINK_CHECK","h":"SIMILAR_REGIME_CALIBRATION","i":"ERROR_PROBABILITY_SCENARIO"}[step], "detail": f"checked {step}", "evidence_refs": [f"chief-{step}"]}
                       for step in "abcdefghi"},
@@ -416,4 +417,30 @@ def test_persisted_pipeline_requires_database_backed_source_provenance_before_ce
     assert "PERSISTED_SOURCE_PROVENANCE_NOT_VERIFIED" in result["blockers"]
     assert "certainty" not in result["details"]
     assert result["audit_chain_valid"] is True
+    assert result["trade_allowed"] is False
+
+
+def test_pipeline_rejects_chief_reasoning_bound_to_another_signal_input():
+    bundle = make_bundle()
+    bundle["chief_reasoning"]["signal_input_hash"] = "sha256:" + "f" * 64
+    unsigned = dict(bundle["chief_reasoning"])
+    unsigned.pop("reasoning_hash")
+    bundle["chief_reasoning"]["reasoning_hash"] = canonical_hash(unsigned)
+    bundle["permission_request"]["chief_reasoning_hash"] = bundle["chief_reasoning"]["reasoning_hash"]
+
+    result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
+
+    assert result["status"] == "HOLD"
+    assert "CHIEF_SIGNAL_INPUT_HASH_MISMATCH" in result["blockers"]
+    assert result["trade_allowed"] is False
+
+
+def test_pipeline_rejects_chief_reasoning_without_precomputed_hash():
+    bundle = make_bundle()
+    bundle["chief_reasoning"].pop("reasoning_hash")
+
+    result = evaluate_signal_bundle(bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW)
+
+    assert result["status"] == "HOLD"
+    assert "CHIEF_REASONING_HASH_MISSING" in result["blockers"]
     assert result["trade_allowed"] is False
