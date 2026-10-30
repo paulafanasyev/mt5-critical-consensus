@@ -45,6 +45,7 @@ def make_record(publisher_id="central-bank-a", url="https://cb-a.example/release
         "content_sha256": digest, "content_bytes": len(body), "captured_content": body,
         "response_content_type": "application/json",
         "publication_time_attestation": "operator_attested",
+        "publication_time_field": "",
         "capture_method": "https_fetch", "registry_version": "1",
     }
 
