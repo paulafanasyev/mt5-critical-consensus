@@ -5,6 +5,7 @@ must never be used as reviewer callbacks or as authoritative review evidence.
 """
 from __future__ import annotations
 
+import hashlib
 import uuid
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
@@ -13,6 +14,48 @@ from .gates import anonymized_peer_review, challenge_resolution_loop
 
 ReviewCallable = Callable[[dict[str, Any], list[dict[str, Any]]], Awaitable[Mapping[str, Any]]]
 ChallengeResolver = Callable[[dict[str, Any], int], Mapping[str, Any]]
+
+
+def make_non_author_challenge_resolver(
+    verdicts: Sequence[Mapping[str, Any]],
+    resolver_registry: Sequence[tuple[str, ChallengeResolver]],
+) -> ChallengeResolver:
+    """Route each challenge to a registered resolver other than the challenged verdict's author."""
+    if not isinstance(verdicts, Sequence) or not verdicts:
+        raise ValueError("verdicts are required for non-author challenge routing")
+    author_by_verdict: dict[str, str] = {}
+    for verdict in verdicts:
+        if not isinstance(verdict, Mapping):
+            raise ValueError("verdict registry contains an invalid record")
+        verdict_id = str(verdict.get("verdict_id", "")).strip()
+        agent_id = str(verdict.get("agent_id", "")).strip()
+        if not verdict_id or not agent_id or verdict_id in author_by_verdict:
+            raise ValueError("verdict and agent identities must be complete and unique")
+        author_by_verdict[verdict_id] = agent_id
+    if (not isinstance(resolver_registry, Sequence) or not resolver_registry
+            or any(not isinstance(item, tuple) or len(item) != 2
+                   or not str(item[0]).strip() or not callable(item[1])
+                   for item in resolver_registry)):
+        raise ValueError("resolver registry is invalid")
+    resolver_ids = [str(item[0]).strip() for item in resolver_registry]
+    if len(set(resolver_ids)) != len(resolver_ids):
+        raise ValueError("resolver identities must be unique")
+
+    def route(challenge: dict[str, Any], round_no: int) -> Mapping[str, Any]:
+        target_agent = author_by_verdict.get(str(challenge.get("target_verdict_id", "")).strip())
+        if not target_agent:
+            return {"resolved": False, "evidence_refs": [], "error_code": "CHALLENGE_TARGET_AUTHOR_UNKNOWN"}
+        candidates = [(agent_id, callback) for agent_id, callback in resolver_registry
+                      if str(agent_id).strip() != target_agent]
+        if not candidates:
+            return {"resolved": False, "evidence_refs": [], "error_code": "NO_NON_AUTHOR_CHALLENGE_RESOLVER"}
+        challenge_id = str(challenge.get("challenge_id", "")).strip()
+        selector = hashlib.sha256(f"{challenge_id}:{round_no}".encode("utf-8")).hexdigest()
+        index = int(selector[:8], 16) % len(candidates)
+        _resolver_id, callback = candidates[index]
+        return callback(challenge, round_no)
+
+    return route
 
 
 async def run_peer_review_cycle(
