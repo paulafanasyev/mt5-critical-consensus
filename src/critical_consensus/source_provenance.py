@@ -227,24 +227,27 @@ def validate_source_capture(
     }
     if not supported_content_type:
         blockers.append("SOURCE_CONTENT_TYPE_UNSUPPORTED")
-    configured_pointer = profile.get("published_at_json_pointer")
-    if isinstance(configured_pointer, str) and configured_pointer.strip():
-        pointer = configured_pointer.strip()
-        if (attestation != "publisher_json_pointer" or publication_time_field != pointer
-                or content_type != "application/json"):
-            blockers.append("SOURCE_PUBLISHER_JSON_TIMESTAMP_POLICY_MISMATCH")
+    if "published_at_json_pointer" in profile:
+        configured_pointer = profile.get("published_at_json_pointer")
+        if (not isinstance(configured_pointer, str) or not configured_pointer.startswith("/")
+                or configured_pointer == "/"):
+            blockers.append("SOURCE_PUBLISHER_JSON_TIMESTAMP_POINTER_POLICY_INVALID")
         else:
-            try:
-                decoded_document = json.loads(actual_bytes.decode("utf-8-sig"))
-                raw_published_value = _json_pointer_value(decoded_document, pointer)
-                pointer_stamp = _stamp(raw_published_value)
-                if pointer_stamp is None or published is None or pointer_stamp != published:
-                    blockers.append("SOURCE_PUBLISHER_JSON_TIMESTAMP_MISMATCH")
-            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
-                blockers.append("SOURCE_PUBLISHER_JSON_TIMESTAMP_INVALID")
-    else:
-        if attestation != "operator_attested" or publication_time_field:
-            blockers.append("SOURCE_PUBLICATION_TIME_ATTESTATION_NOT_ALLOWED")
+            pointer = configured_pointer
+            if (attestation != "publisher_json_pointer" or publication_time_field != pointer
+                    or content_type != "application/json"):
+                blockers.append("SOURCE_PUBLISHER_JSON_TIMESTAMP_POLICY_MISMATCH")
+            else:
+                try:
+                    decoded_document = json.loads(actual_bytes.decode("utf-8-sig"))
+                    raw_published_value = _json_pointer_value(decoded_document, pointer)
+                    pointer_stamp = _stamp(raw_published_value)
+                    if pointer_stamp is None or published is None or pointer_stamp != published:
+                        blockers.append("SOURCE_PUBLISHER_JSON_TIMESTAMP_MISMATCH")
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+                    blockers.append("SOURCE_PUBLISHER_JSON_TIMESTAMP_INVALID")
+    elif attestation != "operator_attested" or publication_time_field:
+        blockers.append("SOURCE_PUBLICATION_TIME_ATTESTATION_NOT_ALLOWED")
     registry_version = str(registry.get("version", "")).strip()
     if str(record.get("registry_version", "")).strip() != registry_version or not registry_version:
         blockers.append("SOURCE_REGISTRY_VERSION_MISMATCH")
