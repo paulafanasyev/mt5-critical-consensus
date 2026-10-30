@@ -98,8 +98,12 @@ string SafeGlobalKey(string order_id)
    {
       ushort ch = StringGetCharacter(order_id, i);
       bool allowed = ((ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) ||
-                      (ch >= 97 && ch <= 122) || ch == 95);
-      safe_id += allowed ? StringSubstr(order_id, i, 1) : "_";
+                      (ch >= 97 && ch <= 122) || ch == 95 || ch == 45);
+      // Preserve the ID exactly (including UUID hyphens); reject unsafe characters
+      // rather than normalizing different IDs into a colliding terminal key.
+      if(!allowed)
+         return "";
+      safe_id += StringSubstr(order_id, i, 1);
    }
 
    string account_id = IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
