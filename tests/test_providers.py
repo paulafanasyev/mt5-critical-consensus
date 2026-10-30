@@ -174,3 +174,33 @@ async def test_provider_call_timeout_does_not_wait_for_blocking_thread_shutdown(
     assert any(thread.name == "cc-provider-call" and thread.daemon
                for thread in threading.enumerate())
     time.sleep(0.32)
+
+
+@pytest.mark.parametrize("timeout", [True, False, 0, -1, float("nan"), float("inf"), -float("inf"), 121, "15", None])
+def test_provider_rejects_invalid_timeout_types_and_bounds(timeout):
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        OpenAICompatibleAgent(
+            agent_id="agent", model="test-model", api_key="test-secret",
+            timeout_seconds=timeout,
+        )
+
+
+@pytest.mark.parametrize("ttl", [True, False, 1.5, "300", None, 0, -1, 3601])
+def test_provider_rejects_invalid_ttl_types_and_bounds(ttl):
+    with pytest.raises(ValueError, match="ttl_seconds"):
+        OpenAICompatibleAgent(
+            agent_id="agent", model="test-model", api_key="test-secret",
+            ttl_seconds=ttl,
+        )
+
+
+def test_provider_env_loader_does_not_coerce_invalid_timeout_or_ttl(monkeypatch):
+    monkeypatch.setenv("A_API_KEY", "secret-for-test")
+    for field, value in (("timeout_seconds", "15"), ("ttl_seconds", 1.5)):
+        config = {
+            "agent_id": "agent", "independence_group": "provider-a", "model": "test-model",
+            "api_key_env": "A_API_KEY", field: value,
+        }
+        monkeypatch.setenv("MT5_AGENT_PROVIDERS", json.dumps([config]))
+        with pytest.raises(ValueError, match=field):
+            load_agent_specs_from_env()
