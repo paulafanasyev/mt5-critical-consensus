@@ -11,6 +11,7 @@ import socket
 import ssl
 import threading
 import math
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
@@ -124,8 +125,9 @@ def _fetch(url: str, *, max_bytes: int, timeout: float) -> tuple[bytes, str]:
     if (isinstance(max_bytes, bool) or not isinstance(max_bytes, int)
             or not 1 <= max_bytes <= 512_000):
         raise ValueError("max_bytes must be an integer between 1 and 512000")
-    if not 1 <= timeout <= 30:
-        raise ValueError("timeout must be between 1 and 30 seconds")
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout) or not 1 <= timeout <= 30):
+        raise ValueError("timeout must be finite and between 1 and 30 seconds")
     parsed = urlsplit(url)
     host = (parsed.hostname or "").lower().rstrip(".")
     if parsed.scheme != "https" or not host or parsed.port not in (None, 443):
@@ -135,44 +137,80 @@ def _fetch(url: str, *, max_bytes: int, timeout: float) -> tuple[bytes, str]:
         path += "?" + parsed.query
     addresses = _resolve_public_addresses(host)
     headers = {
-        "User-Agent": "MT5-Critical-Consensus-SourceCapture/1.0",
+        "User-Agent": "MT5-CriticalConsensus-SourceCapture/1.0",
         "Accept": "text/html,application/json,application/xml,text/plain",
         "Connection": "close",
     }
+    deadline = time.monotonic() + float(timeout)
     last_network_error: OSError | None = None
     for address in addresses:
-        connection = _PinnedHTTPSConnection(host, address, timeout=timeout)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        connection = _PinnedHTTPSConnection(host, address, timeout=remaining)
+        response = None
         try:
             connection.request("GET", path, headers=headers)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("publisher_response_deadline_exceeded")
+            sock = getattr(connection, "sock", None)
+            if sock is not None:
+                sock.settimeout(remaining)
             response = connection.getresponse()
             if response.status < 200 or response.status >= 300:
                 status = response.status
-                response.close()
                 raise RuntimeError(f"publisher_http_error:{status}")
             content_type = response.getheader("Content-Type", "").split(";", 1)[0].strip().lower()
             if not (content_type.startswith("text/") or content_type in {
                 "application/json", "application/xml", "application/rss+xml", "application/atom+xml"
             }):
-                response.close()
                 raise ValueError("publisher response is not a supported text or JSON document")
             declared = response.getheader("Content-Length")
+            declared_length = None
             if declared is not None:
                 try:
                     declared_length = int(declared)
                 except ValueError:
-                    response.close()
                     raise ValueError("publisher returned an invalid Content-Length") from None
                 if declared_length < 0 or declared_length > max_bytes:
-                    response.close()
                     raise ValueError("publisher response exceeds the configured size limit")
-            body = response.read(max_bytes + 1)
-            response.close()
+            reader = getattr(response, "read1", None)
+            if callable(reader):
+                body_buffer = bytearray()
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("publisher_response_deadline_exceeded")
+                    sock = getattr(connection, "sock", None)
+                    if sock is not None:
+                        sock.settimeout(remaining)
+                    chunk = reader(min(64_000, max_bytes + 1 - len(body_buffer)))
+                    if not chunk:
+                        break
+                    body_buffer.extend(chunk)
+                    if len(body_buffer) > max_bytes:
+                        raise ValueError("publisher response is empty or exceeds the configured size limit")
+                body = bytes(body_buffer)
+            else:
+                # Compatibility for test doubles; the real http.client response exposes read1.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("publisher_response_deadline_exceeded")
+                sock = getattr(connection, "sock", None)
+                if sock is not None:
+                    sock.settimeout(remaining)
+                body = response.read(max_bytes + 1)
             if not body or len(body) > max_bytes:
                 raise ValueError("publisher response is empty or exceeds the configured size limit")
+            if declared_length is not None and len(body) != declared_length:
+                raise RuntimeError("publisher_response_content_length_mismatch")
             return body, content_type
         except (OSError, http.client.HTTPException) as exc:
             last_network_error = exc
         finally:
+            if response is not None:
+                response.close()
             connection.close()
     if last_network_error is not None:
         raise RuntimeError("publisher_network_or_tls_error") from None
