@@ -8,6 +8,7 @@
   "required": [
     "reasoning_id",
     "signal_id",
+    "signal_input_hash",
     "verdict",
     "reasons_against",
     "steps",
@@ -27,6 +28,10 @@
     },
     "signal_id": {
       "type": "string"
+    },
+    "signal_input_hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
     },
     "verdict": {
       "enum": [
