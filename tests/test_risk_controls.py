@@ -115,3 +115,16 @@ def test_risk_snapshot_rejects_spread_above_capture_policy():
     result = risk_snapshot_gate(snapshot, now=NOW)
     assert result["status"] == "DENY"
     assert "RISK_SNAPSHOT_SPREAD_LIMIT_EXCEEDED" in result["blockers"]
+
+
+def test_risk_snapshot_rejects_invalid_freshness_policy():
+    snapshot = good_snapshot()
+    for invalid in (True, False, 1.5, "15", None, float("nan"), float("inf"), 0, -1, 301):
+        result = risk_snapshot_gate(snapshot, now=NOW, max_age_seconds=invalid)
+        assert result["status"] == "DENY"
+        assert result["blockers"] == ["RISK_SNAPSHOT_MAX_AGE_POLICY_INVALID"]
+
+
+def test_risk_snapshot_accepts_bounded_positive_integer_freshness_policy():
+    result = risk_snapshot_gate(good_snapshot(), now=NOW, max_age_seconds=15)
+    assert result["status"] == "PASS"
