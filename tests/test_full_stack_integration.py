@@ -13,6 +13,7 @@ from critical_consensus.calibration_eval import evaluate_csv
 from critical_consensus.market_data import MarketBar, build_market_snapshot
 from critical_consensus.persistence import PostgresRepository
 from critical_consensus.risk_controls import risk_controlled_permission
+from critical_consensus.audit import canonical_hash
 
 
 pytestmark = pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="TEST_DATABASE_URL not configured")
@@ -43,7 +44,7 @@ async def test_market_history_agents_forecast_calibration_audit_and_kill_switch(
             assert signal["market_snapshot"]["symbol"] == symbol
             return {
                 "agent_id": agent_id, "signal_id": signal_id, "verdict_id": "v-" + agent_id,
-                "input_hash": "sha256:" + "a" * 64, "confidence": 0.5, "verdict": "ABSTAIN",
+                "input_hash": canonical_hash(signal), "confidence": 0.5, "verdict": "ABSTAIN",
                 "ttl_seconds": 300, "created_at": now.isoformat(),
                 "evidence_refs": ["market-bars:" + signal_id],
             }
