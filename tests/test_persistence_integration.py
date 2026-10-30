@@ -57,3 +57,34 @@ def test_postgres_forecast_cannot_be_rewritten_after_issue_or_resolution():
     exported = repo.export_resolved_forecasts(model_id=model_id)
     assert len(exported) == 1
     assert exported[0]["signal_id"] == signal_id
+
+def test_persisted_kill_switch_defaults_active_and_appends_audit_events():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    initial = repo.get_kill_switch_state()
+    assert initial["status"] == "PERSISTED"
+    assert initial["kill_switch_active"] is True
+    disabled = repo.set_kill_switch(active=False, actor_id="pytest-operator",
+                                    reason="test-only controlled disable")
+    assert disabled["kill_switch_active"] is False
+    assert repo.get_kill_switch_state()["kill_switch_active"] is False
+    enabled = repo.set_kill_switch(active=True, actor_id="pytest-operator",
+                                   reason="test complete; stop re-enabled")
+    assert enabled["kill_switch_active"] is True
+    assert repo.get_kill_switch_state()["kill_switch_active"] is True
+
+
+def test_mt5_risk_snapshot_is_persisted_immutably():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    snapshot = {
+        "observed_at": datetime.now(timezone.utc).isoformat(), "status": "DENY",
+        "account_mode": "unknown", "symbol": "EURUSD", "trade_allowed": False,
+        "blockers": ["TEST_MISSING_TERMINAL"],
+    }
+    stored = repo.record_mt5_risk_snapshot(snapshot)
+    assert stored["snapshot_sha256"].startswith("sha256:")
+    loaded = repo.get_latest_mt5_risk_snapshot("EURUSD")
+    assert loaded is not None
+    assert loaded["status"] == "DENY"
+    assert loaded["blockers"] == ["TEST_MISSING_TERMINAL"]
