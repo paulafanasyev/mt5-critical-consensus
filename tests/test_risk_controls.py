@@ -1,0 +1,68 @@
+from datetime import datetime, timedelta, timezone
+
+from critical_consensus.risk_controls import (
+    global_kill_switch_gate, risk_controlled_permission, risk_snapshot_gate,
+)
+
+
+NOW = datetime(2026, 10, 30, 1, 0, tzinfo=timezone.utc)
+
+
+def good_state(active=False):
+    return {"kill_switch_active": active, "updated_by": "operator", "reason": "test state",
+            "updated_at": (NOW - timedelta(seconds=1)).isoformat(), "status": "PERSISTED"}
+
+
+def good_snapshot():
+    return {"status": "PASS", "observed_at": NOW.isoformat(), "account_mode": "demo",
+            "symbol": "EURUSD", "symbol_group": "fx-major", "account_equity": 10000.0,
+            "day_start_equity": 10000.0, "equity_high_watermark": 10200.0,
+            "risk_fraction": 0.002, "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0196,
+            "open_positions": 1, "correlated_open_positions": 1,
+            "within_high_impact_news_window": None}
+
+
+def test_missing_or_active_kill_switch_blocks():
+    assert "KILL_SWITCH_STATE_UNKNOWN" in global_kill_switch_gate(None)["blockers"]
+    result = global_kill_switch_gate(good_state(active=True))
+    assert result["status"] == "DENY"
+    assert "KILL_SWITCH_ACTIVE_OR_INVALID" in result["blockers"]
+
+
+def test_only_explicit_persisted_disabled_switch_passes_control_gate():
+    assert global_kill_switch_gate(good_state(active=False))["status"] == "PASS"
+
+
+def test_missing_stale_future_or_real_account_snapshot_blocks():
+    assert "RISK_SNAPSHOT_MISSING" in risk_snapshot_gate(None, now=NOW)["blockers"]
+    stale = good_snapshot()
+    stale["observed_at"] = (NOW - timedelta(seconds=60)).isoformat()
+    assert "RISK_SNAPSHOT_STALE" in risk_snapshot_gate(stale, now=NOW)["blockers"]
+    future = good_snapshot()
+    future["observed_at"] = (NOW + timedelta(minutes=2)).isoformat()
+    assert "RISK_SNAPSHOT_FROM_FUTURE" in risk_snapshot_gate(future, now=NOW)["blockers"]
+    real = good_snapshot()
+    real["account_mode"] = "real"
+    assert "MT5_ACCOUNT_NOT_DEMO_OR_UNKNOWN" in risk_snapshot_gate(real, now=NOW)["blockers"]
+
+
+def test_risk_controlled_permission_blocks_when_global_switch_active_even_if_request_looks_valid():
+    result = risk_controlled_permission(
+        {"instrument": "EURUSD", "mode": "demo"}, {"permission_matrix": {}},
+        kill_switch_state=good_state(active=True), snapshot=good_snapshot(), now=NOW,
+    )
+    assert result["status"] == "DENY"
+    assert result["trade_allowed"] is False
+    assert "KILL_SWITCH_ACTIVE_OR_INVALID" in result["blockers"]
+
+
+def test_risk_controlled_permission_fails_closed_when_account_baseline_unknown():
+    bad = good_snapshot()
+    bad["equity_high_watermark"] = None
+    result = risk_controlled_permission(
+        {"instrument": "EURUSD", "mode": "demo"}, {"permission_matrix": {}},
+        kill_switch_state=good_state(active=False), snapshot=bad, now=NOW,
+    )
+    assert result["status"] == "DENY"
+    assert result["trade_allowed"] is False
+    assert "RISK_SNAPSHOT_EQUITY_HIGH_WATERMARK_MISSING_OR_INVALID" in result["blockers"]
