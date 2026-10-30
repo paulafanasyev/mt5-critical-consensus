@@ -112,12 +112,17 @@ class OpenAICompatibleAgent:
         self.model = str(model).strip()
         self.api_key = str(api_key)
         self.base_url = str(base_url).rstrip("/")
-        if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
-                or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 120):
+        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+            raise ValueError("timeout_seconds must be finite and in (0,120]")
+        try:
+            timeout_value = float(timeout_seconds)
+        except (OverflowError, TypeError, ValueError):
+            timeout_value = math.inf
+        if not math.isfinite(timeout_value) or not 0 < timeout_value <= 120:
             raise ValueError("timeout_seconds must be finite and in (0,120]")
         if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int) or not 1 <= ttl_seconds <= 3600:
             raise ValueError("ttl_seconds must be an integer in [1,3600]")
-        self.timeout_seconds = float(timeout_seconds)
+        self.timeout_seconds = timeout_value
         self.ttl_seconds = ttl_seconds
         self.role = str(role).strip().lower()
         try:
