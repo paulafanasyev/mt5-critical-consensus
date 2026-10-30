@@ -127,6 +127,7 @@ def capture_manifest(manifest_path: Path, registry_path: Path, *, timeout: float
             "content_sha256": digest,
             "content_bytes": len(body),
             "captured_content": body,
+            "response_content_type": content_type,
             "publication_time_attestation": attestation,
             "capture_method": "https_fetch",
             "registry_version": str(registry.get("version", "")),
@@ -137,7 +138,6 @@ def capture_manifest(manifest_path: Path, registry_path: Path, *, timeout: float
                 f"source entry {index} failed provenance policy: " +
                 ",".join(validation.get("blockers", []))
             )
-        record["response_content_type"] = content_type
         output.append(record)
     return output
 
