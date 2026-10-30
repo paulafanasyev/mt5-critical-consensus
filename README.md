@@ -20,7 +20,7 @@
 - `src/critical_consensus/redis_streams.py` — idempotent event publishing, consumer groups, retry/DLQ and pending-message recovery; `scripts/run_worker.py` durably writes events to PostgreSQL before ACK. This worker archives events; it does not dispatch orders.
 - `schemas/` — JSON Schema Draft 2020-12 для 11 контрактов.
 - `config/` — deny-by-default policy thresholds и permissions.
-- `mql5/CriticalConsensusEA.mq5` — демонстрационный EA: demo account only, disabled by default, TTL/SL/TP/slippage/idempotency checks.
+- `mql5/CriticalConsensusEA.mq5` — демонстрационный EA: demo account only, disabled by default, TTL/SL/TP/slippage guards, account-scoped atomic attempt lock, pre-send persistent marker and legacy marker compatibility. The terminal marker is local to one MT5 terminal and expires after four weeks of inactivity; cross-terminal idempotency still requires the not-yet-implemented server-side PostgreSQL execution ledger.
 - `src/critical_consensus/persistence.py` — PostgreSQL repository for immutable market bars, pre-outcome forecasts, one-time labels, allowlisted publisher captures, kill-switch/risk evidence, Redis inbox events and full pipeline decision/audit persistence. `db/postgres_schema.sql` + `db/migrations/` — base and append-only evidence schemas; `neo4j/schema.cypher` — graph schema.
 - `tests/` — adversarial unit tests.
 - `.github/workflows/security-audit.yml` and `.github/workflows/validation-suite.yml` — dependency/source security scans, unit contracts and PostgreSQL/Redis integration checks.
