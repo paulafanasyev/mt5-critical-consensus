@@ -159,8 +159,10 @@ async def anonymized_peer_review(
 ) -> list[dict[str, Any]]:
     """Obtain anonymized peer reviews and reject malformed or evidence-free reviews."""
     output: list[dict[str, Any]] = []
-    if isinstance(min_reviewers_per_verdict, bool) or min_reviewers_per_verdict < 1:
-        raise ValueError("min_reviewers_per_verdict must be >= 1")
+    if (isinstance(min_reviewers_per_verdict, bool)
+            or not isinstance(min_reviewers_per_verdict, int)
+            or min_reviewers_per_verdict < 1):
+        raise ValueError("min_reviewers_per_verdict must be a positive integer")
     if (isinstance(review_timeout_seconds, bool) or not isinstance(review_timeout_seconds, (int, float))
             or not math.isfinite(review_timeout_seconds) or review_timeout_seconds <= 0
             or review_timeout_seconds > 120):
