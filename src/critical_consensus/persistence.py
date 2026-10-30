@@ -104,6 +104,26 @@ class PostgresRepository:
                 duplicates += 1
         return {"inserted": inserted, "identical_duplicates": duplicates, "total": len(records)}
 
+    def get_recent_market_bars(self, symbol: str, timeframe: str, limit: int = 200) -> list[MarketBar]:
+        """Return the newest immutable bars in chronological order."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 21 <= limit <= 5000:
+            raise ValueError("limit must be an integer between 21 and 5000")
+        symbol, timeframe = str(symbol).strip().upper(), str(timeframe).strip().upper()
+        if not symbol or not timeframe:
+            raise ValueError("symbol and timeframe are required")
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT symbol, timeframe, bar_time, open, high, low, close, tick_volume, spread_points, source
+                   FROM market_bars WHERE symbol=%s AND timeframe=%s ORDER BY bar_time DESC LIMIT %s""",
+                (symbol, timeframe, limit),
+            ).fetchall()
+        return [
+            MarketBar(row[0], row[1], row[2], float(row[3]), float(row[4]), float(row[5]), float(row[6]),
+                      int(row[7]) if row[7] is not None else None,
+                      int(row[8]) if row[8] is not None else None, str(row[9]))
+            for row in reversed(rows)
+        ]
+
     def record_forecast(
         self, *, model_id: str, signal_id: str, issued_at: datetime | str,
         probability: float, input_sha256: str,
