@@ -47,6 +47,8 @@ async def test_market_history_agents_forecast_calibration_audit_and_kill_switch(
                 "ttl_seconds": 300, "created_at": now.isoformat(),
                 "evidence_refs": ["market-bars:" + signal_id],
             }
+        run.provider_origin = f"test-{agent_id}.example"
+        run.provider_identity = f"test-{agent_id}.example::fixture-model-{agent_id}"
         return AgentSpec(agent_id, group, run)
 
     collected = await collect_agent_verdicts(
