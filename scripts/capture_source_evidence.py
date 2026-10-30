@@ -6,7 +6,6 @@ import argparse
 import hashlib
 import ipaddress
 import json
-import re
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
