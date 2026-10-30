@@ -12,7 +12,7 @@ import math
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
-from .risk_controls import risk_request_binding_hash
+from .risk_controls import MAX_RISK_SNAPSHOT_QUOTE_AGE_SECONDS, risk_request_binding_hash
 
 
 def _number(value: Any) -> float | None:
@@ -76,7 +76,8 @@ def collect_mt5_risk_snapshot(
     stop_loss = float(sl_tp["sl"])
     take_profit = float(sl_tp["tp"])
 
-    if isinstance(max_quote_age_seconds, bool) or not isinstance(max_quote_age_seconds, int) or max_quote_age_seconds < 1:
+    if (isinstance(max_quote_age_seconds, bool) or not isinstance(max_quote_age_seconds, int)
+            or not 1 <= max_quote_age_seconds <= MAX_RISK_SNAPSHOT_QUOTE_AGE_SECONDS):
         return {"status": "DENY", "blockers": ["MAX_QUOTE_AGE_POLICY_INVALID"], "trade_allowed": False}
 
     try:
