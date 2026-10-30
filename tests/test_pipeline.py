@@ -26,7 +26,7 @@ CERTAINTY_POLICY = {
 PERMISSION_MATRIX = {
     "permission_matrix": {
         "instruments": ["EURUSD"], "max_size_per_trade": 0.2, "max_positions": 5,
-        "max_correlated_positions": 2, "max_risk_per_trade_fraction": 0.005,
+        "max_correlated_positions": 2, "max_spread_points": 20, "max_risk_per_trade_fraction": 0.005,
         "daily_loss_limit_fraction": 0.02, "max_drawdown_fraction": 0.10,
         "allowed_directions": ["BUY", "SELL"], "allowed_time_utc": {"start": "07:00", "end": "19:00"},
         "rollover_block_utc": {"start": "20:55", "end": "21:10"}, "blocked_around_news": True,
@@ -106,7 +106,7 @@ def make_bundle():
             "sources": [{"id": "s1", "credibility": 0.95, "age_seconds": 20}, {"id": "s2", "credibility": 0.94, "age_seconds": 40}],
             "expires_at": (NOW + timedelta(minutes=5)).isoformat(), "within_high_impact_news_window": False,
             "risk_snapshot": {"risk_fraction": 0.003, "daily_loss_fraction": 0.004, "drawdown_fraction": 0.02,
-                              "open_positions": 1, "correlated_open_positions": 0},
+                              "open_positions": 1, "correlated_open_positions": 0, "spread_points": 10.0},
         },
     }
     bundle["chief_reasoning"]["reasoning_hash"] = canonical_hash(bundle["chief_reasoning"])
