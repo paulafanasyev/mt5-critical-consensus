@@ -1,6 +1,10 @@
 # A publisher only becomes trusted after an operator explicitly reviews and adds
 # its official HTTPS hostname, independence group, conservative credibility weight
 # and maximum source age. This score is a policy input, not a calibrated probability.
+# Optional per-publisher `published_at_json_pointer` may identify a timezone-aware
+# ISO-8601 string in an official JSON API response. When set, the capture script
+# derives the timestamp from the exact response bytes; it never falls back to a
+# manifest-supplied date. Otherwise the operator must attest the publication time.
 version: "1"
 max_clock_skew_seconds: 60
 max_capture_age_seconds: 300
