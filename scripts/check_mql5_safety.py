@@ -47,7 +47,21 @@ def main() -> int:
     if body.index("if(!CheckKillSwitch()) return;") > body.index("if(!FetchCommand(body)) return;"):
         print("FAIL: command polling appears before the kill-switch check")
         return 1
-    print(f"PASS: {len(required) + 4} static EA safety invariants verified.")
+
+    execute_start = source.find("bool ExecuteDemoCommand")
+    execute_end = source.find("\\nvoid OnInit", execute_start)
+    if execute_start < 0 or execute_end < 0:
+        print("FAIL: ExecuteDemoCommand function boundaries are missing")
+        return 1
+    execute_body = source[execute_start:execute_end]
+    preflight = execute_body.find("if(!OrderCheck(request, check))")
+    recheck = execute_body.find("if(!CheckKillSwitch())")
+    attempt = execute_body.find("GlobalVariableSet(global_key")
+    send = execute_body.find("OrderSend(request, result)")
+    if min(preflight, recheck, attempt, send) < 0 or not (preflight < recheck < attempt < send):
+        print("FAIL: fresh kill-switch recheck must follow OrderCheck and precede the order attempt")
+        return 1
+    print(f"PASS: {len(required) + 5} static EA safety invariants verified.")
     print("LIMIT: MQL5 compilation and terminal/demo-account execution are NOT PROVEN by static checks.")
     return 0
 
