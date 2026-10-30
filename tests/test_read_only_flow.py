@@ -28,6 +28,8 @@ async def test_market_snapshot_to_agent_collection_never_authorizes_trade():
                 "created_at": datetime(2026, 10, 2, 0, 0, tzinfo=timezone.utc).isoformat(),
                 "evidence_refs": ["market-snapshot:snapshot-test-001"],
             }
+        run.provider_origin = f"test-{agent_id}.example"
+        run.provider_identity = f"test-{agent_id}.example::fixture-model-{agent_id}"
         return AgentSpec(agent_id, group, run)
 
     result = await collect_agent_verdicts(
