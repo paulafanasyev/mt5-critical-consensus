@@ -65,9 +65,13 @@ def test_source_capture_requires_allowlisted_https_publisher_and_exact_domain():
     for bad_url in (
         "http://cb-a.example/releases/1",
         "https://cb-a.example.attacker.invalid/releases/1",
+        "https://sub.cb-a.example/releases/1",
         "https://user:pass@cb-a.example/releases/1",
         "https://127.0.0.1/private",
         "https://cb-a.example:8443/releases/1",
+        "https://cb-a.example/",
+        "https://cb-a.example/releases/1?token=secret",
+        "https://cb-a.example/releases/1?unreviewed=value",
     ):
         item = record(url=bad_url)
         assert validate_source_capture(item, registry(), now=NOW)["status"] == "DENY"
