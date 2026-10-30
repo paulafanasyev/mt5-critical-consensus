@@ -369,6 +369,19 @@ def test_persisted_pipeline_permission_requires_exact_order_bound_fresh_risk_sna
     assert result["trade_allowed"] is False
 
 
+def test_persisted_pipeline_permission_rejects_stale_terminal_quote():
+    bundle = make_bundle()
+    state, snapshot = _persisted_demo_risk_evidence(bundle)
+    snapshot["quote_age_seconds"] = 45.0
+    result = evaluate_signal_bundle(
+        bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
+        require_persisted_risk=True, kill_switch_state=state, terminal_risk_snapshot=snapshot,
+    )
+    assert result["status"] == "DENY"
+    assert "MT5_QUOTE_STALE" in result["blockers"]
+    assert result["trade_allowed"] is False
+
+
 def test_persisted_pipeline_permission_rejects_snapshot_bound_to_another_order():
     bundle = make_bundle()
     state, snapshot = _persisted_demo_risk_evidence(
