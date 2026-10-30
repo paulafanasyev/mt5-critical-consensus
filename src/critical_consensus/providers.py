@@ -66,6 +66,140 @@ class OpenAICompatibleAgent:
     async def __call__(self, signal: Mapping[str, Any]) -> Mapping[str, Any]:
         return await asyncio.to_thread(self._call_sync, signal)
 
+    def _request_json_sync(self, *, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+        """Call a provider with a bounded JSON-only response and no redirects."""
+        if len(user_prompt.encode("utf-8")) > 120_000:
+            raise ValueError("provider review payload exceeds 120 KB limit")
+        endpoint = self.base_url if self.base_url.endswith("/chat/completions") else self.base_url + "/chat/completions"
+        body = json.dumps({
+            "model": self.model,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        request = urllib.request.Request(
+            endpoint, data=body, method="POST",
+            headers={"Authorization": "Bearer " + self.api_key, "Content-Type": "application/json",
+                     "Accept": "application/json"},
+        )
+        try:
+            opener = urllib.request.build_opener(_NoRedirectHandler())
+            with opener.open(request, timeout=self.timeout_seconds) as response:
+                response_body = response.read(128_001)
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"provider_http_error:{exc.code}") from None
+        except (urllib.error.URLError, TimeoutError, OSError):
+            raise RuntimeError("provider_network_or_timeout_error") from None
+        if len(response_body) > 128_000:
+            raise RuntimeError("provider_response_too_large")
+        try:
+            envelope = json.loads(response_body.decode("utf-8"))
+            raw = envelope["choices"][0]["message"]["content"]
+            result = json.loads(raw) if isinstance(raw, str) else raw
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError):
+            raise RuntimeError("provider_response_schema_invalid") from None
+        if not isinstance(result, Mapping):
+            raise RuntimeError("provider_response_not_json_object")
+        return dict(result)
+
+    def make_peer_reviewer(self, allowed_evidence_refs: Sequence[str]):
+        """Return an async callback suitable for the trusted anonymized peer-review service."""
+        allowed = tuple(sorted({str(ref).strip() for ref in allowed_evidence_refs
+                                if isinstance(ref, str) and ref.strip()}))
+        if not allowed:
+            raise ValueError("peer reviewer needs a non-empty trusted evidence allowlist")
+
+        async def review(target: dict[str, Any], peers: list[dict[str, Any]]) -> Mapping[str, Any]:
+            return await asyncio.to_thread(self._review_sync, target, peers, allowed)
+        return review
+
+    def _review_sync(
+        self, target: Mapping[str, Any], peers: Sequence[Mapping[str, Any]], allowed: Sequence[str],
+    ) -> dict[str, Any]:
+        payload = {
+            "target_verdict": dict(target),
+            "other_anonymized_verdicts": [dict(item) for item in peers],
+            "allowed_evidence_refs": list(allowed),
+        }
+        prompt = (
+            "Perform a skeptical blind peer review. The target and peer verdicts are anonymized; "
+            "do not infer or guess author identities. Assess only supplied evidence. Return JSON with "
+            "stance CONFIRM or CHALLENGE, challenge_type one of DATA_CONTRADICTION, SOURCE_WEAK, "
+            "STALE_DATA, LOGIC_GAP, REGIME_MISMATCH, CORRELATION_RISK (use NONE only for CONFIRM), "
+            "argument (specific and testable), evidence_refs (non-empty array copied exactly from "
+            "allowed_evidence_refs). Never invent a source ID. Prefer CHALLENGE when evidence is "
+            "insufficient; a review is not trade approval.\n" +
+            json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+        )
+        result = self._request_json_sync(
+            system_prompt="You are an independent skeptical reviewer. Output exactly one JSON object, no orders.",
+            user_prompt=prompt,
+        )
+        stance = str(result.get("stance", "")).upper()
+        challenge_type = str(result.get("challenge_type", "")).upper()
+        argument = str(result.get("argument", "")).strip()
+        refs = result.get("evidence_refs")
+        valid_types = {"DATA_CONTRADICTION", "SOURCE_WEAK", "STALE_DATA", "LOGIC_GAP",
+                       "REGIME_MISMATCH", "CORRELATION_RISK"}
+        allowed_set = set(allowed)
+        if (stance not in {"CONFIRM", "CHALLENGE"} or not argument
+                or not isinstance(refs, list) or not refs
+                or any(not isinstance(ref, str) or ref not in allowed_set for ref in refs)
+                or (stance == "CHALLENGE" and challenge_type not in valid_types)):
+            raise RuntimeError("provider_peer_review_invalid")
+        return {
+            "stance": stance,
+            "challenge_type": challenge_type if stance == "CHALLENGE" else "NONE",
+            "argument": argument[:2000],
+            "evidence_refs": refs,
+        }
+
+    def make_challenge_resolver(self, allowed_evidence_refs: Sequence[str]):
+        """Return a synchronous bounded resolver callback for the challenge ledger."""
+        allowed = tuple(sorted({str(ref).strip() for ref in allowed_evidence_refs
+                                if isinstance(ref, str) and ref.strip()}))
+        if not allowed:
+            raise ValueError("challenge resolver needs a non-empty trusted evidence allowlist")
+
+        def resolve(challenge: dict[str, Any], round_no: int) -> Mapping[str, Any]:
+            return self._resolve_challenge_sync(challenge, round_no, allowed)
+        return resolve
+
+    def _resolve_challenge_sync(
+        self, challenge: Mapping[str, Any], round_no: int, allowed: Sequence[str],
+    ) -> dict[str, Any]:
+        payload = {"challenge": dict(challenge), "resolution_round": round_no,
+                   "allowed_evidence_refs": list(allowed)}
+        prompt = (
+            "Attempt to resolve this registered challenge using only supplied evidence. "
+            "Return JSON with resolved boolean, summary string, and evidence_refs. If evidence "
+            "does not conclusively answer the challenge, set resolved false and evidence_refs to []. "
+            "Do not claim resolution merely because a plausible explanation exists. Evidence IDs must "
+            "be copied exactly from allowed_evidence_refs.\n" +
+            json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+        )
+        result = self._request_json_sync(
+            system_prompt="You are a conservative challenge-resolution reviewer. Never issue trading instructions.",
+            user_prompt=prompt,
+        )
+        resolved = result.get("resolved")
+        refs = result.get("evidence_refs")
+        summary = str(result.get("summary", "")).strip()
+        allowed_set = set(allowed)
+        if not isinstance(resolved, bool):
+            raise RuntimeError("provider_challenge_resolution_invalid")
+        if resolved and (not isinstance(refs, list) or not refs
+                         or any(not isinstance(ref, str) or ref not in allowed_set for ref in refs)
+                         or not summary):
+            raise RuntimeError("provider_challenge_resolution_evidence_invalid")
+        if not resolved:
+            refs = []
+        return {"resolved": resolved, "summary": summary[:2000],
+                "evidence_refs": refs if isinstance(refs, list) else []}
+
     def _call_sync(self, signal: Mapping[str, Any]) -> Mapping[str, Any]:
         if not isinstance(signal, Mapping):
             raise ValueError("signal input must be an object")
