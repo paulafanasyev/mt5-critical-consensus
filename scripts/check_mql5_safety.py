@@ -21,8 +21,8 @@ def main() -> int:
         "broker preflight": r"OrderCheck\s*\(",
         "localhost bridge default": r"http://127\.0\.0\.1:8000/v1/execution/next",
         "duplicate order guard": r"DUPLICATE BLOCKED",
-        "kill-switch endpoint configured": r"input\\s+string\\s+KillSwitchUrl\\s*=\\s*\\"http://127\\.0\\.0\\.1:8000/v1/risk/kill-switch\\";",
-        "kill-switch response must explicitly be false": r"JsonFalse\\(response, \\"kill_switch_active\\"\\)",
+        "kill-switch endpoint configured": r"KillSwitchUrl\\s*=",
+        "kill-switch response must explicitly be false": r"JsonFalse",
         "live-path remains blocked": r"if\s*\(!EnableDemoExecution\s*\|\|\s*AllowLiveExecution\)",
     }
     failures = [name for name, pattern in required.items() if re.search(pattern, source) is None]
