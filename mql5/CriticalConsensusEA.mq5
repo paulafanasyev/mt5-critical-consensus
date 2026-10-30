@@ -15,6 +15,9 @@ input double MaxVolume = 0.20;
 
 // This deliberately small parser supports only flat, trusted scalar JSON emitted by a schema-validated
 // localhost bridge. It is NOT a general JSON parser. Production must replace it with a vetted MQL5 JSON library.
+// Per-account client_order_id markers serialize attempts across EAs in this terminal. They are local
+// terminal state only and expire after four weeks of inactivity; they are NOT a durable cross-terminal
+// idempotency guarantee. A production deployment must enforce the same idempotency key in PostgreSQL.
 string JsonString(const string json, const string key)
 {
    string needle = "\"" + key + "\"";
@@ -83,13 +86,78 @@ bool JsonTrue(const string json, const string key)
    return JsonBooleanValue(json, key, "true");
 }
 
-string SafeGlobalKey(string command_id)
+string SafeGlobalKey(string order_id)
 {
-   StringReplace(command_id, "-", "_");
-   StringReplace(command_id, ":", "_");
-   StringReplace(command_id, ".", "_");
-   if(StringLen(command_id) > 48) command_id = StringSubstr(command_id,0,48);
-   return "CC_TRIED_" + command_id;
+   // Terminal global variable names are limited to 63 characters. The account
+   // login is part of the key so two MT5 accounts in one terminal cannot collide.
+   if(StringLen(order_id) <= 0 || StringLen(order_id) > 38)
+      return "";
+
+   string safe_id = "";
+   for(int i=0; i<StringLen(order_id); i++)
+   {
+      ushort ch = StringGetCharacter(order_id, i);
+      bool allowed = ((ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) ||
+                      (ch >= 97 && ch <= 122) || ch == 95);
+      safe_id += allowed ? StringSubstr(order_id, i, 1) : "_";
+   }
+
+   string account_id = IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
+   string key = "CCO_" + account_id + "_" + safe_id;
+   if(StringLen(key) > 63)
+      return "";
+   return key;
+}
+
+string ExecutionLockKey()
+{
+   return "CCLOCK_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
+}
+
+bool AcquireExecutionLock(const string lock_key, double &lease_value)
+{
+   if(!GlobalVariableCheck(lock_key))
+   {
+      ResetLastError();
+      if(!GlobalVariableTemp(lock_key) && !GlobalVariableCheck(lock_key))
+      {
+         Print("BLOCKED: cannot create account execution lock; error=", GetLastError());
+         return false;
+      }
+   }
+
+   ResetLastError();
+   double observed = GlobalVariableGet(lock_key);
+   if(GetLastError() != 0)
+   {
+      Print("BLOCKED: cannot read account execution lock; error=", GetLastError());
+      return false;
+   }
+
+   double now_value = (double)TimeGMT();
+   if(observed > now_value)
+   {
+      Print("BLOCKED: another EA instance holds the account execution lock.");
+      return false;
+   }
+
+   // A 120-second lease is far above the configured HTTP timeout. The critical
+   // section contains only local global-variable operations, never OrderSend.
+   lease_value = now_value + 120.0;
+   ResetLastError();
+   if(!GlobalVariableSetOnCondition(lock_key, lease_value, observed))
+   {
+      Print("BLOCKED: account execution lock was acquired by another EA instance; error=", GetLastError());
+      return false;
+   }
+   return true;
+}
+
+void ReleaseExecutionLock(const string lock_key, const double lease_value)
+{
+   ResetLastError();
+   if(!GlobalVariableSetOnCondition(lock_key, 0.0, lease_value))
+      Print("WARNING: account execution lock lease could not be released; error=", GetLastError());
 }
 
 bool JsonFalse(const string json, const string key)
@@ -184,8 +252,8 @@ bool ExecuteDemoCommand(const string body)
    { Print("BLOCKED: invalid volume/SL/TP/expected price."); return false; }
 
    string global_key = SafeGlobalKey(order_id);
-   if(GlobalVariableCheck(global_key))
-   { Print("DUPLICATE BLOCKED: client_order_id already attempted: ", order_id); return false; }
+   if(global_key=="")
+   { Print("BLOCKED: client_order_id is invalid or cannot be represented without key collision."); return false; }
 
    if(!SymbolSelect(symbol, true)) { Print("BLOCKED: SymbolSelect failed for ",symbol); return false; }
    MqlTick tick;
@@ -235,9 +303,35 @@ bool ExecuteDemoCommand(const string body)
    if(!CheckKillSwitch())
    { Print("BLOCKED: kill switch changed before order submission."); return false; }
 
-   // At-most-once: record attempt before network operation. A timeout/uncertain result needs reconciliation,
-   // never blind retry. A production bridge must persist the same idempotency key in PostgreSQL too.
-   GlobalVariableSet(global_key, (double)TimeGMT());
+   // Serialize order-attempt creation across all charts/EAs in this terminal account.
+   // Set the durable attempt marker under the account lock, flush it, then release the lock
+   // before OrderSend. A crash after this marker but before sending requires reconciliation,
+   // never blind retry. Terminal global variables expire after four weeks of inactivity;
+   // production therefore also requires a durable server-side PostgreSQL idempotency ledger.
+   string lock_key = ExecutionLockKey();
+   double lock_lease = 0.0;
+   if(!AcquireExecutionLock(lock_key, lock_lease))
+      return false;
+
+   if(GlobalVariableCheck(global_key))
+   {
+      ReleaseExecutionLock(lock_key, lock_lease);
+      Print("DUPLICATE BLOCKED: client_order_id already attempted for this account: ", order_id);
+      return false;
+   }
+
+   ResetLastError();
+   datetime marker_written = GlobalVariableSet(global_key, (double)TimeGMT());
+   if(marker_written == 0)
+   {
+      int marker_error = GetLastError();
+      ReleaseExecutionLock(lock_key, lock_lease);
+      Print("BLOCKED: durable order-attempt marker could not be created; error=", marker_error);
+      return false;
+   }
+   GlobalVariablesFlush();
+   ReleaseExecutionLock(lock_key, lock_lease);
+
    ResetLastError();
    bool sent = OrderSend(request, result);
    if(!sent || (result.retcode != TRADE_RETCODE_DONE && result.retcode != TRADE_RETCODE_DONE_PARTIAL && result.retcode != TRADE_RETCODE_PLACED))
