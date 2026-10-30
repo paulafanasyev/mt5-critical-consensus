@@ -20,7 +20,7 @@ async def test_market_snapshot_to_agent_collection_never_authorizes_trade():
 
     def make(agent_id, group):
         async def run(input_snapshot):
-            assert input_snapshot["symbol"] == "EURUSD"
+            assert input_snapshot["market_snapshot"]["symbol"] == "EURUSD"
             return {
                 "agent_id": agent_id, "signal_id": signal_id, "verdict_id": f"v-{agent_id}",
                 "input_hash": "sha256:" + "b" * 64, "confidence": 0.7,
