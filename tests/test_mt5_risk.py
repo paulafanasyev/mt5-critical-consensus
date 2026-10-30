@@ -75,6 +75,8 @@ def test_read_only_demo_risk_snapshot_computes_broker_tick_value_risk(monkeypatc
     assert result["daily_pnl"] == 9.0
     assert result["daily_loss_fraction"] == 0.0
     assert result["risk_fraction"] == pytest.approx(10.0 / 10100.0)
+    assert result["spread_points"] == pytest.approx(10.0)
+    assert result["max_spread_points"] == 20
     assert result["request_binding_sha256"] == risk_request_binding_hash(request)
     assert result["open_positions"] == 1
     assert result["correlated_open_positions"] == 1
@@ -146,3 +148,18 @@ def test_stale_mt5_tick_blocks_risk_snapshot(monkeypatch):
     )
     assert result["status"] == "DENY"
     assert "MT5_QUOTE_STALE" in result["blockers"]
+
+
+
+def test_wide_live_spread_blocks_risk_snapshot(monkeypatch):
+    fake = FakeMT5()
+    fake.tick.ask = 1.1010
+    monkeypatch.setitem(__import__("sys").modules, "MetaTrader5", fake)
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
+        proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        max_spread_points=20,
+    )
+    assert result["status"] == "DENY"
+    assert "MT5_SPREAD_LIMIT_EXCEEDED" in result["blockers"]
+    assert result["spread_points"] == pytest.approx(100.0)
