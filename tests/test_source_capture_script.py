@@ -107,6 +107,8 @@ def test_dns_resolution_returns_only_public_validated_addresses(monkeypatch):
 
 def test_fetch_uses_the_prevalidated_ip_and_does_not_follow_redirects(monkeypatch):
     calls = {}
+    publisher_profile = policy()["publishers"]["official-a"]
+    publisher_profile["allowed_query_parameters"] = ["id"]
     class FakeResponse:
         status = 200
         def getheader(self, name, default=None):
@@ -129,7 +131,7 @@ def test_fetch_uses_the_prevalidated_ip_and_does_not_follow_redirects(monkeypatc
     monkeypatch.setattr(CAPTURE, "_resolve_public_addresses", lambda host: ["93.184.216.34"])
     monkeypatch.setattr(CAPTURE, "_PinnedHTTPSConnection", FakeConnection)
     body, content_type = CAPTURE._fetch(
-        "https://official-a.example/releases/item?id=42", profile=policy()["publishers"]["official-a"],
+        "https://official-a.example/releases/item?id=42", profile=publisher_profile,
         max_bytes=512000, timeout=4,
     )
     assert calls["hostname"] == "official-a.example"
