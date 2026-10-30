@@ -113,6 +113,18 @@ string SafeGlobalKey(string order_id)
    return key;
 }
 
+string LegacyGlobalKey(string order_id)
+{
+   // Preserve the prior EA marker format during upgrades so an order attempted
+   // by the previous version remains blocked after this version is installed.
+   StringReplace(order_id, "-", "_");
+   StringReplace(order_id, ":", "_");
+   StringReplace(order_id, ".", "_");
+   if(StringLen(order_id) > 48)
+      order_id = StringSubstr(order_id, 0, 48);
+   return "CC_TRIED_" + order_id;
+}
+
 string ExecutionLockKey()
 {
    return "CCLOCK_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
@@ -256,6 +268,7 @@ bool ExecuteDemoCommand(const string body)
    { Print("BLOCKED: invalid volume/SL/TP/expected price."); return false; }
 
    string global_key = SafeGlobalKey(order_id);
+   string legacy_global_key = LegacyGlobalKey(order_id);
    if(global_key=="")
    { Print("BLOCKED: client_order_id is invalid or cannot be represented without key collision."); return false; }
 
@@ -317,7 +330,9 @@ bool ExecuteDemoCommand(const string body)
    if(!AcquireExecutionLock(lock_key, lock_lease))
       return false;
 
-   if(GlobalVariableCheck(global_key))
+   // Check both the account-bound key and the legacy key used by prior EA builds.
+   // This intentionally preserves conservative duplicate blocking during upgrades.
+   if(GlobalVariableCheck(global_key) || GlobalVariableCheck(legacy_global_key))
    {
       ReleaseExecutionLock(lock_key, lock_lease);
       Print("DUPLICATE BLOCKED: client_order_id already attempted for this account: ", order_id);
