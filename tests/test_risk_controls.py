@@ -83,3 +83,25 @@ def test_risk_snapshot_cannot_be_reused_for_a_different_order_size():
     assert result["status"] == "DENY"
     assert "RISK_REQUEST_BINDING_MISMATCH" in result["blockers"]
     assert result["trade_allowed"] is False
+
+
+
+def test_risk_snapshot_symbol_must_match_bound_request_instrument():
+    snapshot = good_snapshot()
+    snapshot["symbol"] = "GBPUSD"
+    result = risk_controlled_permission(
+        good_request(), {"permission_matrix": {}},
+        kill_switch_state=good_state(active=False), snapshot=snapshot, now=NOW,
+    )
+    assert result["status"] == "DENY"
+    assert "RISK_SNAPSHOT_SYMBOL_MISMATCH" in result["blockers"]
+    assert result["trade_allowed"] is False
+
+
+def test_risk_snapshot_rejects_impossible_correlated_position_count():
+    snapshot = good_snapshot()
+    snapshot["open_positions"] = 1
+    snapshot["correlated_open_positions"] = 2
+    result = risk_snapshot_gate(snapshot, now=NOW)
+    assert result["status"] == "DENY"
+    assert "CORRELATED_POSITION_COUNT_EXCEEDS_OPEN_POSITIONS" in result["blockers"]
