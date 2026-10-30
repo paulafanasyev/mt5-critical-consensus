@@ -49,8 +49,21 @@ def _key_bytes(key: str | bytes | bytearray | None) -> bytes:
     return encoded
 
 
+def _reject_non_string_keys(value: Any, path: str = "payload") -> None:
+    """JSON object keys must be strings; int keys would silently collide after encoding."""
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise EvidenceError(f"{path} contains a non-string object key")
+            _reject_non_string_keys(item, f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _reject_non_string_keys(item, f"{path}[{index}]")
+
+
 def canonical_bytes(payload: Any) -> bytes:
     """Strict canonical JSON; no string coercion means hash collisions are not possible."""
+    _reject_non_string_keys(payload)
     try:
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
                          allow_nan=False)
@@ -243,7 +256,7 @@ def bundle_body(bundle: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(bundle, Mapping):
         raise EvidenceError("bundle must be an object")
     return {key: value for key, value in bundle.items()
-            if key not in ("evidence_envelope", "user_decision")}
+            if key not in ("evidence_envelope", "user_decision", "user_decision_envelope")}
 
 
 def sign_bundle(
@@ -307,3 +320,36 @@ def verify_wrapper(
         now=now, max_age_seconds=max_age_seconds, future_skew_seconds=future_skew_seconds,
         domain=domain,
     )
+
+
+OPERATOR_DOMAIN = "operator"
+
+
+def sign_decision(
+    decision: Mapping[str, Any],
+    *,
+    key: str | bytes | bytearray | None,
+    issuer: str,
+    issued_at: datetime | None = None,
+    nonce: str | None = None,
+    ttl_seconds: int = 120,
+) -> dict[str, Any]:
+    """Sign a human operator approval in the operator domain, never the evidence domain."""
+    if not isinstance(decision, Mapping):
+        raise EvidenceError("decision must be an object")
+    return make_envelope(decision, key=key, issuer=issuer, issued_at=issued_at, nonce=nonce,
+                         ttl_seconds=ttl_seconds, domain=OPERATOR_DOMAIN)
+
+
+def verify_decision(
+    decision: Any,
+    envelope: Mapping[str, Any] | None,
+    *,
+    key: str | bytes | bytearray | None,
+    expected_issuer: str | None = None,
+    now: datetime | None = None,
+    max_age_seconds: int = 120,
+) -> dict[str, Any]:
+    """Verify that an operator approval was signed by the pinned operator issuer."""
+    return verify_envelope(decision, envelope, key=key, expected_issuer=expected_issuer,
+                           now=now, max_age_seconds=max_age_seconds, domain=OPERATOR_DOMAIN)

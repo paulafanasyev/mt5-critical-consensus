@@ -14,8 +14,9 @@ from .evidence import verify_wrapper
 from .gates import (
     certainty_gate,
     chief_skeptic_pass,
-    permission_gate,
+    revalidate_review_evidence,
 )
+from .calibration import weighted_consensus
 from .governance import apply_attested_calibration, verify_governance_attestation
 from .persistence import PostgresRepository
 from .risk_controls import risk_controlled_permission
@@ -180,7 +181,39 @@ def evaluate_certainty(body: CertaintyRequest) -> dict[str, Any]:
         raw_verdicts if isinstance(raw_verdicts, list) else [],
         governance, issuer=governance_issuer,
     )
-    return certainty_gate(evaluated, _yaml("certainty_thresholds.yaml"), governance=governance)
+    thresholds = _yaml("certainty_thresholds.yaml")
+    review_evidence = revalidate_review_evidence(
+        evaluated, evaluated["verdicts"],
+        min_reviewers_per_verdict=thresholds.get("min_reviewers_per_verdict", 2)
+        if isinstance(thresholds.get("min_reviewers_per_verdict"), int) else 2,
+    )
+    evidence_blockers = list(review_evidence.get("blockers", []))
+    verdicts_with_counts = []
+    for verdict in evaluated["verdicts"]:
+        if not isinstance(verdict, dict):
+            verdicts_with_counts.append(verdict)
+            continue
+        verdict_id = str(verdict.get("verdict_id", "")).strip()
+        verdicts_with_counts.append({**verdict,
+                                     "reviewer_count": review_evidence["reviewer_counts"].get(verdict_id, 0)})
+    evaluated["verdicts"] = verdicts_with_counts
+    try:
+        recomputed_consensus = weighted_consensus(verdicts_with_counts)
+    except (TypeError, ValueError, KeyError, OverflowError):
+        recomputed_consensus = 0.0
+        evidence_blockers.append("CONSENSUS_SCORE_COULD_NOT_BE_RECOMPUTED")
+    supplied_consensus = evaluated.get("consensus_score")
+    if (isinstance(supplied_consensus, bool) or not isinstance(supplied_consensus, (int, float))
+            or abs(float(supplied_consensus) - recomputed_consensus) > 1e-9):
+        evidence_blockers.append("CONSENSUS_SCORE_DOES_NOT_MATCH_VERDICTS")
+    evaluated["consensus_score"] = recomputed_consensus
+    if review_evidence["open_challenges"] is not None:
+        evaluated["open_challenges"] = [{"challenge_id": challenge_id}
+                                        for challenge_id in review_evidence["open_challenges"]]
+    raw_flags = evaluated.get("risk_flags", [])
+    flags = list(raw_flags) if isinstance(raw_flags, list) else []
+    evaluated["risk_flags"] = flags + evidence_blockers
+    return certainty_gate(evaluated, thresholds, governance=governance)
 
 
 @app.post("/v1/chief/review", dependencies=[Depends(require_bridge_key)])
@@ -189,8 +222,13 @@ def review_chief(body: SignedPayload) -> dict[str, Any]:
 
 
 @app.post("/v1/permission/check", dependencies=[Depends(require_bridge_key)])
-def check_permission(body: SignedPayload) -> dict[str, Any]:
-    return permission_gate(_verified_payload(body), _yaml("permission_matrix.yaml"))
+def check_permission() -> None:
+    # Caller-supplied risk aggregates are not terminal measurements. Use the persisted
+    # kill-switch and terminal snapshot endpoint instead; this route stays disabled.
+    raise HTTPException(
+        status_code=status.HTTP_423_LOCKED,
+        detail="Permission check disabled: caller-supplied risk aggregates are not trusted; use /v1/risk/permission/check",
+    )
 
 
 @app.get("/v1/risk/kill-switch", dependencies=[Depends(require_bridge_key)])

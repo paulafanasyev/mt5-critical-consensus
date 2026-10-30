@@ -195,3 +195,71 @@ def test_authorization_endpoint_does_not_trust_client_supplied_permission(monkey
     )
     assert response.status_code == 423
     assert "server-side permission state" in response.json()["detail"]
+
+
+def _review(target, alias, stance="CONFIRM", **extra):
+    return {"target_verdict_id": target, "reviewer_alias": alias, "stance": stance,
+            "status": "VALIDATED", "argument": "independent check",
+            "evidence_refs": [f"doc-{alias}"], **extra}
+
+
+def test_api_recomputes_consensus_score_instead_of_trusting_payload(monkeypatch):
+    configure(monkeypatch)
+    payload = {
+        "verdicts": [{"verdict_id": "v1", "agent_id": "PlatformScoutAgent",
+                      "verdict": "APPROVE", "confidence": 0.5}],
+        "consensus_score": 0.99,
+    }
+    response = client.post(
+        "/v1/certainty/evaluate", headers={"X-Bridge-Key": BRIDGE},
+        json={**signed_body(payload), "governance_attestation": governance_attestation()},
+    )
+    assert response.status_code == 200
+    blockers = response.json()["blockers"]
+    assert any("CONSENSUS_SCORE_DOES_NOT_MATCH_VERDICTS" in blocker for blocker in blockers)
+    assert response.json()["trade_allowed"] is False
+
+
+def test_api_recomputes_reviewer_counts_from_review_records(monkeypatch):
+    configure(monkeypatch)
+    payload = {
+        "verdicts": [{"verdict_id": "v1", "agent_id": "PlatformScoutAgent",
+                      "verdict": "APPROVE", "confidence": 0.9, "reviewer_count": 5}],
+        "peer_reviews": [_review("v1", "r1"), _review("v1", "r2")],
+    }
+    response = client.post(
+        "/v1/certainty/evaluate", headers={"X-Bridge-Key": BRIDGE},
+        json={**signed_body(payload), "governance_attestation": governance_attestation()},
+    )
+    assert response.status_code == 200
+    blockers = response.json()["blockers"]
+    assert any("REVIEWER_COUNT_DOES_NOT_MATCH_RECORDS:v1" in blocker for blocker in blockers)
+
+
+def test_api_rejects_open_challenge_hidden_from_ledger(monkeypatch):
+    configure(monkeypatch)
+    payload = {
+        "verdicts": [{"verdict_id": "v1", "agent_id": "PlatformScoutAgent",
+                      "verdict": "APPROVE", "confidence": 0.9}],
+        "peer_reviews": [_review("v1", "r1"),
+                         _review("v1", "r2", stance="CHALLENGE", challenge_type="EVIDENCE_GAP")],
+        "open_challenges": [],
+        "challenge_records": [{"challenge_id": "c1", "target_verdict_id": "v1",
+                               "argument": "source is stale", "status": "OPEN",
+                               "rounds": [], "evidence_refs": ["doc-c1"]}],
+    }
+    response = client.post(
+        "/v1/certainty/evaluate", headers={"X-Bridge-Key": BRIDGE},
+        json={**signed_body(payload), "governance_attestation": governance_attestation()},
+    )
+    assert response.status_code == 200
+    blockers = response.json()["blockers"]
+    assert any("OPEN_CHALLENGE_STATE_CONTRADICTS_LEDGER" in blocker for blocker in blockers)
+
+
+def test_permission_route_refuses_caller_supplied_risk_aggregates(monkeypatch):
+    configure(monkeypatch)
+    response = client.post("/v1/permission/check", headers={"X-Bridge-Key": BRIDGE},
+                           json={"payload": {}})
+    assert response.status_code == 423
+    assert "/v1/risk/permission/check" in response.json()["detail"]

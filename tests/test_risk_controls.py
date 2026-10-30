@@ -1,7 +1,8 @@
 from datetime import datetime, timedelta, timezone
 
 from critical_consensus.risk_controls import (
-    global_kill_switch_gate, risk_controlled_permission, risk_snapshot_gate, risk_request_binding_hash,
+    global_kill_switch_gate, risk_controlled_permission, risk_request_binding_hash,
+    risk_snapshot_gate, risk_snapshot_matches_order,
 )
 
 
@@ -22,7 +23,9 @@ def good_snapshot():
     return {"status": "PASS", "observed_at": NOW.isoformat(), "account_mode": "demo",
             "symbol": "EURUSD", "symbol_group": "fx-major", "account_equity": 10000.0,
             "day_start_equity": 10000.0, "equity_high_watermark": 10200.0,
-            "risk_fraction": 0.002, "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0196,
+            "risk_fraction": 0.002, "risk_value_account_currency": 20.0,
+            "risk_tick_size": 0.0001, "risk_tick_value_loss": 20.0,
+            "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0196,
             "open_positions": 1, "correlated_open_positions": 1,
             "request_binding_sha256": risk_request_binding_hash(good_request()),
             "within_high_impact_news_window": None}
@@ -82,4 +85,40 @@ def test_risk_snapshot_cannot_be_reused_for_a_different_order_size():
     )
     assert result["status"] == "DENY"
     assert "RISK_REQUEST_BINDING_MISMATCH" in result["blockers"]
+    assert result["trade_allowed"] is False
+
+
+def test_snapshot_aggregates_must_match_the_measured_order_and_equity():
+    assert risk_snapshot_matches_order(good_request(), good_snapshot()) == []
+
+    understated = good_snapshot()
+    understated["risk_fraction"] = 0.0001
+    assert "RISK_FRACTION_DOES_NOT_MATCH_ORDER" in risk_snapshot_matches_order(
+        good_request(), understated)
+
+    forged_value = good_snapshot()
+    forged_value["risk_value_account_currency"] = 1.0
+    assert "RISK_VALUE_DOES_NOT_MATCH_ORDER" in risk_snapshot_matches_order(
+        good_request(), forged_value)
+
+    forged_drawdown = good_snapshot()
+    forged_drawdown["drawdown_fraction"] = 0.0
+    assert "DRAWDOWN_DOES_NOT_MATCH_EQUITY" in risk_snapshot_matches_order(
+        good_request(), forged_drawdown)
+
+    wrong_symbol = good_snapshot()
+    wrong_symbol["symbol"] = "XAUUSD"
+    assert "RISK_SNAPSHOT_SYMBOL_MISMATCH" in risk_snapshot_matches_order(
+        good_request(), wrong_symbol)
+
+
+def test_risk_controlled_permission_denies_a_reconciled_mismatch_before_policy():
+    snapshot = good_snapshot()
+    snapshot["risk_fraction"] = 0.00001
+    result = risk_controlled_permission(
+        good_request(), {"permission_matrix": {}},
+        kill_switch_state=good_state(active=False), snapshot=snapshot, now=NOW,
+    )
+    assert result["status"] == "DENY"
+    assert "RISK_FRACTION_DOES_NOT_MATCH_ORDER" in result["blockers"]
     assert result["trade_allowed"] is False

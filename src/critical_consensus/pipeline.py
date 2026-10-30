@@ -13,7 +13,7 @@ from typing import Any, Mapping, Sequence
 
 from .audit import canonical_hash, make_audit_event, verify_audit_chain
 from .calibration import weighted_consensus
-from .evidence import EvidenceError, key_bytes, verify_bundle
+from .evidence import EvidenceError, key_bytes, verify_bundle, verify_decision
 from .gates import certainty_gate, chief_skeptic_pass, permission_gate, user_authorization_gate
 from .governance import apply_attested_calibration, verify_governance_attestation
 from .risk_controls import risk_controlled_permission
@@ -121,6 +121,9 @@ def evaluate_signal_bundle(
     expected_evidence_issuer: str | None = None,
     expected_governance_issuer: str = "calibration-service",
     authorization_store: Any | None = None,
+    operator_key: str | bytes | bytearray | None = None,
+    expected_operator_issuer: str | None = None,
+    operator_decision_envelope: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate certainty → ChiefAgent → Permission → user authorization, fail-closed.
 
@@ -275,6 +278,8 @@ def evaluate_signal_bundle(
 
     max_review_age = _policy_seconds(certainty_policy, "max_review_age_seconds")
     max_challenge_age = _policy_seconds(certainty_policy, "max_challenge_age_seconds")
+    max_chief_age = _policy_seconds(certainty_policy, "max_chief_reasoning_age_seconds",
+                                    default=900.0)
     reviews = _as_records(bundle.get("peer_reviews"))
     review_index: dict[str, set[str]] = {}
     review_blockers: list[str] = []
@@ -550,7 +555,7 @@ def evaluate_signal_bundle(
         emit("CHIEF_EVIDENCE_VALIDATION", {"signal_id": signal_id, "status": "HOLD",
                                            "blockers": sorted(set(chief_evidence_blockers))})
         return finish("HOLD", chief_evidence_blockers, certainty=certainty)
-    chief = chief_skeptic_pass(chief_input, now=current)
+    chief = chief_skeptic_pass(chief_input, now=current, max_age_seconds=max_chief_age)
     emit("CHIEF_REVIEW", {"signal_id": signal_id, "status": chief.get("verdict"),
                           "reasoning_hash": chief.get("reasoning_hash"), "blockers": chief.get("blockers", [])})
     if chief.get("verdict") == "REJECT":
@@ -640,6 +645,50 @@ def evaluate_signal_bundle(
     req["compliance_status"] = compliance_status
     req["risk_flags"] = all_risk_flags
     user_decision = bundle.get("user_decision")
+    decision_envelope = (operator_decision_envelope if operator_decision_envelope is not None
+                         else bundle.get("user_decision_envelope"))
+    if user_decision is not None:
+        # Approval is outside the evidence envelope on purpose: whoever can sign evidence must
+        # not be able to approve a trade. The operator signature uses a distinct key and issuer.
+        operator_config_blockers: list[str] = []
+        operator_issuer = str(expected_operator_issuer or "").strip()
+        if not operator_issuer:
+            operator_config_blockers.append("OPERATOR_ISSUER_NOT_CONFIGURED")
+        elif operator_issuer in {str(expected_evidence_issuer or "").strip(),
+                                 str(expected_governance_issuer or "").strip()}:
+            operator_config_blockers.append("OPERATOR_ISSUER_NOT_DISTINCT")
+        try:
+            operator_key_bytes = key_bytes(operator_key)
+        except EvidenceError:
+            operator_config_blockers.append("OPERATOR_KEY_NOT_CONFIGURED")
+        else:
+            try:
+                if operator_key_bytes in (key_bytes(evidence_key), key_bytes(governance_key)):
+                    operator_config_blockers.append("OPERATOR_KEY_NOT_DISTINCT")
+            except EvidenceError:
+                pass
+        if operator_config_blockers:
+            emit("OPERATOR_DECISION", {"signal_id": signal_id, "status": "DENY",
+                                        "blockers": operator_config_blockers})
+            return finish("DENY", operator_config_blockers, certainty=certainty, chief=chief)
+        if not isinstance(user_decision, Mapping):
+            emit("OPERATOR_DECISION", {"signal_id": signal_id, "status": "DENY",
+                                        "blockers": ["USER_DECISION_INVALID"]})
+            return finish("DENY", ["USER_DECISION_INVALID"], certainty=certainty, chief=chief)
+        decision_check = verify_decision(
+            user_decision, decision_envelope, key=operator_key,
+            expected_issuer=operator_issuer, now=current,
+        )
+        emit("OPERATOR_DECISION", {
+            "signal_id": signal_id,
+            "status": "PASS" if decision_check.get("valid") is True else "DENY",
+            "issuer": decision_check.get("issuer"),
+            "payload_sha256": decision_check.get("payload_sha256"),
+            "blockers": list(decision_check.get("blockers", [])),
+        })
+        if decision_check.get("valid") is not True:
+            return finish("DENY", list(decision_check.get("blockers", [])),
+                          certainty=certainty, chief=chief)
     if user_decision is not None and require_persisted_risk is not True:
         # A client-supplied approval must never bypass the persisted kill switch and
         # fresh terminal risk snapshot. Authorization therefore requires this path.
@@ -664,6 +713,19 @@ def evaluate_signal_bundle(
                               "risk_snapshot_validation": permission.get("risk_snapshot_validation")})
     if permission.get("status") == "DENY":
         return finish("DENY", list(permission.get("blockers", [])), certainty=certainty, chief=chief, permission=permission)
+
+    if user_decision is not None:
+        # The signed approval must name this signal and the exact Chief reasoning reviewed.
+        decision_binding_blockers: list[str] = []
+        if str(user_decision.get("signal_id", "")).strip() != signal_id:
+            decision_binding_blockers.append("USER_DECISION_SIGNAL_ID_MISMATCH")
+        if user_decision.get("chief_reasoning_hash") != chief.get("reasoning_hash"):
+            decision_binding_blockers.append("USER_DECISION_CHIEF_HASH_MISMATCH")
+        if decision_binding_blockers:
+            emit("USER_AUTHORIZATION", {"signal_id": signal_id, "status": "DENY",
+                                        "blockers": decision_binding_blockers})
+            return finish("DENY", decision_binding_blockers, certainty=certainty, chief=chief,
+                          permission=permission)
 
     human_review_packet = {
         "signal_id": signal_id,

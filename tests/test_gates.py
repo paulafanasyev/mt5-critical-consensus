@@ -1,6 +1,9 @@
 from datetime import datetime, timezone, timedelta
 from critical_consensus.authorization import InMemoryNonceStore
-from critical_consensus.gates import certainty_gate, chief_skeptic_pass, permission_gate, user_authorization_gate
+from critical_consensus.gates import (
+    certainty_gate, chief_skeptic_pass, permission_gate, revalidate_review_evidence,
+    user_authorization_gate,
+)
 from critical_consensus.audit import canonical_hash
 
 AGENTS = ["PlatformScoutAgent", "TechnicalAnalystAgent", "RiskManagerAgent", "ComplianceAgent"]
@@ -358,3 +361,64 @@ def test_authorization_requires_nonce_store_and_rejects_expired_permission():
     expired = {**permission, "expires_at": (now - timedelta(seconds=1)).isoformat()}
     assert "PERMISSION_EXPIRED" in user_authorization_gate(
         expired, decision, now=now, nonce_store=InMemoryNonceStore())["blockers"]
+
+
+def test_live_authorization_stays_denied_even_with_self_asserted_verification():
+    now = datetime.now(timezone.utc)
+    permission = {"status": "REQUIRE_HUMAN", "permission_id": "p-live", "mode": "live",
+                  "expires_at": (now + timedelta(minutes=5)).isoformat()}
+    decision = {"decision": "APPROVE", "decision_id": "d-live", "user_id": "operator-1",
+                "reason": "reviewed", "permission_id": "p-live", "nonce": "n" * 24,
+                "timestamp": now.isoformat(), "ttl_seconds": 300,
+                "two_fa_verified": True, "signature_verified": True}
+    result = user_authorization_gate(permission, decision, now=now,
+                                     nonce_store=InMemoryNonceStore())
+    assert result["status"] == "DENY"
+    assert result["authorized"] is False
+    assert "LIVE_AUTHORIZATION_NOT_IMPLEMENTED" in result["blockers"]
+
+
+def test_stale_chief_reasoning_cannot_confirm():
+    base = datetime.now(timezone.utc) - timedelta(seconds=1000)
+    reasoning = {"reasoning_id": "chief-old", "signal_id": "sig-old", "created_at": base.isoformat(),
+                 "verdict": "CONFIRM",
+                 "steps": {k: {"passed": True, "detail": "checked", "evidence_refs": [f"ev-{k}"]} for k in "abcdefghi"},
+                 "reasons_against": ["macro", "news", "correlation", "liquidity", "regime"],
+                 "tail_risk_probability": 0.01,
+                 "tail_risk_scenarios": [{"scenario": "shock", "probability": 0.01,
+                                          "impact": "repricing", "evidence_refs": ["risk-1"]}],
+                 "open_challenges": [], "all_challenges_read": True,
+                 "challenge_ledger_snapshot": [], "challenge_ledger_hash": canonical_hash([]),
+                 "reviewed_challenge_ids": []}
+    reasoning["reasoning_hash"] = canonical_hash(reasoning)
+    result = chief_skeptic_pass(reasoning, now=datetime.now(timezone.utc), max_age_seconds=900)
+    assert result["verdict"] == "HOLD"
+    assert "CHIEF_REASONING_EXPIRED" in result["blockers"]
+
+
+def test_review_counts_and_open_challenges_are_recomputed_from_records():
+    verdicts = [{"verdict_id": "v1", "reviewer_count": 999}]
+    payload = {
+        "peer_reviews": [
+            {"review_id": "r1", "target_verdict_id": "v1", "reviewer_alias": "a1",
+             "stance": "CONFIRM", "argument": "checked", "evidence_refs": ["e1"],
+             "status": "VALIDATED"},
+            {"review_id": "r2", "target_verdict_id": "v1", "reviewer_alias": "a2",
+             "stance": "CONFIRM", "argument": "checked", "evidence_refs": ["e2"],
+             "status": "VALIDATED"},
+        ],
+        "challenge_records": [{"challenge_id": "c1", "target_verdict_id": "v1",
+                               "argument": "still open", "status": "OPEN", "rounds": [],
+                               "evidence_refs": ["e1"]}],
+        "open_challenges": [],
+    }
+    result = revalidate_review_evidence(payload, verdicts, min_reviewers_per_verdict=2)
+    assert result["reviewer_counts"] == {"v1": 2}
+    assert "REVIEWER_COUNT_DOES_NOT_MATCH_RECORDS:v1" in result["blockers"]
+    assert "OPEN_CHALLENGE_STATE_CONTRADICTS_LEDGER" in result["blockers"]
+
+    payload["open_challenges"] = [{"challenge_id": "c1"}]
+    result = revalidate_review_evidence(payload, [{"verdict_id": "v1", "reviewer_count": 2}],
+                                        min_reviewers_per_verdict=2)
+    assert result["blockers"] == []
+    assert result["open_challenges"] == ["c1"]

@@ -290,6 +290,131 @@ def challenge_resolution_loop(challenges: Sequence[Mapping[str, Any]],
     }
 
 
+_VALID_CHALLENGE_TYPES = frozenset({
+    "DATA_CONTRADICTION", "SOURCE_WEAK", "STALE_DATA", "LOGIC_GAP",
+    "REGIME_MISMATCH", "CORRELATION_RISK",
+})
+
+
+def revalidate_review_evidence(payload: Mapping[str, Any], verdicts: Sequence[Mapping[str, Any]],
+                               *, min_reviewers_per_verdict: int = 2) -> dict[str, Any]:
+    """Recompute reviewer counts and open-challenge state from raw records.
+
+    The bridge must not be able to assert its own aggregates: a supplied
+    ``reviewer_count`` larger than the validated review records, a consensus score
+    detached from the verdicts, or an open challenge hidden from the ledger is a
+    trust-boundary violation. Callers overwrite their aggregates with these values.
+    """
+    blockers: list[str] = []
+    if (isinstance(min_reviewers_per_verdict, bool) or not isinstance(min_reviewers_per_verdict, int)
+            or min_reviewers_per_verdict < 1):
+        blockers.append("INVALID_REVIEWER_POLICY")
+        min_reviewers = 2
+    else:
+        min_reviewers = min_reviewers_per_verdict
+    if not isinstance(verdicts, Sequence) or isinstance(verdicts, (str, bytes)):
+        return {"blockers": sorted(set(blockers + ["VERDICTS_MISSING_OR_INVALID"])),
+                "reviewer_counts": {}, "open_challenges": None}
+
+    verdict_ids: set[str] = set()
+    for verdict in verdicts:
+        if not isinstance(verdict, Mapping):
+            blockers.append("VERDICT_RECORD_INVALID")
+            continue
+        verdict_id = str(verdict.get("verdict_id", "")).strip()
+        if not verdict_id or verdict_id in verdict_ids:
+            blockers.append("MISSING_OR_DUPLICATE_VERDICT_ID")
+        else:
+            verdict_ids.add(verdict_id)
+
+    reviewer_sets: dict[str, set[str]] = {verdict_id: set() for verdict_id in verdict_ids}
+    raw_reviews = payload.get("peer_reviews")
+    if not isinstance(raw_reviews, Sequence) or isinstance(raw_reviews, (str, bytes)) or not raw_reviews:
+        blockers.append("PEER_REVIEWS_MISSING_OR_INVALID")
+    else:
+        for review in raw_reviews:
+            if not isinstance(review, Mapping):
+                blockers.append("INVALID_PEER_REVIEW_RECORD")
+                continue
+            target = str(review.get("target_verdict_id", "")).strip()
+            alias = str(review.get("reviewer_alias", "")).strip()
+            stance = str(review.get("stance", "")).upper()
+            refs = review.get("evidence_refs")
+            refs_ok = (isinstance(refs, Sequence) and not isinstance(refs, (str, bytes))
+                       and bool(refs) and all(str(ref).strip() for ref in refs))
+            if (target not in reviewer_sets or not alias or stance not in {"CONFIRM", "CHALLENGE"}
+                    or review.get("status") != "VALIDATED"
+                    or not str(review.get("argument", "")).strip() or not refs_ok
+                    or (stance == "CHALLENGE"
+                        and str(review.get("challenge_type", "")).upper() not in _VALID_CHALLENGE_TYPES)):
+                blockers.append("INVALID_PEER_REVIEW_RECORD")
+                continue
+            if alias in reviewer_sets[target]:
+                blockers.append("DUPLICATE_PEER_REVIEWER_FOR_VERDICT")
+                continue
+            reviewer_sets[target].add(alias)
+
+    reviewer_counts: dict[str, int] = {}
+    for verdict_id, aliases in reviewer_sets.items():
+        reviewer_counts[verdict_id] = len(aliases)
+        if len(aliases) < min_reviewers:
+            blockers.append(f"INSUFFICIENT_OR_INVALID_PEER_REVIEWS:{verdict_id}")
+    for verdict in verdicts:
+        if not isinstance(verdict, Mapping):
+            continue
+        verdict_id = str(verdict.get("verdict_id", "")).strip()
+        supplied = verdict.get("reviewer_count")
+        if not isinstance(supplied, bool) and isinstance(supplied, int) and verdict_id in reviewer_counts:
+            if supplied != reviewer_counts[verdict_id]:
+                blockers.append(f"REVIEWER_COUNT_DOES_NOT_MATCH_RECORDS:{verdict_id}")
+
+    open_challenges: list[str] | None = None
+    raw_ledger = payload.get("challenge_records")
+    if not isinstance(raw_ledger, Sequence) or isinstance(raw_ledger, (str, bytes)):
+        blockers.append("CHALLENGE_LEDGER_MISSING_OR_INVALID")
+    else:
+        seen_challenge_ids: set[str] = set()
+        derived_open: list[str] = []
+        for challenge in raw_ledger:
+            if not isinstance(challenge, Mapping):
+                blockers.append("CHALLENGE_LEDGER_HAS_INVALID_RECORDS")
+                continue
+            challenge_id = str(challenge.get("challenge_id", "")).strip()
+            target = str(challenge.get("target_verdict_id", "")).strip()
+            status = str(challenge.get("status", "OPEN")).upper()
+            rounds = challenge.get("rounds")
+            refs = challenge.get("evidence_refs", [])
+            if (not challenge_id or challenge_id in seen_challenge_ids or target not in verdict_ids
+                    or not str(challenge.get("argument", "")).strip()
+                    or status not in {"OPEN", "RESOLVED", "ESCALATED"}
+                    or not isinstance(rounds, Sequence) or isinstance(rounds, (str, bytes))
+                    or len(rounds) > 3
+                    or not isinstance(refs, Sequence) or isinstance(refs, (str, bytes))):
+                blockers.append("CHALLENGE_LEDGER_HAS_INVALID_RECORDS")
+                continue
+            seen_challenge_ids.add(challenge_id)
+            resolution_refs = challenge.get("resolution_evidence_refs")
+            if status == "RESOLVED" and not (
+                    isinstance(resolution_refs, Sequence) and not isinstance(resolution_refs, (str, bytes))
+                    and bool(resolution_refs)):
+                blockers.append("CHALLENGE_RESOLUTION_MISSING_RESOLUTION_EVIDENCE")
+                status = "OPEN"
+            if status != "RESOLVED":
+                derived_open.append(challenge_id)
+        open_challenges = derived_open
+
+    supplied_open = payload.get("open_challenges")
+    if not isinstance(supplied_open, Sequence) or isinstance(supplied_open, (str, bytes)):
+        blockers.append("OPEN_CHALLENGE_STATE_MISSING_OR_INVALID")
+    elif open_challenges is not None:
+        supplied_ids = {str(challenge.get("challenge_id", "")).strip()
+                        for challenge in supplied_open if isinstance(challenge, Mapping)}
+        if len(supplied_ids) != len(supplied_open) or supplied_ids != set(open_challenges):
+            blockers.append("OPEN_CHALLENGE_STATE_CONTRADICTS_LEDGER")
+    return {"blockers": sorted(set(blockers)), "reviewer_counts": reviewer_counts,
+            "open_challenges": open_challenges, "min_reviewers": min_reviewers}
+
+
 def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any], *,
                    governance: Mapping[str, Any] | None = None,
                    now: datetime | None = None) -> dict[str, Any]:
@@ -592,7 +717,8 @@ def devil_advocate_pass(signal: Mapping[str, Any], counter_hypotheses: Sequence[
 
 
 def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probability: float = 0.05,
-                       now: datetime | None = None) -> dict[str, Any]:
+                       now: datetime | None = None,
+                       max_age_seconds: float = 900) -> dict[str, Any]:
     """Require evidence-backed completion of all nine ChiefAgent skepticism checks."""
     if not isinstance(reasoning, Mapping):
         return {"verdict": "HOLD", "passed": False, "blockers": ["INVALID_CHIEF_REASONING"], "trade_allowed": False}
@@ -603,6 +729,10 @@ def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probabilit
         blockers_identity = []
     if not str(reasoning.get("signal_id", "")).strip():
         blockers_identity.append("CHIEF_SIGNAL_ID_MISSING")
+    age_limit = _finite_float(max_age_seconds)
+    if age_limit is None or age_limit <= 0:
+        blockers_identity.append("INVALID_CHIEF_MAX_AGE_POLICY")
+        age_limit = 900.0
     created_at = reasoning.get("created_at")
     if not created_at:
         blockers_identity.append("CHIEF_CREATED_AT_MISSING")
@@ -610,8 +740,11 @@ def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probabilit
         try:
             chief_created_at = _parse_time(created_at)
             current_for_chief = _current_utc(now)
-            if (chief_created_at - current_for_chief).total_seconds() > 30:
+            age_seconds = (current_for_chief - chief_created_at).total_seconds()
+            if age_seconds < -30:
                 blockers_identity.append("CHIEF_CREATED_AT_IN_FUTURE")
+            elif age_seconds > age_limit:
+                blockers_identity.append("CHIEF_REASONING_EXPIRED")
         except (ValueError, TypeError, OverflowError):
             blockers_identity.append("CHIEF_CREATED_AT_INVALID")
     raw_scenarios = reasoning.get("tail_risk_scenarios")
@@ -930,6 +1063,10 @@ def user_authorization_gate(permission_result: Mapping[str, Any], decision: Mapp
     except (ValueError, TypeError, OverflowError):
         blockers.append("INVALID_AUTHORIZATION_TIMESTAMP")
     if mode == "live":
+        # No server-side 2FA or signature verifier exists in this scaffold, so a client-supplied
+        # `two_fa_verified`/`signature_verified` boolean is not proof of anything. Live approval
+        # stays denied until a verifier is implemented and wired in.
+        blockers.append("LIVE_AUTHORIZATION_NOT_IMPLEMENTED")
         if decision.get("two_fa_verified") is not True: blockers.append("LIVE_2FA_REQUIRED")
         if decision.get("signature_verified") is not True: blockers.append("LIVE_SIGNATURE_REQUIRED")
     if blockers:

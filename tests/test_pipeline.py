@@ -5,7 +5,7 @@ from pathlib import Path
 from critical_consensus.audit import canonical_hash, verify_audit_chain
 from critical_consensus.authorization import InMemoryNonceStore
 from critical_consensus.calibration import weighted_consensus
-from critical_consensus.evidence import EvidenceError, sign_bundle
+from critical_consensus.evidence import EvidenceError, make_envelope, sign_bundle, sign_decision
 from critical_consensus.governance import sign_attestation
 from critical_consensus.pipeline import evaluate_signal_bundle
 from critical_consensus.risk_controls import risk_request_binding_hash
@@ -14,8 +14,10 @@ from jsonschema import Draft202012Validator
 NOW = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
 EVIDENCE_KEY = "e" * 64
 GOVERNANCE_KEY = "g" * 64
+OPERATOR_KEY = "o" * 64
 EVIDENCE_ISSUER = "test-ingress"
 GOVERNANCE_ISSUER = "calibration-service"
+OPERATOR_ISSUER = "operator-console"
 
 CERTAINTY_POLICY = {
     "near_certainty_threshold": 0.98,
@@ -146,8 +148,24 @@ def make_governance_attestation(now=NOW, *, dissent_rate=0.125, false_certainty_
     return sign_attestation(payload, key=GOVERNANCE_KEY, issuer=GOVERNANCE_ISSUER, issued_at=now)
 
 
+def sign_operator_approval(bundle, *, now=NOW, key=OPERATOR_KEY, issuer=OPERATOR_ISSUER):
+    """Attach a correctly bound operator signature to a bundle's user_decision."""
+    signed = dict(bundle)
+    decision = dict(bundle["user_decision"])
+    decision.setdefault("signal_id", bundle.get("signal_id"))
+    decision.setdefault("chief_reasoning_hash",
+                        (bundle.get("chief_reasoning") or {}).get("reasoning_hash"))
+    signed["user_decision"] = decision
+    signed["user_decision_envelope"] = sign_decision(
+        decision, key=key, issuer=issuer, issued_at=now,
+    )
+    return signed
+
+
 def run_pipeline(bundle, *, now=NOW, sign=True, policy=None, **kwargs):
     body = dict(bundle)
+    if body.get("user_decision") is not None and "user_decision_envelope" not in body:
+        body = sign_operator_approval(body, now=now)
     body.setdefault("governance_attestation", make_governance_attestation(now))
     if sign:
         try:
@@ -158,6 +176,8 @@ def run_pipeline(bundle, *, now=NOW, sign=True, policy=None, **kwargs):
     kwargs.setdefault("evidence_key", EVIDENCE_KEY)
     kwargs.setdefault("governance_key", GOVERNANCE_KEY)
     kwargs.setdefault("expected_evidence_issuer", EVIDENCE_ISSUER)
+    kwargs.setdefault("operator_key", OPERATOR_KEY)
+    kwargs.setdefault("expected_operator_issuer", OPERATOR_ISSUER)
     return evaluate_signal_bundle(body, policy or CERTAINTY_POLICY, PERMISSION_MATRIX,
                                   now=now, **kwargs)
 
@@ -386,6 +406,8 @@ def _persisted_demo_risk_evidence(bundle, *, kill_switch_active=False, binding_o
         "symbol": request["instrument"], "symbol_group": "fx-major",
         "account_equity": 10000.0, "day_start_equity": 10000.0,
         "equity_high_watermark": 10000.0, "risk_fraction": 0.003,
+        "risk_value_account_currency": 30.0,
+        "risk_tick_size": 0.0001, "risk_tick_value_loss": 15.0,
         "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0,
         "open_positions": 1, "correlated_open_positions": 0,
         "request_binding_sha256": binding_override or risk_request_binding_hash(request),
@@ -608,3 +630,97 @@ def test_expired_challenge_record_fails_closed():
     assert result["status"] == "GATHER_MORE"
     assert any("CHALLENGE_0_CREATED_AT_INVALID" in blocker for blocker in result["blockers"])
     assert result["trade_allowed"] is False
+
+
+def _approval_bundle():
+    bundle = make_bundle()
+    bundle["user_decision"] = {"decision": "APPROVE", "user_id": "operator-1",
+                               "reason": "Reviewed dissent and tail risk",
+                               "permission_id": "perm-1", "decision_id": "decision-1",
+                               "nonce": "n" * 24, "timestamp": NOW.isoformat(),
+                               "ttl_seconds": 300}
+    return bundle
+
+
+def _evaluate_with_approval(bundle, **kwargs):
+    body = dict(bundle)
+    body.setdefault("governance_attestation", make_governance_attestation())
+    body = sign_bundle(body, key=EVIDENCE_KEY, issuer=EVIDENCE_ISSUER, issued_at=NOW)
+    args = dict(evidence_key=EVIDENCE_KEY, governance_key=GOVERNANCE_KEY,
+                expected_evidence_issuer=EVIDENCE_ISSUER,
+                operator_key=OPERATOR_KEY, expected_operator_issuer=OPERATOR_ISSUER)
+    args.update(kwargs)
+    return evaluate_signal_bundle(body, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW, **args)
+
+
+def test_evidence_signed_bundle_cannot_contain_an_unsigned_approval():
+    result = _evaluate_with_approval(_approval_bundle())
+    assert result["status"] == "DENY"
+    assert "EVIDENCE_ENVELOPE_MISSING_OR_INVALID" in result["blockers"]
+    assert result["trade_allowed"] is False
+
+
+def test_approval_signed_in_the_evidence_domain_is_rejected():
+    bundle = _approval_bundle()
+    decision = bundle["user_decision"]
+    bundle["user_decision_envelope"] = make_envelope(
+        decision, key=OPERATOR_KEY, issuer=OPERATOR_ISSUER, issued_at=NOW)
+    result = _evaluate_with_approval(bundle)
+    assert result["status"] == "DENY"
+    assert "EVIDENCE_SIGNATURE_MISMATCH" in result["blockers"]
+
+
+def test_approval_tampering_after_signing_is_rejected():
+    bundle = sign_operator_approval(_approval_bundle())
+    bundle["user_decision"] = dict(bundle["user_decision"], decision="REJECT")
+    result = run_pipeline(bundle)
+    assert result["status"] == "DENY"
+    assert "EVIDENCE_PAYLOAD_HASH_MISMATCH" in result["blockers"]
+
+
+def test_operator_key_and_issuer_must_be_distinct_signing_domains():
+    state, snapshot = _persisted_demo_risk_evidence(_approval_bundle())
+    shared_key = run_pipeline(
+        _approval_bundle(), require_persisted_risk=True, kill_switch_state=state,
+        terminal_risk_snapshot=snapshot, authorization_store=InMemoryNonceStore(),
+        operator_key=EVIDENCE_KEY,
+    )
+    assert shared_key["status"] == "DENY"
+    assert "OPERATOR_KEY_NOT_DISTINCT" in shared_key["blockers"]
+    shared_issuer = run_pipeline(
+        _approval_bundle(), require_persisted_risk=True, kill_switch_state=state,
+        terminal_risk_snapshot=snapshot, authorization_store=InMemoryNonceStore(),
+        expected_operator_issuer=EVIDENCE_ISSUER,
+    )
+    assert shared_issuer["status"] == "DENY"
+    assert "OPERATOR_ISSUER_NOT_DISTINCT" in shared_issuer["blockers"]
+
+
+def test_approval_must_bind_the_signal_and_reviewed_chief_reasoning():
+    bundle = _approval_bundle()
+    decision = bundle["user_decision"]
+    bundle["user_decision_envelope"] = sign_decision(
+        decision, key=OPERATOR_KEY, issuer=OPERATOR_ISSUER, issued_at=NOW)
+    state, snapshot = _persisted_demo_risk_evidence(bundle)
+    result = run_pipeline(bundle, require_persisted_risk=True, kill_switch_state=state,
+                          terminal_risk_snapshot=snapshot,
+                          authorization_store=InMemoryNonceStore())
+    assert result["status"] == "DENY"
+    assert "USER_DECISION_SIGNAL_ID_MISMATCH" in result["blockers"]
+    assert "USER_DECISION_CHIEF_HASH_MISMATCH" in result["blockers"]
+
+
+def test_risk_snapshot_with_forged_aggregates_is_denied_at_authorization():
+    bundle = make_bundle()
+    bundle["user_decision"] = {"decision": "APPROVE", "user_id": "operator-1",
+                               "reason": "Reviewed dissent and tail risk",
+                               "permission_id": "perm-1", "decision_id": "decision-1",
+                               "nonce": "n" * 24, "timestamp": NOW.isoformat(),
+                               "ttl_seconds": 300}
+    state, snapshot = _persisted_demo_risk_evidence(bundle)
+    snapshot["risk_fraction"] = 0.0001  # reported risk no longer matches size/SL/equity
+    result = run_pipeline(bundle, require_persisted_risk=True, kill_switch_state=state,
+                          terminal_risk_snapshot=snapshot,
+                          authorization_store=InMemoryNonceStore())
+    assert result["status"] == "DENY"
+    assert "RISK_FRACTION_DOES_NOT_MATCH_ORDER" in result["blockers"]

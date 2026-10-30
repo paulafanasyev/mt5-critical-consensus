@@ -8,7 +8,9 @@ from critical_consensus.evidence import (
     make_envelope,
     payload_sha256,
     sign_bundle,
+    sign_decision,
     verify_bundle,
+    verify_decision,
     verify_envelope,
     verify_wrapper,
 )
@@ -72,6 +74,33 @@ def test_non_canonical_payload_is_not_silently_stringified():
         payload_sha256({"when": datetime.now(timezone.utc)})
     with pytest.raises(EvidenceError):
         payload_sha256({"value": float("nan")})
+
+
+def test_non_string_json_keys_are_rejected_instead_of_colliding():
+    # json.dumps would turn both of these into {"1": ...} and hash them identically.
+    with pytest.raises(EvidenceError):
+        payload_sha256({1: "value"})
+    with pytest.raises(EvidenceError):
+        payload_sha256({"outer": {2: "nested"}})
+    with pytest.raises(EvidenceError):
+        payload_sha256([{"items": [{3: "deep"}]}])
+
+
+def test_operator_decision_signature_lives_in_a_separate_domain():
+    decision = {"decision": "APPROVE", "permission_id": "perm-1"}
+    envelope = sign_decision(decision, key=OTHER_KEY, issuer="operator-console", issued_at=NOW)
+    assert verify_decision(decision, envelope, key=OTHER_KEY,
+                           expected_issuer="operator-console", now=NOW)["valid"] is True
+    # The operator envelope cannot masquerade as evidence, nor the reverse.
+    assert verify_envelope(decision, envelope, key=OTHER_KEY,
+                           now=NOW)["blockers"] != []
+    evidence_envelope = make_envelope(decision, key=OTHER_KEY, issuer="operator-console",
+                                      issued_at=NOW)
+    assert verify_decision(decision, evidence_envelope, key=OTHER_KEY,
+                           expected_issuer="operator-console", now=NOW)["valid"] is False
+    assert verify_decision({"decision": "APPROVE", "permission_id": "perm-2"}, envelope,
+                           key=OTHER_KEY, expected_issuer="operator-console",
+                           now=NOW)["blockers"] == ["EVIDENCE_PAYLOAD_HASH_MISMATCH"]
 
 
 def test_bundle_signing_excludes_operator_decision_but_binds_everything_else():

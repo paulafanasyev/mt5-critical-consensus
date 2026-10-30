@@ -134,17 +134,75 @@ def risk_snapshot_gate(
     return {"status": "PASS", "trade_allowed": False, "blockers": [], "observed_at": stamp.isoformat()}
 
 
+def risk_snapshot_matches_order(
+    request: Mapping[str, Any], snapshot: Mapping[str, Any], *,
+    tolerance_fraction: float = 0.01,
+) -> list[str]:
+    """Recompute the snapshot's risk metrics from the exact order it claims to measure.
+
+    A snapshot is persisted by a separate process, so its aggregate percentages must
+    agree with its own equity and tick specification; otherwise a tampered or
+    mismatched row could report an artificially small ``risk_fraction``.
+    """
+    tolerance = _finite(tolerance_fraction)
+    if tolerance is None or not 0 <= tolerance <= 0.5:
+        return ["RISK_RECONCILIATION_POLICY_INVALID"]
+    blockers: list[str] = []
+    instrument = str(request.get("instrument", "")).strip().upper()
+    if str(snapshot.get("symbol", "")).strip().upper() != instrument:
+        blockers.append("RISK_SNAPSHOT_SYMBOL_MISMATCH")
+    sl_tp = request.get("sl_tp")
+    size = _finite(request.get("size"))
+    entry = _finite(request.get("expected_price"))
+    stop = _finite(sl_tp.get("sl")) if isinstance(sl_tp, Mapping) else None
+    equity = _finite(snapshot.get("account_equity"))
+    tick_size = _finite(snapshot.get("risk_tick_size"))
+    tick_value_loss = _finite(snapshot.get("risk_tick_value_loss"))
+    if size is None or entry is None or stop is None:
+        return sorted(set(blockers + ["RISK_REQUEST_FIELDS_INVALID"]))
+    if equity is None or equity <= 0:
+        return sorted(set(blockers + ["RISK_SNAPSHOT_ACCOUNT_EQUITY_MISSING_OR_INVALID"]))
+    if tick_size is None or tick_size <= 0 or tick_value_loss is None or tick_value_loss <= 0:
+        return sorted(set(blockers + ["RISK_SNAPSHOT_TICK_SPEC_MISSING_OR_INVALID"]))
+
+    expected_value = abs(entry - stop) / tick_size * tick_value_loss * size
+    expected_fraction = expected_value / equity
+    reported_value = _finite(snapshot.get("risk_value_account_currency"))
+    reported_fraction = _finite(snapshot.get("risk_fraction"))
+
+    def disagrees(reported: float | None, expected: float, name: str) -> None:
+        if reported is None or abs(reported - expected) > max(1e-12, expected * tolerance):
+            blockers.append(name)
+
+    disagrees(reported_fraction, expected_fraction, "RISK_FRACTION_DOES_NOT_MATCH_ORDER")
+    if reported_value is not None:
+        disagrees(reported_value, expected_value, "RISK_VALUE_DOES_NOT_MATCH_ORDER")
+
+    day_start = _finite(snapshot.get("day_start_equity"))
+    peak = _finite(snapshot.get("equity_high_watermark"))
+    if day_start is not None and day_start > 0:
+        disagrees(_finite(snapshot.get("daily_loss_fraction")),
+                  max(0.0, (day_start - equity) / day_start),
+                  "DAILY_LOSS_DOES_NOT_MATCH_EQUITY")
+    if peak is not None and peak > 0:
+        disagrees(_finite(snapshot.get("drawdown_fraction")),
+                  max(0.0, (peak - equity) / peak),
+                  "DRAWDOWN_DOES_NOT_MATCH_EQUITY")
+    return sorted(set(blockers))
+
+
 def risk_controlled_permission(
     request: Mapping[str, Any], matrix: Mapping[str, Any], *,
     kill_switch_state: Mapping[str, Any] | None,
     snapshot: Mapping[str, Any] | None,
     now: datetime | None = None,
     snapshot_max_age_seconds: int = 15,
+    risk_fraction_tolerance_fraction: float = 0.01,
 ) -> dict[str, Any]:
     """Require kill-switch and fresh terminal risk gates before the policy permission gate."""
     switch = global_kill_switch_gate(kill_switch_state)
     risk = risk_snapshot_gate(snapshot, now=now, max_age_seconds=snapshot_max_age_seconds)
-    if switch["status"] != "PASS" or risk["status"] != "PASS":
+    if switch["status"] != "PASS" or risk["status"] != "PASS" or not isinstance(snapshot, Mapping):
         blockers = list(switch.get("blockers", [])) + list(risk.get("blockers", []))
         return {"status": "DENY", "allowed": False, "trade_allowed": False,
                 "blockers": sorted(set(blockers)), "kill_switch": switch, "risk_snapshot": risk}
@@ -156,6 +214,13 @@ def risk_controlled_permission(
     if snapshot.get("request_binding_sha256") != expected_binding:
         return {"status": "DENY", "allowed": False, "trade_allowed": False,
                 "blockers": ["RISK_REQUEST_BINDING_MISMATCH"], "kill_switch": switch, "risk_snapshot": risk}
+    reconciliation = risk_snapshot_matches_order(
+        request, snapshot, tolerance_fraction=risk_fraction_tolerance_fraction,
+    )
+    if reconciliation:
+        return {"status": "DENY", "allowed": False, "trade_allowed": False,
+                "blockers": reconciliation, "kill_switch": switch, "risk_snapshot": risk,
+                "risk_reconciliation": {"status": "FAILED", "blockers": reconciliation}}
     merged = dict(request)
     merged["risk_snapshot"] = {
         **dict(merged.get("risk_snapshot", {}) if isinstance(merged.get("risk_snapshot"), Mapping) else {}),
@@ -170,5 +235,6 @@ def risk_controlled_permission(
     result = permission_gate(merged, matrix, now=now)
     result["kill_switch"] = switch
     result["risk_snapshot_validation"] = risk
+    result["risk_reconciliation"] = {"status": "PASS", "blockers": []}
     result["trade_allowed"] = False
     return result
