@@ -263,3 +263,22 @@ def test_capture_manifest_rejects_api_timestamp_pointer_when_field_missing(tmp_p
         assert False, "missing publisher timestamp field should be rejected"
     except ValueError as exc:
         assert "invalid publisher JSON timestamp field" in str(exc)
+
+
+def test_capture_manifest_rejects_malformed_configured_json_timestamp_pointer(tmp_path):
+    configured = policy()
+    configured["publishers"]["official-a"]["published_at_json_pointer"] = 7
+    registry_path = tmp_path / "registry.yaml"
+    manifest_path = tmp_path / "manifest.json"
+    registry_path.write_text(yaml.safe_dump(configured), encoding="utf-8")
+    manifest_path.write_text(json.dumps({"sources": [{
+        "publisher_id": "official-a",
+        "url": "https://official-a.example/api/releases/latest",
+        "published_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+        "publication_time_attestation": "operator_attested",
+    }]}), encoding="utf-8")
+    try:
+        CAPTURE.capture_manifest(manifest_path, registry_path)
+        assert False, "invalid JSON timestamp pointer should be rejected"
+    except ValueError as exc:
+        assert "invalid configured JSON timestamp pointer" in str(exc)
