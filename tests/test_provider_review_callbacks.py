@@ -25,7 +25,10 @@ async def test_provider_blind_peer_review_accepts_only_allowlisted_evidence(monk
         }
     monkeypatch.setattr(agent, "_request_json_sync", fake_request)
     callback = agent.make_peer_reviewer(
-        ["ev-1", "ev-2"], evidence_context={"ev-1": "Policy rate remains unchanged."},
+        ["ev-1", "ev-2"], evidence_context={
+            "ev-1": "Policy rate remains unchanged.",
+            "ev-2": "A second source independently reports the same policy decision.",
+        },
     )
     result = await callback(
         {"verdict_id": "v-1", "verdict": "APPROVE", "evidence_refs": ["ev-1"]},
@@ -59,7 +62,10 @@ def test_provider_challenge_resolver_requires_allowlisted_resolution_evidence(mo
         "evidence_refs": ["ev-2"],
     }))
     resolver = agent.make_challenge_resolver(
-        ["ev-1", "ev-2"], evidence_context={"ev-1": "Published source calculation: 1.25."},
+        ["ev-1", "ev-2"], evidence_context={
+            "ev-1": "Published source calculation: 1.25.",
+            "ev-2": "Independent report confirms the calculation methodology.",
+        },
     )
     result = resolver({"challenge_id": "ch-1", "target_verdict_id": "v-1",
                        "evidence_refs": ["ev-1"]}, 1)
