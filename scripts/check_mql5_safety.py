@@ -15,7 +15,7 @@ def main() -> int:
         "demo execution disabled by default": r"input\s+bool\s+EnableDemoExecution\s*=\s*false\s*;",
         "live execution switch disabled by default": r"input\s+bool\s+AllowLiveExecution\s*=\s*false\s*;",
         "demo account verification": r"ACCOUNT_TRADE_MODE_DEMO",
-        "command expiry validation": r"expires_at\s*<=\s*\(long\)TimeGMT\(\)",
+        "command expiry validation": r"expires_at\s*<=\s*current_time",
         "protective stop-loss and take-profit validation": r"sl\s*<=\s*0\s*\|\|\s*tp\s*<=\s*0",
         "slippage guard": r"MaxSlippagePoints",
         "live spread cap": r"MaxSpreadPoints",
