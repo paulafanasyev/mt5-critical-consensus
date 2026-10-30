@@ -189,9 +189,15 @@ def test_publisher_json_timestamp_requires_configured_pointer_and_exact_field():
     item = record()
     item["publication_time_attestation"] = "publisher_json_pointer"
     item["publication_time_field"] = "/metadata/published_at"
+    item["source_id"] = source_id_for_capture(
+        item["publisher_id"], item["source_url"], item["content_sha256"],
+        registry_version="1", published_at=item["published_at"],
+        publication_time_attestation="publisher_json_pointer",
+        publication_time_field="/metadata/published_at",
+    )
     result = validate_source_capture(item, registry(), now=NOW)
     assert result["status"] == "DENY"
-    assert "SOURCE_PUBLISHER_JSON_TIMESTAMP_POLICY_MISMATCH" in result["blockers"]
+    assert "SOURCE_PUBLICATION_TIME_ATTESTATION_NOT_ALLOWED" in result["blockers"]
 
 
 def test_malformed_configured_json_timestamp_pointer_fails_closed():
