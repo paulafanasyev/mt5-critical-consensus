@@ -2,7 +2,7 @@ import asyncio
 from critical_consensus.gates import challenge_resolution_loop, devil_advocate_pass, anonymized_peer_review, self_adversarial_pass
 
 def test_challenge_deadlock_escalates():
-    result = challenge_resolution_loop([{"challenge_id": "c1", "status": "OPEN"}],
+    result = challenge_resolution_loop([{"challenge_id": "c1", "target_verdict_id": "v1", "challenge_type": "LOGIC_GAP", "status": "OPEN", "evidence_refs": ["ev-0"]}],
         lambda challenge, round_no: {"resolved": False, "evidence_refs": []}, max_rounds=3)
     assert result["status"] == "ESCALATE"
     assert len(result["transcript"]) == 3
@@ -11,6 +11,8 @@ def test_challenge_resolution_requires_evidence():
     result = challenge_resolution_loop([{"challenge_id": "c1", "status": "OPEN"}],
         lambda challenge, round_no: {"resolved": True, "evidence_refs": ["ev-1"]}, max_rounds=3)
     assert result["status"] == "RESOLVED"
+    assert len(result["resolved_challenges"]) == 1
+    assert result["resolved_challenges"][0]["resolution_evidence_refs"] == ["ev-1"]
 
 def test_devil_advocate_needs_three_evidence_backed_hypotheses():
     report = devil_advocate_pass({"signal_id": "s1"}, [
@@ -50,6 +52,6 @@ def test_mnpi_suspect_is_unconditional_veto():
 def test_challenge_resolver_exception_escalates_without_crashing():
     def broken_resolver(_challenge, _round_no):
         raise RuntimeError("sensitive internals not to be copied")
-    result = challenge_resolution_loop([{"challenge_id": "c-fail", "status": "OPEN"}], broken_resolver, max_rounds=2)
+    result = challenge_resolution_loop([{"challenge_id": "c-fail", "target_verdict_id": "v-fail", "challenge_type": "LOGIC_GAP", "status": "OPEN", "evidence_refs": ["ev-0"]}], broken_resolver, max_rounds=2)
     assert result["status"] == "ESCALATE"
     assert all("sensitive internals" not in str(item) for item in result["transcript"])
