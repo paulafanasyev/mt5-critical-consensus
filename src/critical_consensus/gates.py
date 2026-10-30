@@ -177,35 +177,79 @@ async def anonymized_peer_review(
 def challenge_resolution_loop(challenges: Sequence[Mapping[str, Any]],
                               resolver: Callable[[dict[str, Any], int], Mapping[str, Any]],
                               *, max_rounds: int = 3) -> dict[str, Any]:
-    """Resolve each challenge with bounded rounds; unresolved at the limit escalates."""
+    """Resolve challenges in at most three rounds and return both resolved and open records."""
     if max_rounds < 1 or max_rounds > 3:
         raise ValueError("max_rounds must be 1..3")
     transcript: list[dict[str, Any]] = []
+    resolved_challenges: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
     for original in challenges:
-        challenge = dict(original)
-        if challenge.get("status") in ("RESOLVED", "CLOSED"):
+        if not isinstance(original, Mapping):
+            unresolved.append({"status": "OPEN", "resolution_error": "INVALID_CHALLENGE_RECORD"})
             continue
+        challenge = dict(original)
+        challenge_id = str(challenge.get("challenge_id", "")).strip()
+        target_verdict_id = str(challenge.get("target_verdict_id", "")).strip()
+        challenge_type = str(challenge.get("challenge_type", "")).strip().upper()
+        refs = challenge.get("evidence_refs")
+        refs_valid = (
+            isinstance(refs, Sequence) and not isinstance(refs, (str, bytes))
+            and bool(refs) and all(isinstance(ref, str) and ref.strip() for ref in refs)
+        )
+        if not challenge_id or not target_verdict_id or not challenge_type or not refs_valid:
+            challenge["status"] = "OPEN"
+            challenge["resolution_error"] = "CHALLENGE_ID_TARGET_TYPE_OR_EVIDENCE_INVALID"
+            unresolved.append(challenge)
+            continue
+        if str(challenge.get("status", "")).upper() == "RESOLVED":
+            resolution_refs = challenge.get("resolution_evidence_refs")
+            if (isinstance(resolution_refs, Sequence) and not isinstance(resolution_refs, (str, bytes))
+                    and bool(resolution_refs) and all(isinstance(ref, str) and ref.strip() for ref in resolution_refs)):
+                resolved_challenges.append(challenge)
+            else:
+                challenge["status"] = "OPEN"
+                challenge["resolution_error"] = "PRE_RESOLVED_CHALLENGE_MISSING_RESOLUTION_EVIDENCE"
+                unresolved.append(challenge)
+            continue
+
         resolved = False
         for round_no in range(1, max_rounds + 1):
             try:
                 raw_response = resolver(dict(challenge), round_no)
-                response = dict(raw_response) if isinstance(raw_response, Mapping) else {"resolved": False, "error_code": "INVALID_RESOLVER_RESPONSE"}
+                response = dict(raw_response) if isinstance(raw_response, Mapping) else {
+                    "resolved": False, "error_code": "INVALID_RESOLVER_RESPONSE"
+                }
             except Exception as exc:
                 response = {"resolved": False, "error_code": f"RESOLVER_FAILED:{type(exc).__name__}"}
-            transcript.append({"challenge_id": challenge.get("challenge_id"), "round": round_no,
-                               "response": response})
-            if response.get("resolved") is True and response.get("evidence_refs"):
+            transcript.append({"challenge_id": challenge_id, "round": round_no, "response": response})
+            response_refs = response.get("evidence_refs")
+            valid_response_refs = (
+                isinstance(response_refs, Sequence) and not isinstance(response_refs, (str, bytes))
+                and bool(response_refs) and all(isinstance(ref, str) and ref.strip() for ref in response_refs)
+            )
+            if response.get("resolved") is True and valid_response_refs:
+                resolved_challenges.append({
+                    **challenge, "status": "RESOLVED",
+                    "resolution_evidence_refs": [str(ref) for ref in response_refs],
+                    "resolution_round": round_no,
+                    "resolution_summary": str(response.get("summary", "")).strip()[:2000],
+                })
                 resolved = True
                 break
             challenge["last_resolution_attempt"] = response
         if not resolved:
             challenge["status"] = "OPEN"
             unresolved.append(challenge)
+
     deadlock = bool(unresolved)
-    return {"status": "ESCALATE" if deadlock else "RESOLVED",
-            "open_challenges": unresolved, "transcript": transcript,
-            "max_rounds": max_rounds, "trade_allowed": False if deadlock else None}
+    return {
+        "status": "ESCALATE" if deadlock else "RESOLVED",
+        "resolved_challenges": resolved_challenges,
+        "open_challenges": unresolved,
+        "transcript": transcript,
+        "max_rounds": max_rounds,
+        "trade_allowed": False,
+    }
 
 
 def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, Any]:
