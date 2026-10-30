@@ -20,6 +20,7 @@ from redis.asyncio import Redis
 from critical_consensus.persistence import PostgresRepository
 from critical_consensus.providers import canonical_signal_hash, load_agent_specs_from_env
 from critical_consensus.redis_streams import publish_event
+from critical_consensus.review_service import run_peer_review_cycle
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +65,42 @@ async def run(args) -> int:
                   "agent_errors": [{"code": type(exc).__name__}],
                   "blockers": ["AGENT_CONFIGURATION_OR_COLLECTION_FAILED"],
                   "trade_allowed": False}
+
+    if result.get("status") == "READY_FOR_REVIEW":
+        try:
+            reviewer_registry = [
+                (spec.agent_id, spec.run.make_peer_reviewer(signal["available_evidence_refs"]))
+                for spec in agents if callable(getattr(spec.run, "make_peer_reviewer", None))
+            ]
+            resolver_spec = next(
+                (spec for spec in agents if spec.role == "devil_advocate"
+                 and callable(getattr(spec.run, "make_challenge_resolver", None))),
+                None,
+            )
+            if resolver_spec is None:
+                raise ValueError("trusted challenge resolver provider is not configured")
+            resolver = resolver_spec.run.make_challenge_resolver(signal["available_evidence_refs"])
+            review_cycle = await run_peer_review_cycle(
+                result.get("verdicts", []), reviewer_registry,
+                allowed_evidence_refs=signal["available_evidence_refs"],
+                resolver=resolver, min_reviewers_per_verdict=2, max_resolution_rounds=3,
+            )
+            result["agent_collection"] = dict(result)
+            result["peer_review_cycle"] = review_cycle
+            result["peer_reviews"] = review_cycle.get("peer_reviews", [])
+            result["challenge_records"] = review_cycle.get("challenge_records", [])
+            result["open_challenges"] = review_cycle.get("open_challenges", [])
+            result["challenge_resolution_status"] = review_cycle.get("challenge_resolution_status", "MISSING")
+            result["status"] = review_cycle.get("status", "GATHER_MORE")
+            result["blockers"] = sorted(set(result.get("blockers", []) + review_cycle.get("blockers", [])))
+            result["trade_allowed"] = False
+        except Exception as exc:
+            result["status"] = "GATHER_MORE"
+            result["blockers"] = sorted(set(result.get("blockers", []) + [
+                "TRUSTED_PEER_REVIEW_OR_CHALLENGE_RESOLUTION_FAILED:" + type(exc).__name__
+            ]))
+            result["trade_allowed"] = False
+
     event = {
         "event_id": "agent-collection-" + uuid.uuid4().hex,
         "event_type": "AGENT_COLLECTION_RESULT",
@@ -89,12 +126,15 @@ async def run(args) -> int:
         finally:
             await redis.aclose()
     print(json.dumps({"market_snapshot": snapshot, "collection": result,
-                      "pipeline_stage": "AGENT_COLLECTION_ONLY",
-                      "decision_gate_invoked": False,
+                      "pipeline_stage": "AGENT_COLLECTION_AND_PEER_REVIEW",
+                      "deterministic_Chief_Gate_invoked": False,
+                      "human_authorization_processed": False,
                       "audit_event_id": event["event_id"], "redis_publication": redis_status},
                      indent=2, ensure_ascii=False))
-    if result.get("status") != "READY_FOR_REVIEW":
+    if result.get("status") != "READY_FOR_CHIEF":
         return 2
+    # READY_FOR_CHIEF means only that the evidence-backed peer-review/challenge ledger is complete.
+    # Certainty Gate, deterministic Chief reasoning, Permission Gate and user authorization are separate.
     return 0 if redis_status.get("status") == "PUBLISHED" else 3
 
 
