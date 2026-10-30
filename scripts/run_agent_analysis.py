@@ -59,9 +59,14 @@ async def run(args) -> int:
     available_evidence_refs = [f"market-bars:{snapshot_hash}", *source_ids]
     source_documents = source_context.get("documents", [])
     evidence_context = {
-        str(document["source_id"]): str(document["text"])
-        for document in source_documents
-        if isinstance(document, dict) and document.get("source_id") and document.get("text")
+        f"market-bars:{snapshot_hash}": json.dumps(
+            snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        ),
+        **{
+            str(document["source_id"]): str(document["text"])
+            for document in source_documents
+            if isinstance(document, dict) and document.get("source_id") and document.get("text")
+        },
     }
     signal = {
         "signal_id": signal_id,
