@@ -173,6 +173,7 @@ async def run_peer_review_cycle(
 
     resolution = challenge_resolution_loop(
         challenges, resolver, max_rounds=max_resolution_rounds,
+        resolver_timeout_seconds=review_timeout_seconds,
     )
     resolved: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
