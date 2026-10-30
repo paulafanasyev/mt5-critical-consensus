@@ -83,10 +83,11 @@ assert result["trade_allowed"] is False
 
 ## Проверка текущего каркаса
 
-- Последний подтверждённый GitHub Actions прогон для PR #8, HEAD `2272718ab0a5d67333eadcc1e74139976801cdf8`: **175 passed, 9 skipped** в pytest; **9 passed** в PostgreSQL/Redis integration; `unit-and-static`, `security`/Bandit и `dependency-audit` — PASS. Runs: [pytest](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40994788238), [validation-suite](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40994788299), [dependency-audit](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/40994788287). Эти проверки подтверждают только тестируемое поведение кода и контейнерных интеграций; они не заменяют MetaEditor compile, MT5 Strategy Tester, broker demo-forward или проверку прибыльности.
+- Последний полностью подтверждённый GitHub Actions прогон для PR #8, HEAD `99e60399d80c73b2bbf6e82065a7fafd7f400488`: **187 passed, 10 skipped** в pytest и unit/static; **10 passed** в PostgreSQL/Redis integration; security/Bandit и dependency-audit — PASS. Runs: [pytest](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/41000167675), [validation-suite](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/41000167631), [dependency-audit](https://github.com/paulafanasyev/mt5-critical-consensus/actions/runs/41000167617). Эти проверки подтверждают тестируемое поведение кода и контейнерных интеграций; они не заменяют MetaEditor compile, MT5 Strategy Tester, broker demo-forward или проверку прибыльности.
 - Проверяются fail-closed gates, integrity binding между ChiefReasoning/consensus/source summary и PermissionRequest, выдача полного human review packet, hash chain, API key gate и Redis Streams helpers.
 - Проверка зелёных тестов доказывает поведение локальных функций на синтетических входах, но не проверяет брокер, MQL5-компиляцию, реальную очередь, рыночные данные или доходность.
-- ChiefReasoning hash вычисляется по каноническому JSON без поля `reasoning_hash`; изменение любого шага делает hash невалидным.
+- ChiefReasoning должен содержать точный `signal_input_hash`, совпадающий с неизменяемым снимком сигнала; отсутствующий или чужой hash приводит к HOLD. `reasoning_hash` должен быть заранее вычислен по каноническому JSON без самого поля hash — runtime не синтезирует его за вызывающую сторону.
+- Redis worker восстанавливает idle pending-записи через `XAUTOCLAIM`, повторно проводит их через тот же PostgreSQL-idempotent handler и ACK только после успешного сохранения. Доставка остаётся at-least-once, а не exactly-once.
 
 ## Официальные точки интеграции
 
