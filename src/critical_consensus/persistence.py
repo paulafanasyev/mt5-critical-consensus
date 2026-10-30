@@ -142,9 +142,8 @@ class PostgresRepository:
             raise ValueError("captured_content must be non-empty raw HTTPS response bytes")
         content = bytes(captured)
         digest = str(record.get("content_sha256", ""))
-        if digest != _sha256(content.decode("latin-1")) and (
-            not digest.startswith("sha256:") or hashlib.sha256(content).hexdigest() != digest[7:]
-        ):
+        if (len(digest) != 71 or not digest.startswith("sha256:")
+                or hashlib.sha256(content).hexdigest() != digest[7:]):
             raise ValueError("captured source bytes do not match content_sha256")
         if len(content) != int(record.get("content_bytes", -1)) or len(content) > 512_000:
             raise ValueError("source content byte count is invalid")
