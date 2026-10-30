@@ -191,7 +191,7 @@ async def test_agent_runtime_requires_a_nonempty_signal_evidence_allowlist_befor
     assert called is False
 
 
-@pytest.mark.parametrize("timeout", [True, False, 0, -1, float("nan"), float("inf"), "15", None])
+@pytest.mark.parametrize("timeout", [True, False, 0, -1, float("nan"), float("inf"), "15", None, 10 ** 1000])
 async def test_agent_runtime_rejects_invalid_collection_policy_types(timeout):
     result = await collect_agent_verdicts(
         {"signal_id": "s1", "available_evidence_refs": ["source:1"]},
