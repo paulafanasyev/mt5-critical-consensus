@@ -9,7 +9,9 @@ import os
 from redis.asyncio import Redis
 
 from critical_consensus.persistence import PostgresRepository
-from critical_consensus.redis_streams import (\n    ensure_consumer_group, process_message_batch, read_new_messages, reclaim_pending_messages,\n)
+from critical_consensus.redis_streams import (
+    ensure_consumer_group, process_message_batch, read_new_messages, reclaim_pending_messages,
+)
 
 
 async def main() -> None:
