@@ -96,5 +96,6 @@ async def test_worker_reclaims_abandoned_pending_event_after_consumer_crash():
         assert int((await redis.xpending(stream, group))["pending"]) == 0
         assert await asyncio.to_thread(repo.persist_event_once, event, consumer_name=group) is False
     finally:
-        await redis.delete(stream, f"cc:attempts:{stream}:{group}:0-0")
+        attempt_keys = await redis.keys(f"cc:attempts:{stream}:{group}:*")
+        await redis.delete(stream, *attempt_keys)
         await redis.aclose()
