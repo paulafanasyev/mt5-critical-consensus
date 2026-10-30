@@ -9,6 +9,7 @@ import pytest
 
 from critical_consensus.market_data import MarketBar
 from critical_consensus.persistence import PostgresRepository
+from critical_consensus.audit import make_audit_event, canonical_hash
 
 
 pytestmark = pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="TEST_DATABASE_URL not configured")
@@ -88,3 +89,40 @@ def test_mt5_risk_snapshot_is_persisted_immutably():
     assert loaded is not None
     assert loaded["status"] == "DENY"
     assert loaded["blockers"] == ["TEST_MISSING_TERMINAL"]
+
+
+def test_full_pipeline_decision_and_audit_chain_are_persisted_atomically():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    signal_input = {"signal_id": "persist-" + uuid.uuid4().hex, "symbol": "EURUSD"}
+    signal_id = signal_input["signal_id"]
+    first = make_audit_event("SIGNAL_RECEIVED", {"signal_id": signal_id})
+    second = make_audit_event("PIPELINE_RESULT", {"signal_id": signal_id, "status": "GATHER_MORE"},
+                              first["event_hash"])
+    result = {
+        "signal_id": signal_id, "status": "GATHER_MORE", "trade_allowed": False,
+        "blockers": ["TEST_EVIDENCE_MISSING"],
+        "audit_events": [first, second], "audit_chain_valid": True,
+    }
+    persisted = repo.persist_pipeline_result(
+        result, signal_input_sha256=canonical_hash(signal_input),
+    )
+    assert persisted["status"] == "GATHER_MORE"
+    assert persisted["audit_event_count"] == 2
+    assert persisted["audit_events_inserted"] == 2
+    assert persisted["trade_allowed"] is False
+    with pytest.raises(ValueError, match="invalid"):
+        repo.persist_pipeline_result(
+            dict(result, audit_events=[first, dict(second, payload={"tampered": True})]),
+            signal_input_sha256=canonical_hash(signal_input),
+        )
+
+
+def test_pipeline_result_persistence_rejects_missing_or_forged_signal_hash():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    event = make_audit_event("PIPELINE_RESULT", {"signal_id": "bad-hash"})
+    result = {"signal_id": "bad-hash", "status": "GATHER_MORE", "blockers": [],
+              "audit_events": [event], "audit_chain_valid": True}
+    with pytest.raises(ValueError, match="signal_input_sha256"):
+        repo.persist_pipeline_result(result, signal_input_sha256="sha256:bad")
