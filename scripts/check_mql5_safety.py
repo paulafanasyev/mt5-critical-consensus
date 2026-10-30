@@ -73,13 +73,21 @@ def main() -> int:
     preflight = execute_body.find("if(!OrderCheck(request, check))")
     recheck = execute_body.find("if(!CheckKillSwitch())")
     lock = execute_body.find("if(!AcquireExecutionLock(lock_key, lock_lease))")
-    duplicate = execute_body.find("if(GlobalVariableCheck(global_key))")
+    duplicate = execute_body.find(
+        "if(GlobalVariableCheck(global_key) || GlobalVariableCheck(legacy_global_key))"
+    )
     attempt = execute_body.find("GlobalVariableSet(global_key")
     flush = execute_body.find("GlobalVariablesFlush()")
     release = execute_body.find("ReleaseExecutionLock(lock_key, lock_lease)", flush)
     send = execute_body.find("OrderSend(request, result)")
-    if min(preflight, recheck, lock, duplicate, attempt, flush, release, send) < 0:
-        print("FAIL: one or more order attempt controls are missing")
+    controls = {
+        "OrderCheck": preflight, "kill-switch recheck": recheck, "account lock": lock,
+        "current and legacy duplicate check": duplicate, "attempt marker": attempt,
+        "GlobalVariablesFlush": flush, "post-flush lock release": release, "OrderSend": send,
+    }
+    missing_controls = [name for name, position in controls.items() if position < 0]
+    if missing_controls:
+        print("FAIL: missing order attempt controls: " + ", ".join(missing_controls))
         return 1
     if not (preflight < recheck < lock < duplicate < attempt < flush < release < send):
         print("FAIL: order attempt must be locked, duplicate-checked, flushed and unlocked before OrderSend")
