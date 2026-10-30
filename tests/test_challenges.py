@@ -8,7 +8,7 @@ def test_challenge_deadlock_escalates():
     assert len(result["transcript"]) == 3
 
 def test_challenge_resolution_requires_evidence():
-    result = challenge_resolution_loop([{"challenge_id": "c1", "status": "OPEN"}],
+    result = challenge_resolution_loop([{"challenge_id": "c1", "target_verdict_id": "v1", "challenge_type": "LOGIC_GAP", "status": "OPEN", "evidence_refs": ["ev-0"]}],
         lambda challenge, round_no: {"resolved": True, "evidence_refs": ["ev-1"]}, max_rounds=3)
     assert result["status"] == "RESOLVED"
     assert len(result["resolved_challenges"]) == 1
