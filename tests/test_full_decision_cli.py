@@ -16,6 +16,8 @@ EVIDENCE_ENV = {
     "MT5_EVIDENCE_ISSUER": "test-ingress",
     "MT5_GOVERNANCE_HMAC_KEY": "g" * 64,
     "MT5_GOVERNANCE_ISSUER": "calibration-service",
+    "MT5_REVIEW_HMAC_KEY": "r" * 64,
+    "MT5_REVIEW_ISSUER": "review-service",
 }
 
 

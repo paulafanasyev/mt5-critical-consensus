@@ -76,6 +76,22 @@ def test_non_canonical_payload_is_not_silently_stringified():
         payload_sha256({"value": float("nan")})
 
 
+def test_hostile_signature_and_surrogate_payload_fail_closed_not_raise():
+    payload = {"a": 1}
+    envelope = make_envelope(payload, key=KEY, issuer=ISSUER, issued_at=NOW)
+    non_ascii = dict(envelope, signature="hmac-sha256:é" + "0" * 63)
+    result = verify_envelope(payload, non_ascii, key=KEY, expected_issuer=ISSUER, now=NOW)
+    assert result["valid"] is False
+    assert "EVIDENCE_SIGNATURE_INVALID" in result["blockers"]
+
+    # A lone surrogate survives json.loads but cannot be UTF-8 encoded; verification
+    # must return a blocker instead of raising UnicodeEncodeError.
+    with_surrogate = dict(payload, note="\ud800")
+    raw = verify_envelope(with_surrogate, envelope, key=KEY, expected_issuer=ISSUER, now=NOW)
+    assert raw["valid"] is False
+    assert "EVIDENCE_PAYLOAD_NOT_CANONICALLY_HASHABLE" in raw["blockers"]
+
+
 def test_non_string_json_keys_are_rejected_instead_of_colliding():
     # json.dumps would turn both of these into {"1": ...} and hash them identically.
     with pytest.raises(EvidenceError):

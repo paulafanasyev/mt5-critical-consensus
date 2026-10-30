@@ -5,9 +5,14 @@ from pathlib import Path
 from critical_consensus.audit import canonical_hash, verify_audit_chain
 from critical_consensus.authorization import InMemoryNonceStore
 from critical_consensus.calibration import weighted_consensus
-from critical_consensus.evidence import EvidenceError, make_envelope, sign_bundle, sign_decision
+from critical_consensus.evidence import (
+    EvidenceError, make_envelope, sign_bundle, sign_decision, sign_review,
+)
 from critical_consensus.governance import sign_attestation
-from critical_consensus.pipeline import evaluate_signal_bundle
+from critical_consensus.pipeline import (
+    evaluate_signal_bundle,
+    review_attestation_payload as review_payload,
+)
 from critical_consensus.risk_controls import risk_request_binding_hash
 from jsonschema import Draft202012Validator
 
@@ -15,9 +20,11 @@ NOW = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
 EVIDENCE_KEY = "e" * 64
 GOVERNANCE_KEY = "g" * 64
 OPERATOR_KEY = "o" * 64
+REVIEW_KEY = "r" * 64
 EVIDENCE_ISSUER = "test-ingress"
 GOVERNANCE_ISSUER = "calibration-service"
 OPERATOR_ISSUER = "operator-console"
+REVIEW_ISSUER = "review-service"
 
 CERTAINTY_POLICY = {
     "near_certainty_threshold": 0.98,
@@ -48,7 +55,15 @@ PERMISSION_MATRIX = {
 }
 
 
-def make_bundle():
+def sign_review_attestation(bundle, *, now=NOW, key=REVIEW_KEY, issuer=REVIEW_ISSUER):
+    signed = dict(bundle)
+    signed["review_attestation"] = sign_review(
+        review_payload(bundle), key=key, issuer=issuer, issued_at=now,
+    )
+    return signed
+
+
+def make_bundle(now=NOW):
     agents = ["PlatformScoutAgent", "TechnicalAnalystAgent", "RiskManagerAgent", "ComplianceAgent"]
     signal_input = {"signal_id": "sig-100", "instrument": "EURUSD", "direction": "BUY",
                     "market_snapshot_hash": "sha256:" + "c" * 64,
@@ -57,7 +72,7 @@ def make_bundle():
     verdicts = [
         {"verdict_id": f"v-{i}", "signal_id": "sig-100", "agent_id": agent,
          "verdict": "APPROVE", "confidence": 0.99,
-         "reviewer_count": 999, "created_at": NOW.isoformat(), "ttl_seconds": 300,
+         "reviewer_count": 999, "created_at": now.isoformat(), "ttl_seconds": 300,
          "input_hash": signal_input_hash, "evidence_refs": ["market-bars:EURUSD:H1"],
          "calibration_meta": {"brier_score": 0.05, "sample_size": 100,
                                "calibration_status": "CALIBRATED"}}
@@ -73,12 +88,12 @@ def make_bundle():
                             "challenge_type": "LOGIC_GAP" if is_dissent else "NONE",
                             "argument": "A calculation needs reconciliation" if is_dissent else "Independent cross-check supports the evidence",
                             "evidence_refs": [f"review-evidence-{i}-{j}"], "status": "VALIDATED",
-                            "created_at": NOW.isoformat()})
+                            "created_at": now.isoformat()})
     resolved_challenge = {"challenge_id": "ch-resolved-1", "target_verdict_id": "v-0", "challenge_type": "LOGIC_GAP",
                           "argument": "A calculation needs reconciliation", "rounds": [{"round": 1, "resolved": True}],
                           "status": "RESOLVED", "evidence_refs": ["review-evidence-0-0"],
                           "resolution_evidence_refs": ["resolved-calculation-1"],
-                          "created_at": NOW.isoformat()}
+                          "created_at": now.isoformat()}
     challenge_snapshot = [resolved_challenge]
     bundle = {
         "signal_id": "sig-100", "signal_input": signal_input,
@@ -88,9 +103,9 @@ def make_bundle():
         "news_or_rumor": False,
         "key_sources": [
             {"source_id": "s1", "credibility": 0.95, "age_seconds": 20, "ttl_seconds": 900,
-             "observed_at": (NOW - timedelta(seconds=20)).isoformat()},
+             "observed_at": (now - timedelta(seconds=20)).isoformat()},
             {"source_id": "s2", "credibility": 0.94, "age_seconds": 40, "ttl_seconds": 900,
-             "observed_at": (NOW - timedelta(seconds=40)).isoformat()},
+             "observed_at": (now - timedelta(seconds=40)).isoformat()},
         ],
         "devil_advocate_report": {"status": "PASS", "counter_hypotheses": [
             {"hypothesis": "adverse move", "evidence_refs": ["e1"]},
@@ -101,7 +116,7 @@ def make_bundle():
         "dissent_rate": 0.125, "dissent_sample_size": 80,
         "false_certainty_rate": 0.02, "false_certainty_sample_size": 80,
         "chief_reasoning": {
-            "reasoning_id": "chief-r-100", "signal_id": "sig-100", "created_at": NOW.isoformat(),
+            "reasoning_id": "chief-r-100", "signal_id": "sig-100", "created_at": now.isoformat(),
             "verdict": "CONFIRM",
             "steps": {step: {"passed": True, "detail": f"checked {step}", "evidence_refs": [f"chief-{step}"]}
                       for step in "abcdefghi"},
@@ -119,7 +134,7 @@ def make_bundle():
             "expected_rr": 2.5, "expected_price": 1.0840, "sl_tp": {"sl": 1.0820, "tp": 1.0890},
             "consensus_score": 0.0, "chief_reasoning_hash": "", "tail_risk_summary": "Stress scenarios reviewed",
             "sources": [{"id": "s1", "credibility": 0.95, "age_seconds": 20}, {"id": "s2", "credibility": 0.94, "age_seconds": 40}],
-            "expires_at": (NOW + timedelta(minutes=5)).isoformat(), "within_high_impact_news_window": False,
+            "expires_at": (now + timedelta(minutes=5)).isoformat(), "within_high_impact_news_window": False,
             "risk_snapshot": {"risk_fraction": 0.003, "daily_loss_fraction": 0.004, "drawdown_fraction": 0.02,
                               "open_positions": 1, "correlated_open_positions": 0},
         },
@@ -127,7 +142,7 @@ def make_bundle():
     bundle["chief_reasoning"]["reasoning_hash"] = canonical_hash(bundle["chief_reasoning"])
     bundle["permission_request"]["chief_reasoning_hash"] = bundle["chief_reasoning"]["reasoning_hash"]
     bundle["permission_request"]["consensus_score"] = weighted_consensus(verdicts)
-    return bundle
+    return sign_review_attestation(bundle, now=now)
 
 
 def make_governance_attestation(now=NOW, *, dissent_rate=0.125, false_certainty_rate=0.02,
@@ -166,11 +181,17 @@ def sign_operator_approval(bundle, *, now=NOW, key=OPERATOR_KEY, issuer=OPERATOR
     return signed
 
 
-def run_pipeline(bundle, *, now=NOW, sign=True, policy=None, **kwargs):
+def run_pipeline(bundle, *, now=NOW, sign=True, policy=None, resign_review=None, **kwargs):
     body = dict(bundle)
     if body.get("user_decision") is not None and "user_decision_envelope" not in body:
         body = sign_operator_approval(body, now=now)
     body.setdefault("governance_attestation", make_governance_attestation(now))
+    if resign_review is None:
+        # Tests mutate make_bundle() output as if the review service produced that exact
+        # snapshot; re-attesting keeps the signed review view consistent with the bundle.
+        resign_review = sign
+    if resign_review:
+        body = sign_review_attestation(body, now=now)
     if sign:
         try:
             body = sign_bundle(body, key=EVIDENCE_KEY, issuer=EVIDENCE_ISSUER, issued_at=now)
@@ -182,6 +203,8 @@ def run_pipeline(bundle, *, now=NOW, sign=True, policy=None, **kwargs):
     kwargs.setdefault("expected_evidence_issuer", EVIDENCE_ISSUER)
     kwargs.setdefault("operator_key", OPERATOR_KEY)
     kwargs.setdefault("expected_operator_issuer", OPERATOR_ISSUER)
+    kwargs.setdefault("review_key", REVIEW_KEY)
+    kwargs.setdefault("expected_review_issuer", REVIEW_ISSUER)
     return evaluate_signal_bundle(body, policy or CERTAINTY_POLICY, PERMISSION_MATRIX,
                                   now=now, **kwargs)
 
@@ -415,6 +438,7 @@ def _persisted_demo_risk_evidence(bundle, *, kill_switch_active=False, binding_o
         "risk_tick_size": 0.0001, "risk_tick_value_loss": 15.0,
         "reference_price": request["expected_price"],
         "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0,
+        "open_stop_risk_fraction": 0.0,
         "open_positions": 1, "correlated_open_positions": 0,
         "request_binding_sha256": binding_override or risk_request_binding_hash(request),
         "within_high_impact_news_window": False,
@@ -479,6 +503,7 @@ def test_pipeline_requires_a_valid_signed_evidence_envelope():
         bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
         evidence_key=EVIDENCE_KEY, governance_key=GOVERNANCE_KEY,
         expected_evidence_issuer=EVIDENCE_ISSUER,
+        review_key=REVIEW_KEY, expected_review_issuer=REVIEW_ISSUER,
     )
     assert result["status"] == "GATHER_MORE"
     assert "EVIDENCE_ENVELOPE_MISSING_OR_INVALID" in result["blockers"]
@@ -489,6 +514,7 @@ def test_pipeline_requires_configured_issuer_pinning():
     result = evaluate_signal_bundle(
         make_bundle(), CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
         evidence_key=EVIDENCE_KEY, governance_key=GOVERNANCE_KEY,
+        review_key=REVIEW_KEY, expected_review_issuer=REVIEW_ISSUER,
     )
     assert result["status"] == "GATHER_MORE"
     assert result["blockers"] == ["EVIDENCE_EXPECTED_ISSUER_NOT_CONFIGURED"]
@@ -517,6 +543,7 @@ def test_pipeline_rejects_bundle_tampering_after_signing():
         bundle, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
         evidence_key=EVIDENCE_KEY, governance_key=GOVERNANCE_KEY,
         expected_evidence_issuer=EVIDENCE_ISSUER,
+        review_key=REVIEW_KEY, expected_review_issuer=REVIEW_ISSUER,
     )
     assert result["status"] == "GATHER_MORE"
     assert "EVIDENCE_PAYLOAD_HASH_MISMATCH" in result["blockers"]
@@ -530,6 +557,7 @@ def test_pipeline_requires_a_valid_governance_attestation():
         body, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
         evidence_key=EVIDENCE_KEY, governance_key=GOVERNANCE_KEY,
         expected_evidence_issuer=EVIDENCE_ISSUER,
+        review_key=REVIEW_KEY, expected_review_issuer=REVIEW_ISSUER,
     )
     assert result["status"] == "GATHER_MORE"
     assert any(blocker.startswith("GOVERNANCE_") for blocker in result["blockers"])
@@ -654,7 +682,8 @@ def _evaluate_with_approval(bundle, **kwargs):
     body = sign_bundle(body, key=EVIDENCE_KEY, issuer=EVIDENCE_ISSUER, issued_at=NOW)
     args = dict(evidence_key=EVIDENCE_KEY, governance_key=GOVERNANCE_KEY,
                 expected_evidence_issuer=EVIDENCE_ISSUER,
-                operator_key=OPERATOR_KEY, expected_operator_issuer=OPERATOR_ISSUER)
+                operator_key=OPERATOR_KEY, expected_operator_issuer=OPERATOR_ISSUER,
+                review_key=REVIEW_KEY, expected_review_issuer=REVIEW_ISSUER)
     args.update(kwargs)
     return evaluate_signal_bundle(body, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW, **args)
 
@@ -748,7 +777,9 @@ def test_operator_approval_is_bound_to_the_exact_order_parameters():
         body, CERTAINTY_POLICY, PERMISSION_MATRIX, now=NOW,
         evidence_key=EVIDENCE_KEY, governance_key=GOVERNANCE_KEY,
         expected_evidence_issuer=EVIDENCE_ISSUER, operator_key=OPERATOR_KEY,
-        expected_operator_issuer=OPERATOR_ISSUER, require_persisted_risk=True,
+        expected_operator_issuer=OPERATOR_ISSUER,
+        review_key=REVIEW_KEY, expected_review_issuer=REVIEW_ISSUER,
+        require_persisted_risk=True,
         kill_switch_state=state, terminal_risk_snapshot=snapshot,
         authorization_store=InMemoryNonceStore(),
     )
@@ -793,3 +824,99 @@ def test_operator_key_must_differ_from_the_governance_domain():
         )
         assert result["status"] == "DENY"
         assert blocker in result["blockers"]
+
+
+def test_human_review_packet_shows_the_terminal_snapshot_the_gate_validated():
+    bundle = make_bundle()
+    state, snapshot = _persisted_demo_risk_evidence(bundle)
+    # The bundle's own summary understates risk; the packet must not echo it.
+    bundle["permission_request"]["risk_snapshot"]["risk_fraction"] = 0.0001
+    result = run_pipeline(bundle, require_persisted_risk=True, kill_switch_state=state,
+                          terminal_risk_snapshot=snapshot)
+    assert result["status"] == "REQUIRE_HUMAN"
+    packet = result["details"]["human_review_packet"]
+    assert packet["risk_snapshot_source"] == "persisted_terminal_snapshot"
+    assert packet["risk_snapshot"]["risk_fraction"] == snapshot["risk_fraction"]
+    assert packet["risk_snapshot"]["open_stop_risk_fraction"] == 0.0
+    assert packet["risk_snapshot_validation"]["status"] == "PASS"
+    assert packet["risk_reconciliation"]["status"] == "PASS"
+
+
+def test_pipeline_requires_a_signed_review_attestation():
+    bundle = make_bundle()
+    bundle.pop("review_attestation")
+    result = run_pipeline(bundle, resign_review=False)
+    assert result["status"] == "GATHER_MORE"
+    assert "REVIEW_ENVELOPE_MISSING_OR_INVALID" in result["blockers"]
+    assert "certainty" not in result["details"]
+
+
+def test_evidence_key_holder_cannot_mint_chief_or_peer_review_output():
+    bundle = make_bundle()
+    bundle["chief_reasoning"]["tail_risk_probability"] = 0.0001
+    bundle["chief_reasoning"]["reasoning_hash"] = canonical_hash(bundle["chief_reasoning"])
+    bundle["permission_request"]["chief_reasoning_hash"] = bundle["chief_reasoning"]["reasoning_hash"]
+    # The evidence key can re-sign the whole bundle, but not the review-domain attestation.
+    result = run_pipeline(bundle, resign_review=False)
+    assert result["status"] == "GATHER_MORE"
+    assert "REVIEW_PAYLOAD_HASH_MISMATCH" in result["blockers"]
+    assert "certainty" not in result["details"]
+
+
+def test_review_attestation_is_bound_to_the_signal_id():
+    bundle = make_bundle()
+    bundle["review_attestation"] = sign_review(
+        {**review_payload(bundle), "signal_id": "sig-other"},
+        key=REVIEW_KEY, issuer=REVIEW_ISSUER, issued_at=NOW,
+    )
+    result = run_pipeline(bundle, resign_review=False)
+    assert result["status"] == "GATHER_MORE"
+    assert "REVIEW_PAYLOAD_HASH_MISMATCH" in result["blockers"]
+
+
+def test_review_attestation_signed_with_the_evidence_key_is_rejected():
+    bundle = sign_review_attestation(make_bundle(), key=EVIDENCE_KEY, issuer=REVIEW_ISSUER)
+    result = run_pipeline(bundle, resign_review=False)
+    assert result["status"] == "GATHER_MORE"
+    assert "REVIEW_SIGNATURE_MISMATCH" in result["blockers"]
+
+
+def test_review_attestation_must_name_the_pinned_issuer():
+    bundle = make_bundle()
+    bundle["review_attestation"] = sign_review(
+        review_payload(bundle), key=REVIEW_KEY, issuer=EVIDENCE_ISSUER, issued_at=NOW,
+    )
+    result = run_pipeline(bundle, resign_review=False)
+    assert result["status"] == "GATHER_MORE"
+    assert "REVIEW_ISSUER_MISMATCH" in result["blockers"]
+
+
+def test_expired_review_attestation_fails_closed():
+    bundle = sign_review_attestation(make_bundle(), now=NOW - timedelta(hours=2))
+    result = run_pipeline(bundle, resign_review=False)
+    assert result["status"] == "GATHER_MORE"
+    assert "REVIEW_EXPIRED" in result["blockers"]
+
+
+def test_review_signing_domain_must_be_distinct_from_evidence_and_operator_domains():
+    cases = (
+        ({"review_key": EVIDENCE_KEY}, "REVIEW_KEY_NOT_DISTINCT"),
+        ({"review_key": OPERATOR_KEY}, "REVIEW_KEY_NOT_DISTINCT"),
+        ({"expected_review_issuer": EVIDENCE_ISSUER}, "REVIEW_ISSUER_NOT_DISTINCT"),
+        ({"expected_review_issuer": OPERATOR_ISSUER}, "REVIEW_ISSUER_NOT_DISTINCT"),
+    )
+    for kwargs, blocker in cases:
+        result = run_pipeline(make_bundle(), **kwargs)
+        assert result["status"] == "GATHER_MORE"
+        assert blocker in result["blockers"], kwargs
+
+
+def test_approval_signed_in_the_review_domain_is_rejected():
+    bundle = _approval_bundle()
+    decision = bundle["user_decision"]
+    bundle["user_decision_envelope"] = sign_review(
+        decision, key=REVIEW_KEY, issuer=REVIEW_ISSUER, issued_at=NOW,
+    )
+    result = _evaluate_with_approval(bundle)
+    assert result["status"] == "DENY"
+    assert "EVIDENCE_SIGNATURE_MISMATCH" in result["blockers"]

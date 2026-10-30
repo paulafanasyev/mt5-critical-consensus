@@ -28,6 +28,7 @@ def good_snapshot():
             "risk_tick_size": 0.0001, "risk_tick_value_loss": 20.0,
             "reference_price": 1.1001,
             "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0196,
+            "open_stop_risk_fraction": 0.0,
             "open_positions": 1, "correlated_open_positions": 1,
             "request_binding_sha256": risk_request_binding_hash(good_request()),
             "within_high_impact_news_window": None}
@@ -55,6 +56,24 @@ def test_missing_stale_future_or_real_account_snapshot_blocks():
     real = good_snapshot()
     real["account_mode"] = "real"
     assert "MT5_ACCOUNT_NOT_DEMO_OR_UNKNOWN" in risk_snapshot_gate(real, now=NOW)["blockers"]
+
+
+def test_open_stop_risk_is_required_and_cannot_be_omitted():
+    snapshot = good_snapshot()
+    snapshot.pop("open_stop_risk_fraction")
+    assert "OPEN_STOP_RISK_FRACTION_MISSING_OR_INVALID" in risk_snapshot_gate(snapshot, now=NOW)["blockers"]
+
+
+def test_open_stop_risk_counts_toward_the_prospective_daily_cap():
+    snapshot = good_snapshot()
+    snapshot["open_stop_risk_fraction"] = 0.018
+    result = risk_controlled_permission(
+        good_request(), {"permission_matrix": {}},
+        kill_switch_state=good_state(active=False), snapshot=snapshot, now=NOW,
+    )
+    assert result["status"] == "DENY"
+    assert "PROJECTED_DAILY_LOSS_EXCEEDS_LIMIT" in result["blockers"]
+    assert result["trade_allowed"] is False
 
 
 def test_risk_controlled_permission_blocks_when_global_switch_active_even_if_request_looks_valid():

@@ -174,7 +174,8 @@ def test_persist_cli_requires_persisted_risk_before_writing_a_decision(tmp_path)
     bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
     env = {**os.environ, "DATABASE_URL": os.environ["TEST_DATABASE_URL"],
            "MT5_EVIDENCE_HMAC_KEY": "e" * 64, "MT5_EVIDENCE_ISSUER": "test-ingress",
-           "MT5_GOVERNANCE_HMAC_KEY": "g" * 64, "MT5_GOVERNANCE_ISSUER": "calibration-service"}
+           "MT5_GOVERNANCE_HMAC_KEY": "g" * 64, "MT5_GOVERNANCE_ISSUER": "calibration-service",
+           "MT5_REVIEW_HMAC_KEY": "r" * 64, "MT5_REVIEW_ISSUER": "review-service"}
     completed = subprocess.run(
         [sys.executable, str(Path(__file__).resolve().parents[1] / "scripts" / "evaluate_signal_bundle.py"),
          str(bundle_path), "--output", str(output_path), "--persist"],

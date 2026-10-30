@@ -88,6 +88,24 @@ def test_ea_requires_header_safe_token_and_durable_idempotency_tombstone():
     assert source.index("GlobalVariablesFlush()") < source.index("OrderSend(request, result)")
 
 
+def test_ea_refuses_an_empty_token_and_requires_a_successful_tombstone_flush():
+    source = _ea_source()
+    oninit = re.search(r"int\s+OnInit\s*\(\s*\)\s*\{(?P<body>.*?)\n\}", source, re.S).group("body")
+    # An empty token must refuse initialization instead of polling and logging BLOCKED forever.
+    assert "if(!IsValidBridgeToken(BridgeToken))" in oninit
+    assert "StringLen(BridgeToken) > 0 &&" not in oninit
+    assert oninit.index("if(!IsValidBridgeToken(BridgeToken))") < oninit.index("EventSetTimer")
+    command = re.search(r"bool\s+ExecuteDemoCommand\s*\([^)]*\)\s*\{(?P<body>.*?)\n\}", source, re.S)
+    assert command is not None
+    body = command.group("body")
+    # The flush result must gate the send, so the tombstone cannot be best-effort.
+    assert "if(!GlobalVariablesFlush())" in body
+    assert re.search(r"(?m)^\s*GlobalVariablesFlush\(\);\s*$", body) is None
+    assert body.index("if(!GlobalVariablesFlush())") < body.index("OrderSend(request, result)")
+    # The unused expiry cast was removed; expiry is compared in double precision instead.
+    assert "long expires_at =" not in source
+
+
 def test_every_schema_required_order_command_key_is_known_to_the_ea():
     required = json.loads(
         (_root() / "schemas" / "order_command.schema.json").read_text(encoding="utf-8")
@@ -272,7 +290,22 @@ def test_production_checker_and_self_test_cover_the_new_predicates():
                  "token alphabet widened",
                  "URL leading-zero port guard removed",
                  "required-key loop bound shrunk",
-                 "boolean prefix accepted"):
+                 "boolean prefix accepted",
+                 "literal-key slot forged inside the parser",
+                 "parsed key replaced by a literal slot key",
+                 "JsonBoolExact ternary collapses true and false",
+                 "parser boolean slot types swapped",
+                 "kill-switch value check disabled with a parenthesised literal",
+                 "user approval forced with a parenthesised literal",
+                 "identifier validation disabled with a parenthesised literal",
+                 "nested-value rejection keeps the message but stops returning",
+                 "escape rejection keeps the message but stops returning",
+                 "control-character rejection keeps the message but stops returning",
+                 "kill-switch value check keeps the message but stops returning",
+                 "user approval gate keeps the message but stops returning",
+                 "identifier validation keeps the message but stops returning",
+                 "empty token accepted at init",
+                 "tombstone flush result ignored"):
         assert name in checker.MUTATIONS, name
 
 
@@ -309,6 +342,124 @@ def test_checker_rejects_guard_body_and_right_extension_bypasses_outside_the_cat
         assert weakened != source, label
         failures, _ = checker.check_source(weakened)
         assert failures, f"checker accepted the {label} bypass"
+
+
+def test_checker_rejects_forged_parser_slots_and_a_collapsed_boolean_slot():
+    checker = _checker()
+    source = _ea_source()
+    # A fourth store, or a store keyed by a literal instead of the parsed key, forges a field
+    # (user_approved / kill_switch_active) in every response.
+    forged = source.replace(
+        "StoreValidatedValue(key, token, c == 't' ? 3 : 4);",
+        "StoreValidatedValue(key, token, c == 't' ? 3 : 4);\n"
+        '         StoreValidatedValue("user_approved", "true", 3);',
+        1,
+    )
+    assert forged != source
+    failures, _ = checker.check_source(forged)
+    assert "ValidateFlatObject stores exactly three validated values" in failures
+    assert "validated slots are never stored under a literal key" in failures
+
+    swapped = source.replace(
+        "StoreValidatedValue(key, number_token, 2);",
+        'StoreValidatedValue("kill_switch_active", "false", 4);',
+        1,
+    )
+    assert swapped != source
+    failures, _ = checker.check_source(swapped)
+    assert "ValidateFlatObject keys every stored value by the parsed key" in failures
+
+    # Collapsing the JsonBoolExact ternary makes literal true readable as literal false.
+    collapsed = source.replace("(wanted ? 3 : 4)", "(wanted ? 3 : 3)", 1)
+    assert collapsed != source
+    failures, _ = checker.check_source(collapsed)
+    assert "JsonBoolExact resolves the exact type slots" in failures
+
+    # Swapping the slots the parser writes has the same effect from the other direction.
+    swapped_types = source.replace(
+        "StoreValidatedValue(key, token, c == 't' ? 3 : 4);",
+        "StoreValidatedValue(key, token, c == 't' ? 4 : 3);",
+        1,
+    )
+    assert swapped_types != source
+    failures, _ = checker.check_source(swapped_types)
+    assert "parser stores true as slot type 3 and false as slot type 4" in failures
+
+
+def test_checker_rejects_parenthesised_boolean_literal_terms():
+    checker = _checker()
+    source = _ea_source()
+    bypasses = {
+        "kill-switch value": (
+            'if(!JsonFalse("kill_switch_active"))',
+            'if(!JsonFalse("kill_switch_active") && (false))',
+        ),
+        "user approval": (
+            'bool user_approved = JsonTrue("user_approved");',
+            'bool user_approved = JsonTrue("user_approved") || (true);',
+        ),
+        "identifier validation": (
+            "if(!IsSafeIdentifier(command_id) || !IsSafeIdentifier(order_id) || !IsSafeIdentifier(symbol))",
+            "if((!IsSafeIdentifier(command_id) || !IsSafeIdentifier(order_id) || "
+            "!IsSafeIdentifier(symbol)) && ( false ))",
+        ),
+    }
+    for label, (old, new) in bypasses.items():
+        weakened = source.replace(old, new, 1)
+        assert weakened != source, label
+        stripped = checker._strip_comments(weakened)
+        assert checker._parenthesised_literal_terms(stripped), label
+        failures, _ = checker.check_source(weakened)
+        assert "parenthesised boolean literal term is forbidden" in failures, label
+    # The parser's `while(true)` is a whole control condition, not a bypass term.
+    assert checker._parenthesised_literal_terms(checker._strip_comments(source)) == []
+
+
+def test_checker_requires_complete_guard_blocks_not_just_their_text():
+    checker = _checker()
+    source = _ea_source()
+    weakenings = {
+        "parser nested values": (
+            """if(c == '{' || c == '[') { error = "nested value rejected"; return false; }""",
+            """if(c == '{' || c == '[') { error = "nested value rejected"; }""",
+            "parser rejects nested values in a complete fail-closed branch",
+        ),
+        "parser value escapes": (
+            r"""if(vc == '\\') { error = "escape sequences rejected"; return false; }""",
+            r"""if(vc == '\\') { error = "escape sequences rejected"; }""",
+            "parser rejects value escapes in a complete fail-closed branch",
+        ),
+        "parser key control characters": (
+            """if(kc < 0x20) { error = "control character rejected"; return false; }""",
+            """if(kc < 0x20) { error = "control character rejected"; }""",
+            "parser rejects key control characters in a complete fail-closed branch",
+        ),
+        "kill-switch value": (
+            '   {\n      Print("BLOCKED: kill switch is active or state is invalid.");\n'
+            "      return false;\n   }\n",
+            '   {\n      Print("BLOCKED: kill switch is active or state is invalid.");\n   }\n',
+            "kill-switch value check is a complete fail-closed branch",
+        ),
+        "user approval": (
+            'if(mode != "demo" || decision != "APPROVE" || !user_approved)\n'
+            '   { Print("BLOCKED: demo mode and explicit user approval are required."); return false; }',
+            'if(mode != "demo" || decision != "APPROVE" || !user_approved)\n'
+            '   { Print("BLOCKED: demo mode and explicit user approval are required."); }',
+            "user approval gate is a complete fail-closed branch",
+        ),
+        "identifier validation": (
+            "if(!IsSafeIdentifier(command_id) || !IsSafeIdentifier(order_id) || !IsSafeIdentifier(symbol))\n"
+            '   { Print("BLOCKED: command/order/symbol identifier contains unsupported characters."); return false; }',
+            "if(!IsSafeIdentifier(command_id) || !IsSafeIdentifier(order_id) || !IsSafeIdentifier(symbol))\n"
+            '   { Print("BLOCKED: command/order/symbol identifier contains unsupported characters."); }',
+            "identifier validation is a complete fail-closed branch",
+        ),
+    }
+    for label, (old, new, invariant) in weakenings.items():
+        weakened = source.replace(old, new, 1)
+        assert weakened != source, label
+        failures, _ = checker.check_source(weakened)
+        assert invariant in failures, (label, failures)
 
 
 def test_parser_fixtures_are_bound_to_the_ea_parser_in_both_directions():

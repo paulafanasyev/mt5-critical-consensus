@@ -11,7 +11,11 @@ structural check. Predicates are pinned to their exact comparison direction, ope
 order and right-hand delimiter, because a flipped ``==``/``!=`` or a threshold
 multiplied past the closing parenthesis is the most common silent weakening. Each
 ``Print("BLOCKED...")`` branch must also contain its own ``return false;``: keeping the
-message but dropping the return would otherwise leave a guard that only logs.
+message but dropping the return would otherwise leave a guard that only logs. Guards
+whose message must survive are pinned as complete ``if (<cond>) { <body> }`` statements
+compared with whitespace removed, so a branch cannot be neutralised while its text stays
+in place, and a parenthesised boolean literal used as a term (``&& (false)``) is rejected
+outright because it disables the surrounding expression without deleting any predicate.
 
 A Python reference model of the EA's flat-object parser is exercised against the shared
 fixtures in ``config/mql5_flat_object_cases.json``. The fixtures are bound to the EA in
@@ -135,7 +139,9 @@ def _required_checks() -> dict[str, str]:
         "approval gate includes user approval": (
             r"if\s*\(\s*mode\s*!=\s*\"demo\"\s*\|\|\s*decision\s*!=\s*\"APPROVE\"\s*\|\|\s*!\s*user_approved\s*\)"
         ),
-        "explicit user approval required": r'JsonTrue\s*\(\s*"user_approved"\s*\)',
+        "explicit user approval required": (
+            r"bool\s+user_approved\s*=\s*JsonTrue\s*\(\s*\"user_approved\"\s*\)\s*;"
+        ),
         # Command expiry, TTL and size limits. Right-anchored so a widened limit cannot match.
         "command expiry validation": r"if\s*\(\s*expires_raw\s*<=\s*now_epoch\s*\)",
         "expiry must be a whole positive number": (
@@ -208,7 +214,10 @@ def _required_checks() -> dict[str, str]:
         # Idempotency tombstones.
         "idempotency persist failure is fail-closed": r"GlobalVariableSet\s*\(\s*command_key\s*,\s*\(double\)TimeGMT\s*\(\s*\)\s*\)\s*==\s*0",
         "order tombstone persist failure is fail-closed": r"GlobalVariableSet\s*\(\s*order_key\s*,\s*\(double\)TimeGMT\s*\(\s*\)\s*\)\s*==\s*0",
-        "unconditional idempotency flush": r"(?m)^[ \t]*GlobalVariablesFlush\(\);[ \t]*$",
+        "idempotency flush result is fail-closed": (
+            r'if\s*\(\s*!\s*GlobalVariablesFlush\s*\(\s*\)\s*\)\s*\{\s*'
+            r'Print\(\s*"BLOCKED:[^"]*"\s*\)\s*;\s*return\s+false\s*;\s*\}'
+        ),
         "command tombstone hashes command_id": r'return\s+"CC_TRIED_C_"\s*\+\s*Fnv1aHex\s*\(\s*command_id\s*\)',
         "order tombstone hashes client_order_id": r'return\s+"CC_TRIED_O_"\s*\+\s*Fnv1aHex\s*\(\s*order_id\s*\)',
         "full-string FNV-1a hash": r"string\s+Fnv1aHex\s*\(",
@@ -243,6 +252,17 @@ def _required_checks() -> dict[str, str]:
         "validated key slots declared": r"string\s+g_validated_keys\[\]",
         "validated value slots declared": r"string\s+g_validated_values\[\]",
         "validated type slots declared": r"int\s+g_validated_types\[\]",
+        # Slot type 3 is the literal `true`, 4 is the literal `false`; collapsing the ternary
+        # would make JsonFalse("kill_switch_active") accept a literal true (and JsonTrue accept
+        # false), so the whole return expression is pinned, not just its left-hand side.
+        "JsonBoolExact resolves the exact type slots": (
+            r"return\s+g_validated_types\[index\]\s*==\s*\(\s*wanted\s*\?\s*3\s*:\s*4\s*\)\s*;"
+        ),
+        # The parser writes the same mapping; swapping it would make JsonFalse accept an active
+        # kill switch (a literal true stored as slot type 4).
+        "parser stores true as slot type 3 and false as slot type 4": (
+            r"StoreValidatedValue\s*\(\s*key\s*,\s*token\s*,\s*c\s*==\s*'t'\s*\?\s*3\s*:\s*4\s*\)"
+        ),
         "validated slot lookup helper": r"\bint\s+FindValidatedKey\s*\(",
         "validated slot store helper": r"\bvoid\s+StoreValidatedValue\s*\(",
         "strict RFC-8259 number token": r"\bbool\s+IsJsonNumberToken\s*\(",
@@ -318,6 +338,7 @@ def _forbidden_checks() -> dict[str, str]:
         "condition forced with || true": r"\|\|\s*true\s*\)",
         "condition forced with true": r"if\s*\(\s*true\s*\)",
         "identifier alphabet weakened with a negation": r"if\s*\(\s*!\s*allowed\s*&&",
+        "approval flag reassigned outside its declaration": r"(?m)^[ \t]*user_approved\s*=",
         "return filling fallback restored": r"ORDER_FILLING_RETURN",
         "truncating idempotency key restored": r"SanitizeKeyPart|IdempotencyKey",
         "void OnInit signature restored": r"^void\s+OnInit",
@@ -326,6 +347,7 @@ def _forbidden_checks() -> dict[str, str]:
         "loopback host checked by prefix": r"StringFind\s*\(\s*(?:BridgeUrl|KillSwitchUrl)\s*,\s*\"http://127\.0\.0\.1:\"\s*\)\s*!=\s*0",
         "kill switch treated as active": r"if\s*\(\s*JsonTrue\s*\(\s*\"kill_switch_active\"\s*\)\s*\)",
         "broker preflight result ignored": r"(?m)^[ \t]*OrderCheck\s*\(",
+        "idempotency flush result ignored": r"(?m)^[ \t]*GlobalVariablesFlush\s*\(\s*\)\s*;[ \t]*$",
         "idempotency flush made conditional": r"if\s*\([^\n]*\)\s*GlobalVariablesFlush\s*\(\s*\)\s*;",
         "write request introduced": r"WebRequest\s*\(\s*\"(?:POST|PUT|PATCH|DELETE)\"",
         "asynchronous or direct order API": (
@@ -356,6 +378,125 @@ def _after(haystack: str, first: str, second: str) -> bool:
     return first in haystack and second in haystack and haystack.index(first) < haystack.index(second)
 
 
+_WS_RE = re.compile(r"\s+")
+
+
+def _squeeze(text: str) -> str:
+    """Whitespace-insensitive form of a fragment, for comparing statements not substrings."""
+    return _WS_RE.sub("", text)
+
+
+def _match_delimiter(source: str, start: int, opening: str, closing: str) -> int:
+    """Index of the delimiter closing ``source[start]``; string and char literals are skipped."""
+    depth = 0
+    i = start
+    n = len(source)
+    while i < n:
+        ch = source[i]
+        if ch in "\"'":
+            quote = ch
+            i += 1
+            while i < n:
+                if source[i] == "\\":
+                    i += 2
+                    continue
+                if source[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == opening:
+            depth += 1
+        elif ch == closing:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _if_block_keys(source: str) -> list[str]:
+    """Whitespace-free form of every complete ``if (<cond>) { <body> }`` statement.
+
+    Pinning a whole statement instead of a sub-expression is what stops a branch from being
+    neutralised while its message and predicates stay in the source. Only a braced body is
+    captured; a braceless ``if`` cannot satisfy any of the pinned blocks.
+    """
+    keys: list[str] = []
+    for match in re.finditer(r"\bif\s*\(", source):
+        open_paren = source.find("(", match.start())
+        close_paren = _match_delimiter(source, open_paren, "(", ")")
+        if close_paren < 0:
+            continue
+        brace = close_paren + 1
+        while brace < len(source) and source[brace].isspace():
+            brace += 1
+        if brace >= len(source) or source[brace] != "{":
+            continue
+        close_brace = _match_delimiter(source, brace, "{", "}")
+        if close_brace < 0:
+            continue
+        keys.append("if(" + _squeeze(source[open_paren + 1:close_paren]) + "){"
+                    + _squeeze(source[brace + 1:close_brace]) + "}")
+    return keys
+
+
+def _has_if_block(blocks: list[str], expected: str) -> bool:
+    """True when ``expected`` matches one complete ``if`` statement, layout and comments aside."""
+    return _squeeze(expected) in blocks
+
+
+def _mask_string_literals(source: str) -> str:
+    """Blank out string/char literal contents, preserving offsets, so literals cannot match."""
+    out: list[str] = []
+    i = 0
+    n = len(source)
+    quote = ""
+    while i < n:
+        ch = source[i]
+        if not quote:
+            out.append(ch)
+            if ch in "\"'":
+                quote = ch
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append("  ")
+            i += 2
+            continue
+        if ch == quote:
+            out.append(ch)
+            quote = ""
+        else:
+            out.append(" ")
+        i += 1
+    return "".join(out)
+
+
+def _parenthesised_literal_terms(source: str) -> list[str]:
+    """Parenthesised boolean literals used as terms, e.g. ``... && (false)``.
+
+    A whole control condition such as ``while(true)`` is left to the dedicated dead-branch
+    checks; a literal wrapped in parentheses anywhere inside an expression is a bypass, because
+    it neutralises (or forces) the surrounding conjunction/disjunction while every required
+    sub-expression stays textually present. String literals are masked first so a message that
+    mentions ``(false)`` cannot trip the check.
+    """
+    masked = _mask_string_literals(source)
+    terms: list[str] = []
+    for match in re.finditer(r"\(\s*(?:true|false)\s*\)", masked):
+        before = masked[:match.start()].rstrip()
+        after = masked[match.end():].lstrip()
+        whole_condition = (
+            (before.endswith("if") or before.endswith("while") or before.endswith("for")
+             or before.endswith("else"))
+            and (after.startswith("{") or after.startswith(";") or after == "")
+        )
+        if not whole_condition:
+            terms.append(match.group(0))
+    return terms
+
+
 def _guard_body_checks(source: str) -> list[tuple[str, bool]]:
     """Every BLOCKED branch must return by itself, not merely log.
 
@@ -380,6 +521,7 @@ def _guard_body_checks(source: str) -> list[tuple[str, bool]]:
 def _structural_checks(source: str) -> list[tuple[str, bool]]:
     checks: list[tuple[str, bool]] = []
     send = "OrderSend(request, result)"
+    blocks = _if_block_keys(source)
     if send not in source:
         return [("expected broker send function is absent", False)]
     checks.append(("exactly one broker OrderSend call", source.count("OrderSend(") == 1))
@@ -446,8 +588,19 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
     if parser is not None:
         for slot in ("g_validated_keys", "g_validated_values", "g_validated_types"):
             checks.append((f"ValidateFlatObject resets {slot}", f"ArrayResize({slot}, 0)" in parser))
-        checks.append(("ValidateFlatObject stores all three scalar types",
-                       parser.count("StoreValidatedValue(") >= 3))
+        # Exactly three slots are stored (string, number, boolean) and each is keyed by the
+        # parsed `key` variable. A literal key such as StoreValidatedValue("user_approved", ...)
+        # would forge that field in every response, so the count and the first argument are pinned.
+        slot_calls = re.findall(r"StoreValidatedValue\s*\(", parser)
+        keyed_calls = re.findall(r"StoreValidatedValue\s*\(\s*key\s*,", parser)
+        checks.append(("ValidateFlatObject stores exactly three validated values",
+                       len(slot_calls) == 3))
+        checks.append(("ValidateFlatObject keys every stored value by the parsed key",
+                       len(keyed_calls) == 3))
+        checks.append(("validated slots are never stored under a literal key",
+                       re.search(r'StoreValidatedValue\s*\(\s*"', source) is None))
+        checks.append(("validated slots are stored only by the parser",
+                       len(re.findall(r"StoreValidatedValue\s*\(", source)) == 4))
         checks.append(("duplicate key rejection is inside ValidateFlatObject",
                        "DUPLICATE JSON KEY" in parser))
         checks.append(("number values use the strict token parser",
@@ -468,11 +621,23 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
         checks.append(("the parser acceptance after a value follows the duplicate-key guard",
                        "DUPLICATE JSON KEY" in parser
                        and parser.rindex("return true;") > parser.index("DUPLICATE JSON KEY")))
+        # Presence of the message is not enforcement: each rejection must still be a whole
+        # `if (<predicate>) { error = "..."; return false; }` statement.
+        checks.append(("parser rejects nested values in a complete fail-closed branch",
+                       _has_if_block(blocks, """if(c == '{' || c == '[') { error = "nested value rejected"; return false; }""")))
+        checks.append(("parser rejects key escapes in a complete fail-closed branch",
+                       _has_if_block(blocks, r"""if(kc == '\\') { error = "escape sequences rejected"; return false; }""")))
+        checks.append(("parser rejects value escapes in a complete fail-closed branch",
+                       _has_if_block(blocks, r"""if(vc == '\\') { error = "escape sequences rejected"; return false; }""")))
+        checks.append(("parser rejects key control characters in a complete fail-closed branch",
+                       _has_if_block(blocks, """if(kc < 0x20) { error = "control character rejected"; return false; }""")))
+        checks.append(("parser rejects value control characters in a complete fail-closed branch",
+                       _has_if_block(blocks, """if(vc < 0x20) { error = "control character rejected"; return false; }""")))
 
     lookups = {
         "JsonString": ("string", "return g_validated_values[index];", 1),
         "JsonNumber": ("double", "g_validated_values[index]", 2),
-        "JsonBoolExact": ("bool", "g_validated_types[index] ==", None),
+        "JsonBoolExact": ("bool", "return g_validated_types[index] == (wanted ? 3 : 4);", None),
     }
     for name, (return_type, needle, slot_type) in lookups.items():
         body = _function_body(source, name, return_type)
@@ -518,6 +683,17 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
         checks.append(("exactly one kill-switch re-read in the command path",
                        command.count("CheckKillSwitch()") == 1))
         checks.append(("the send result is checked", "if(!sent || (result.retcode" in command))
+        checks.append(("the pre-send tombstone flush is fail-closed",
+                       _has_if_block(blocks, 'if(!GlobalVariablesFlush()) { Print("BLOCKED: cannot flush idempotency tombstones."); return false; }')))
+        # The predicates alone are not enforcement: each gate must still be the complete
+        # statement whose body prints and returns, in one piece.
+        checks.append(("user approval gate is a complete fail-closed branch",
+                       _has_if_block(blocks, 'if(mode != "demo" || decision != "APPROVE" || !user_approved) '
+                                             '{ Print("BLOCKED: demo mode and explicit user approval are required."); return false; }')))
+        checks.append(("identifier validation is a complete fail-closed branch",
+                       _has_if_block(blocks, 'if(!IsSafeIdentifier(command_id) || !IsSafeIdentifier(order_id) '
+                                             '|| !IsSafeIdentifier(symbol)) '
+                                             '{ Print("BLOCKED: command/order/symbol identifier contains unsupported characters."); return false; }')))
         checks.append(("order comment is bounded", "StringSubstr(order_id,0,20)" in command))
         checks.append(("ExecuteDemoCommand has exactly one success return",
                        command.count("return true;") == 1))
@@ -546,6 +722,9 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
                        _after(kill, "if(code != 200)", "ValidateFlatObject(response")))
         checks.append(("kill-switch response must contain the active flag",
                        'KeyInList("kill_switch_active")' in kill))
+        checks.append(("kill-switch value check is a complete fail-closed branch",
+                       _has_if_block(blocks, 'if(!JsonFalse("kill_switch_active")) '
+                                             '{ Print("BLOCKED: kill switch is active or state is invalid."); return false; }')))
         checks.append(("CheckKillSwitch has exactly one success return", kill.count("return true;") == 1))
         checks.append(("CheckKillSwitch success return follows the active-state check",
                        kill.count("return true;") == 1 and 'JsonFalse("kill_switch_active")' in kill
@@ -574,6 +753,8 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
                        _after(oninit, "IsLoopbackHttpUrl(KillSwitchUrl", "EventSetTimer")))
         checks.append(("OnInit rejects a malformed configured token",
                        _after(oninit, "IsValidBridgeToken(BridgeToken)", "EventSetTimer")))
+        checks.append(("OnInit requires a configured bridge token before starting the timer",
+                       _after(oninit, "if(!IsValidBridgeToken(BridgeToken))", "EventSetTimer")))
         checks.append(("OnInit succeeds only at the end", oninit.rindex("return(INIT_SUCCEEDED)") > oninit.rindex("EventSetTimer")))
 
     url = _function_body(source, "IsLoopbackHttpUrl")
@@ -617,6 +798,8 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
                    fnv is not None and fnv.rstrip().endswith('return StringFormat("%016I64X", (long)hash);')))
 
     checks += _guard_body_checks(source)
+    literal_terms = _parenthesised_literal_terms(source)
+    checks.append(("parenthesised boolean literal term is forbidden", not literal_terms))
     return checks
 
 
@@ -643,10 +826,13 @@ MUTATIONS: dict[str, tuple[str, str]] = {
         "   return StringSubstr(g_validated_values[index], 0, 0);",
     ),
     "symbol trade mode disabled": ("trade_mode != SYMBOL_TRADE_MODE_FULL", "trade_mode != SYMBOL_TRADE_MODE_DISABLED"),
-    "tombstone flush removed": ("   GlobalVariablesFlush();\n", ""),
-    "tombstone flush made conditional": (
+    "tombstone flush removed": (
+        '   if(!GlobalVariablesFlush())\n   { Print("BLOCKED: cannot flush idempotency tombstones."); return false; }\n',
+        "",
+    ),
+    "tombstone flush result ignored": (
+        '   if(!GlobalVariablesFlush())\n   { Print("BLOCKED: cannot flush idempotency tombstones."); return false; }\n',
         "   GlobalVariablesFlush();\n",
-        "   if(GetLastError() != 0) GlobalVariablesFlush();\n",
     ),
     "kill-switch URL parser removed": ("if(!IsLoopbackHttpUrl(KillSwitchUrl, url_error))", "if(false)"),
     "terminal trading check short-circuited": (
@@ -775,6 +961,77 @@ MUTATIONS: dict[str, tuple[str, str]] = {
         "if(i - int_start > 1 && StringGetCharacter(text, int_start) == '0')",
         "if(false)",
     ),
+    # Round-6 bypasses: parser slot forging, ternary collapse, parenthesised literals and
+    # message-only guards.
+    "literal-key slot forged inside the parser": (
+        "StoreValidatedValue(key, token, c == 't' ? 3 : 4);",
+        'StoreValidatedValue(key, token, c == \'t\' ? 3 : 4);\n'
+        '         StoreValidatedValue("user_approved", "true", 3);',
+    ),
+    "parsed key replaced by a literal slot key": (
+        "StoreValidatedValue(key, number_token, 2);",
+        'StoreValidatedValue("user_approved", "true", 3);',
+    ),
+    "JsonBoolExact ternary collapses true and false": (
+        "(wanted ? 3 : 4)",
+        "(wanted ? 3 : 3)",
+    ),
+    "parser boolean slot types swapped": (
+        "StoreValidatedValue(key, token, c == 't' ? 3 : 4);",
+        "StoreValidatedValue(key, token, c == 't' ? 4 : 3);",
+    ),
+    "kill-switch value check disabled with a parenthesised literal": (
+        'if(!JsonFalse("kill_switch_active"))',
+        'if(!JsonFalse("kill_switch_active") && (false))',
+    ),
+    "user approval forced with a parenthesised literal": (
+        'bool user_approved = JsonTrue("user_approved");',
+        'bool user_approved = JsonTrue("user_approved") || (true);',
+    ),
+    "approval flag reassigned after validation": (
+        'bool user_approved = JsonTrue("user_approved");',
+        'bool user_approved = JsonTrue("user_approved");\n   user_approved = true;',
+    ),
+    "identifier validation disabled with a parenthesised literal": (
+        "if(!IsSafeIdentifier(command_id) || !IsSafeIdentifier(order_id) || !IsSafeIdentifier(symbol))",
+        "if((!IsSafeIdentifier(command_id) || !IsSafeIdentifier(order_id) || !IsSafeIdentifier(symbol)) && (false))",
+    ),
+    "nested-value rejection keeps the message but stops returning": (
+        """if(c == '{' || c == '[') { error = "nested value rejected"; return false; }""",
+        """if(c == '{' || c == '[') { error = "nested value rejected"; }""",
+    ),
+    "escape rejection keeps the message but stops returning": (
+        r"""if(vc == '\\') { error = "escape sequences rejected"; return false; }""",
+        r"""if(vc == '\\') { error = "escape sequences rejected"; }""",
+    ),
+    "control-character rejection keeps the message but stops returning": (
+        """if(kc < 0x20) { error = "control character rejected"; return false; }""",
+        """if(kc < 0x20) { error = "control character rejected"; }""",
+    ),
+    "kill-switch value check keeps the message but stops returning": (
+        '   {\n      Print("BLOCKED: kill switch is active or state is invalid.");\n      return false;\n   }\n',
+        '   {\n      Print("BLOCKED: kill switch is active or state is invalid.");\n   }\n',
+    ),
+    "user approval gate keeps the message but stops returning": (
+        'if(mode != "demo" || decision != "APPROVE" || !user_approved)\n'
+        '   { Print("BLOCKED: demo mode and explicit user approval are required."); return false; }',
+        'if(mode != "demo" || decision != "APPROVE" || !user_approved)\n'
+        '   { Print("BLOCKED: demo mode and explicit user approval are required."); }',
+    ),
+    "identifier validation keeps the message but stops returning": (
+        'if(!IsSafeIdentifier(command_id) || !IsSafeIdentifier(order_id) || !IsSafeIdentifier(symbol))\n'
+        '   { Print("BLOCKED: command/order/symbol identifier contains unsupported characters."); return false; }',
+        'if(!IsSafeIdentifier(command_id) || !IsSafeIdentifier(order_id) || !IsSafeIdentifier(symbol))\n'
+        '   { Print("BLOCKED: command/order/symbol identifier contains unsupported characters."); }',
+    ),
+    "empty token accepted at init": (
+        '   if(!IsValidBridgeToken(BridgeToken))\n'
+        '   {\n'
+        '      Print("BLOCKED: BridgeToken is empty or not 24..256 characters of [A-Za-z0-9._~-]; refusing to initialize.");',
+        '   if(StringLen(BridgeToken) > 0 && !IsValidBridgeToken(BridgeToken))\n'
+        '   {\n'
+        '      Print("BLOCKED: BridgeToken is empty or not 24..256 characters of [A-Za-z0-9._~-]; refusing to initialize.");',
+    ),
 }
 
 # Each mutation must be rejected for its intended reason, not just for any failure.
@@ -785,8 +1042,8 @@ MUTATION_EXPECTATIONS: dict[str, str] = {
     "JsonString type guard removed": "JsonString enforces its value type",
     "JsonString re-parses the raw body": "JsonString does not re-parse the raw body",
     "symbol trade mode disabled": "symbol requires full trading mode",
-    "tombstone flush removed": "unconditional idempotency flush",
-    "tombstone flush made conditional": "unconditional idempotency flush",
+    "tombstone flush removed": "idempotency flush result is fail-closed",
+    "tombstone flush result ignored": "idempotency flush result is fail-closed",
     "kill-switch URL parser removed": "OnInit validates both loopback URLs",
     "terminal trading check short-circuited": "terminal and account trading allowed check",
     "demo account comparison inverted": "demo account comparison direction",
@@ -837,6 +1094,21 @@ MUTATION_EXPECTATIONS: dict[str, str] = {
     "URL printable check weakened": "URL printable ASCII only",
     "URL userinfo rejection removed": "URL userinfo separator rejected",
     "number leading-zero guard removed": "number token rejects a leading zero",
+    "literal-key slot forged inside the parser": "ValidateFlatObject stores exactly three validated values",
+    "parsed key replaced by a literal slot key": "validated slots are never stored under a literal key",
+    "JsonBoolExact ternary collapses true and false": "JsonBoolExact resolves the exact type slots",
+    "parser boolean slot types swapped": "parser stores true as slot type 3 and false as slot type 4",
+    "kill-switch value check disabled with a parenthesised literal": "parenthesised boolean literal term is forbidden",
+    "user approval forced with a parenthesised literal": "parenthesised boolean literal term is forbidden",
+    "approval flag reassigned after validation": "approval flag reassigned outside its declaration",
+    "identifier validation disabled with a parenthesised literal": "parenthesised boolean literal term is forbidden",
+    "nested-value rejection keeps the message but stops returning": "parser rejects nested values in a complete fail-closed branch",
+    "escape rejection keeps the message but stops returning": "parser rejects value escapes in a complete fail-closed branch",
+    "control-character rejection keeps the message but stops returning": "parser rejects key control characters in a complete fail-closed branch",
+    "kill-switch value check keeps the message but stops returning": "kill-switch value check is a complete fail-closed branch",
+    "user approval gate keeps the message but stops returning": "user approval gate is a complete fail-closed branch",
+    "identifier validation keeps the message but stops returning": "identifier validation is a complete fail-closed branch",
+    "empty token accepted at init": "OnInit requires a configured bridge token before starting the timer",
 }
 
 

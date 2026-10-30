@@ -998,23 +998,31 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
         for key, value in risk_values.items():
             if value is None or value < 0 or value > 1 or risk_limits[key] is None or risk_limits[key] < 0 or risk_limits[key] > 1:
                 blockers.append(f"INVALID_RISK_VALUE:{key}")
+        # Open positions carry committed stop risk that is not yet realised. Ignoring it
+        # would let several individually-small orders breach the session caps together.
+        open_stop_risk = _finite_float(risk.get("open_stop_risk_fraction"))
+        if open_stop_risk is not None and not 0 <= open_stop_risk <= 1:
+            blockers.append("INVALID_RISK_VALUE:open_stop_risk_fraction")
+            open_stop_risk = None
+        effective_daily_loss = max(risk_values["daily_loss_fraction"], open_stop_risk)             if risk_values["daily_loss_fraction"] is not None and open_stop_risk is not None             else risk_values["daily_loss_fraction"]
+        effective_drawdown = max(risk_values["drawdown_fraction"], open_stop_risk)             if risk_values["drawdown_fraction"] is not None and open_stop_risk is not None             else risk_values["drawdown_fraction"]
         if risk_values["risk_fraction"] is not None and risk_limits["risk_fraction"] is not None and risk_values["risk_fraction"] > risk_limits["risk_fraction"]:
             blockers.append("RISK_PER_TRADE_LIMIT_EXCEEDED")
-        if risk_values["daily_loss_fraction"] is not None and risk_limits["daily_loss_fraction"] is not None and risk_values["daily_loss_fraction"] >= risk_limits["daily_loss_fraction"]:
+        if effective_daily_loss is not None and risk_limits["daily_loss_fraction"] is not None and effective_daily_loss >= risk_limits["daily_loss_fraction"]:
             blockers.append("DAILY_LOSS_LIMIT_REACHED")
-        if risk_values["drawdown_fraction"] is not None and risk_limits["drawdown_fraction"] is not None and risk_values["drawdown_fraction"] >= risk_limits["drawdown_fraction"]:
+        if effective_drawdown is not None and risk_limits["drawdown_fraction"] is not None and effective_drawdown >= risk_limits["drawdown_fraction"]:
             blockers.append("MAX_DRAWDOWN_REACHED")
         # Caps are prospective: a trade that would breach the limit if its stop is hit
         # must not be admitted just because the loss has not been realized yet.
         proposed_risk = risk_values["risk_fraction"]
         if proposed_risk is not None and proposed_risk >= 0:
-            if (risk_values["daily_loss_fraction"] is not None
+            if (effective_daily_loss is not None
                     and risk_limits["daily_loss_fraction"] is not None
-                    and risk_values["daily_loss_fraction"] + proposed_risk > risk_limits["daily_loss_fraction"]):
+                    and effective_daily_loss + proposed_risk >= risk_limits["daily_loss_fraction"] - 1e-12):
                 blockers.append("PROJECTED_DAILY_LOSS_EXCEEDS_LIMIT")
-            if (risk_values["drawdown_fraction"] is not None
+            if (effective_drawdown is not None
                     and risk_limits["drawdown_fraction"] is not None
-                    and risk_values["drawdown_fraction"] + proposed_risk > risk_limits["drawdown_fraction"]):
+                    and effective_drawdown + proposed_risk >= risk_limits["drawdown_fraction"] - 1e-12):
                 blockers.append("PROJECTED_DRAWDOWN_EXCEEDS_LIMIT")
         for key, limit_key, message in (("open_positions", "max_positions", "MAX_OPEN_POSITIONS_REACHED"),
                                         ("correlated_open_positions", "max_correlated_positions", "CORRELATED_EXPOSURE_LIMIT_REACHED")):
@@ -1162,6 +1170,23 @@ def user_authorization_gate(permission_result: Mapping[str, Any], decision: Mapp
     if consumed is not True:
         return {"status": "DENY", "authorized": False,
                 "blockers": ["AUTHORIZATION_NONCE_REPLAYED"], "trade_allowed": False}
+    permission_store = (store if callable(getattr(store, "consume_permission", None)) else None)
+    if permission_store is None:
+        # A fresh nonce must not buy a second authorization for an already-used permission.
+        return {"status": "DENY", "authorized": False,
+                "blockers": ["AUTHORIZATION_PERMISSION_STORE_REQUIRED"], "trade_allowed": False}
+    try:
+        permission_consumed = permission_store.consume_permission(
+            permission_id=str(permission_result.get("permission_id")).strip(),
+            expires_at=permission_expires if permission_expires is not None else current,
+            now=current,
+        )
+    except Exception:
+        return {"status": "DENY", "authorized": False,
+                "blockers": ["AUTHORIZATION_PERMISSION_STORE_UNAVAILABLE"], "trade_allowed": False}
+    if permission_consumed is not True:
+        return {"status": "DENY", "authorized": False,
+                "blockers": ["AUTHORIZATION_PERMISSION_ALREADY_USED"], "trade_allowed": False}
     return {"status": "ALLOW_ONCE", "authorized": True, "blockers": [],
             "user_id": decision.get("user_id"), "timestamp": decision.get("timestamp"),
             "decision_id": decision.get("decision_id"), "nonce_consumed": True,

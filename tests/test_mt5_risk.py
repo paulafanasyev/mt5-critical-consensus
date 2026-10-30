@@ -20,12 +20,17 @@ def proposed_request():
 class FakeMT5:
     ACCOUNT_TRADE_MODE_DEMO = 0
     ACCOUNT_TRADE_MODE_CONTEST = 1
+    DEAL_TYPE_BUY = 0
+    DEAL_TYPE_SELL = 1
+    DEAL_TYPE_BALANCE = 2
 
     def __init__(self, *, trade_mode=0, positions=None, deals=None, fail_positions=False):
         self.info = SimpleNamespace(trade_mode=trade_mode, equity=10100.0, balance=10000.0,
                                     server="Demo-Server", currency="USD")
-        self.positions = positions or [SimpleNamespace(symbol="EURUSD")]
-        self.deals = deals or [SimpleNamespace(profit=10.0, commission=-1.0, swap=0.0, fee=0.0)]
+        self.positions = positions or [SimpleNamespace(
+            symbol="EURUSD", type=0, volume=0.1, price_open=1.1000, sl=1.0980)]
+        self.deals = deals or [SimpleNamespace(
+            type=0, profit=10.0, commission=-1.0, swap=0.0, fee=0.0)]
         self.spec = SimpleNamespace(trade_tick_size=0.00001, trade_tick_value_loss=1.0,
                                     trade_tick_value=1.0, point=0.00001)
         self.tick = SimpleNamespace(bid=1.1000, ask=1.1001, time=int(NOW.timestamp()))
@@ -119,7 +124,7 @@ def test_missing_equity_baselines_blocks_before_mt5_initializes(monkeypatch):
 def test_daily_loss_uses_equity_change_and_includes_open_position_loss(monkeypatch):
     fake = FakeMT5()
     fake.info.equity = 9500.0
-    fake.deals = [SimpleNamespace(profit=100.0, commission=0.0, swap=0.0, fee=0.0)]
+    fake.deals = [SimpleNamespace(type=0, profit=100.0, commission=0.0, swap=0.0, fee=0.0)]
     monkeypatch.setitem(__import__("sys").modules, "MetaTrader5", fake)
     result = collect_mt5_risk_snapshot(
         symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
@@ -262,3 +267,64 @@ def test_collector_blocks_a_peak_below_the_day_start(monkeypatch):
     )
     assert result["status"] == "DENY"
     assert "EQUITY_HIGH_WATERMARK_BELOW_DAY_START" in result["blockers"]
+
+
+def test_collector_accepts_a_net_loss_day_and_reports_it_as_finite(monkeypatch):
+    fake = FakeMT5()
+    fake.info.equity = 9800.0
+    fake.info.balance = 9800.0
+    fake.deals = [SimpleNamespace(type=0, profit=-200.0, commission=0.0, swap=0.0, fee=0.0)]
+    monkeypatch.setitem(__import__("sys").modules, "MetaTrader5", fake)
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
+        proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        server_utc_offset_seconds=0,
+    )
+    assert result["status"] == "PASS"
+    assert result["daily_pnl"] == -200.0
+    assert result["daily_loss_fraction"] == pytest.approx(0.02)
+    assert "MT5_RISK_METRICS_NONFINITE" not in result["blockers"]
+
+
+def test_balance_cashflows_are_not_counted_as_trading_pnl(monkeypatch):
+    fake = FakeMT5()
+    fake.info.equity = 12000.0
+    fake.info.balance = 12000.0
+    fake.deals = [
+        SimpleNamespace(type=0, profit=10.0, commission=0.0, swap=0.0, fee=0.0),
+        SimpleNamespace(type=2, profit=2000.0, commission=0.0, swap=0.0, fee=0.0),
+    ]
+    monkeypatch.setitem(__import__("sys").modules, "MetaTrader5", fake)
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=12000.0,
+        proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        server_utc_offset_seconds=0,
+    )
+    assert result["daily_pnl"] == 10.0
+    assert result["daily_deals_count"] == 1
+    # The deposit is caught by the baseline reconciliation instead of refreshing the budget.
+    assert result["status"] == "DENY"
+    assert "DAY_START_EQUITY_BELOW_DAILY_PNL_IMPLIED_BALANCE" in result["blockers"]
+
+
+def test_collector_reports_open_stop_risk_and_blocks_unknown_position_stops(monkeypatch):
+    fake = FakeMT5()
+    monkeypatch.setitem(__import__("sys").modules, "MetaTrader5", fake)
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
+        proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        server_utc_offset_seconds=0,
+    )
+    # |1.1000 - 1.0980| / 0.00001 * 1.0 * 0.1 = 20 account-currency units at risk.
+    assert result["open_stop_risk_value_account_currency"] == pytest.approx(20.0)
+    assert result["open_stop_risk_fraction"] == pytest.approx(20.0 / 10100.0)
+
+    fake.positions = [SimpleNamespace(symbol="EURUSD", type=0, volume=0.1,
+                                      price_open=1.1000, sl=0.0)]
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
+        proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        server_utc_offset_seconds=0,
+    )
+    assert result["status"] == "DENY"
+    assert "OPEN_POSITION_STOP_RISK_UNKNOWN" in result["blockers"]

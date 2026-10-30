@@ -156,6 +156,11 @@ def risk_snapshot_gate(
         blockers.append("DAILY_LOSS_MISSING_OR_INVALID")
     if drawdown is None or not 0 <= drawdown <= 1:
         blockers.append("DRAWDOWN_MISSING_OR_INVALID")
+    open_stop_risk = _finite(snapshot.get("open_stop_risk_fraction"))
+    if open_stop_risk is None or not 0 <= open_stop_risk <= 1:
+        # Open stops are loss already committed to the market even while unrealized;
+        # without them the prospective daily-loss/drawdown caps are understated.
+        blockers.append("OPEN_STOP_RISK_FRACTION_MISSING_OR_INVALID")
     for key in ("open_positions", "correlated_open_positions"):
         count = _finite(snapshot.get(key))
         if count is None or count < 0 or not count.is_integer():
@@ -314,6 +319,7 @@ def risk_controlled_permission(
         "risk_fraction": snapshot["risk_fraction"],
         "daily_loss_fraction": snapshot["daily_loss_fraction"],
         "drawdown_fraction": snapshot["drawdown_fraction"],
+        "open_stop_risk_fraction": snapshot["open_stop_risk_fraction"],
         "open_positions": snapshot["open_positions"],
         "correlated_open_positions": snapshot["correlated_open_positions"],
     }

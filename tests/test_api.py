@@ -4,8 +4,9 @@ from fastapi.testclient import TestClient
 
 from critical_consensus.api import app
 from critical_consensus.audit import canonical_hash
-from critical_consensus.evidence import make_envelope
+from critical_consensus.evidence import make_envelope, sign_review
 from critical_consensus.governance import sign_attestation
+from critical_consensus.pipeline import review_attestation_payload as review_payload
 
 client = TestClient(app)
 
@@ -13,15 +14,23 @@ BRIDGE = "test-bridge-secret-that-is-long-enough"
 EVIDENCE_KEY = "k" * 64
 GOVERNANCE_KEY = "v" * 64
 OPERATOR_KEY = "o" * 64
+REVIEW_KEY = "r" * 64
 EVIDENCE_ISSUER = "test-ingress"
 GOVERNANCE_ISSUER = "calibration-service"
 OPERATOR_ISSUER = "operator-console"
+REVIEW_ISSUER = "review-service"
 NOW = datetime.now(timezone.utc)
 
 
-def signed_body(payload, *, key=EVIDENCE_KEY, issuer=EVIDENCE_ISSUER):
-    return {"payload": payload,
-            "envelope": make_envelope(payload, key=key, issuer=issuer)}
+def signed_body(payload, *, key=EVIDENCE_KEY, issuer=EVIDENCE_ISSUER,
+                review=True, review_key=REVIEW_KEY, review_issuer=REVIEW_ISSUER):
+    body = dict(payload)
+    if review:
+        body.setdefault("review_attestation", sign_review(
+            review_payload(body), key=review_key, issuer=review_issuer,
+        ))
+    return {"payload": body,
+            "envelope": make_envelope(body, key=key, issuer=issuer)}
 
 
 def governance_attestation(*, observed_at=NOW, key=GOVERNANCE_KEY,
@@ -46,7 +55,8 @@ def governance_attestation(*, observed_at=NOW, key=GOVERNANCE_KEY,
 
 
 def configure(monkeypatch, *, bridge=BRIDGE, evidence_issuer=EVIDENCE_ISSUER,
-              governance_issuer=GOVERNANCE_ISSUER, governance_key=GOVERNANCE_KEY):
+              governance_issuer=GOVERNANCE_ISSUER, governance_key=GOVERNANCE_KEY,
+              review_key=REVIEW_KEY, review_issuer=REVIEW_ISSUER):
     if bridge is None:
         monkeypatch.delenv("MT5_BRIDGE_TOKEN", raising=False)
     else:
@@ -57,6 +67,8 @@ def configure(monkeypatch, *, bridge=BRIDGE, evidence_issuer=EVIDENCE_ISSUER,
     monkeypatch.setenv("MT5_GOVERNANCE_ISSUER", governance_issuer)
     monkeypatch.setenv("MT5_OPERATOR_HMAC_KEY", OPERATOR_KEY)
     monkeypatch.setenv("MT5_OPERATOR_ISSUER", OPERATOR_ISSUER)
+    monkeypatch.setenv("MT5_REVIEW_HMAC_KEY", review_key)
+    monkeypatch.setenv("MT5_REVIEW_ISSUER", review_issuer)
 
 
 def test_health_is_available_but_never_enables_execution(monkeypatch):
@@ -77,11 +89,39 @@ def test_health_reports_configured_authentication_without_secrets(monkeypatch):
     assert body["evidence_verification_configured"] is True
     assert body["governance_verification_configured"] is True
     assert body["operator_verification_configured"] is True
+    assert body["review_verification_configured"] is True
+    assert body["operator_key_distinct"] is True
+    assert body["operator_issuer_distinct"] is True
+    assert body["review_key_distinct"] is True
+    assert body["review_issuer_distinct"] is True
+    assert body["kill_switch_admin_distinct_from_request_secrets"] is False
     assert body["signing_keys_distinct"] is True
     assert body["signing_issuers_distinct"] is True
     assert BRIDGE not in str(body)
     assert EVIDENCE_KEY not in str(body)
     assert GOVERNANCE_KEY not in str(body)
+    assert REVIEW_KEY not in str(body)
+
+
+def test_kill_switch_admin_token_must_not_reuse_request_secrets(monkeypatch):
+    configure(monkeypatch)
+    monkeypatch.setenv("MT5_KILL_SWITCH_ADMIN_TOKEN", BRIDGE)
+    body = client.get("/health").json()
+    assert body["kill_switch_admin_distinct_from_request_secrets"] is False
+    response = client.post(
+        "/v1/risk/kill-switch",
+        headers={"X-Bridge-Key": BRIDGE, "X-Kill-Switch-Admin": BRIDGE},
+        json={"active": False, "actor_id": "operator", "reason": "attempted disable"},
+    )
+    assert response.status_code == 503
+    assert "MT5_BRIDGE_TOKEN" in response.json()["detail"]
+
+
+def test_operator_domain_must_not_share_evidence_material(monkeypatch):
+    configure(monkeypatch)
+    monkeypatch.setenv("MT5_OPERATOR_HMAC_KEY", EVIDENCE_KEY)
+    body = client.get("/health").json()
+    assert body["operator_key_distinct"] is False
 
 
 def test_bridge_token_that_reuses_a_signing_key_is_rejected(monkeypatch):
@@ -350,8 +390,9 @@ def test_policy_endpoint_rejects_shared_signing_issuers(monkeypatch):
 
 def test_health_is_hermetic_when_no_secrets_are_configured(monkeypatch):
     for name in ("MT5_BRIDGE_TOKEN", "MT5_EVIDENCE_HMAC_KEY", "MT5_GOVERNANCE_HMAC_KEY",
-                 "MT5_OPERATOR_HMAC_KEY", "MT5_EVIDENCE_ISSUER", "MT5_GOVERNANCE_ISSUER",
-                 "MT5_OPERATOR_ISSUER", "MT5_KILL_SWITCH_ADMIN_TOKEN"):
+                 "MT5_OPERATOR_HMAC_KEY", "MT5_REVIEW_HMAC_KEY", "MT5_EVIDENCE_ISSUER",
+                 "MT5_GOVERNANCE_ISSUER", "MT5_OPERATOR_ISSUER", "MT5_REVIEW_ISSUER",
+                 "MT5_KILL_SWITCH_ADMIN_TOKEN"):
         monkeypatch.delenv(name, raising=False)
     body = client.get("/health").json()
     assert body["execution_enabled"] is False
@@ -359,6 +400,69 @@ def test_health_is_hermetic_when_no_secrets_are_configured(monkeypatch):
     assert body["evidence_verification_configured"] is False
     assert body["governance_verification_configured"] is False
     assert body["operator_verification_configured"] is False
+    assert body["review_verification_configured"] is False
+
+
+def _review_endpoint_call(payload, **signed_kwargs):
+    return client.post(
+        "/v1/certainty/evaluate", headers={"X-Bridge-Key": BRIDGE},
+        json={**signed_body(payload, **signed_kwargs), "governance_attestation": governance_attestation()},
+    )
+
+
+def test_policy_endpoint_requires_a_review_attestation(monkeypatch):
+    configure(monkeypatch)
+    response = _review_endpoint_call({}, review=False)
+    assert response.status_code == 403
+    assert response.json()["detail"]["error"] == "review_attestation_invalid"
+    assert "REVIEW_ENVELOPE_MISSING_OR_INVALID" in response.json()["detail"]["blockers"]
+
+
+def test_ingress_key_cannot_mint_a_review_attestation(monkeypatch):
+    configure(monkeypatch)
+    payload = {"peer_reviews": [_review("v1", "r1"), _review("v1", "r2")],
+               "verdicts": [{"verdict_id": "v1", "agent_id": "PlatformScoutAgent",
+                             "verdict": "APPROVE", "confidence": 0.9}]}
+    response = _review_endpoint_call(payload, review_key=EVIDENCE_KEY)
+    assert response.status_code == 403
+    assert "REVIEW_SIGNATURE_MISMATCH" in response.json()["detail"]["blockers"]
+
+
+def test_review_attestation_must_use_the_pinned_review_issuer(monkeypatch):
+    configure(monkeypatch)
+    response = _review_endpoint_call({}, review_issuer=EVIDENCE_ISSUER)
+    assert response.status_code == 403
+    assert "REVIEW_ISSUER_MISMATCH" in response.json()["detail"]["blockers"]
+
+
+def test_policy_endpoint_rejects_review_signing_material_shared_with_ingress(monkeypatch):
+    configure(monkeypatch, review_key=EVIDENCE_KEY)
+    response = _review_endpoint_call({})
+    assert response.status_code == 503
+    assert "must be different" in response.json()["detail"]
+    body = client.get("/health").json()
+    assert body["review_key_distinct"] is False
+    assert body["authenticated_policy_endpoints"] is False
+
+
+def test_health_flags_shared_review_issuer(monkeypatch):
+    configure(monkeypatch, review_issuer=GOVERNANCE_ISSUER)
+    body = client.get("/health").json()
+    assert body["review_issuer_distinct"] is False
+    assert body["signing_issuers_distinct"] is False
+    response = _review_endpoint_call({})
+    assert response.status_code == 503
+
+
+def test_chief_review_endpoint_requires_a_review_attestation(monkeypatch):
+    configure(monkeypatch)
+    rejected = client.post("/v1/chief/review", headers={"X-Bridge-Key": BRIDGE},
+                           json=signed_body({}, review=False))
+    assert rejected.status_code == 403
+    accepted = client.post("/v1/chief/review", headers={"X-Bridge-Key": BRIDGE},
+                           json=signed_body({}))
+    assert accepted.status_code == 200
+    assert accepted.json()["trade_allowed"] is False
 
 
 def test_execution_endpoints_can_never_return_or_accept_an_order(monkeypatch):

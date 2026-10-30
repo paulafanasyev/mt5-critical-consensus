@@ -437,7 +437,6 @@ bool ExecuteDemoCommand(const string body)
    double tp = JsonNumber("tp");
    double expected_price = JsonNumber("expected_price");
    double expires_raw = JsonNumber("expires_at_epoch");
-   long expires_at = (long)expires_raw;
    bool user_approved = JsonTrue("user_approved");
 
    if(command_id=="" || order_id=="" || symbol=="" || direction=="" || mode=="" || decision=="")
@@ -537,7 +536,10 @@ bool ExecuteDemoCommand(const string body)
    if(GlobalVariableSet(command_key, (double)TimeGMT()) == 0
       || GlobalVariableSet(order_key, (double)TimeGMT()) == 0)
    { Print("BLOCKED: cannot persist idempotency tombstones."); return false; }
-   GlobalVariablesFlush();
+   // The flush must be confirmed: a best-effort flush could leave the process before the
+   // terminal persisted the tombstones, so a resend after a restart would not be blocked.
+   if(!GlobalVariablesFlush())
+   { Print("BLOCKED: cannot flush idempotency tombstones."); return false; }
 
    ResetLastError();
    bool sent = OrderSend(request, result);
@@ -555,7 +557,8 @@ bool ExecuteDemoCommand(const string body)
 int OnInit()
 {
    // Fail closed: only exact loopback hosts with an explicit numeric port are permitted, no
-   // warning-only path exists. A configured token must also be header-safe.
+   // warning-only path exists. An empty or malformed token must also refuse initialization;
+   // an empty token would otherwise poll forever and log a BLOCKED line on every tick.
    string url_error = "";
    if(!IsLoopbackHttpUrl(BridgeUrl, url_error))
    {
@@ -567,9 +570,9 @@ int OnInit()
       Print("BLOCKED: KillSwitchUrl rejected (", url_error, "); refusing to initialize.");
       return(INIT_FAILED);
    }
-   if(StringLen(BridgeToken) > 0 && !IsValidBridgeToken(BridgeToken))
+   if(!IsValidBridgeToken(BridgeToken))
    {
-      Print("BLOCKED: BridgeToken must be 24..256 characters of [A-Za-z0-9._~-]; refusing to initialize.");
+      Print("BLOCKED: BridgeToken is empty or not 24..256 characters of [A-Za-z0-9._~-]; refusing to initialize.");
       return(INIT_FAILED);
    }
    EventSetTimer((int)MathMax(1, PollSeconds));

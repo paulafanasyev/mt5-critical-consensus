@@ -169,10 +169,15 @@ def collect_mt5_risk_snapshot(
         if deals_raw is None:
             return {"status": "DENY", "blockers": ["MT5_DAILY_HISTORY_UNAVAILABLE"], "account_mode": mode, "trade_allowed": False}
         deals = list(deals_raw)
+        # MetaTrader also reports deposits/withdrawals as deals (DEAL_TYPE_BALANCE) whose
+        # "profit" is the cashflow. Counting them as trading P/L would silently refresh the
+        # daily-loss budget; the balance reconciliation below must catch them instead.
+        trade_types = {int(getattr(mt5, "DEAL_TYPE_BUY", 0)), int(getattr(mt5, "DEAL_TYPE_SELL", 1))}
+        trade_deals = [deal for deal in deals if int(getattr(deal, "type", -1)) in trade_types]
         daily_pnl = sum(
             float(getattr(deal, "profit", 0.0)) + float(getattr(deal, "commission", 0.0))
             + float(getattr(deal, "swap", 0.0)) + float(getattr(deal, "fee", 0.0))
-            for deal in deals
+            for deal in trade_deals
         )
         equity = _number(getattr(info, "equity", None))
         balance = _number(getattr(info, "balance", None))
@@ -192,7 +197,42 @@ def collect_mt5_risk_snapshot(
         drawdown_fraction = max(0.0, (equity_peak - equity) / equity_peak)
         risk_value_account_currency = abs(risk_entry_price - stop_loss) / tick_size * tick_value_loss * size
         risk_fraction = risk_value_account_currency / equity
-        if not all(math.isfinite(v) and v >= 0 for v in (daily_pnl, daily_loss_fraction, drawdown_fraction, risk_value_account_currency, risk_fraction)):
+
+        def _position_stop_risk(position: Any) -> float | None:
+            pos_symbol = str(getattr(position, "symbol", "")).strip().upper()
+            pos_type = int(getattr(position, "type", -1))
+            pos_volume = _number(getattr(position, "volume", None))
+            pos_open = _number(getattr(position, "price_open", None))
+            pos_stop = _number(getattr(position, "sl", None))
+            if (pos_type not in (0, 1) or pos_volume is None or pos_volume <= 0
+                    or pos_open is None or pos_open <= 0 or pos_stop is None or pos_stop <= 0):
+                return None
+            spec = symbol_info if pos_symbol == symbol else mt5.symbol_info(pos_symbol)
+            if spec is None:
+                return None
+            pos_tick_size = _number(getattr(spec, "trade_tick_size", None))
+            pos_tick_value = _number(getattr(spec, "trade_tick_value_loss", None))
+            if pos_tick_value is None or pos_tick_value <= 0:
+                pos_tick_value = _number(getattr(spec, "trade_tick_value", None))
+            if pos_tick_size is None or pos_tick_size <= 0 or pos_tick_value is None or pos_tick_value <= 0:
+                return None
+            return abs(pos_open - pos_stop) / pos_tick_size * pos_tick_value * pos_volume
+
+        open_stop_risk_value = 0.0
+        for position in positions:
+            position_risk = _position_stop_risk(position)
+            if position_risk is None:
+                blockers.append("OPEN_POSITION_STOP_RISK_UNKNOWN")
+            else:
+                open_stop_risk_value += position_risk
+        open_stop_risk_fraction = open_stop_risk_value / equity
+        # daily_pnl is legitimately negative on a losing day; only the fractions are bounded.
+        metrics = (daily_pnl, daily_loss_fraction, drawdown_fraction, risk_value_account_currency,
+                   risk_fraction, open_stop_risk_value, open_stop_risk_fraction)
+        if not all(math.isfinite(v) for v in metrics) or any(
+                v < 0 for v in (daily_loss_fraction, drawdown_fraction, risk_value_account_currency,
+                                risk_fraction, open_stop_risk_value, open_stop_risk_fraction)
+        ):
             blockers.append("MT5_RISK_METRICS_NONFINITE")
 
         correlated = 0
@@ -215,6 +255,8 @@ def collect_mt5_risk_snapshot(
             "daily_pnl": daily_pnl, "daily_loss_fraction": daily_loss_fraction,
             "drawdown_fraction": drawdown_fraction, "risk_fraction": risk_fraction,
             "risk_value_account_currency": risk_value_account_currency,
+            "open_stop_risk_value_account_currency": open_stop_risk_value,
+            "open_stop_risk_fraction": open_stop_risk_fraction,
             "risk_tick_size": tick_size, "risk_tick_value_loss": tick_value_loss,
             "risk_entry_price": risk_entry_price,
             "request_binding_sha256": request_hash,
@@ -227,7 +269,7 @@ def collect_mt5_risk_snapshot(
             "max_quote_age_seconds": max_quote_age_seconds, "slippage_points_at_capture": slippage_points,
             "max_slippage_points": max_slippage_points, "open_positions": len(positions),
             "correlated_open_positions": correlated, "position_symbols": position_symbols,
-            "unknown_position_group_symbols": unknown_groups, "daily_deals_count": len(deals),
+            "unknown_position_group_symbols": unknown_groups, "daily_deals_count": len(trade_deals),
             "within_high_impact_news_window": None, "news_status": "NOT_CONNECTED_FAIL_CLOSED",
             "trade_allowed": False, "blockers": sorted(set(blockers)),
             "evidence_limit": "Tick-value risk is an estimate before fees, slippage and gaps; proposed order fields are hash-bound and risk is sized at the worse of reviewed and reference price. Day-start equity/high-water mark and cash-flow adjustment are operator inputs. News status is not connected.",

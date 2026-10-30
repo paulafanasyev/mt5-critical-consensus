@@ -27,6 +27,7 @@ _SIGNATURE_CONTEXT = b"critical-consensus-envelope-v1:"
 _DOMAIN_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 _HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_SIGNATURE_RE = re.compile(r"^hmac-sha256:[0-9a-f]{64}$")
 _ENVELOPE_FIELDS = frozenset({
     "schema_version", "issuer", "issued_at", "nonce", "ttl_seconds",
     "payload_sha256", "signature",
@@ -69,7 +70,12 @@ def canonical_bytes(payload: Any) -> bytes:
                          allow_nan=False)
     except (TypeError, ValueError) as exc:
         raise EvidenceError("payload is not canonically serializable") from exc
-    return raw.encode("utf-8")
+    try:
+        return raw.encode("utf-8")
+    except UnicodeError as exc:
+        # Lone surrogates survive json.loads but cannot be encoded; this must be an
+        # EvidenceError so verification fails closed instead of raising a UnicodeError.
+        raise EvidenceError("payload is not canonically serializable") from exc
 
 
 def payload_sha256(payload: Any) -> str:
@@ -234,7 +240,9 @@ def verify_envelope(
                 blockers.append("EVIDENCE_PAYLOAD_HASH_MISMATCH")
 
     signature = envelope.get("signature")
-    if not isinstance(signature, str) or not signature.startswith(_SIGNATURE_PREFIX):
+    # The regex is not cosmetic: compare_digest raises TypeError on non-ASCII strings,
+    # which would turn a hostile envelope into an unhandled 500 instead of a deny.
+    if not isinstance(signature, str) or _SIGNATURE_RE.fullmatch(signature) is None:
         blockers.append("EVIDENCE_SIGNATURE_INVALID")
     else:
         unsigned = {field: value for field, value in envelope.items() if field != "signature"}
@@ -248,6 +256,34 @@ def verify_envelope(
 
     result["blockers"] = sorted(set(blockers))
     result["valid"] = not blockers
+    return result
+
+
+REVIEW_DOMAIN = "review"
+
+
+def sign_review(payload: Any, *, key: str | bytes | bytearray | None, issuer: str,
+                issued_at: datetime | None = None, nonce: str | None = None,
+                ttl_seconds: int = DEFAULT_MAX_AGE_SECONDS) -> dict[str, Any]:
+    """Sign review-service/Chief output in its own HMAC domain.
+
+    Evidence ingress must not be able to mint "independent" peer reviews or a Chief
+    CONFIRM: those records are only accepted when the review service signed them.
+    """
+    return make_envelope(payload, key=key, issuer=issuer, issued_at=issued_at,
+                         nonce=nonce, ttl_seconds=ttl_seconds, domain=REVIEW_DOMAIN)
+
+
+def verify_review(payload: Any, envelope: Mapping[str, Any] | None, *,
+                  key: str | bytes | bytearray | None, expected_issuer: str | None,
+                  now: datetime | None = None,
+                  max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS) -> dict[str, Any]:
+    result = verify_envelope(payload, envelope, key=key, expected_issuer=expected_issuer,
+                             now=now, max_age_seconds=max_age_seconds, domain=REVIEW_DOMAIN)
+    # Envelope diagnostics are domain-agnostic; relabel them so an operator can tell a
+    # broken review-service attestation apart from a broken ingress evidence envelope.
+    result["blockers"] = [blocker.replace("EVIDENCE_", "REVIEW_", 1)
+                          for blocker in result.get("blockers", [])]
     return result
 
 

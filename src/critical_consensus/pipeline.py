@@ -13,7 +13,7 @@ from typing import Any, Mapping, Sequence
 
 from .audit import canonical_hash, make_audit_event, verify_audit_chain
 from .calibration import weighted_consensus
-from .evidence import EvidenceError, key_bytes, verify_bundle, verify_decision
+from .evidence import EvidenceError, key_bytes, verify_bundle, verify_decision, verify_review
 from .gates import certainty_gate, chief_skeptic_pass, permission_gate, user_authorization_gate
 from .governance import apply_attested_calibration, verify_governance_attestation
 from .risk_controls import risk_controlled_permission
@@ -107,6 +107,14 @@ def _validate_verdict_metadata(
     return blockers
 
 
+def review_attestation_payload(bundle: Mapping[str, Any]) -> dict[str, Any]:
+    """The exact review-service view a review attestation must cover."""
+    return {"signal_id": bundle.get("signal_id"),
+            "peer_reviews": bundle.get("peer_reviews"),
+            "challenge_records": bundle.get("challenge_records"),
+            "chief_reasoning": bundle.get("chief_reasoning")}
+
+
 def evaluate_signal_bundle(
     bundle: Mapping[str, Any],
     certainty_policy: Mapping[str, Any],
@@ -124,6 +132,8 @@ def evaluate_signal_bundle(
     operator_key: str | bytes | bytearray | None = None,
     expected_operator_issuer: str | None = None,
     operator_decision_envelope: Mapping[str, Any] | None = None,
+    review_key: str | bytes | bytearray | None = None,
+    expected_review_issuer: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate certainty → ChiefAgent → Permission → user authorization, fail-closed.
 
@@ -182,9 +192,25 @@ def evaluate_signal_bundle(
     elif (isinstance(expected_evidence_issuer, str) and expected_evidence_issuer.strip()
           and expected_evidence_issuer.strip() == expected_governance_issuer.strip()):
         config_blockers.append("GOVERNANCE_ISSUER_NOT_DISTINCT_FROM_EVIDENCE_ISSUER")
+    if not isinstance(expected_review_issuer, str) or not expected_review_issuer.strip():
+        config_blockers.append("REVIEW_EXPECTED_ISSUER_NOT_CONFIGURED")
+    else:
+        review_issuer_value = expected_review_issuer.strip()
+        reserved_issuers = {str(expected_evidence_issuer or "").strip(),
+                            str(expected_governance_issuer or "").strip(),
+                            str(expected_operator_issuer or "").strip()} - {""}
+        if review_issuer_value in reserved_issuers:
+            config_blockers.append("REVIEW_ISSUER_NOT_DISTINCT")
     try:
-        if key_bytes(evidence_key) == key_bytes(governance_key):
+        evidence_key_bytes = key_bytes(evidence_key)
+        governance_key_bytes = key_bytes(governance_key)
+        if evidence_key_bytes == governance_key_bytes:
             config_blockers.append("GOVERNANCE_KEY_NOT_DISTINCT_FROM_EVIDENCE_KEY")
+        review_key_bytes = key_bytes(review_key)
+        if review_key_bytes in (evidence_key_bytes, governance_key_bytes):
+            config_blockers.append("REVIEW_KEY_NOT_DISTINCT")
+        if operator_key is not None and review_key_bytes == key_bytes(operator_key):
+            config_blockers.append("REVIEW_KEY_NOT_DISTINCT")
     except EvidenceError:
         pass  # unusable keys are reported by envelope verification below
     if config_blockers:
@@ -245,6 +271,23 @@ def evaluate_signal_bundle(
     allowed_evidence_refs = {item.strip() for item in raw_evidence_refs}
     emit("SIGNAL_EVIDENCE_REGISTRY", {"signal_id": signal_id, "status": "PASSED",
                                      "evidence_ref_count": len(allowed_evidence_refs)})
+
+    # Peer reviews, challenge records and Chief reasoning are review-service output, not
+    # ingress evidence. A holder of the evidence key must not be able to mint them, and
+    # binding signal_id prevents replaying an attested review snapshot under another signal.
+    review_check = verify_review(
+        review_attestation_payload(bundle), bundle.get("review_attestation"), key=review_key,
+        expected_issuer=expected_review_issuer, now=current,
+    )
+    emit("REVIEW_ATTESTATION", {
+        "signal_id": signal_id, "valid": review_check.get("valid") is True,
+        "issuer": review_check.get("issuer"),
+        "payload_sha256": review_check.get("payload_sha256"),
+        "blockers": list(review_check.get("blockers", [])),
+    })
+    if review_check.get("valid") is not True:
+        return finish("GATHER_MORE", list(review_check.get("blockers", [])),
+                      review_attestation=review_check)
 
     raw_verdicts = bundle.get("verdicts")
     verdicts = [dict(v) for v in _as_records(raw_verdicts)]
@@ -741,6 +784,17 @@ def evaluate_signal_bundle(
             return finish("DENY", decision_binding_blockers, certainty=certainty, chief=chief,
                           permission=permission)
 
+    # The human must approve the risk the persisted gate actually validated, not a
+    # client-declared summary echoed back from the bundle.
+    if require_persisted_risk is True and isinstance(terminal_risk_snapshot, Mapping):
+        packet_risk_snapshot = dict(terminal_risk_snapshot)
+        packet_risk_source = "persisted_terminal_snapshot"
+    elif isinstance(req.get("risk_snapshot"), Mapping):
+        packet_risk_snapshot = dict(req["risk_snapshot"])
+        packet_risk_source = "client_supplied_unverified"
+    else:
+        packet_risk_snapshot = {}
+        packet_risk_source = "missing"
     human_review_packet = {
         "signal_id": signal_id,
         "peer_reviews": [dict(review) for review in reviews],
@@ -750,7 +804,10 @@ def evaluate_signal_bundle(
         "tail_risk_probability": chief_input.get("tail_risk_probability"),
         "tail_risk_scenarios": chief_input.get("tail_risk_scenarios", []),
         "source_reports": [dict(source) for source in key_sources if isinstance(source, Mapping)],
-        "risk_snapshot": dict(req.get("risk_snapshot", {})) if isinstance(req.get("risk_snapshot"), Mapping) else {},
+        "risk_snapshot": packet_risk_snapshot,
+        "risk_snapshot_source": packet_risk_source,
+        "risk_snapshot_validation": permission.get("risk_snapshot_validation"),
+        "risk_reconciliation": permission.get("risk_reconciliation"),
         "risk_flags": list(all_risk_flags),
         "permission_summary": {key: req.get(key) for key in (
             "instrument", "direction", "size", "expected_price", "sl_tp", "expected_rr", "consensus_score", "mode", "expires_at"

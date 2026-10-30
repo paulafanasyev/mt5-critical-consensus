@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
 from .audit import canonical_hash
-from .evidence import verify_wrapper
+from .evidence import verify_review, verify_wrapper
 from .gates import (
     certainty_gate,
     chief_skeptic_pass,
@@ -21,8 +21,11 @@ from .gates import (
 from .calibration import weighted_consensus
 from .governance import apply_attested_calibration, verify_governance_attestation
 from .persistence import PostgresRepository
-from .pipeline import _validate_verdict_metadata
-from .risk_controls import risk_controlled_permission
+from .pipeline import (
+    _validate_verdict_metadata,
+    evaluate_signal_bundle,
+    review_attestation_payload,
+)
 
 ROOT = Path(os.getenv("POLICY_DIR", str(Path(__file__).resolve().parents[2] / "config")))
 
@@ -39,16 +42,29 @@ def _yaml(name: str) -> dict:
     return value
 
 
-SIGNING_KEY_ENV = ("MT5_EVIDENCE_HMAC_KEY", "MT5_GOVERNANCE_HMAC_KEY", "MT5_OPERATOR_HMAC_KEY")
+SIGNING_KEY_ENV = ("MT5_EVIDENCE_HMAC_KEY", "MT5_GOVERNANCE_HMAC_KEY", "MT5_OPERATOR_HMAC_KEY",
+                   "MT5_REVIEW_HMAC_KEY")
 
 
-def _bridge_token_reuses_signing_key(token: str) -> str | None:
-    """Return the signing-domain env name that shares this token, if any."""
+def _secret_reuses_signing_key(token: str) -> str | None:
+    """Return the signing-domain env name that shares this secret, if any."""
     for name in SIGNING_KEY_ENV:
         other = os.getenv(name, "")
         if other and hmac.compare_digest(token.encode("utf-8"), other.encode("utf-8")):
             return name
     return None
+
+
+def _bridge_token_reuses_signing_key(token: str) -> str | None:
+    return _secret_reuses_signing_key(token)
+
+
+def _kill_switch_admin_reuses_secret(token: str) -> str | None:
+    """The emergency-stop disable secret must be independent of every request credential."""
+    bridge = os.getenv("MT5_BRIDGE_TOKEN", "")
+    if bridge and hmac.compare_digest(token.encode("utf-8"), bridge.encode("utf-8")):
+        return "MT5_BRIDGE_TOKEN"
+    return _secret_reuses_signing_key(token)
 
 
 def require_bridge_key(x_bridge_key: str | None = Header(default=None, alias="X-Bridge-Key")) -> None:
@@ -108,19 +124,24 @@ def _governance_configuration() -> tuple[str, str]:
     return _required_key("MT5_GOVERNANCE_HMAC_KEY"), _required_issuer("MT5_GOVERNANCE_ISSUER")
 
 
+def _review_configuration() -> tuple[str, str]:
+    return _required_key("MT5_REVIEW_HMAC_KEY"), _required_issuer("MT5_REVIEW_ISSUER")
+
+
 def _assert_separated_domains() -> None:
-    """Evidence ingress and calibration governance must not share key material or issuer."""
+    """Ingress, governance and review-service signing material must never be shared."""
     evidence_key, evidence_issuer = _evidence_configuration()
     governance_key, governance_issuer = _governance_configuration()
-    if evidence_key == governance_key:
+    review_key, review_issuer = _review_configuration()
+    if evidence_key == governance_key or review_key in (evidence_key, governance_key):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Evidence and governance HMAC keys must be different; configuration rejected",
+            detail="Evidence, governance and review HMAC keys must be different; configuration rejected",
         )
-    if evidence_issuer == governance_issuer:
+    if evidence_issuer == governance_issuer or review_issuer in (evidence_issuer, governance_issuer):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Evidence and governance issuers must be different; configuration rejected",
+            detail="Evidence, governance and review issuers must be different; configuration rejected",
         )
 
 
@@ -155,35 +176,81 @@ def _verified_payload(body: SignedPayload) -> dict[str, Any]:
     return body.payload
 
 
+def _require_review_attestation(payload: Mapping[str, Any]) -> None:
+    """Peer reviews and Chief reasoning are only trusted when the review service signed them."""
+    key, issuer = _review_configuration()
+    check = verify_review(review_attestation_payload(payload), payload.get("review_attestation"),
+                          key=key, expected_issuer=issuer)
+    if check.get("valid") is not True:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "review_attestation_invalid", "blockers": check.get("blockers", [])},
+        )
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     """Non-sensitive liveness endpoint; reports the execution state, never credentials."""
     bridge_token = os.getenv("MT5_BRIDGE_TOKEN", "")
     bridge_token_distinct = bool(bridge_token) and _bridge_token_reuses_signing_key(bridge_token) is None
     bridge_ready = len(bridge_token) >= 24 and bridge_token_distinct
+    evidence_key = os.getenv("MT5_EVIDENCE_HMAC_KEY", "")
+    governance_key = os.getenv("MT5_GOVERNANCE_HMAC_KEY", "")
+    operator_key = os.getenv("MT5_OPERATOR_HMAC_KEY", "")
+    review_key = os.getenv("MT5_REVIEW_HMAC_KEY", "")
     evidence_key_ready = _key_configured("MT5_EVIDENCE_HMAC_KEY")
     governance_key_ready = _key_configured("MT5_GOVERNANCE_HMAC_KEY")
     operator_key_ready = _key_configured("MT5_OPERATOR_HMAC_KEY")
+    review_key_ready = _key_configured("MT5_REVIEW_HMAC_KEY")
+    configured_keys = [key for key, ready in (
+        (evidence_key, evidence_key_ready), (governance_key, governance_key_ready),
+        (operator_key, operator_key_ready), (review_key, review_key_ready),
+    ) if ready]
     keys_distinct = (
-        evidence_key_ready and governance_key_ready
-        and os.getenv("MT5_EVIDENCE_HMAC_KEY") != os.getenv("MT5_GOVERNANCE_HMAC_KEY")
+        evidence_key_ready and governance_key_ready and review_key_ready
+        and len(set(configured_keys)) == len(configured_keys)
     )
     evidence_issuer = os.getenv("MT5_EVIDENCE_ISSUER", "").strip()
     governance_issuer = os.getenv("MT5_GOVERNANCE_ISSUER", "").strip()
     operator_issuer = os.getenv("MT5_OPERATOR_ISSUER", "").strip()
+    review_issuer = os.getenv("MT5_REVIEW_ISSUER", "").strip()
+    operator_key_distinct = (
+        operator_key_ready and operator_key not in (evidence_key, governance_key, review_key, bridge_token)
+    )
+    operator_issuer_distinct = (
+        bool(operator_issuer) and operator_issuer not in (evidence_issuer, governance_issuer, review_issuer)
+    )
+    review_key_distinct = (
+        review_key_ready and review_key not in (evidence_key, governance_key, operator_key, bridge_token)
+    )
+    review_issuer_distinct = (
+        bool(review_issuer) and review_issuer not in (evidence_issuer, governance_issuer, operator_issuer)
+    )
+    admin_token = os.getenv("MT5_KILL_SWITCH_ADMIN_TOKEN", "")
+    admin_distinct = len(admin_token) >= 32 and _kill_switch_admin_reuses_secret(admin_token) is None
+    evaluation_ready = (bridge_ready and keys_distinct and bool(evidence_issuer)
+                        and bool(governance_issuer) and bool(review_issuer))
+    configured_issuers = [issuer for issuer in
+                          (evidence_issuer, governance_issuer, review_issuer, operator_issuer) if issuer]
     return {
         "status": "ok",
         "service": "policy-api",
         "execution_enabled": False,
         "live_enabled": False,
-        "authenticated_policy_endpoints": bridge_ready,
+        "authenticated_policy_endpoints": evaluation_ready,
         "bridge_token_distinct_from_signing_keys": bridge_token_distinct,
+        "kill_switch_admin_distinct_from_request_secrets": admin_distinct,
         "evidence_verification_configured": evidence_key_ready and bool(evidence_issuer),
         "governance_verification_configured": governance_key_ready and bool(governance_issuer),
         "operator_verification_configured": operator_key_ready and bool(operator_issuer),
+        "review_verification_configured": review_key_ready and bool(review_issuer),
+        "operator_key_distinct": operator_key_distinct,
+        "operator_issuer_distinct": operator_issuer_distinct,
+        "review_key_distinct": review_key_distinct,
+        "review_issuer_distinct": review_issuer_distinct,
         "signing_keys_distinct": keys_distinct,
-        "signing_issuers_distinct": bool(evidence_issuer) and bool(governance_issuer)
-                                   and evidence_issuer != governance_issuer,
+        "signing_issuers_distinct": all((evidence_issuer, governance_issuer, review_issuer))
+                                    and len(set(configured_issuers)) == len(configured_issuers),
     }
 
 
@@ -230,6 +297,7 @@ def _verdict_metadata_blockers(payload: Mapping[str, Any]) -> list[str]:
 def evaluate_certainty(body: CertaintyRequest) -> dict[str, Any]:
     _assert_separated_domains()
     payload = _verified_payload(body)
+    _require_review_attestation(payload)
     governance_key, governance_issuer = _governance_configuration()
     governance = verify_governance_attestation(
         body.governance_attestation, key=governance_key,
@@ -285,7 +353,10 @@ def evaluate_certainty(body: CertaintyRequest) -> dict[str, Any]:
 
 @app.post("/v1/chief/review", dependencies=[Depends(require_bridge_key)])
 def review_chief(body: SignedPayload) -> dict[str, Any]:
-    return chief_skeptic_pass(_verified_payload(body))
+    _assert_separated_domains()
+    payload = _verified_payload(body)
+    _require_review_attestation(payload)
+    return chief_skeptic_pass(payload)
 
 
 @app.post("/v1/permission/check", dependencies=[Depends(require_bridge_key)])
@@ -317,6 +388,12 @@ def update_kill_switch(
         expected = os.getenv("MT5_KILL_SWITCH_ADMIN_TOKEN", "")
         if len(expected) < 32:
             raise HTTPException(status_code=503, detail="Separate kill-switch admin token is not configured; switch cannot be disabled")
+        reused = _kill_switch_admin_reuses_secret(expected)
+        if reused:
+            raise HTTPException(
+                status_code=503,
+                detail=f"MT5_KILL_SWITCH_ADMIN_TOKEN must not equal {reused}; configuration rejected",
+            )
         if not x_kill_switch_admin or not hmac.compare_digest(
             x_kill_switch_admin.encode("utf-8"), expected.encode("utf-8")
         ):
@@ -331,26 +408,49 @@ def update_kill_switch(
 
 @app.post("/v1/risk/permission/check", dependencies=[Depends(require_bridge_key)])
 def check_risk_controlled_permission(body: SignedPayload) -> dict[str, Any]:
-    """Policy check with persisted global kill-switch and fresh terminal risk snapshot."""
+    """Re-run the whole gate chain and reconcile a persisted terminal risk snapshot.
+
+    Caller-declared ``chief_verdict``/``certainty_status``/``compliance_status`` strings are
+    never evidence: they are recomputed from the signed bundle before the risk gate runs.
+    """
+    _assert_separated_domains()
     payload = _verified_payload(body)
-    request_payload = payload.get("permission_request", payload)
-    if not isinstance(request_payload, dict):
+    bundle = payload.get("signal_bundle")
+    if not isinstance(bundle, Mapping):
         return {"status": "DENY", "allowed": False, "trade_allowed": False,
-                "blockers": ["INVALID_PERMISSION_REQUEST"]}
-    symbol = str(request_payload.get("instrument", "")).strip().upper()
+                "blockers": ["SIGNED_SIGNAL_BUNDLE_REQUIRED"]}
+    bundle = dict(bundle)
+    request_payload = bundle.get("permission_request")
+    symbol = (str(request_payload.get("instrument", "")).strip().upper()
+              if isinstance(request_payload, Mapping) else "")
     if not symbol:
         return {"status": "DENY", "allowed": False, "trade_allowed": False,
                 "blockers": ["INSTRUMENT_MISSING"]}
+    evidence_key, evidence_issuer = _evidence_configuration()
+    governance_key, governance_issuer = _governance_configuration()
+    review_key, review_issuer = _review_configuration()
     try:
         repo = PostgresRepository()
         kill_switch = repo.get_kill_switch_state()
         snapshot = repo.get_latest_mt5_risk_snapshot(symbol)
-        return risk_controlled_permission(
-            request_payload, _yaml("permission_matrix.yaml"),
-            kill_switch_state=kill_switch, snapshot=snapshot,
-        )
     except Exception as exc:
         raise HTTPException(status_code=503, detail="Risk controls unavailable; request denied") from exc
+    result = evaluate_signal_bundle(
+        bundle, _yaml("certainty_thresholds.yaml"), _yaml("permission_matrix.yaml"),
+        require_persisted_risk=True,
+        kill_switch_state=kill_switch, terminal_risk_snapshot=snapshot,
+        evidence_key=evidence_key, governance_key=governance_key,
+        expected_evidence_issuer=evidence_issuer, expected_governance_issuer=governance_issuer,
+        operator_key=os.getenv("MT5_OPERATOR_HMAC_KEY", "") or None,
+        expected_operator_issuer=os.getenv("MT5_OPERATOR_ISSUER", "").strip() or None,
+        review_key=review_key, expected_review_issuer=review_issuer,
+    )
+    # Approval still requires a durable nonce/permission store, which this route does not own.
+    if bundle.get("user_decision") is not None:
+        result["blockers"] = sorted(set(result.get("blockers", [])) | {"AUTHORIZATION_REQUIRES_DURABLE_STORE"})
+        result["status"] = "DENY"
+    result["trade_allowed"] = False
+    return result
 
 
 @app.post("/v1/authorization/check", dependencies=[Depends(require_bridge_key)])

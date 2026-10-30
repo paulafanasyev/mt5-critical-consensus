@@ -236,6 +236,44 @@ def test_authorization_nonce_is_one_time_per_operator_across_permissions():
     assert other["authorized"] is True
 
 
+def test_authorization_is_once_per_permission_not_just_per_nonce():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    store = InMemoryNonceStore()
+    permission = {"status": "REQUIRE_HUMAN", "permission_id": "perm-once", "mode": "demo",
+                  "expires_at": (now + timedelta(minutes=5)).isoformat()}
+
+    def approval(nonce, user_id, decision_id):
+        return {"decision": "APPROVE", "user_id": user_id, "reason": "reviewed",
+                "permission_id": "perm-once", "decision_id": decision_id,
+                "nonce": nonce, "timestamp": now.isoformat(), "ttl_seconds": 300}
+
+    first = user_authorization_gate(permission, approval("n" * 24, "operator-1", "d-1"),
+                                    now=now, nonce_store=store)
+    assert first["authorized"] is True
+    # A freshly signed approval with a brand-new nonce must not authorize the same order twice.
+    second = user_authorization_gate(permission, approval("m" * 24, "operator-2", "d-2"),
+                                     now=now, nonce_store=store)
+    assert second["status"] == "DENY"
+    assert "AUTHORIZATION_PERMISSION_ALREADY_USED" in second["blockers"]
+
+
+def test_authorization_requires_a_store_with_permission_tombstones():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    permission = {"status": "REQUIRE_HUMAN", "permission_id": "perm-1", "mode": "demo",
+                  "expires_at": (now + timedelta(minutes=5)).isoformat()}
+    decision = {"decision": "APPROVE", "user_id": "operator-1", "reason": "reviewed",
+                "permission_id": "perm-1", "decision_id": "d-1", "nonce": "n" * 24,
+                "timestamp": now.isoformat(), "ttl_seconds": 300}
+
+    class NonceOnlyStore:
+        def consume(self, **kwargs):
+            return True
+
+    result = user_authorization_gate(permission, decision, now=now, nonce_store=NonceOnlyStore())
+    assert result["status"] == "DENY"
+    assert "AUTHORIZATION_PERMISSION_STORE_REQUIRED" in result["blockers"]
+
+
 def test_policy_owned_mandatory_agents_cannot_be_overridden_by_payload():
     payload = good_payload()
     payload["mandatory_agents"] = ["PlatformScoutAgent"]

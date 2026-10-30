@@ -3,23 +3,66 @@ from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 
 from critical_consensus import api
-from critical_consensus.evidence import make_envelope
+from critical_consensus.evidence import make_envelope, sign_bundle
+from critical_consensus.risk_controls import risk_request_binding_hash
+from test_pipeline import (
+    CERTAINTY_POLICY, EVIDENCE_ISSUER, EVIDENCE_KEY, GOVERNANCE_ISSUER,
+    GOVERNANCE_KEY, OPERATOR_ISSUER, OPERATOR_KEY, PERMISSION_MATRIX, REVIEW_ISSUER,
+    REVIEW_KEY, make_bundle, make_governance_attestation, sign_review_attestation,
+)
 
 
 client = TestClient(api.app)
 BRIDGE = "a-valid-bridge-token-longer-than-24"
-EVIDENCE_KEY = "k" * 64
 
 
 def signed_body(payload):
     return {"payload": payload,
-            "envelope": make_envelope(payload, key=EVIDENCE_KEY, issuer="test-ingress")}
+            "envelope": make_envelope(payload, key=EVIDENCE_KEY, issuer=EVIDENCE_ISSUER)}
 
 
 def configure(monkeypatch):
     monkeypatch.setenv("MT5_BRIDGE_TOKEN", BRIDGE)
     monkeypatch.setenv("MT5_EVIDENCE_HMAC_KEY", EVIDENCE_KEY)
-    monkeypatch.setenv("MT5_EVIDENCE_ISSUER", "test-ingress")
+    monkeypatch.setenv("MT5_EVIDENCE_ISSUER", EVIDENCE_ISSUER)
+    monkeypatch.setenv("MT5_GOVERNANCE_HMAC_KEY", GOVERNANCE_KEY)
+    monkeypatch.setenv("MT5_GOVERNANCE_ISSUER", GOVERNANCE_ISSUER)
+    monkeypatch.setenv("MT5_OPERATOR_HMAC_KEY", OPERATOR_KEY)
+    monkeypatch.setenv("MT5_OPERATOR_ISSUER", OPERATOR_ISSUER)
+    monkeypatch.setenv("MT5_REVIEW_HMAC_KEY", REVIEW_KEY)
+    monkeypatch.setenv("MT5_REVIEW_ISSUER", REVIEW_ISSUER)
+
+
+def sign_signal_bundle(bundle, now):
+    body = sign_review_attestation(dict(bundle), now=now)
+    body["governance_attestation"] = make_governance_attestation(now)
+    return sign_bundle(body, key=EVIDENCE_KEY, issuer=EVIDENCE_ISSUER, issued_at=now)
+
+
+def risk_snapshot_for(bundle, now):
+    request = bundle["permission_request"]
+    return {
+        "status": "PASS", "observed_at": now.isoformat(), "account_mode": "demo",
+        "symbol": request["instrument"], "symbol_group": "fx-major",
+        "account_equity": 10000.0, "account_balance": 10000.0, "daily_pnl": 0.0,
+        "day_start_equity": 10000.0, "equity_high_watermark": 10200.0,
+        "risk_fraction": 0.004, "risk_value_account_currency": 40.0,
+        "risk_tick_size": 0.0001, "risk_tick_value_loss": 20.0,
+        "reference_price": request["expected_price"],
+        "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0196,
+        "open_positions": 1, "correlated_open_positions": 0, "open_stop_risk_fraction": 0.0,
+        "request_binding_sha256": risk_request_binding_hash(request),
+        "within_high_impact_news_window": False,
+    }
+
+
+def _policy(name):
+    if name == "certainty_thresholds.yaml":
+        return dict(CERTAINTY_POLICY)
+    matrix = {**PERMISSION_MATRIX, "permission_matrix": dict(PERMISSION_MATRIX["permission_matrix"])}
+    matrix["permission_matrix"]["allowed_time_utc"] = {"start": "00:00", "end": "23:59"}
+    matrix["permission_matrix"]["rollover_block_utc"] = None
+    return matrix
 
 
 class FakeRepository:
@@ -100,7 +143,7 @@ def test_risk_endpoints_fail_closed_when_the_database_is_unavailable(monkeypatch
     assert activate.status_code == 503
     permission = client.post(
         "/v1/risk/permission/check", headers=bridge,
-        json=signed_body({"instrument": "EURUSD", "mode": "demo"}),
+        json=signed_body({"signal_bundle": {"permission_request": {"instrument": "EURUSD"}}}),
     )
     assert permission.status_code == 503
 
@@ -110,9 +153,12 @@ def test_risk_permission_route_denies_without_real_persisted_terminal_snapshot(m
     fake.state["kill_switch_active"] = False
     monkeypatch.setattr(api, "PostgresRepository", lambda: fake)
     configure(monkeypatch)
+    monkeypatch.setattr(api, "_yaml", _policy)
+    now = datetime.now(timezone.utc)
+    bundle = sign_signal_bundle(make_bundle(now), now)
     response = client.post(
         "/v1/risk/permission/check", headers={"X-Bridge-Key": BRIDGE},
-        json=signed_body({"instrument": "EURUSD", "mode": "demo"}),
+        json=signed_body({"signal_bundle": bundle}),
     )
     assert response.status_code == 200
     assert response.json()["status"] == "DENY"
@@ -149,55 +195,59 @@ def test_activating_the_kill_switch_needs_no_admin_secret(monkeypatch):
     assert response.json()["kill_switch_active"] is True
 
 
-def test_risk_permission_route_reaches_human_review_when_evidence_agrees(monkeypatch):
-    from datetime import timedelta
-
-    from critical_consensus.risk_controls import risk_request_binding_hash
-
+def test_risk_permission_route_reaches_human_review_with_a_signed_pipeline_bundle(monkeypatch):
     now = datetime.now(timezone.utc)
-    request = {
-        "permission_id": "perm-1", "instrument": "EURUSD", "direction": "BUY", "size": 0.1,
-        "mode": "demo", "expected_price": 1.1001, "sl_tp": {"sl": 1.0991, "tp": 1.1020},
-        "expected_rr": 1.9, "chief_verdict": "CONFIRM", "certainty_status": "PASS",
-        "compliance_status": "PASS", "risk_flags": [],
-        "expires_at": (now + timedelta(minutes=5)).isoformat(),
-        "within_high_impact_news_window": False,
-    }
-    snapshot = {
-        "status": "PASS", "observed_at": now.isoformat(), "account_mode": "demo",
-        "symbol": "EURUSD", "symbol_group": "fx-major", "account_equity": 10000.0,
-        "account_balance": 10000.0, "daily_pnl": 0.0,
-        "day_start_equity": 10000.0, "equity_high_watermark": 10200.0,
-        "risk_fraction": 0.002, "risk_value_account_currency": 20.0,
-        "risk_tick_size": 0.0001, "risk_tick_value_loss": 20.0,
-        "reference_price": 1.1001,
-        "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0196,
-        "open_positions": 1, "correlated_open_positions": 1,
-        "request_binding_sha256": risk_request_binding_hash(request),
-        "within_high_impact_news_window": False,
-    }
+    bundle = make_bundle(now)
     fake = FakeRepository()
     fake.state["kill_switch_active"] = False
-    fake.get_latest_mt5_risk_snapshot = lambda symbol: dict(snapshot)
+    fake.get_latest_mt5_risk_snapshot = lambda symbol: risk_snapshot_for(bundle, now)
     monkeypatch.setattr(api, "PostgresRepository", lambda: fake)
-    matrix = {"permission_matrix": {
-        "instruments": ["EURUSD"], "max_size_per_trade": 0.2, "max_positions": 5,
-        "max_correlated_positions": 2, "max_risk_per_trade_fraction": 0.005,
-        "daily_loss_limit_fraction": 0.02, "max_drawdown_fraction": 0.10,
-        "allowed_directions": ["BUY", "SELL"],
-        "allowed_time_utc": {"start": "00:00", "end": "23:59"}, "rollover_block_utc": None,
-        "blocked_around_news": True, "blocked_flags": ["sanctions", "mnpi"],
-        "min_expected_rr": 1.5, "expected_rr_tolerance_fraction": 0.01,
-        "require_stop_loss": True, "require_take_profit": True,
-        "max_command_ttl_seconds": 600, "demo_enabled": True, "live_enabled": False,
-    }}
-    monkeypatch.setattr(api, "_yaml", lambda name: matrix)
+    monkeypatch.setattr(api, "_yaml", _policy)
     configure(monkeypatch)
-    response = client.post("/v1/risk/permission/check", headers={"X-Bridge-Key": BRIDGE},
-                           json=signed_body({"permission_request": request}))
+    response = client.post(
+        "/v1/risk/permission/check", headers={"X-Bridge-Key": BRIDGE},
+        json=signed_body({"signal_bundle": sign_signal_bundle(bundle, now)}),
+    )
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "REQUIRE_HUMAN"
     assert body["blockers"] == []
-    assert body["risk_reconciliation"]["status"] == "PASS"
+    assert body["details"]["permission"]["risk_reconciliation"]["status"] == "PASS"
     assert body["trade_allowed"] is False
+
+
+def test_risk_permission_route_recomputes_gates_instead_of_trusting_caller_booleans(monkeypatch):
+    now = datetime.now(timezone.utc)
+    bundle = make_bundle(now)
+    for verdict in bundle["verdicts"]:
+        verdict["verdict"] = "REJECT"
+    # The forged stage booleans are exactly what the old endpoint trusted.
+    bundle["permission_request"].update({
+        "chief_verdict": "CONFIRM", "certainty_status": "PASS", "compliance_status": "PASS",
+        "risk_flags": [],
+    })
+    bundle["chief_reasoning"]["reasoning_hash"] = "sha256:" + "0" * 64
+    fake = FakeRepository()
+    fake.state["kill_switch_active"] = False
+    fake.get_latest_mt5_risk_snapshot = lambda symbol: risk_snapshot_for(bundle, now)
+    monkeypatch.setattr(api, "PostgresRepository", lambda: fake)
+    monkeypatch.setattr(api, "_yaml", _policy)
+    configure(monkeypatch)
+    response = client.post(
+        "/v1/risk/permission/check", headers={"X-Bridge-Key": BRIDGE},
+        json=signed_body({"signal_bundle": sign_signal_bundle(bundle, now)}),
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] != "REQUIRE_HUMAN"
+    assert response.json()["trade_allowed"] is False
+
+
+def test_risk_permission_route_requires_a_signed_signal_bundle(monkeypatch):
+    configure(monkeypatch)
+    response = client.post(
+        "/v1/risk/permission/check", headers={"X-Bridge-Key": BRIDGE},
+        json=signed_body({"permission_request": {"instrument": "EURUSD"}}),
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "DENY"
+    assert "SIGNED_SIGNAL_BUNDLE_REQUIRED" in response.json()["blockers"]

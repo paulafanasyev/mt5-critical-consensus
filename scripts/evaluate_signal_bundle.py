@@ -67,17 +67,23 @@ def run(bundle_path: Path, output_path: Path, *, persist: bool,
         )
     evidence_key = _required_env("MT5_EVIDENCE_HMAC_KEY")
     governance_key = _required_env("MT5_GOVERNANCE_HMAC_KEY")
+    review_key = _required_env("MT5_REVIEW_HMAC_KEY")
     evidence_issuer = _required_issuer("MT5_EVIDENCE_ISSUER")
     governance_issuer = _required_issuer("MT5_GOVERNANCE_ISSUER")
-    if evidence_key == governance_key:
-        raise ValueError("MT5_EVIDENCE_HMAC_KEY and MT5_GOVERNANCE_HMAC_KEY must be different")
-    if evidence_issuer == governance_issuer:
-        raise ValueError("MT5_EVIDENCE_ISSUER and MT5_GOVERNANCE_ISSUER must be different")
+    review_issuer = _required_issuer("MT5_REVIEW_ISSUER")
+    if evidence_key == governance_key or review_key in (evidence_key, governance_key):
+        raise ValueError("MT5_EVIDENCE_HMAC_KEY, MT5_GOVERNANCE_HMAC_KEY and "
+                         "MT5_REVIEW_HMAC_KEY must be different")
+    if evidence_issuer == governance_issuer or review_issuer in (evidence_issuer, governance_issuer):
+        raise ValueError("MT5_EVIDENCE_ISSUER, MT5_GOVERNANCE_ISSUER and "
+                         "MT5_REVIEW_ISSUER must be different")
     verify_args = {
         "evidence_key": evidence_key,
         "governance_key": governance_key,
         "expected_evidence_issuer": evidence_issuer,
         "expected_governance_issuer": governance_issuer,
+        "review_key": review_key,
+        "expected_review_issuer": review_issuer,
     }
 
     certainty_policy = _load_yaml(policy_dir / "certainty_thresholds.yaml")

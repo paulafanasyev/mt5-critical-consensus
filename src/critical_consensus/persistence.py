@@ -256,6 +256,26 @@ class PostgresRepository:
             ).fetchone()
         return row is not None
 
+    def consume_authorization_permission(self, *, permission_id: str, expires_at: datetime) -> bool:
+        """Atomically burn a permission id; True only for the first authorization."""
+        permission_value = str(permission_id).strip()
+        if not permission_value:
+            raise ValueError("permission_id is required")
+        expires = expires_at if isinstance(expires_at, datetime) else _timestamp(expires_at, "expires_at")
+        if expires.tzinfo is None or expires.utcoffset() is None:
+            raise ValueError("expires_at must include a timezone")
+        expires = expires.astimezone(timezone.utc)
+        if expires <= datetime.now(timezone.utc):
+            raise ValueError("expires_at must be in the future")
+        with self._connect() as conn:
+            row = conn.execute(
+                """INSERT INTO authorization_permissions (permission_id, expires_at)
+                   VALUES (%s,%s) ON CONFLICT (permission_id) DO NOTHING
+                   RETURNING permission_id""",
+                (permission_value, expires),
+            ).fetchone()
+        return row is not None
+
     def set_kill_switch(self, *, active: bool, actor_id: str, reason: str) -> dict[str, Any]:
         """Persist emergency-stop state and append a hash-chained event in one transaction."""
         if not isinstance(active, bool):

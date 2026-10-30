@@ -17,6 +17,10 @@ class NonceStore(Protocol):
                 now: datetime | None = None) -> bool:
         """Atomically record a nonce; return False when already used or already expired."""
 
+    def consume_permission(self, *, permission_id: str, expires_at: datetime,
+                           now: datetime | None = None) -> bool:
+        """Atomically record a permission as authorized; False when it already was."""
+
 
 class InMemoryNonceStore:
     """Thread-safe, process-local nonce store for tests and single-process demos."""
@@ -24,6 +28,7 @@ class InMemoryNonceStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._entries: dict[tuple[str, str], datetime] = {}
+        self._permissions: dict[str, datetime] = {}
 
     def consume(self, *, scope: str, nonce: str, expires_at: datetime,
                 now: datetime | None = None) -> bool:
@@ -47,6 +52,27 @@ class InMemoryNonceStore:
             self._entries[key] = expires_at
             return True
 
+    def consume_permission(self, *, permission_id: str, expires_at: datetime,
+                           now: datetime | None = None) -> bool:
+        """A permission may be authorized at most once, regardless of nonce or operator."""
+        permission_id = str(permission_id).strip()
+        if not permission_id:
+            raise ValueError("permission_id is required")
+        if not isinstance(expires_at, datetime) or expires_at.tzinfo is None or expires_at.utcoffset() is None:
+            raise ValueError("expires_at must be timezone-aware")
+        current = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+        if current.tzinfo is None or current.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        expires_at = expires_at.astimezone(timezone.utc)
+        current = current.astimezone(timezone.utc)
+        with self._lock:
+            if permission_id in self._permissions:
+                return False
+            if expires_at <= current:
+                return False
+            self._permissions[permission_id] = expires_at
+            return True
+
     def purge_expired(self, *, now: datetime | None = None) -> int:
         """Explicitly drop expired tombstones; replay is denied before this can matter."""
         current = now if isinstance(now, datetime) else datetime.now(timezone.utc)
@@ -57,7 +83,10 @@ class InMemoryNonceStore:
             expired = [key for key, expiry in self._entries.items() if expiry <= current]
             for key in expired:
                 del self._entries[key]
-        return len(expired)
+            expired_permissions = [pid for pid, expiry in self._permissions.items() if expiry <= current]
+            for pid in expired_permissions:
+                del self._permissions[pid]
+        return len(expired) + len(expired_permissions)
 
 
 class PostgresNonceStore:
@@ -77,4 +106,17 @@ class PostgresNonceStore:
             return False
         return bool(self._repository.consume_authorization_nonce(
             scope=str(scope), nonce=str(nonce), expires_at=expires_at,
+        ))
+
+    def consume_permission(self, *, permission_id: str, expires_at: datetime,
+                           now: datetime | None = None) -> bool:
+        current = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+        if current.tzinfo is None or current.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        if not isinstance(expires_at, datetime) or expires_at.tzinfo is None or expires_at.utcoffset() is None:
+            raise ValueError("expires_at must be timezone-aware")
+        if expires_at.astimezone(timezone.utc) <= current.astimezone(timezone.utc):
+            return False
+        return bool(self._repository.consume_authorization_permission(
+            permission_id=str(permission_id), expires_at=expires_at,
         ))
