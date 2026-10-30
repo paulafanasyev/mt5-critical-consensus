@@ -315,12 +315,13 @@ bool ExecuteDemoCommand(const string body)
    double step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
    double minvol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
    double maxvol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
-   double volume_steps = volume / step;
    if(!MathIsValidNumber(step) || !MathIsValidNumber(minvol) || !MathIsValidNumber(maxvol) ||
-      !MathIsValidNumber(volume_steps) || step <= 0 || minvol <= 0 || maxvol < minvol ||
-      volume < minvol || volume > maxvol ||
-      MathAbs(volume_steps - MathRound(volume_steps)) > 0.000001)
+      step <= 0 || minvol <= 0 || maxvol < minvol || volume < minvol || volume > maxvol)
    { Print("BLOCKED: broker volume constraints invalid or unsatisfied."); return false; }
+   double volume_steps = volume / step;
+   if(!MathIsValidNumber(volume_steps) ||
+      MathAbs(volume_steps - MathRound(volume_steps)) > 0.000001)
+   { Print("BLOCKED: invalid broker volume step."); return false; }
 
    MqlTradeRequest request = {};
    MqlTradeCheckResult check = {};
