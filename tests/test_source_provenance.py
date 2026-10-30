@@ -137,9 +137,10 @@ def test_empty_publisher_allowlist_fails_closed():
 
 def test_generic_https_capture_only_accepts_operator_attested_publication_time():
     item = record()
-    profile = registry()["publishers"]["central-bank-a"]
+    policy = registry()
+    profile = policy["publishers"]["central-bank-a"]
     profile["allowed_publication_time_attestations"].append("publisher_api_field")
     item["publication_time_attestation"] = "publisher_api_field"
-    result = validate_source_capture(item, registry(), now=NOW)
+    result = validate_source_capture(item, policy, now=NOW)
     assert result["status"] == "DENY"
     assert "SOURCE_PUBLICATION_TIME_ATTESTATION_NOT_ALLOWED" in result["blockers"]
