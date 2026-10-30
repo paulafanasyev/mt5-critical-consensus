@@ -25,6 +25,7 @@ def good_snapshot():
             "risk_fraction": 0.002, "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0196,
             "open_positions": 1, "correlated_open_positions": 1,
             "spread_points": 10.0, "max_spread_points": 20.0,
+            "quote_age_seconds": 1.0, "max_quote_age_seconds": 15,
             "request_binding_sha256": risk_request_binding_hash(good_request()),
             "within_high_impact_news_window": None}
 
@@ -128,3 +129,28 @@ def test_risk_snapshot_rejects_invalid_freshness_policy():
 def test_risk_snapshot_accepts_bounded_positive_integer_freshness_policy():
     result = risk_snapshot_gate(good_snapshot(), now=NOW, max_age_seconds=15)
     assert result["status"] == "PASS"
+
+def test_risk_snapshot_rejects_stale_quote_even_when_snapshot_itself_is_fresh():
+    snapshot = good_snapshot()
+    snapshot["quote_age_seconds"] = 45.0
+    snapshot["observed_at"] = NOW.isoformat()
+    result = risk_snapshot_gate(snapshot, now=NOW)
+    assert result["status"] == "DENY"
+    assert "MT5_QUOTE_STALE" in result["blockers"]
+
+
+def test_risk_snapshot_rejects_missing_future_or_unbounded_quote_age_policy():
+    snapshot = good_snapshot()
+    for patch in (
+        {"quote_age_seconds": None},
+        {"quote_age_seconds": -6.0},
+        {"max_quote_age_seconds": 16},
+        {"max_quote_age_seconds": True},
+        {"max_quote_age_seconds": "15"},
+    ):
+        invalid = {**snapshot, **patch}
+        result = risk_snapshot_gate(invalid, now=NOW)
+        assert result["status"] == "DENY"
+        assert any(blocker.startswith("MT5_QUOTE_AGE") or blocker == "MT5_QUOTE_STALE"
+                   for blocker in result["blockers"])
+
