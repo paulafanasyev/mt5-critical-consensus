@@ -282,3 +282,29 @@ def test_capture_manifest_rejects_malformed_configured_json_timestamp_pointer(tm
         assert False, "invalid JSON timestamp pointer should be rejected"
     except ValueError as exc:
         assert "invalid configured JSON timestamp pointer" in str(exc)
+
+
+def test_dns_resolution_timeout_returns_without_waiting_for_blocked_resolver(monkeypatch):
+    import time
+
+    def blocked_dns(*args, **kwargs):
+        time.sleep(0.5)
+        return []
+
+    monkeypatch.setattr(CAPTURE.socket, "getaddrinfo", blocked_dns)
+    started = time.monotonic()
+    try:
+        CAPTURE._resolve_public_addresses("official-a.example", timeout=0.02)
+        assert False, "slow DNS must time out"
+    except RuntimeError as exc:
+        assert "publisher_dns_resolution_timeout" in str(exc)
+    assert time.monotonic() - started < 0.2
+
+
+def test_dns_resolution_rejects_invalid_timeout():
+    for timeout in (0, -1, float("inf"), True, 31):
+        try:
+            CAPTURE._resolve_public_addresses("official-a.example", timeout=timeout)
+            assert False, "invalid DNS timeout must be rejected"
+        except ValueError as exc:
+            assert "DNS timeout" in str(exc)
