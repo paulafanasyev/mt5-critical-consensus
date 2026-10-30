@@ -25,7 +25,16 @@ from critical_consensus.source_provenance import (
 
 
 def _safe_url(url: str, profile: dict) -> str:
-    parsed = urlsplit(url)
+    if not isinstance(url, str) or not url or len(url) > 4096:
+        raise ValueError("source URL must be a non-empty string of at most 4096 characters")
+    if not isinstance(profile, dict):
+        raise ValueError("publisher URL policy must be an object")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in url) or "\\" in url:
+        raise ValueError("source URL contains a forbidden control character or backslash")
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        raise ValueError("source URL is invalid") from None
     host = (parsed.hostname or "").lower().rstrip(".")
     try:
         ipaddress.ip_address(host)
@@ -39,7 +48,10 @@ def _safe_url(url: str, profile: dict) -> str:
     allowed_query_parameters = profile.get("allowed_query_parameters", [])
     if not isinstance(allowed_query_parameters, list) or any(not isinstance(key, str) for key in allowed_query_parameters):
         raise ValueError("publisher allowed_query_parameters policy is invalid")
-    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    try:
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True, max_num_fields=32)
+    except ValueError:
+        raise ValueError("source URL has too many or malformed query parameters") from None
     forbidden_names = {"token", "access_token", "api_key", "apikey", "password", "secret",
                        "signature", "authorization", "client_secret"}
     if (any(name.lower() in forbidden_names for name, _ in query_pairs)
@@ -121,17 +133,16 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
             raise
 
 
-def _fetch(url: str, *, max_bytes: int, timeout: float) -> tuple[bytes, str]:
+def _fetch(url: str, *, profile: dict, max_bytes: int, timeout: float) -> tuple[bytes, str]:
     if (isinstance(max_bytes, bool) or not isinstance(max_bytes, int)
             or not 1 <= max_bytes <= 512_000):
         raise ValueError("max_bytes must be an integer between 1 and 512000")
     if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
             or not math.isfinite(timeout) or not 1 <= timeout <= 30):
         raise ValueError("timeout must be finite and between 1 and 30 seconds")
+    # Keep the network primitive safe even when reused outside capture_manifest.
+    host = _safe_url(url, profile)
     parsed = urlsplit(url)
-    host = (parsed.hostname or "").lower().rstrip(".")
-    if parsed.scheme != "https" or not host or parsed.port not in (None, 443):
-        raise ValueError("publisher URL must be HTTPS on the default port")
     path = parsed.path or "/"
     if parsed.query:
         path += "?" + parsed.query
@@ -251,7 +262,7 @@ def capture_manifest(manifest_path: Path, registry_path: Path, *, timeout: float
             or configured_pointer == "/"
         ):
             raise ValueError(f"source entry {index} has an invalid configured JSON timestamp pointer")
-        body, content_type = _fetch(url, max_bytes=max_bytes, timeout=timeout)
+        body, content_type = _fetch(url, profile=profile, max_bytes=max_bytes, timeout=timeout)
         if has_json_timestamp_pointer:
             publication_time_field = configured_pointer
             if content_type != "application/json":
