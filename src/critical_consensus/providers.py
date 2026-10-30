@@ -13,6 +13,13 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Do not forward Authorization credentials to a redirected endpoint."""
+
+    def redirect_request(self, request, fp, code, msg, headers, new_url):
+        return None
+
+
 def canonical_signal_hash(signal: Mapping[str, Any]) -> str:
     encoded = json.dumps(signal, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
                          allow_nan=False, default=str)
@@ -94,8 +101,9 @@ class OpenAICompatibleAgent:
                      "Accept": "application/json"},
         )
         try:
-            # B310: endpoint scheme/host is allow-listed in __init__; this is the intended HTTP transport.
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:  # nosec B310
+            # Scheme was restricted in __init__; opener also refuses redirects to any other endpoint.
+            opener = urllib.request.build_opener(_NoRedirectHandler())
+            with opener.open(request, timeout=self.timeout_seconds) as response:
                 response_body = response.read(256_001)
         except urllib.error.HTTPError as exc:
             raise RuntimeError(f"provider_http_error:{exc.code}") from None
