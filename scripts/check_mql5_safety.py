@@ -25,6 +25,8 @@ def main() -> int:
         "duplicate order guard": r"DUPLICATE BLOCKED",
         "kill-switch endpoint configured": r"KillSwitchUrl",
         "kill-switch response must explicitly be false": r"JsonFalse",
+        "strict JSON boolean parser is present": r"JsonBooleanValue",
+        "boolean token must end at a JSON delimiter": r"return\\s+tail==','\\s*\\|\\|\\s*tail=='}'",
         "live-path remains blocked": r"if\s*\(!EnableDemoExecution\s*\|\|\s*AllowLiveExecution\)",
     }
     failures = [name for name, pattern in required.items() if re.search(pattern, source) is None]
