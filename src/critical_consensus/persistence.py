@@ -428,17 +428,34 @@ class PostgresRepository:
             raise ValueError("symbol is required")
         with self._connect() as conn:
             row = conn.execute(
-                """SELECT observed_at, account_mode, snapshot_sha256, snapshot
+                """SELECT observed_at, account_mode, symbol, snapshot_sha256, snapshot
                    FROM mt5_risk_snapshots WHERE symbol=%s ORDER BY observed_at DESC, inserted_at DESC
                    LIMIT 1""", (symbol,)
             ).fetchone()
         if row is None:
             return None
-        snapshot = row[3] if isinstance(row[3], Mapping) else json.loads(row[3])
+        snapshot = row[4] if isinstance(row[4], Mapping) else json.loads(row[4])
+        if not isinstance(snapshot, Mapping):
+            raise RuntimeError("persisted MT5 risk snapshot is not a JSON object")
         output = dict(snapshot)
-        output.setdefault("observed_at", row[0].isoformat())
-        output.setdefault("account_mode", row[1])
-        output["snapshot_sha256"] = row[2]
+        stored_digest = str(row[3])
+        actual_digest = _sha256(_canonical(output))
+        if (len(stored_digest) != 71 or not stored_digest.startswith("sha256:")
+                or stored_digest != actual_digest):
+            raise RuntimeError("persisted MT5 risk snapshot hash mismatch")
+        payload_observed = _timestamp(output.get("observed_at"), "snapshot.observed_at")
+        column_observed = _timestamp(row[0], "database.observed_at")
+        if payload_observed != column_observed:
+            raise RuntimeError("persisted MT5 risk snapshot timestamp column mismatch")
+        payload_mode = str(output.get("account_mode", "unknown")).lower()
+        if payload_mode not in {"demo", "contest", "real", "unknown"}:
+            payload_mode = "unknown"
+        if payload_mode != str(row[1]).lower():
+            raise RuntimeError("persisted MT5 risk snapshot account-mode column mismatch")
+        payload_symbol = str(output.get("symbol", "")).strip().upper() or "UNKNOWN"
+        if payload_symbol != str(row[2]).strip().upper():
+            raise RuntimeError("persisted MT5 risk snapshot symbol column mismatch")
+        output["snapshot_sha256"] = stored_digest
         return output
 
     def persist_pipeline_result(
