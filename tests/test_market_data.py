@@ -2,7 +2,7 @@ from datetime import datetime, timezone, timedelta
 
 import pytest
 
-from critical_consensus.market_data import MarketBar, build_market_snapshot, read_mt5_csv, validate_bar_series
+from critical_consensus.market_data import (MarketBar, build_market_snapshot, build_next_bar_forecast_contract,\n                                            read_mt5_csv, retain_completed_bars, validate_bar_series)
 
 
 def bars(n=25):
@@ -59,3 +59,36 @@ def test_mt5_export_rejects_duplicate_timestamps(tmp_path):
                     "2026.10.01,10:00:00,1.0,1.1,0.9,1.05\n", encoding="utf-8")
     with pytest.raises(ValueError, match="strictly increasing"):
         read_mt5_csv(path, symbol="EURUSD", timeframe="H1", source_timezone="UTC")
+
+
+def test_forecast_snapshot_excludes_a_still_forming_bar():
+    data = bars(25)
+    now = data[-1].time + timedelta(hours=1, seconds=1)
+    closed = retain_completed_bars(data, now=now, finalization_grace_seconds=2)
+    assert closed[-1].time == data[-2].time
+    assert len(closed) == 24
+
+
+def test_forecast_snapshot_includes_bar_after_finalization_grace():
+    data = bars(25)
+    now = data[-1].time + timedelta(hours=1, seconds=3)
+    closed = retain_completed_bars(data, now=now, finalization_grace_seconds=2)
+    assert closed[-1].time == data[-1].time
+
+
+def test_objective_forecast_contract_binds_symbol_timeframe_and_reference_close():
+    snapshot = build_market_snapshot(bars(25))
+    contract = build_next_bar_forecast_contract(snapshot)
+    assert contract["target_event"] == "NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE"
+    assert contract["target_policy_version"] == "next-available-bar-close-above-reference-v1"
+    assert contract["symbol"] == "EURUSD"
+    assert contract["timeframe"] == "H1"
+    assert contract["reference_at"] == snapshot["as_of"]
+    assert contract["reference_close"] == snapshot["last_close"]
+
+
+def test_objective_forecast_contract_rejects_unsupported_monthly_timeframe():
+    snapshot = build_market_snapshot(bars(25))
+    snapshot["timeframe"] = "MN1"
+    with pytest.raises(ValueError, match="does not support this timeframe"):
+        build_next_bar_forecast_contract(snapshot)
