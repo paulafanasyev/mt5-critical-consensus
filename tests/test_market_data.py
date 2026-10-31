@@ -288,3 +288,32 @@ def test_weekend_suppression_does_not_hide_extended_or_missing_weekly_history():
                   1.05, 1.15, 0.95, 1.1),
     ]
     assert len(detect_potential_bar_gaps(missing_week, ignore_weekend_closures=True)) == 1
+
+
+
+def test_postgres_clock_normalizes_non_utc_session_timezone_with_test_double():
+    class Cursor:
+        def fetchone(self):
+            return (
+                datetime(2026, 10, 31, 10, 0, tzinfo=timezone(timedelta(hours=7))),
+                "Asia/Ho_Chi_Minh",
+            )
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query):
+            assert "current_setting('TimeZone')" in query
+            return Cursor()
+
+    repo = PostgresRepository(
+        "postgresql://unused/unused",
+        connect_fn=lambda _dsn: Connection(),
+    )
+    clock = repo.get_database_clock()
+    assert clock["session_timezone"] == "Asia/Ho_Chi_Minh"
+    assert clock["now_utc"] == datetime(2026, 10, 31, 3, 0, tzinfo=timezone.utc)
