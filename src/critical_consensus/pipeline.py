@@ -16,7 +16,7 @@ from .calibration import weighted_consensus
 from .evidence import EvidenceError, key_bytes, verify_bundle, verify_decision, verify_review
 from .gates import certainty_gate, chief_skeptic_pass, permission_gate, user_authorization_gate
 from .governance import apply_attested_calibration, verify_governance_attestation
-from .risk_controls import risk_controlled_permission
+from .risk_controls import global_kill_switch_gate, risk_controlled_permission
 
 _VERDICT_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _VERDICT_FUTURE_SKEW_SECONDS = 30
@@ -205,6 +205,20 @@ def evaluate_signal_bundle(
                 "audit_chain_check": chain_check}
 
     emit("SIGNAL_RECEIVED", {"signal_id": signal_id or "unknown", "bundle_hash": bundle_hash})
+
+    # The persisted emergency stop has priority over completeness of the signal bundle.
+    # Otherwise an incomplete bundle could return GATHER_MORE while an active account-wide
+    # stop was already known. No evidence, model or operator decision may bypass this gate.
+    if require_persisted_risk is True:
+        switch = global_kill_switch_gate(kill_switch_state)
+        emit("GLOBAL_KILL_SWITCH", {
+            "signal_id": signal_id or "unknown",
+            "status": switch.get("status"),
+            "blockers": switch.get("blockers", []),
+        })
+        if switch.get("status") != "PASS":
+            return finish("DENY", list(switch.get("blockers", [])),
+                          kill_switch=switch)
 
     config_blockers: list[str] = []
     if not isinstance(expected_evidence_issuer, str) or not expected_evidence_issuer.strip():
