@@ -75,6 +75,7 @@ COMMAND_EVENT = "demo_order_command"
 SERVED_EVENT = "demo_order_served"
 OUTCOME_EVENT = "demo_order_outcome"
 ACK_EVENT = "demo_reconciliation_ack"
+RISK_BASELINE_EVENT = "demo_risk_baseline"
 SYMBOL_SKIPPED_EVENT = "demo_symbol_unavailable"
 STATE_FILLED = "FILLED"
 STATE_EXPIRED = "EXPIRED"
@@ -279,8 +280,8 @@ class DemoTerminal(LiveMT5Backend):
 
     ``LiveMT5Backend`` implements the order-free read surface; this subclass adds the
     equity baselines the agent requires and a deal-history reader used to prove a fill.
-    Baselines are reconstructed from the live process (day start = first equity seen on
-    the current broker-server day) and from the broker's own closed deals, never guessed.
+    Intraday baseline and peak values are persisted in the append-only decision journal,
+    keyed by broker account and server day, so restarting this process cannot reset drawdown.
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -288,19 +289,90 @@ class DemoTerminal(LiveMT5Backend):
         self._peak: float | None = None
         self._day: Any = None
         self._day_start: float | None = None
+        self._journal: DecisionJournal | None = None
+
+    def attach_journal(self, journal: DecisionJournal) -> None:
+        """Attach the durable audit journal before any risk-gated cycle can run."""
+        if not isinstance(journal, DecisionJournal):
+            raise TypeError("risk baseline journal must be a DecisionJournal")
+        self._journal = journal
+        self._day = None
+        self._day_start = None
+        self._peak = None
 
     def _server_day(self) -> Any:
         return (datetime.now(UTC) + timedelta(seconds=self.server_utc_offset_seconds)).date()
 
+    def _restore_baselines(self, account: Any, day: Any, equity: float) -> tuple[float, float, bool]:
+        journal = self._journal
+        if journal is None:
+            # The standalone adapter remains useful in isolated unit tests. The actual
+            # demo runner attaches its journal before constructing agents or executors.
+            return equity, equity, True
+
+        integrity = journal.chain_status()
+        if not integrity.get("valid"):
+            raise RuntimeError("risk baseline journal integrity check failed")
+
+        day_key = day.isoformat()
+        records = journal.events(limit=None, event_type=RISK_BASELINE_EVENT)
+        matching: list[tuple[float, float]] = []
+        for event in records:
+            payload = event.get("payload")
+            if not isinstance(payload, Mapping):
+                raise RuntimeError("risk baseline journal payload is invalid")
+            if payload.get("account_login") != account.login \
+                    or payload.get("account_server") != account.server:
+                continue
+            if payload.get("server_day") != day_key:
+                continue
+            start = _number(payload.get("day_start_equity"))
+            peak = _number(payload.get("peak_equity"))
+            if start is None or peak is None or start <= 0 or peak < start:
+                raise RuntimeError("risk baseline journal values are invalid")
+            matching.append((start, peak))
+
+        if not matching:
+            return equity, equity, True
+        day_start = matching[0][0]
+        if any(start != day_start for start, _peak in matching):
+            raise RuntimeError("risk baseline journal has conflicting day-start values")
+        peak = max(value for _start, value in matching)
+        return day_start, max(peak, equity), equity > peak
+
+    def _record_baselines(self, account: Any, day: Any, equity: float,
+                          day_start: float, peak: float) -> None:
+        if self._journal is None:
+            return
+        self._journal.record(RISK_BASELINE_EVENT, {
+            "account_login": int(account.login),
+            "account_server": str(account.server),
+            "server_day": day.isoformat(),
+            "day_start_equity": float(day_start),
+            "peak_equity": float(peak),
+            "observed_equity": float(equity),
+            "at": datetime.now(UTC).isoformat(),
+            "broker_order_sent": False,
+        })
+
     def _ensure_baselines(self) -> tuple[float, float]:
-        equity = float(self.account().equity)
+        account = self.account()
+        equity = float(account.equity)
+        if not math.isfinite(equity) or equity <= 0:
+            raise RuntimeError("risk baseline equity is invalid")
         day = self._server_day()
         if self._day != day or self._day_start is None or self._peak is None:
+            day_start, peak, needs_record = self._restore_baselines(account, day, equity)
+            if needs_record:
+                self._record_baselines(account, day, equity, day_start, peak)
             self._day = day
-            self._day_start = equity
+            self._day_start = day_start
+            self._peak = peak
+        elif equity > self._peak:
+            # Persist the high-water mark before making it available to the risk gate. A
+            # journal write failure therefore blocks the cycle instead of losing the peak.
+            self._record_baselines(account, day, equity, self._day_start, equity)
             self._peak = equity
-        else:
-            self._peak = max(self._peak, equity)
         return self._day_start, self._peak
 
     @property
@@ -836,6 +908,7 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
             return 2
 
         journal = DecisionJournal(args.db, run_id=run_id)
+        terminal.attach_journal(journal)
         try:
             bridge = DemoBridge(token=token, tombstones_path=args.tombstones,
                                 kill_switch_store=switch, host="127.0.0.1",
