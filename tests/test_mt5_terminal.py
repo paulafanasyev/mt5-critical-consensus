@@ -54,3 +54,18 @@ def test_terminal_preflight_rejects_disconnected_terminal_and_shuts_down(monkeyp
     with pytest.raises(RuntimeError, match="not connected"):
         MODULE.probe_terminal("EURUSD", "M1")
     assert calls == ["shutdown"]
+
+
+
+def test_terminal_preflight_shuts_down_when_initialize_fails(monkeypatch):
+    calls = []
+    fake = SimpleNamespace(
+        initialize=lambda **kwargs: False,
+        shutdown=lambda: calls.append("shutdown"),
+        last_error=lambda: (-10004, "no connection"),
+    )
+    monkeypatch.setattr(MODULE.importlib, "import_module", lambda name: fake)
+
+    with pytest.raises(RuntimeError, match="initialize failed"):
+        MODULE.probe_terminal("EURUSD", "M1")
+    assert calls == ["shutdown"]
