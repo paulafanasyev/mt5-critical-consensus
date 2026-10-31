@@ -128,8 +128,9 @@ def main() -> int:
             ),
             "potential_gaps": potential_gaps,
             "interpretation": (
-                "Advisory only. Weekend-spanning intervals are ignored; other gaps may "
-                "reflect broker sessions or holidays and require operator review."
+                "Advisory only. Weekend-spanning intervals are included unless "
+                "--ignore-weekend-closures is explicitly set after verifying the broker session; "
+                "other gaps may reflect holidays or maintenance."
             ),
             "weekend_gaps_ignored": args.ignore_weekend_closures,
             "automatic_backfill": False,
