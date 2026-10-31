@@ -114,7 +114,7 @@ jobs:
             }
             $log = [System.IO.Path]::ChangeExtension($target, ".log")
             if (-not (Test-Path $log)) {
-              throw "MetaEditor did not create a compiler log. Process exit code: $($compile.ExitCode)"
+              throw "MetaEditor did not create a compiler log. Process exit code: $compileExitCode"
             }
             Get-Content $log
             $logText = Get-Content $log -Raw
@@ -128,7 +128,15 @@ jobs:
             if (-not (Test-Path $ex5)) {
               throw "Compiler log reports no errors but the expected EX5 artifact is missing."
             }
+
+            # Persist exact compiler evidence for upload. The MetaEditor executable may return
+            # process code 1 even after a successful GUI compile; the validated log + EX5 are authoritative.
+            Copy-Item $probeLog (Join-Path $env:RUNNER_TEMP "MetaEditorSmoke.log") -Force
+            Copy-Item $probeEx5 (Join-Path $env:RUNNER_TEMP "MetaEditorSmoke.ex5") -Force
+            Copy-Item $log (Join-Path $env:RUNNER_TEMP "CriticalConsensusEA.log") -Force
+            Copy-Item $ex5 (Join-Path $env:RUNNER_TEMP "CriticalConsensusEA.ex5") -Force
             Write-Host "PASS: MetaEditor produced CriticalConsensusEA.ex5 with zero compiler errors."
+            $global:LASTEXITCODE = 0
           }
           catch {
             "Failure=$($_.Exception.Message)" | Add-Content -Path $report
@@ -141,9 +149,9 @@ jobs:
         with:
           name: mql5-metaeditor-compile-evidence
           path: |
-            **/CriticalConsensusEA.log
-            **/CriticalConsensusEA.ex5
-            **/MetaEditorSmoke.log
-            **/MetaEditorSmoke.ex5
+            ${{ runner.temp }}/CriticalConsensusEA.log
+            ${{ runner.temp }}/CriticalConsensusEA.ex5
+            ${{ runner.temp }}/MetaEditorSmoke.log
+            ${{ runner.temp }}/MetaEditorSmoke.ex5
             ${{ runner.temp }}/mt5-install-diagnostics.txt
           if-no-files-found: warn
