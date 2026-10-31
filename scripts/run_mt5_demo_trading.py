@@ -958,8 +958,9 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
                         if outcome.stop_run:
                             # Durable, not a variable: a halt over an unknown send must still
                             # block the EA after this process exits and the next one starts.
-                            _set_stop(switch, language=language,
-                                      reason=f"{symbol}:{outcome.state}")
+                            if outcome.state != "UNCONFIRMED":
+                                _set_stop(switch, language=language,
+                                          reason=f"{symbol}:{outcome.state}")
                             halted = True
                             halted_by = symbol
                             print(text("runner.stopped_uncertain", language),
