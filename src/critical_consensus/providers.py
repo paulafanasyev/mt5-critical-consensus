@@ -346,6 +346,17 @@ class OpenAICompatibleAgent:
         if (not isinstance(available, Sequence) or isinstance(available, (str, bytes))
                 or not available or any(not str(ref).strip() for ref in available)):
             raise ValueError("available_evidence_refs must contain pre-validated evidence IDs")
+        forecast_contract = signal.get("forecast_contract")
+        if (not isinstance(forecast_contract, Mapping)
+                or forecast_contract.get("target_policy_version") != "next-available-bar-close-above-reference-v1"
+                or forecast_contract.get("target_event") != "NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE"
+                or not str(forecast_contract.get("symbol", "")).strip()
+                or not str(forecast_contract.get("timeframe", "")).strip()):
+            raise ValueError("a validated objective market-event forecast_contract is required")
+        reference_close = forecast_contract.get("reference_close")
+        if (isinstance(reference_close, bool) or not isinstance(reference_close, (int, float))
+                or not math.isfinite(float(reference_close)) or float(reference_close) <= 0):
+            raise ValueError("forecast contract reference_close must be a positive finite number")
         signal_json = json.dumps(signal, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
                                   allow_nan=False, default=str)
         if len(signal_json.encode("utf-8")) > 200_000:
@@ -360,11 +371,17 @@ class OpenAICompatibleAgent:
         }[self.role]
         prompt = (
             "Role: " + self.role + ". " + role_guidance + " Assess only supplied evidence. "
-            "Do not invent prices, news, citations or source IDs. The confidence number is subjective and "
-            "UNCALIBRATED; it must not be presented as a proven probability until evaluated out-of-sample. "
-            "Return one JSON object with exactly these fields: verdict (APPROVE, ABSTAIN, REJECT, VETO), "
-            "confidence (number 0..1), evidence_refs (non-empty array chosen only from available_evidence_refs), "
-            "abstain_reason (string), rationale (short factual summary), risks (array of short strings). "
+            "Do not invent prices, news, citations or source IDs. Keep two distinct numeric fields: confidence "
+            "is subjective confidence in your qualitative verdict and is never a market-event probability. "
+            "next_bar_up_probability is your probability from 0 to 1 that the close of the first persisted market "
+            "bar whose bar_time is strictly after this agent's issue timestamp will be greater than the exact "
+            "reference_close in forecast_contract. Flat or lower close means outcome 0. Never use a bar that "
+            "started before your forecast was issued. This is a forecast of one next available bar, not a "
+            "multi-bar investment return. Return one JSON object with exactly these fields: verdict "
+            "(APPROVE, ABSTAIN, REJECT, VETO), confidence (number 0..1), next_bar_up_probability (number 0..1), "
+            "evidence_refs (non-empty array chosen only from available_evidence_refs), abstain_reason (string), "
+            "rationale (short factual summary), risks (array of short strings). Both numeric values must be "
+            "independently assessed; do not copy confidence into next_bar_up_probability. "
             "APPROVE is not a trade authorization. Prefer ABSTAIN if evidence is insufficient. "
             "Do not output a trade command. Input follows:\n" + signal_json
         )
@@ -409,17 +426,24 @@ class OpenAICompatibleAgent:
             raise RuntimeError("provider_response_not_json_object")
         verdict = str(result.get("verdict", "")).upper()
         confidence = result.get("confidence")
+        forecast_probability = result.get("next_bar_up_probability")
         try:
             numeric_confidence = float(confidence) if not isinstance(confidence, bool) else float("nan")
         except (TypeError, ValueError, OverflowError):
             numeric_confidence = float("nan")
+        if isinstance(forecast_probability, bool) or not isinstance(forecast_probability, (int, float)):
+            numeric_forecast_probability = float("nan")
+        else:
+            numeric_forecast_probability = float(forecast_probability)
         evidence_refs = result.get("evidence_refs")
         allowed_refs = {str(ref) for ref in available}
         if (verdict not in {"APPROVE", "ABSTAIN", "REJECT", "VETO"}
-                or not 0 <= numeric_confidence <= 1
+                or not math.isfinite(numeric_confidence) or not 0 <= numeric_confidence <= 1
+                or not math.isfinite(numeric_forecast_probability)
+                or not 0 <= numeric_forecast_probability <= 1
                 or not isinstance(evidence_refs, list) or not evidence_refs
                 or any(not isinstance(ref, str) or ref not in allowed_refs for ref in evidence_refs)):
-            raise RuntimeError("provider_verdict_or_evidence_invalid")
+            raise RuntimeError("provider_verdict_or_objective_forecast_invalid")
         return {
             "agent_id": self.agent_id,
             "role": self.role,
@@ -430,6 +454,8 @@ class OpenAICompatibleAgent:
             "ttl_seconds": self.ttl_seconds,
             "verdict": verdict,
             "confidence": numeric_confidence,
+            "next_bar_up_probability": numeric_forecast_probability,
+            "forecast_contract": dict(forecast_contract),
             "evidence_refs": evidence_refs,
             "abstain_reason": str(result.get("abstain_reason", "")).strip(),
             "rationale": str(result.get("rationale", "")).strip()[:2000],

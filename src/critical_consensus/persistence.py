@@ -10,11 +10,11 @@ import hashlib
 import json
 import math
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from .market_data import MarketBar, validate_bar_series
+from .market_data import MarketBar, forecast_bar_duration, retain_completed_bars, validate_bar_series
 from .audit import verify_audit_chain
 from .source_provenance import validate_source_capture
 
@@ -98,8 +98,23 @@ class PostgresRepository:
             for script in scripts:
                 conn.execute(script, prepare=False)
 
+    def get_database_clock(self) -> dict[str, Any]:
+        """Return PostgreSQL's current time normalized to UTC and its session timezone."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT now(), current_setting('TimeZone')"
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("PostgreSQL did not return its server clock")
+        return {
+            "now_utc": _timestamp(row[0], "database clock"),
+            "session_timezone": str(row[1]),
+        }
+
     def append_market_bars(self, bars: Iterable[MarketBar]) -> dict[str, int]:
-        records = validate_bar_series(bars)
+        # The immutable ledger must never store a forming MT5 candle: its OHLC values
+        # can still change, and a later completed version would conflict with the first insert.
+        records = retain_completed_bars(bars, min_bars=1)
         inserted = duplicates = 0
         sql = """
           INSERT INTO market_bars
@@ -281,78 +296,393 @@ class PostgresRepository:
         by_id = {str(row[0]): dict(zip(columns, row)) for row in rows}
         return [by_id[item] for item in ids if item in by_id]
 
+    def record_forecasts(self, forecasts: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+        """Atomically record immutable forecasts; only explicit market-event targets are calibratable.
+
+        Legacy rows that contain only verdict confidence are tagged LEGACY and excluded
+        from calibration exports. New objective forecasts must carry the exact target contract.
+        """
+        if (not isinstance(forecasts, Sequence)
+                or isinstance(forecasts, (str, bytes, bytearray))):
+            raise ValueError("forecasts must be a sequence of objects")
+        if not forecasts:
+            return {"inserted": 0, "identical_replays": 0, "total": 0}
+
+        prepared: list[tuple[Any, ...]] = []
+        seen: set[tuple[str, str]] = set()
+        for index, forecast in enumerate(forecasts):
+            if not isinstance(forecast, Mapping):
+                raise ValueError(f"forecast {index} must be an object")
+            raw_model_id = forecast.get("model_id")
+            raw_signal_id = forecast.get("signal_id")
+            if not isinstance(raw_model_id, str) or not isinstance(raw_signal_id, str):
+                raise ValueError(f"forecast {index} model_id and signal_id must be strings")
+            model_id, signal_id = raw_model_id.strip(), raw_signal_id.strip()
+            if not model_id or not signal_id:
+                raise ValueError(f"forecast {index} requires model_id and signal_id")
+            key = (model_id, signal_id)
+            if key in seen:
+                raise ValueError("forecast batch contains duplicate model_id/signal_id keys")
+            seen.add(key)
+
+            issued = _timestamp(forecast.get("issued_at"), "issued_at")
+            raw_probability = forecast.get("probability")
+            if isinstance(raw_probability, bool) or not isinstance(raw_probability, (int, float)):
+                raise ValueError("probability must be a numeric value, not a string or boolean")
+            probability = float(raw_probability)
+            if not math.isfinite(probability) or not 0 <= probability <= 1:
+                raise ValueError("probability must be finite and in [0,1]")
+            input_sha256 = forecast.get("input_sha256")
+            if (not isinstance(input_sha256, str) or len(input_sha256) != 71
+                    or not input_sha256.startswith("sha256:")
+                    or any(ch not in "0123456789abcdef" for ch in input_sha256[7:])):
+                raise ValueError("input_sha256 must use sha256:<64 lowercase hex characters>")
+
+            kind = forecast.get("forecast_kind", "LEGACY_VERDICT_CONFIDENCE")
+            if not isinstance(kind, str) or kind not in {
+                "LEGACY_VERDICT_CONFIDENCE", "NEXT_BAR_MARKET_EVENT"
+            }:
+                raise ValueError("forecast_kind is unsupported")
+            version = target_event = symbol = timeframe = reference_at = reference_close = None
+            if kind == "NEXT_BAR_MARKET_EVENT":
+                version = forecast.get("target_policy_version")
+                target_event = forecast.get("target_event")
+                raw_symbol = forecast.get("symbol")
+                raw_timeframe = forecast.get("timeframe")
+                if (version != "next-available-bar-close-above-reference-v1"
+                        or target_event != "NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE"
+                        or not isinstance(raw_symbol, str) or not raw_symbol.strip()
+                        or not isinstance(raw_timeframe, str)):
+                    raise ValueError("objective forecast target contract is missing or unsupported")
+                symbol = raw_symbol.strip().upper()
+                timeframe = raw_timeframe.strip().upper()
+                reference_duration = forecast_bar_duration(timeframe)
+                reference_at = _timestamp(forecast.get("reference_at"), "reference_at")
+                if reference_at + reference_duration + timedelta(seconds=2) > issued:
+                    raise ValueError("reference market bar must be fully finalized before agent issue time")
+                raw_reference_close = forecast.get("reference_close")
+                if (isinstance(raw_reference_close, bool)
+                        or not isinstance(raw_reference_close, (int, float))):
+                    raise ValueError("reference_close must be a positive finite number")
+                reference_close = float(raw_reference_close)
+                if not math.isfinite(reference_close) or reference_close <= 0:
+                    raise ValueError("reference_close must be a positive finite number")
+            prepared.append((
+                model_id, signal_id, issued, probability, input_sha256, kind,
+                version, target_event, symbol, timeframe, reference_at, reference_close,
+            ))
+
+        inserted_count = replay_count = 0
+        with self._connect() as conn:
+            # The reference price must already exist as an immutable stored market bar;
+            # callers cannot manufacture a reference close in an API payload.
+            for record in prepared:
+                (model_id, signal_id, issued, probability, input_sha256, kind,
+                 version, target_event, symbol, timeframe, reference_at, reference_close) = record
+                if kind == "NEXT_BAR_MARKET_EVENT":
+                    reference_bar = conn.execute(
+                        """SELECT close FROM market_bars
+                           WHERE symbol=%s AND timeframe=%s AND bar_time=%s""",
+                        (symbol, timeframe, reference_at),
+                    ).fetchone()
+                    if (reference_bar is None
+                            or not math.isclose(float(reference_bar[0]), reference_close,
+                                                rel_tol=0.0, abs_tol=1e-12)):
+                        raise ValueError("forecast reference close does not match an immutable persisted market bar")
+            for record in prepared:
+                (model_id, signal_id, issued, probability, input_sha256, kind,
+                 version, target_event, symbol, timeframe, reference_at, reference_close) = record
+                inserted = conn.execute(
+                    """INSERT INTO forecast_predictions
+                       (model_id, signal_id, issued_at, probability, input_sha256,
+                        forecast_kind, target_policy_version, target_event, symbol,
+                        timeframe, reference_at, reference_close)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (model_id, signal_id) DO NOTHING
+                       RETURNING signal_id""",
+                    (model_id, signal_id, issued, probability, input_sha256, kind,
+                     version, target_event, symbol, timeframe, reference_at, reference_close),
+                ).fetchone()
+                if inserted:
+                    inserted_count += 1
+                    continue
+                old = conn.execute(
+                    """SELECT issued_at, probability, input_sha256, forecast_kind,
+                              target_policy_version, target_event, symbol, timeframe,
+                              reference_at, reference_close
+                       FROM forecast_predictions WHERE model_id=%s AND signal_id=%s""",
+                    (model_id, signal_id),
+                ).fetchone()
+                if old is None:
+                    raise RuntimeError("forecast conflict row disappeared")
+                same = (
+                    old[0] == issued
+                    and math.isclose(float(old[1]), probability, rel_tol=0.0, abs_tol=0.0)
+                    and old[2] == input_sha256 and old[3] == kind
+                    and old[4] == version and old[5] == target_event and old[6] == symbol
+                    and old[7] == timeframe and old[8] == reference_at
+                    and (old[9] is None and reference_close is None
+                         or old[9] is not None and reference_close is not None
+                         and math.isclose(float(old[9]), reference_close, rel_tol=0.0, abs_tol=0.0))
+                )
+                if not same:
+                    raise ValueError("conflicting replay for immutable issued forecast")
+                replay_count += 1
+        return {"inserted": inserted_count, "identical_replays": replay_count, "total": len(prepared)}
+
     def record_forecast(
         self, *, model_id: str, signal_id: str, issued_at: datetime | str,
         probability: float, input_sha256: str,
     ) -> bool:
-        """Persist a probability at issue time; returns False for an identical replay."""
-        model_id, signal_id = str(model_id).strip(), str(signal_id).strip()
-        if not model_id or not signal_id:
-            raise ValueError("model_id and signal_id are required")
-        issued = _timestamp(issued_at, "issued_at")
-        if isinstance(probability, bool) or not math.isfinite(float(probability)) or not 0 <= float(probability) <= 1:
-            raise ValueError("probability must be finite and in [0,1]")
-        if not isinstance(input_sha256, str) or len(input_sha256) != 71 or not input_sha256.startswith("sha256:"):
-            raise ValueError("input_sha256 must use sha256:<64 hex characters>")
-        if any(ch not in "0123456789abcdef" for ch in input_sha256[7:]):
-            raise ValueError("input_sha256 must contain lowercase hex")
-        with self._connect() as conn:
-            inserted = conn.execute(
-                """INSERT INTO forecast_predictions(model_id, signal_id, issued_at, probability, input_sha256)
-                   VALUES (%s,%s,%s,%s,%s) ON CONFLICT (model_id, signal_id) DO NOTHING
-                   RETURNING signal_id""",
-                (model_id, signal_id, issued, float(probability), input_sha256),
-            ).fetchone()
-            if inserted:
-                return True
-            old = conn.execute(
-                """SELECT issued_at, probability, input_sha256 FROM forecast_predictions
-                   WHERE model_id=%s AND signal_id=%s""", (model_id, signal_id)
-            ).fetchone()
-            if old is None:
-                raise RuntimeError("forecast conflict row disappeared")
-            if old[0] != issued or not math.isclose(float(old[1]), float(probability), rel_tol=0.0, abs_tol=0.0) or old[2] != input_sha256:
-                raise ValueError("conflicting replay for immutable issued forecast")
-            return False
+        """Compatibility capture for legacy verdict confidence; never calibration eligible."""
+        result = self.record_forecasts([{
+            "model_id": model_id, "signal_id": signal_id, "issued_at": issued_at,
+            "probability": probability, "input_sha256": input_sha256,
+            "forecast_kind": "LEGACY_VERDICT_CONFIDENCE",
+        }])
+        return result["inserted"] == 1
 
-    def resolve_forecast(self, *, model_id: str, signal_id: str, resolved_at: datetime | str, outcome: int) -> bool:
-        """Label a prior forecast once the outcome is known; conflicting relabels fail closed."""
-        if isinstance(outcome, bool) or outcome not in (0, 1):
-            raise ValueError("outcome must be integer 0 or 1")
-        resolved = _timestamp(resolved_at, "resolved_at")
+    def resolve_forecast(self, *, model_id: str, signal_id: str,
+                         resolved_at: datetime | str, outcome: int) -> bool:
+        """Manual binary labels are disabled; outcomes must come from persisted market bars."""
+        raise ValueError(
+            "manual forecast labels are disabled; use resolve_forecast_from_market_data"
+        )
+
+    def resolve_forecast_from_market_data(
+        self, *, model_id: str, signal_id: str, now: datetime | None = None,
+        finalization_grace_seconds: float = 2.0,
+    ) -> dict[str, Any]:
+        """Resolve one target only from the first immutable market bar opened after issue time."""
+        if not isinstance(model_id, str) or not model_id.strip():
+            raise ValueError("model_id is required")
+        if not isinstance(signal_id, str) or not signal_id.strip():
+            raise ValueError("signal_id is required")
+        current = _timestamp(now or datetime.now(timezone.utc), "now")
+        if (isinstance(finalization_grace_seconds, bool)
+                or not isinstance(finalization_grace_seconds, (int, float))
+                or not math.isfinite(float(finalization_grace_seconds))
+                or not 0 <= float(finalization_grace_seconds) <= 60):
+            raise ValueError("finalization_grace_seconds must be finite and in [0,60]")
+        grace = timedelta(seconds=float(finalization_grace_seconds))
+
         with self._connect() as conn:
             row = conn.execute(
-                """SELECT issued_at, outcome, resolved_at FROM forecast_predictions
-                   WHERE model_id=%s AND signal_id=%s FOR UPDATE""", (model_id, signal_id)
+                """SELECT issued_at, input_sha256, forecast_kind, target_policy_version,
+                          target_event, symbol, timeframe, reference_at, reference_close,
+                          outcome, resolved_at, resolution_evidence_sha256
+                   FROM forecast_predictions
+                   WHERE model_id=%s AND signal_id=%s FOR UPDATE""",
+                (model_id, signal_id),
             ).fetchone()
             if row is None:
-                raise ValueError("cannot resolve an unknown forecast")
-            if resolved <= row[0]:
-                raise ValueError("resolved_at must be later than issued_at")
-            if row[1] is not None:
-                if row[1] == outcome and row[2] == resolved:
-                    return False
-                raise ValueError("a resolved forecast cannot be relabelled")
+                raise ValueError("unknown forecast")
+            (issued_at, input_sha256, kind, policy_version, target_event, symbol, timeframe,
+             reference_at, reference_close, old_outcome, old_resolved_at, old_evidence_hash) = row
+            if kind != "NEXT_BAR_MARKET_EVENT":
+                raise ValueError("legacy verdict-confidence observations are not market-event forecasts")
+            if old_outcome is not None:
+                event = conn.execute(
+                    """SELECT evidence FROM forecast_resolution_events
+                       WHERE model_id=%s AND signal_id=%s""",
+                    (model_id, signal_id),
+                ).fetchone()
+                evidence = event[0] if event else None
+                return {
+                    "status": "ALREADY_RESOLVED",
+                    "outcome": int(old_outcome),
+                    "resolved_at": old_resolved_at.isoformat(),
+                    "resolution_evidence_sha256": old_evidence_hash,
+                    "evidence": evidence,
+                    "inserted": False,
+                }
+
+            duration = forecast_bar_duration(str(timeframe))
+            reference_bar = conn.execute(
+                """SELECT bar_time, open, high, low, close, tick_volume, spread_points, source
+                   FROM market_bars
+                   WHERE symbol=%s AND timeframe=%s AND bar_time=%s""",
+                (symbol, timeframe, reference_at),
+            ).fetchone()
+            if reference_bar is None or not math.isclose(
+                    float(reference_bar[4]), float(reference_close), rel_tol=0.0, abs_tol=1e-12):
+                raise RuntimeError("persisted reference market bar is missing or does not match forecast contract")
+            target = conn.execute(
+                """SELECT bar_time, open, high, low, close, tick_volume,
+                          spread_points, source
+                   FROM market_bars
+                   WHERE symbol=%s AND timeframe=%s AND bar_time > %s
+                   ORDER BY bar_time ASC LIMIT 1""",
+                (symbol, timeframe, issued_at),
+            ).fetchone()
+            if target is None:
+                return {"status": "PENDING_NO_FUTURE_BAR", "inserted": False}
+            (bar_time, open_price, high, low, close, tick_volume, spread_points, source) = target
+            if bar_time <= issued_at:
+                raise RuntimeError("market-bar resolver selected a bar opened before forecast issuance")
+            if current < bar_time + duration + grace:
+                return {
+                    "status": "PENDING_BAR_NOT_CLOSED",
+                    "target_bar_time": bar_time.isoformat(),
+                    "eligible_after": (bar_time + duration + grace).isoformat(),
+                    "inserted": False,
+                }
+            numeric_close = float(close)
+            if not math.isfinite(numeric_close) or numeric_close <= 0:
+                raise ValueError("target market bar close is invalid")
+            outcome = int(numeric_close > float(reference_close))
+            evidence = {
+                "protocol": "market-bar-resolution-v1",
+                "target_policy_version": str(policy_version),
+                "target_event": str(target_event),
+                "model_id": model_id,
+                "signal_id": signal_id,
+                "issued_at": issued_at.isoformat(),
+                "input_sha256": str(input_sha256),
+                "reference_bar": {
+                    "symbol": str(symbol), "timeframe": str(timeframe),
+                    "bar_time": reference_bar[0].isoformat(),
+                    "open": float(reference_bar[1]), "high": float(reference_bar[2]),
+                    "low": float(reference_bar[3]), "close": float(reference_bar[4]),
+                    "tick_volume": reference_bar[5], "spread_points": reference_bar[6],
+                    "source": str(reference_bar[7]),
+                },
+                "target_bar": {
+                    "bar_time": bar_time.isoformat(),
+                    "open": float(open_price), "high": float(high), "low": float(low),
+                    "close": numeric_close, "tick_volume": tick_volume,
+                    "spread_points": spread_points, "source": str(source),
+                },
+                "resolution": {
+                    "outcome": outcome,
+                    "rule": "target_bar.close > reference.close",
+                    "recorded_at": current.isoformat(),
+                    "finalization_grace_seconds": float(finalization_grace_seconds),
+                },
+                "provenance_limit": (
+                    "This binds the result to an immutable locally persisted market bar; "
+                    "the broker feed itself is not independently authenticated by this resolver."
+                ),
+            }
+            encoded_evidence = _canonical(evidence)
+            evidence_sha256 = _sha256(encoded_evidence)
+            inserted_event = conn.execute(
+                """INSERT INTO forecast_resolution_events
+                   (model_id, signal_id, target_policy_version, resolved_bar_time,
+                    outcome, evidence_sha256, evidence)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb)
+                   ON CONFLICT (model_id, signal_id) DO NOTHING
+                   RETURNING resolution_id""",
+                (model_id, signal_id, str(policy_version), bar_time,
+                 outcome, evidence_sha256, encoded_evidence),
+            ).fetchone()
+            if not inserted_event:
+                existing = conn.execute(
+                    """SELECT outcome, evidence_sha256 FROM forecast_resolution_events
+                       WHERE model_id=%s AND signal_id=%s""",
+                    (model_id, signal_id),
+                ).fetchone()
+                if existing is None or int(existing[0]) != outcome or str(existing[1]) != evidence_sha256:
+                    raise ValueError("conflicting forecast resolution event already exists")
             conn.execute(
-                """UPDATE forecast_predictions SET outcome=%s, resolved_at=%s
-                   WHERE model_id=%s AND signal_id=%s""", (int(outcome), resolved, model_id, signal_id)
+                """UPDATE forecast_predictions
+                   SET outcome=%s, resolved_at=%s, resolved_bar_time=%s,
+                       resolved_bar_close=%s, resolution_source=%s,
+                       resolution_evidence_sha256=%s
+                   WHERE model_id=%s AND signal_id=%s AND outcome IS NULL""",
+                (outcome, current, bar_time, numeric_close, str(source), evidence_sha256,
+                 model_id, signal_id),
             )
-        return True
+        return {
+            "status": "RESOLVED" if inserted_event else "ALREADY_RESOLVED",
+            "outcome": outcome,
+            "resolved_bar_time": bar_time.isoformat(),
+            "resolution_evidence_sha256": evidence_sha256,
+            "evidence": evidence,
+            "inserted": inserted_event is not None,
+        }
+
+    def resolve_due_market_forecasts(
+        self, *, symbol: str | None = None, timeframe: str | None = None,
+        now: datetime | None = None, limit: int = 500,
+        finalization_grace_seconds: float = 2.0,
+    ) -> dict[str, Any]:
+        """Attempt due outcomes without assigning labels to missing or incomplete bars."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 5000:
+            raise ValueError("limit must be an integer in [1,5000]")
+        symbol_value = str(symbol).strip().upper() if symbol else None
+        timeframe_value = str(timeframe).strip().upper() if timeframe else None
+        if timeframe_value:
+            forecast_bar_duration(timeframe_value)
+        query = """SELECT model_id, signal_id
+                   FROM forecast_predictions
+                   WHERE forecast_kind=%s AND outcome IS NULL
+                     AND (%s IS NULL OR symbol=%s)
+                     AND (%s IS NULL OR timeframe=%s)
+                   ORDER BY issued_at, model_id, signal_id LIMIT %s"""
+        params = (
+            "NEXT_BAR_MARKET_EVENT", symbol_value, symbol_value,
+            timeframe_value, timeframe_value, limit,
+        )
+        with self._connect() as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
+        results = []
+        for model_id, signal_id in rows:
+            results.append(self.resolve_forecast_from_market_data(
+                model_id=str(model_id), signal_id=str(signal_id), now=now,
+                finalization_grace_seconds=finalization_grace_seconds,
+            ))
+        counts: dict[str, int] = {}
+        for item in results:
+            status = str(item.get("status", "UNKNOWN"))
+            counts[status] = counts.get(status, 0) + 1
+        return {"attempted": len(results), "status_counts": counts, "results": results}
 
     def export_resolved_forecasts(self, *, model_id: str | None = None) -> list[dict[str, Any]]:
-        query = """SELECT model_id, signal_id, issued_at, resolved_at, probability, outcome
-                   FROM forecast_predictions WHERE outcome IS NOT NULL"""
+        """Export only objective next-bar forecasts with the exact append-only evidence payload."""
+        query = """SELECT f.model_id, f.signal_id, f.issued_at, f.resolved_at,
+                          f.probability, f.outcome, f.input_sha256,
+                          f.target_policy_version, f.target_event, f.symbol, f.timeframe,
+                          f.reference_at, f.reference_close, f.resolved_bar_time,
+                          f.resolved_bar_close, f.resolution_source,
+                          f.resolution_evidence_sha256, e.evidence
+                   FROM forecast_predictions f
+                   JOIN forecast_resolution_events e
+                     ON e.model_id=f.model_id AND e.signal_id=f.signal_id
+                    AND e.evidence_sha256=f.resolution_evidence_sha256
+                   WHERE f.outcome IS NOT NULL AND f.forecast_kind='NEXT_BAR_MARKET_EVENT'"""
         params: tuple[Any, ...] = ()
         if model_id:
-            query += " AND model_id=%s"
+            query += " AND f.model_id=%s"
             params = (model_id,)
-        query += " ORDER BY issued_at, model_id, signal_id"
+        query += " ORDER BY f.issued_at, f.model_id, f.signal_id"
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
-        return [{
-            "model_id": row[0], "signal_id": row[1], "issued_at": row[2].isoformat(),
-            "resolved_at": row[3].isoformat(), "probability": float(row[4]), "outcome": int(row[5]),
-        } for row in rows]
+        output = []
+        for row in rows:
+            evidence = row[17]
+            if isinstance(evidence, Mapping):
+                evidence_json = _canonical(dict(evidence))
+            elif isinstance(evidence, (str, bytes, bytearray)):
+                evidence_json = evidence.decode("utf-8") if isinstance(evidence, (bytes, bytearray)) else evidence
+                parsed = json.loads(evidence_json)
+                if not isinstance(parsed, Mapping):
+                    raise RuntimeError("forecast resolution evidence is not a JSON object")
+                evidence_json = _canonical(dict(parsed))
+            else:
+                raise RuntimeError("forecast resolution evidence is missing or has an unsupported type")
+            output.append({
+                "model_id": row[0], "signal_id": row[1], "issued_at": row[2].isoformat(),
+                "resolved_at": row[3].isoformat(), "probability": float(row[4]),
+                "outcome": int(row[5]), "input_sha256": row[6],
+                "target_policy_version": row[7], "target_event": row[8],
+                "symbol": row[9], "timeframe": row[10],
+                "reference_at": row[11].isoformat(), "reference_close": float(row[12]),
+                "resolved_bar_time": row[13].isoformat(), "resolved_bar_close": float(row[14]),
+                "resolution_source": row[15], "resolution_evidence_sha256": row[16],
+                "resolution_evidence": evidence_json,
+            })
+        return output
 
     def store_calibration_report(self, report: Mapping[str, Any]) -> dict[str, str | bool]:
         if not isinstance(report, Mapping) or not isinstance(report.get("dataset"), Mapping):

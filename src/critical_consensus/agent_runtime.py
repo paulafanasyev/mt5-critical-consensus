@@ -51,8 +51,9 @@ def _valid_stamp(value: Any) -> datetime | None:
 
 
 def _validate_result(
-    result: Mapping[str, Any], spec: AgentSpec, signal_id: str, expected_input_hash: str,
-    *, allowed_evidence_refs: set[str], now: datetime, max_future_skew_seconds: int = 30,
+    result: Mapping[str, Any], spec: AgentSpec, signal: Mapping[str, Any],
+    signal_id: str, expected_input_hash: str, *,
+    allowed_evidence_refs: set[str], now: datetime, max_future_skew_seconds: int = 30,
 ) -> list[str]:
     blockers: list[str] = []
     if str(result.get("agent_id", "")).strip() != spec.agent_id:
@@ -75,6 +76,28 @@ def _validate_result(
         confidence = None
     if confidence is None or not math.isfinite(confidence) or not 0 <= confidence <= 1:
         blockers.append("CONFIDENCE_INVALID")
+    raw_event_probability = result.get("next_bar_up_probability")
+    if isinstance(raw_event_probability, bool) or not isinstance(raw_event_probability, (int, float)):
+        event_probability = None
+    else:
+        event_probability = float(raw_event_probability)
+    if (event_probability is None or not math.isfinite(event_probability)
+            or not 0 <= event_probability <= 1):
+        blockers.append("OBJECTIVE_FORECAST_PROBABILITY_INVALID")
+    expected_contract = signal.get("forecast_contract")
+    if (not isinstance(expected_contract, Mapping)
+            or expected_contract.get("target_policy_version") != "next-available-bar-close-above-reference-v1"
+            or expected_contract.get("target_event") != "NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE"
+            or not str(expected_contract.get("symbol", "")).strip()
+            or not str(expected_contract.get("timeframe", "")).strip()
+            or isinstance(expected_contract.get("reference_close"), bool)
+            or not isinstance(expected_contract.get("reference_close"), (int, float))
+            or not math.isfinite(float(expected_contract.get("reference_close")))
+            or float(expected_contract.get("reference_close")) <= 0
+            or not _valid_stamp(expected_contract.get("reference_at"))):
+        blockers.append("OBJECTIVE_FORECAST_CONTRACT_MISSING_OR_INVALID")
+    if result.get("forecast_contract") != expected_contract:
+        blockers.append("OBJECTIVE_FORECAST_CONTRACT_MISMATCH")
     if str(result.get("verdict", "")).upper() not in {"APPROVE", "ABSTAIN", "REJECT", "VETO", "HOLD"}:
         blockers.append("VERDICT_INVALID")
     created = _valid_stamp(result.get("created_at"))
@@ -219,7 +242,7 @@ async def collect_agent_verdicts(
             if not isinstance(result, Mapping):
                 return spec, None, "AGENT_RESULT_NOT_OBJECT"
             reasons = _validate_result(
-                result, spec, signal_id, expected_input_hash,
+                result, spec, signal, signal_id, expected_input_hash,
                 allowed_evidence_refs=allowed_evidence_refs, now=current,
             )
             if reasons:

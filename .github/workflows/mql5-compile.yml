@@ -1,0 +1,155 @@
+name: mql5-compile
+
+on:
+  push:
+    paths:
+      - "mql5/**"
+      - ".github/workflows/mql5-compile.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  metaeditor-compile:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download official MetaTrader 5 installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Join-Path $env:RUNNER_TEMP "mt5setup.exe"
+          Invoke-WebRequest -Uri "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile $installer
+          $signature = Get-AuthenticodeSignature $installer
+          if ($signature.Status -ne "Valid") {
+            throw "MetaTrader installer signature is not valid: $($signature.Status)"
+          }
+          Write-Host "Verified official installer signature: $($signature.SignerCertificate.Subject)"
+
+      - name: Install MetaTrader 5 and compile the EA
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Join-Path $env:RUNNER_TEMP "mt5setup.exe"
+          $installRoot = Join-Path $env:RUNNER_TEMP "MetaTrader5"
+          $report = Join-Path $env:RUNNER_TEMP "mt5-install-diagnostics.txt"
+          New-Item -ItemType Directory -Force -Path $installRoot | Out-Null
+
+          try {
+            # Install into writable runner temp, not Program Files. /path is supported by MetaQuotes.
+            $process = Start-Process -FilePath $installer -ArgumentList @("/auto", "/path:$installRoot") -WorkingDirectory $env:RUNNER_TEMP -PassThru -Wait
+            "InstallerExitCode=$($process.ExitCode)" | Set-Content -Path $report
+            "RequestedInstallPath=$installRoot" | Add-Content -Path $report
+            Write-Host "Installer exit code: $($process.ExitCode)"
+
+            $editor = Join-Path $installRoot "metaeditor64.exe"
+            if (-not (Test-Path $editor)) {
+              $candidate = Get-ChildItem -Path $installRoot -Filter "metaeditor64.exe" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($candidate) { $editor = $candidate.FullName }
+            }
+
+            if (-not (Test-Path $editor)) {
+              $roots = @(
+                (Join-Path $env:ProgramFiles "MetaTrader 5"),
+                (Join-Path $env:ProgramFiles "MetaTrader 5 Terminal"),
+                (Join-Path $env:LOCALAPPDATA "Programs"),
+                (Join-Path $env:APPDATA "MetaQuotes")
+              ) | Where-Object { $_ -and (Test-Path $_) }
+              foreach ($root in $roots) {
+                $candidate = Get-ChildItem -Path $root -Filter "metaeditor64.exe" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($candidate) { $editor = $candidate.FullName; break }
+              }
+            }
+            if (-not (Test-Path $editor)) {
+              "MetaEditorFound=False" | Add-Content -Path $report
+              "InstallRootContents:" | Add-Content -Path $report
+              Get-ChildItem -Path $installRoot -Force -ErrorAction SilentlyContinue | Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize | Out-String | Add-Content -Path $report
+              throw "MetaEditor was not installed or could not be located; inspect mt5-install-diagnostics.txt."
+            }
+
+            "MetaEditorPath=$editor" | Add-Content -Path $report
+            $terminalRoot = Split-Path $editor -Parent
+            $experts = Join-Path $terminalRoot "MQL5\Experts"
+            New-Item -ItemType Directory -Force -Path $experts | Out-Null
+            $source = Join-Path $PWD "mql5\CriticalConsensusEA.mq5"
+            $target = Join-Path $experts "CriticalConsensusEA.mq5"
+            Copy-Item $source $target -Force
+
+            # First compile a tiny probe. This separates a broken compiler launch from
+            # errors in the project EA itself. RUNNER_TEMP has no spaces on hosted Windows runners.
+            $probe = Join-Path $env:RUNNER_TEMP "MetaEditorSmoke.mq5"
+            @('#property strict', 'void OnStart() { Print("MetaEditor smoke test"); }') | Set-Content -Path $probe -Encoding ascii
+            $probeCommand = "$editor /compile:$probe /log"
+            $probeOutput = & $env:ComSpec /d /c $probeCommand 2>&1
+            $probeExitCode = $LASTEXITCODE
+            "MetaEditorProbeExitCode=$probeExitCode" | Add-Content -Path $report
+            if ($probeOutput) {
+              "MetaEditorProbeOutput=$($probeOutput -join ' | ')" | Add-Content -Path $report
+            }
+            $probeLog = [System.IO.Path]::ChangeExtension($probe, ".log")
+            if (-not (Test-Path $probeLog)) {
+              $foundLogs = Get-ChildItem -Path $installRoot,$env:RUNNER_TEMP -Filter "*.log" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+              "CompilerLogsFound=$($foundLogs -join ';')" | Add-Content -Path $report
+              throw "MetaEditor smoke compile did not create a log; inspect installer diagnostics."
+            }
+            $probeText = Get-Content $probeLog -Raw
+            Get-Content $probeLog
+            if ($probeText -match "(?im)\b[1-9]\d* errors?\b" -or $probeText -notmatch "(?im)\b0 errors?\b") {
+              throw "MetaEditor smoke compile did not report zero errors."
+            }
+            $probeEx5 = [System.IO.Path]::ChangeExtension($probe, ".ex5")
+            if (-not (Test-Path $probeEx5)) {
+              throw "MetaEditor smoke compile log reports no errors but the EX5 probe artifact is missing."
+            }
+
+            $compileCommand = "$editor /compile:$target /log"
+            $compileOutput = & $env:ComSpec /d /c $compileCommand 2>&1
+            $compileExitCode = $LASTEXITCODE
+            "MetaEditorExitCode=$compileExitCode" | Add-Content -Path $report
+            if ($compileOutput) {
+              "MetaEditorOutput=$($compileOutput -join ' | ')" | Add-Content -Path $report
+            }
+            $log = [System.IO.Path]::ChangeExtension($target, ".log")
+            if (-not (Test-Path $log)) {
+              throw "MetaEditor did not create a compiler log. Process exit code: $compileExitCode"
+            }
+            Get-Content $log
+            $logText = Get-Content $log -Raw
+            if ($logText -match "(?im)\b[1-9]\d* errors?\b" -or $logText -notmatch "(?im)\b0 errors?\b") {
+              throw "MQL5 compilation did not report zero errors."
+            }
+            if ($logText -match "(?im)\b[1-9]\d* warnings?\b") {
+              Write-Warning "MetaEditor reported compiler warnings; review the uploaded log."
+            }
+            $ex5 = [System.IO.Path]::ChangeExtension($target, ".ex5")
+            if (-not (Test-Path $ex5)) {
+              throw "Compiler log reports no errors but the expected EX5 artifact is missing."
+            }
+
+            # Persist exact compiler evidence for upload. The MetaEditor executable may return
+            # process code 1 even after a successful GUI compile; the validated log + EX5 are authoritative.
+            Copy-Item $log (Join-Path $env:RUNNER_TEMP "CriticalConsensusEA.log") -Force
+            Copy-Item $ex5 (Join-Path $env:RUNNER_TEMP "CriticalConsensusEA.ex5") -Force
+            Write-Host "PASS: MetaEditor produced CriticalConsensusEA.ex5 with zero compiler errors."
+            $global:LASTEXITCODE = 0
+          }
+          catch {
+            "Failure=$($_.Exception.Message)" | Add-Content -Path $report
+            throw
+          }
+
+      - name: Upload MetaEditor compiler evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: mql5-metaeditor-compile-evidence
+          path: |
+            ${{ runner.temp }}/CriticalConsensusEA.log
+            ${{ runner.temp }}/CriticalConsensusEA.ex5
+            ${{ runner.temp }}/MetaEditorSmoke.log
+            ${{ runner.temp }}/MetaEditorSmoke.ex5
+            ${{ runner.temp }}/mt5-install-diagnostics.txt
+          if-no-files-found: warn

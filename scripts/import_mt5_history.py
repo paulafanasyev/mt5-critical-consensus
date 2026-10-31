@@ -6,7 +6,7 @@ import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 
-from critical_consensus.market_data import fetch_mt5_bars, read_mt5_csv
+from critical_consensus.market_data import fetch_mt5_bars, read_mt5_csv, retain_completed_bars
 from critical_consensus.persistence import PostgresRepository
 
 
@@ -23,7 +23,7 @@ def main() -> int:
     source.add_argument("--csv", type=Path, help="MT5 OHLC CSV export; the file is not modified")
     source.add_argument("--live-terminal", action="store_true", help="query the installed MT5 terminal read-only")
     parser.add_argument("--symbol", required=True)
-    parser.add_argument("--timeframe", required=True, choices=["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"])
+    parser.add_argument("--timeframe", required=True, choices=["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1"])
     parser.add_argument("--source-timezone", help="required for naive CSV dates, e.g. Europe/Helsinki or UTC")
     parser.add_argument("--from-utc", type=parse_aware, help="required for --live-terminal")
     parser.add_argument("--to-utc", type=parse_aware, help="required for --live-terminal")
@@ -45,12 +45,19 @@ def main() -> int:
 
     if not bars:
         parser.error("source returned zero market bars; nothing was persisted")
+    received_count = len(bars)
+    try:
+        bars = retain_completed_bars(bars, min_bars=1)
+    except ValueError as exc:
+        parser.error(f"no finalized market bars available; nothing was persisted: {exc}")
+    dropped_forming = received_count - len(bars)
     repo = PostgresRepository()
     repo.migrate()
     result = repo.append_market_bars(bars)
     print(f"source={source_name}; symbol={args.symbol.upper()}; timeframe={args.timeframe}; "
-          f"rows={len(bars)}; inserted={result['inserted']}; "
-          f"identical_duplicates={result['identical_duplicates']}; conflicting bars are rejected.")
+          f"received={received_count}; finalized={len(bars)}; dropped_forming={dropped_forming}; "
+          f"inserted={result['inserted']}; identical_duplicates={result['identical_duplicates']}; "
+          "conflicting or late historical bars are rejected.")
     return 0
 
 

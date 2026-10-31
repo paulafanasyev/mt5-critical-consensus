@@ -14,7 +14,10 @@ from pathlib import Path
 import yaml
 
 from critical_consensus.agent_runtime import collect_agent_verdicts
-from critical_consensus.market_data import build_market_snapshot
+from critical_consensus.decision_bundle import build_decision_bundle, write_decision_bundle
+from critical_consensus.pipeline import evaluate_signal_bundle
+from critical_consensus.market_data import (build_market_snapshot, build_next_bar_forecast_contract,
+                                            retain_completed_bars)
 from redis.asyncio import Redis
 
 from critical_consensus.persistence import PostgresRepository
@@ -31,8 +34,15 @@ async def run(args) -> int:
     repo = PostgresRepository()
     repo.migrate()
     bars = await asyncio.to_thread(repo.get_recent_market_bars, args.symbol, args.timeframe, args.bars)
+    # MT5 may return the still-forming current bar. Never use it as a reference close.
+    bars = retain_completed_bars(bars, min_bars=21)
     snapshot = build_market_snapshot(bars)
+    forecast_contract = build_next_bar_forecast_contract(snapshot)
     snapshot_hash = canonical_signal_hash(snapshot)
+    source_registry = yaml.safe_load(
+        (ROOT / "config" / "source_registry.yaml").read_text(encoding="utf-8")
+    ) or {}
+    source_records = []
     if len(args.source_id) < 2 or len(args.source_id) > 12:
         source_context = {
             "status": "GATHER_MORE",
@@ -40,9 +50,6 @@ async def run(args) -> int:
             "documents": [], "available_evidence_refs": [],
         }
     else:
-        source_registry = yaml.safe_load(
-            (ROOT / "config" / "source_registry.yaml").read_text(encoding="utf-8")
-        ) or {}
         source_records = await asyncio.to_thread(repo.get_source_evidence, args.source_id)
         source_context = await asyncio.to_thread(
             build_source_context,
@@ -72,6 +79,7 @@ async def run(args) -> int:
         "signal_id": signal_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "market_snapshot": snapshot,
+        "forecast_contract": forecast_contract,
         "source_documents": source_documents,
         "source_independence_groups": source_context.get("independence_groups", []),
         "available_evidence_refs": available_evidence_refs,
@@ -110,6 +118,63 @@ async def run(args) -> int:
                       "agent_errors": [{"code": type(exc).__name__}],
                       "blockers": ["AGENT_CONFIGURATION_OR_COLLECTION_FAILED"],
                       "trade_allowed": False}
+
+    # Store each validated objective next-bar event probability before peer review and
+    # before the target bar can close. Subjective verdict confidence stays separate.
+    forecast_capture = {"inserted": 0, "identical_replays": 0, "total": 0}
+    forecast_records = []
+    valid_verdicts = result.get("verdicts", [])
+    if isinstance(valid_verdicts, list):
+        for verdict in valid_verdicts:
+            if not isinstance(verdict, dict):
+                continue
+            model_id = str(verdict.get("provider_identity", "")).strip()
+            verdict_id = str(verdict.get("verdict_id", "")).strip()
+            verdict_signal_id = str(verdict.get("signal_id", "")).strip()
+            if not model_id or not verdict_id or verdict_signal_id != signal_id:
+                result["status"] = "GATHER_MORE"
+                result["blockers"] = sorted(set(result.get("blockers", []) + [
+                    "PRE_OUTCOME_FORECAST_PROVENANCE_MISSING"
+                ]))
+                result["trade_allowed"] = False
+                forecast_records = []
+                break
+            forecast_records.append({
+                "model_id": model_id,
+                "signal_id": signal_id + "::" + verdict_id,
+                "issued_at": verdict.get("created_at"),
+                "probability": verdict.get("next_bar_up_probability"),
+                "input_sha256": verdict.get("input_hash"),
+                "forecast_kind": "NEXT_BAR_MARKET_EVENT",
+                "target_policy_version": forecast_contract["target_policy_version"],
+                "target_event": forecast_contract["target_event"],
+                "symbol": forecast_contract["symbol"],
+                "timeframe": forecast_contract["timeframe"],
+                "reference_at": forecast_contract["reference_at"],
+                "reference_close": forecast_contract["reference_close"],
+            })
+    if forecast_records:
+        try:
+            forecast_capture = await asyncio.to_thread(repo.record_forecasts, forecast_records)
+            for verdict, observation in zip(valid_verdicts, forecast_records):
+                verdict["forecast_observation"] = {
+                    "model_id": observation["model_id"],
+                    "signal_id": observation["signal_id"],
+                    "issued_at": observation["issued_at"],
+                    "input_sha256": observation["input_sha256"],
+                    "meaning": "probability of NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE; subjective verdict confidence is separate",
+                    "target_policy_version": forecast_contract["target_policy_version"],
+                    "target_event": forecast_contract["target_event"],
+                    "reference_at": forecast_contract["reference_at"],
+                    "reference_close": forecast_contract["reference_close"],
+                    "persistence": "PERSISTED_UNRESOLVED",
+                }
+        except Exception as exc:
+            result["status"] = "GATHER_MORE"
+            result["blockers"] = sorted(set(result.get("blockers", []) + [
+                "PRE_OUTCOME_FORECAST_CAPTURE_FAILED:" + type(exc).__name__
+            ]))
+            result["trade_allowed"] = False
 
     if result.get("status") == "READY_FOR_REVIEW":
         try:
@@ -152,6 +217,46 @@ async def run(args) -> int:
             ]))
             result["trade_allowed"] = False
 
+    # Continue the verified agent/review evidence into deterministic gates. Missing
+    # Chief reasoning, calibration history, permission metadata and human approval
+    # remain missing: this adapter never manufactures them.
+    decision_bundle = build_decision_bundle(signal, result)
+    decision_evaluation_error = None
+    decision_persistence = None
+    try:
+        decision_certainty_policy = yaml.safe_load(
+            (ROOT / "config" / "certainty_thresholds.yaml").read_text(encoding="utf-8")
+        ) or {}
+        decision_permission_matrix = yaml.safe_load(
+            (ROOT / "config" / "permission_matrix.yaml").read_text(encoding="utf-8")
+        ) or {}
+        decision_evaluation = evaluate_signal_bundle(
+            decision_bundle,
+            decision_certainty_policy,
+            decision_permission_matrix,
+            require_persisted_sources=True,
+            source_evidence_records=source_records,
+            source_registry=source_registry,
+        )
+        decision_persistence = await asyncio.to_thread(
+            repo.persist_pipeline_result,
+            decision_evaluation,
+            signal_input_sha256=decision_bundle["signal_input_hash"],
+        )
+    except Exception as exc:
+        # Do not expose database URLs, provider errors or exception messages.
+        decision_evaluation_error = type(exc).__name__
+        decision_evaluation = {
+            "status": "GATHER_MORE",
+            "blockers": ["DETERMINISTIC_PIPELINE_OR_AUDIT_PERSISTENCE_FAILED"],
+            "audit_chain_valid": False,
+            "trade_allowed": False,
+        }
+
+    decision_bundle_path = None
+    if args.decision_bundle_output:
+        decision_bundle_path = str(write_decision_bundle(args.decision_bundle_output, decision_bundle))
+
     event = {
         "event_id": "agent-collection-" + uuid.uuid4().hex,
         "event_type": "AGENT_COLLECTION_RESULT",
@@ -184,22 +289,37 @@ async def run(args) -> int:
                                          "independence_groups": source_context.get("independence_groups", []),
                                          "blockers": source_context.get("blockers", [])},
                       "collection": result,
-                      "pipeline_stage": "AGENT_COLLECTION_AND_PEER_REVIEW",
-                      "deterministic_Chief_Gate_invoked": False,
+                      "pre_outcome_forecast_capture": forecast_capture,
+                      "pipeline_stage": "AGENT_REVIEW_AND_DETERMINISTIC_GATES",
+                      "deterministic_pipeline": {
+                          "status": decision_evaluation.get("status"),
+                          "blockers": decision_evaluation.get("blockers", []),
+                          "audit_chain_valid": decision_evaluation.get("audit_chain_valid", False),
+                          "decision_id": (decision_persistence or {}).get("decision_id"),
+                          "audit_persisted": decision_persistence is not None,
+                          "trade_allowed": False,
+                      },
+                      "decision_pipeline_error": decision_evaluation_error,
+                      "decision_bundle_output": decision_bundle_path,
+                      "chief_reasoning_supplied": "chief_reasoning" in decision_bundle,
                       "human_authorization_processed": False,
+                      "order_created": False,
+                      "trade_allowed": False,
                       "audit_event_id": event["event_id"], "redis_publication": redis_status},
                      indent=2, ensure_ascii=False))
     if result.get("status") != "READY_FOR_CHIEF":
         return 2
-    # READY_FOR_CHIEF means only that the evidence-backed peer-review/challenge ledger is complete.
-    # Certainty Gate, deterministic Chief reasoning, Permission Gate and user authorization are separate.
+    # Exit success only when all deterministic gates reached human review and the
+    # analysis event was published. A peer-review-only READY_FOR_CHIEF is not PASS.
+    if decision_evaluation.get("status") != "REQUIRE_HUMAN":
+        return 2
     return 0 if redis_status.get("status") == "PUBLISHED" else 3
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--symbol", required=True)
-    parser.add_argument("--timeframe", required=True, choices=["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"])
+    parser.add_argument("--timeframe", required=True, choices=["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1"])
     parser.add_argument("--bars", type=int, default=200)
     parser.add_argument("--timeout", type=float, default=15.0)
     parser.add_argument("--review-cycle-timeout", type=float, default=120.0)
@@ -208,6 +328,10 @@ def main() -> int:
                         help="exact persisted trusted source ID; repeat at least twice for distinct publishers")
     parser.add_argument("--minimum-agents", type=int, default=4)
     parser.add_argument("--minimum-independence-groups", type=int, default=3)
+    parser.add_argument(
+        "--decision-bundle-output", type=Path, default=None,
+        help="optional atomic export of the exact evidence packet passed to deterministic gates",
+    )
     args = parser.parse_args()
     if args.bars < 21 or args.bars > 5000:
         parser.error("--bars must be between 21 and 5000")

@@ -1,6 +1,6 @@
 # MT5 Critical Consensus: full validation runbook
 
-Status as of this change: infrastructure and tests are being added; production readiness is not implied. Do not connect a live account. The intended order is data → persistence → agent evidence → calibration → EA demo → end-to-end verification.
+Status: CI for the current decision/forecast changes is green, but production readiness is NOT PROVEN. Do not connect a live account. The intended order is data → persistence → agent evidence → objective forecast outcomes → calibration → EA demo → end-to-end verification.
 
 ## 1. Read-only market data
 
@@ -9,16 +9,43 @@ On the Windows host that already has MetaTrader 5 installed and logged in:
 ```powershell
 python -m pip install -e ".[data]" MetaTrader5
 $env:DATABASE_URL = "postgresql://USER:PASSWORD@127.0.0.1:5432/mt5cc"
+# First verify terminal connectivity and access to two closed bars; no order APIs are called.
+python scripts/check_mt5_terminal.py --symbol EURUSD --timeframe H1
+# Only after the preflight reports PASS, import historical data:
 python scripts/import_mt5_history.py --live-terminal --symbol EURUSD --timeframe H1 --from-utc 2026-10-01T00:00:00Z --to-utc 2026-10-30T00:00:00Z
 ```
 
-The connector only calls `initialize`, `symbol_select`, `copy_rates_range`, and `shutdown`. It contains no order submission calls. For CSV export, specify the broker/server timezone explicitly:
+For repeated synchronization, use the incremental cycle. The first run needs a bootstrap timestamp; later runs resume from the latest persisted bar. It imports only completed bars and attempts resolution after ingestion:
+
+```powershell
+python scripts/sync_mt5_market_data.py --symbol EURUSD --timeframe H1 --bootstrap-from-utc 2026-10-01T00:00:00Z
+# Subsequent Task Scheduler runs omit --bootstrap-from-utc:
+python scripts/sync_mt5_market_data.py --symbol EURUSD --timeframe H1
+```
+
+For a single logged command that performs the preflight first and then synchronizes, use the PowerShell wrapper:
+
+```powershell
+.\scripts\run_mt5_sync.ps1 -Symbol EURUSD -Timeframe H1 -TerminalPath "C:\Program Files\MetaTrader 5\terminal64.exe" -BootstrapFromUtc "2026-10-01T00:00:00Z"
+# Subsequent runs omit -BootstrapFromUtc:
+.\scripts\run_mt5_sync.ps1 -Symbol EURUSD -Timeframe H1 -TerminalPath "C:\Program Files\MetaTrader 5\terminal64.exe"
+```
+
+The wrapper writes a timestamped log under `logs/`, refuses to start synchronization if the live terminal preflight fails, and never prints the `DATABASE_URL` value. Configure `DATABASE_URL` in the Windows task's user/service environment or secret manager; do not put credentials in Task Scheduler arguments. The sync fails closed on a PostgreSQL or MT5 error and does not resolve forecasts after a failed ingestion. There is no blind in-process retry: the next scheduled invocation resumes from the latest committed bar. An identical replay is idempotent, so a lost acknowledgement after a committed insert does not create a second market-bar row.
+
+For Windows Task Scheduler, create a task under the same Windows account that owns the configured MT5 terminal session. Set **Program/script** to `powershell.exe`, **Add arguments** to `-NoProfile -ExecutionPolicy Bypass -File "C:\\path\\to\\mt5-critical-consensus\\scripts\\run_mt5_sync.ps1" -Symbol EURUSD -Timeframe H1 -TerminalPath "C:\\Program Files\\MetaTrader 5\\terminal64.exe"`, and **Start in** to the repository root. Run it at an interval appropriate to the timeframe (for example, every five minutes for H1 monitoring). This is read-only data synchronization and forecast resolution; it does not submit orders.
+
+Each synchronization scans up to the latest 5,000 persisted bars plus newly received closed bars and includes `market_history_integrity` in its JSON result. Every timestamp gap is retained as an advisory finding. Intervals touching Saturday/Sunday receive `WEEKEND_SPANNING_GAP_REQUIRES_SESSION_REVIEW`; weekday intervals receive `POTENTIAL_GAP_REQUIRES_SESSION_REVIEW`. There is deliberately no weekend-suppression flag: a Friday-to-Monday interval that looks like a normal closure can still contain missing bars after the instrument reopens. The application does not guess broker sessions, holidays, maintenance windows or DST transitions. All stored timestamps are compared in UTC; when reviewing around a DST change, convert the broker's documented IANA timezone/session schedule to UTC rather than assuming a fixed offset. This is not a broker-calendar oracle. Review alerts against the selected broker's actual instrument schedule before classifying them as missing data. The sync does not backfill older bars automatically, because the append-only forward ledger intentionally rejects late inserts that could alter forecast outcomes. Historical correction/backfill remains a separately audited operation.
+
+The MT5 data adapter re-checks terminal connectivity immediately before reading rates and shuts down after both successful and failed initialization paths. A successful preflight is only a point-in-time connection check; the data adapter checks again because the terminal can disconnect between preflight and ingestion. Finalization and due-forecast resolution use PostgreSQL's `SELECT now()` clock normalized to UTC, not the Windows process clock. The JSON result records the PostgreSQL session timezone and the measured application/database clock skew for diagnosis; a non-UTC PostgreSQL session is normalized rather than silently interpreted as UTC.
+
+The connector only calls `initialize`, `terminal_info`, `symbol_select`, `copy_rates_range`, and `shutdown`. It contains no order submission calls. For CSV export, specify the broker/server timezone explicitly:
 
 ```powershell
 python scripts/import_mt5_history.py --csv .\EURUSD_H1.csv --source-timezone Europe/Helsinki --symbol EURUSD --timeframe H1
 ```
 
-Do not assume the broker's export timezone; verify it in MT5 first. Naive timestamps without an explicit timezone are rejected. The source CSV is read-only. OHLC rows are validated for finite prices, valid ranges, ordered unique UTC timestamps, symbol and timeframe consistency.
+Do not assume the broker's export timezone; verify it in MT5 first. Naive timestamps without an explicit timezone are rejected. The source CSV is read-only. OHLC rows are validated for finite prices, valid ranges, ordered unique UTC timestamps, symbol and timeframe consistency. After the initial chronological history load, the PostgreSQL market-bar ledger accepts only forward inserts for each symbol/timeframe; identical replays remain idempotent, while late backfills are rejected because they could retroactively change which bar resolves an already-issued forecast. Historical corrections require a separately audited revision path.
 
 ## 2. PostgreSQL and Redis
 
@@ -42,9 +69,9 @@ python scripts/run_agent_analysis.py --symbol EURUSD --timeframe H1 --bars 200 -
 ```
 
 Each provider must have a unique configured HTTPS endpoint origin and unique endpoint/model pair. The runtime blocks duplicate origins even when declared group names differ. This is only a configuration-diversity check; statistical independence of training data and model behaviour remains NOT PROVEN and requires an external audit.
-The template contains all nine mandatory IDs from `certainty_thresholds.yaml`. The runner requires 2–12 exact persisted source IDs from different operator-configured publisher independence groups; missing, stale, tampered, unregistered or single-group sources cause `GATHER_MORE` before any model call. It verifies each capture's bytes and SHA-256, then extracts visible HTML or JSON text and passes that untrusted document text together with the read-only market snapshot to the nine mandatory agents. Source text is data only: system prompts explicitly instruct models to ignore embedded directives, and peer-review/challenge callbacks receive only the same allowlisted evidence IDs and extracted text. Four functional roles are required: analyst, critic, devil_advocate and risk_review. Each configured agent must have its own endpoint origin and unique model identity; duplicate origins/models are rejected at configuration level. When all nine verdicts pass, providers perform anonymized peer reviews (two reviewers per verdict), validate citations against the signal evidence registry, register each CHALLENGE and attempt resolution in at most three rounds. Missing/invalid reviews produce `GATHER_MORE`; unresolved challenges produce `ESCALATE`; only a complete evidence-backed ledger returns `READY_FOR_CHIEF`. The complete result is written to a PostgreSQL audit event and published to Redis when `REDIS_URL` is configured. This is still not a Certainty Gate decision: real walk-forward calibration and system-health metrics, contradiction scans, source ranking, portfolio/risk evidence, deterministic nine-step Chief reasoning and permission request are not fabricated by the runner. LLM confidence remains `UNCALIBRATED_SUBJECTIVE`.
+The template contains all nine mandatory IDs from `certainty_thresholds.yaml`. The runner requires 2–12 exact persisted source IDs from different operator-configured publisher independence groups; missing, stale, tampered, unregistered or single-group sources cause `GATHER_MORE` before any model call. It verifies each capture's bytes and SHA-256, then extracts visible HTML or JSON text and passes that untrusted document text together with the read-only market snapshot to the nine mandatory agents. Source text is data only: system prompts explicitly instruct models to ignore embedded directives, and peer-review/challenge callbacks receive only the same allowlisted evidence IDs and extracted text. Four functional roles are required: analyst, critic, devil_advocate and risk_review. Each configured agent must have its own endpoint origin and unique model identity; duplicate origins/models are rejected at configuration level. When all nine verdicts pass, providers perform anonymized peer reviews (two reviewers per verdict), validate citations against the signal evidence registry, register each CHALLENGE and attempt resolution in at most three rounds. Missing/invalid reviews produce `GATHER_MORE`; unresolved challenges produce `ESCALATE`; only a complete evidence-backed ledger returns `READY_FOR_CHIEF`. The complete result is written to a PostgreSQL audit event and published to Redis when `REDIS_URL` is configured. The runner now also hands the exact signal, verdicts, peer reviews and challenge ledger to `evaluate_signal_bundle(...)` with persisted publisher-provenance checks enabled, then stores the hash-linked deterministic decision trace in append-only `decision_runs`/`audit_events`. To export the exact handoff packet for replay or inspection, add `--decision-bundle-output .\\decision-bundle.json`. The runner does not synthesize calibration history, contradiction scans, source ranking, portfolio/risk evidence, deterministic nine-step Chief reasoning, a permission request or human approval. Until those independently produced inputs exist, the deterministic pipeline must remain at `GATHER_MORE` or `HOLD`; `READY_FOR_CHIEF` alone is not a full-pipeline PASS. The process returns success only if the deterministic gates reach `REQUIRE_HUMAN` and Redis publication succeeds. LLM confidence remains `UNCALIBRATED_SUBJECTIVE`.
 
-`chief_review` here is an LLM reviewer role, not the deterministic `chief_skeptic_pass` gate. The full `evaluate_signal_bundle(...)` gate still requires the complete peer-review/challenge ledger, source and risk metadata, all nine Chief reasoning steps, permission binding and human authorization packet. The read-only runner does not auto-populate or bypass those prerequisites and never creates an order. Shared model families, vendors, prompts or market sources can still create correlated errors; role/group labels do not prove independence.
+`chief_review` here is an LLM reviewer role, not the deterministic `chief_skeptic_pass` gate. The runner automatically invokes the deterministic pipeline after agent review, but it intentionally stops short of filling fields that must come from separate evidence-producing stages: all nine Chief reasoning steps, calibrated historical metrics, complete risk metadata and a bound permission request. Passing deterministic checks produces a human-review packet only; this runner does not process human authorization and never creates an order. Shared model families, vendors, prompts or market sources can still create correlated errors; role/group labels do not prove independence.
 
 Register actual model/provider callables using `AgentSpec` and `collect_agent_verdicts`. Set the required number of distinct providers and independent groups explicitly. A provider must return signal-bound verdict ID, agent ID, SHA-256 input binding, UTC creation time, positive TTL and evidence references. Errors, timeouts and invalid output cause `GATHER_MORE`.
 
@@ -96,24 +123,51 @@ For an API that returns a timezone-aware ISO-8601 publication field, the operato
 
 
 
-## 4. Walk-forward calibration
+## 4. Objective market-event forecasts and walk-forward calibration
 
-Capture the model forecast before its outcome is available, persist the exact issue timestamp and canonical input hash, then resolve it once the outcome is known. Export rows to a CSV with columns:
+The runner records each validated agent's **objective event probability** before peer review and before the target bar can close. It keeps the agent's qualitative verdict confidence as a separate field; subjective confidence is not used as the calibration probability.
 
-```csv
-model_id,signal_id,issued_at,resolved_at,probability,outcome
-technical-v1,eurusd-h1-001,2026-10-01T10:00:00Z,2026-10-01T11:00:00Z,0.61,1
+The fixed target policy is `next-available-bar-close-above-reference-v1`:
+- The reference is the last completed market bar in the exact signal snapshot, including its symbol, timeframe, UTC bar timestamp and close.
+- The reference close must match an already persisted immutable `market_bars` row before the forecast is accepted.
+- Each agent's issue timestamp is its own UTC `created_at`. The target is the first persisted bar for that symbol/timeframe whose bar-open timestamp is strictly later than that issue timestamp.
+- Outcome is 1 only if that target bar closes strictly above the reference close; flat or lower close is 0.
+- A target bar cannot be resolved until its full timeframe has elapsed plus the configured finalization grace. No later bar may replace the first eligible target bar.
+- Missing reference/target bars remain pending. Manual outcome labels are disabled.
+
+On the Windows host with MT5 installed, first import the newest closed bars. The import is read-only with respect to MT5 and does not send orders:
+
+```powershell
+python scripts/import_mt5_history.py --live-terminal --symbol EURUSD --timeframe H1 --from-utc 2026-10-30T00:00:00Z --to-utc 2026-10-31T00:00:00Z
 ```
 
-Then run:
+For an existing CSV export, provide the verified broker/server timezone:
 
-```bash
-python scripts/evaluate_calibration.py predictions.csv --output calibration-report.json
+```powershell
+python scripts/import_mt5_history.py --csv .\\EURUSD_H1.csv --source-timezone Europe/Helsinki --symbol EURUSD --timeframe H1
 ```
 
-The evaluator fits Platt scaling only on earlier forecasts whose outcomes were already resolved before the next test block. It reports Brier score, log loss, reliability bins, ECE, high-confidence false-certainty rate, sample counts and a deterministic paired bootstrap interval. With too few observations or an interval that does not show improvement, the result remains `NOT_PROVEN`. The script cannot independently prove that a supplied historical forecast was genuinely captured before the outcome; only a trusted append-only capture pipeline and audit trail can provide that provenance.
+Then resolve only forecasts whose first target bar is present and complete:
 
-This is probability calibration, not a strategy/backtest profitability test. A calibrated probability does not prove positive expectancy, execution quality or future profit.
+```powershell
+python scripts/resolve_forecasts.py --symbol EURUSD --timeframe H1 --limit 500
+```
+
+The resolver is idempotent. It stores an append-only evidence object containing the exact reference bar, target bar, their timestamps/OHLC/source metadata, forecast input hash, target policy and outcome hash. It does not create labels when a bar is missing or incomplete. Repeat after new market bars are imported.
+
+Export only database-resolved objective market-event forecasts; legacy subjective-confidence rows are excluded:
+
+```powershell
+python scripts/export_resolved_forecasts.py --output .\\resolved-forecasts.csv
+python scripts/evaluate_calibration_db.py --output .\\calibration-report.json
+python scripts/store_calibration_report.py .\\calibration-report.json
+```
+
+The evaluator rejects incomplete or tampered evidence metadata, checks the canonical resolution-evidence hash and verifies that the declared outcome matches the reference and target closes. Legacy CSV rows without the new evidence contract can be parsed for diagnostics but force provenance status to `NOT_VERIFIED_BY_SCRIPT` and cannot advance the overall status beyond `NOT_PROVEN`. The database-native evaluator reads directly from `forecast_predictions` joined to `forecast_resolution_events`, re-validates every evidence payload, and hashes the exact exported ledger rows. It is the only evaluator allowed to label provenance `DATABASE_LEDGER_SELF_CONSISTENT_NOT_BROKER_AUTHENTICATED`; the CSV evaluator is diagnostic-only and always reports `NOT_VERIFIED_BY_SCRIPT`.
+
+The walk-forward evaluator fits Platt scaling only on earlier forecasts whose outcomes were resolved before the next test block. It reports Brier score, log loss, reliability bins, ECE, high-confidence false-certainty rate, sample counts and deterministic paired-bootstrap intervals. Too few observations or an interval that does not show improvement remains `NOT_PROVEN`. The policy's minimum sample requirements still apply independently.
+
+**Evidence limits:** hashes and database constraints demonstrate internal consistency and immutability within this PostgreSQL ledger. They do not independently authenticate broker-feed accuracy/completeness, prove statistical independence between providers, prove a profitable trading strategy or establish future performance. A calibration report is not a backtest, execution test or profitability claim. Do not manually label outcomes or promote legacy subjective-confidence rows into this dataset.
 
 ## 5. Full deterministic Chief Gate
 

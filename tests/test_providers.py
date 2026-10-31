@@ -15,9 +15,22 @@ def _extract_json_payload(prompt):
     return value
 
 
+def _forecast_contract():
+    return {
+        "target_policy_version": "next-available-bar-close-above-reference-v1",
+        "target_event": "NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE",
+        "symbol": "EURUSD", "timeframe": "H1",
+        "reference_at": "2026-10-30T10:00:00+00:00",
+        "reference_close": 1.1,
+        "definition": "next available bar close > reference close",
+    }
+
+
 def test_openai_compatible_agent_binds_local_identity_and_rejects_unavailable_evidence(monkeypatch):
-    signal = {"signal_id": "s1", "available_evidence_refs": ["market-bars:hash"], "market_snapshot": {"symbol": "EURUSD"}}
+    signal = {"signal_id": "s1", "available_evidence_refs": ["market-bars:hash"],
+              "market_snapshot": {"symbol": "EURUSD"}, "forecast_contract": _forecast_contract()}
     content = json.dumps({"verdict": "ABSTAIN", "confidence": 0.4,
+                          "next_bar_up_probability": 0.63,
                           "evidence_refs": ["market-bars:hash"], "abstain_reason": "no news evidence",
                           "rationale": "market bars only", "risks": ["missing macro sources"]})
     envelope = {"choices": [{"message": {"content": content}}]}
@@ -40,16 +53,20 @@ def test_openai_compatible_agent_binds_local_identity_and_rejects_unavailable_ev
     assert result["signal_id"] == "s1"
     assert result["input_hash"] == canonical_signal_hash(signal)
     assert result["verdict"] == "ABSTAIN"
+    assert result["confidence"] == 0.4
+    assert result["next_bar_up_probability"] == 0.63
+    assert result["forecast_contract"] == _forecast_contract()
 
     bad_envelope = {"choices": [{"message": {"content": json.dumps({
-        "verdict": "APPROVE", "confidence": 0.9, "evidence_refs": ["made-up-source"],
+        "verdict": "APPROVE", "confidence": 0.9, "next_bar_up_probability": 0.8,
+        "evidence_refs": ["made-up-source"],
         "abstain_reason": "", "rationale": "fabricated citation", "risks": [],
     })}}]}
     monkeypatch.setattr("critical_consensus.providers.urllib.request.build_opener",
                         lambda *handlers: type("FakeOpener", (), {
                             "open": lambda self, request, timeout: io.BytesIO(json.dumps(bad_envelope).encode())
                         })())
-    with pytest.raises(RuntimeError, match="evidence_invalid"):
+    with pytest.raises(RuntimeError, match="objective_forecast_invalid"):
         asyncio.run(agent(signal))
 
 

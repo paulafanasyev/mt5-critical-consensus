@@ -3,7 +3,7 @@ from datetime import datetime, timezone, timedelta
 import pytest
 
 from critical_consensus.agent_runtime import AgentSpec, collect_agent_verdicts
-from critical_consensus.market_data import MarketBar, build_market_snapshot
+from critical_consensus.market_data import MarketBar, build_market_snapshot, build_next_bar_forecast_contract
 from critical_consensus.audit import canonical_hash
 
 
@@ -17,6 +17,7 @@ async def test_market_snapshot_to_agent_collection_never_authorizes_trade():
                               close - 0.0001, close + 0.0003, close - 0.0003,
                               close, tick_volume=50, spread_points=8))
     snapshot = build_market_snapshot(bars)
+    forecast_contract = build_next_bar_forecast_contract(snapshot)
     signal_id = "snapshot-test-001"
 
     def make(agent_id, group):
@@ -25,6 +26,8 @@ async def test_market_snapshot_to_agent_collection_never_authorizes_trade():
             return {
                 "agent_id": agent_id, "signal_id": signal_id, "verdict_id": f"v-{agent_id}",
                 "input_hash": canonical_hash(input_snapshot), "confidence": 0.7,
+                "next_bar_up_probability": 0.58,
+                "forecast_contract": dict(input_snapshot["forecast_contract"]),
                 "verdict": "ABSTAIN", "ttl_seconds": 300,
                 "created_at": datetime(2026, 10, 2, 0, 0, tzinfo=timezone.utc).isoformat(),
                 "evidence_refs": ["market-snapshot:snapshot-test-001"],
@@ -35,6 +38,7 @@ async def test_market_snapshot_to_agent_collection_never_authorizes_trade():
 
     result = await collect_agent_verdicts(
         {"signal_id": signal_id, "market_snapshot": snapshot,
+         "forecast_contract": forecast_contract,
          "available_evidence_refs": ["market-snapshot:snapshot-test-001"]},
         [make("macro", "macro-feed"), make("technical", "technical-model"), make("risk", "risk-model")],
         now=datetime(2026, 10, 2, 0, 1, tzinfo=timezone.utc),

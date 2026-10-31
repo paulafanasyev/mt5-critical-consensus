@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from datetime import datetime, timedelta, timezone
 
@@ -11,10 +12,22 @@ import pytest
 from critical_consensus.market_data import MarketBar
 from critical_consensus.persistence import PostgresRepository
 from critical_consensus.audit import make_audit_event, canonical_hash
+from critical_consensus.calibration_eval import evaluate_repository_forecasts
 from critical_consensus.source_provenance import source_id_for_capture
 
 
 pytestmark = pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="TEST_DATABASE_URL not configured")
+
+
+def test_database_clock_returns_utc_time_and_session_timezone():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    clock = repo.get_database_clock()
+    assert isinstance(clock["now_utc"], datetime)
+    assert clock["now_utc"].tzinfo is not None
+    assert clock["now_utc"].utcoffset() == timedelta(0)
+    assert isinstance(clock["session_timezone"], str)
+    assert clock["session_timezone"].strip()
 
 
 def test_postgres_migrations_immutable_bars_and_idempotent_event():
@@ -52,14 +65,201 @@ def test_postgres_forecast_cannot_be_rewritten_after_issue_or_resolution():
                                 probability=0.73, input_sha256=digest) is True
     assert repo.record_forecast(model_id=model_id, signal_id=signal_id, issued_at=issued,
                                 probability=0.73, input_sha256=digest) is False
-    resolved = datetime.now(timezone.utc)
-    assert repo.resolve_forecast(model_id=model_id, signal_id=signal_id, resolved_at=resolved, outcome=1) is True
-    assert repo.resolve_forecast(model_id=model_id, signal_id=signal_id, resolved_at=resolved, outcome=1) is False
-    with pytest.raises(ValueError, match="cannot be relabelled"):
-        repo.resolve_forecast(model_id=model_id, signal_id=signal_id, resolved_at=resolved, outcome=0)
+    # Legacy subjective verdict confidence is not a market-event probability and
+    # manual binary labels are no longer accepted.
+    with pytest.raises(ValueError, match="manual forecast labels are disabled"):
+        repo.resolve_forecast(model_id=model_id, signal_id=signal_id,
+                              resolved_at=datetime.now(timezone.utc), outcome=1)
+    assert repo.export_resolved_forecasts(model_id=model_id) == []
+
+
+
+def test_market_forecast_resolves_only_from_first_future_completed_persisted_bar():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    now = datetime.now(timezone.utc)
+    model_id = "market-event-model-" + uuid.uuid4().hex
+    signal_id = "market-event-signal-" + uuid.uuid4().hex
+    issued = now - timedelta(hours=6)
+    reference_at = issued - timedelta(hours=1, seconds=5)
+    target_bar_at = issued + timedelta(hours=1)
+    symbol = "OUTCOME" + uuid.uuid4().hex[:6].upper()
+    reference_close = 1.1000
+
+    reference_bar = MarketBar(
+        symbol, "H1", reference_at, 1.0990, 1.1020, 1.0980, reference_close,
+        tick_volume=500, spread_points=9,
+    )
+    target_bar = MarketBar(
+        symbol, "H1", target_bar_at, 1.1000, 1.1040, 1.0990, 1.1030,
+        tick_volume=620, spread_points=8,
+    )
+    repo.append_market_bars([reference_bar, target_bar])
+
+    forecast = {
+        "model_id": model_id, "signal_id": signal_id, "issued_at": issued,
+        "probability": 0.73, "input_sha256": "sha256:" + "e" * 64,
+        "forecast_kind": "NEXT_BAR_MARKET_EVENT",
+        "target_policy_version": "next-available-bar-close-above-reference-v1",
+        "target_event": "NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE",
+        "symbol": symbol, "timeframe": "H1",
+        "reference_at": reference_at, "reference_close": reference_close,
+    }
+    assert repo.record_forecasts([forecast]) == {
+        "inserted": 1, "identical_replays": 0, "total": 1
+    }
+
+    before_close = repo.resolve_forecast_from_market_data(
+        model_id=model_id, signal_id=signal_id,
+        now=target_bar_at + timedelta(minutes=30),
+    )
+    assert before_close["status"] == "PENDING_BAR_NOT_CLOSED"
+
+    resolved_at = target_bar_at + timedelta(hours=1, seconds=5)
+    resolved = repo.resolve_forecast_from_market_data(
+        model_id=model_id, signal_id=signal_id, now=resolved_at,
+    )
+    assert resolved["status"] == "RESOLVED"
+    assert resolved["outcome"] == 1
+    assert resolved["resolution_evidence_sha256"].startswith("sha256:")
+    assert resolved["evidence"]["reference_bar"]["close"] == reference_close
+    assert resolved["evidence"]["target_bar"]["close"] == pytest.approx(1.1030)
+    repeated = repo.resolve_forecast_from_market_data(
+        model_id=model_id, signal_id=signal_id, now=resolved_at + timedelta(minutes=1),
+    )
+    assert repeated["status"] == "ALREADY_RESOLVED"
+    assert repeated["resolution_evidence_sha256"] == resolved["resolution_evidence_sha256"]
+
     exported = repo.export_resolved_forecasts(model_id=model_id)
     assert len(exported) == 1
-    assert exported[0]["signal_id"] == signal_id
+    assert exported[0]["target_event"] == "NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE"
+    assert exported[0]["outcome"] == 1
+    assert exported[0]["resolution_evidence_sha256"] == resolved["resolution_evidence_sha256"]
+    report = evaluate_repository_forecasts(repo, model_id=model_id)
+    assert report["dataset"]["row_count"] == 1
+    assert report["provenance_status"] == "DATABASE_LEDGER_SELF_CONSISTENT_NOT_BROKER_AUTHENTICATED"
+    assert report["overall_status"] == "NOT_PROVEN"
+
+
+
+
+def test_market_bars_reject_late_historical_inserts_but_allow_identical_replays():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    symbol = "FORWARD" + uuid.uuid4().hex[:6].upper()
+    start = datetime.now(timezone.utc) - timedelta(days=2)
+    first = MarketBar(symbol, "H1", start, 1.0, 1.2, 0.9, 1.1, tick_volume=10)
+    latest = MarketBar(symbol, "H1", start + timedelta(hours=2), 1.1, 1.3, 1.0, 1.2, tick_volume=12)
+    assert repo.append_market_bars([first, latest])["inserted"] == 2
+    replay = repo.append_market_bars([first])
+    assert replay["identical_duplicates"] == 1
+    late = MarketBar(symbol, "H1", start + timedelta(hours=1), 1.05, 1.25, 1.0, 1.15, tick_volume=11)
+    with pytest.raises(Exception, match="late historical market-bar insert is blocked"):
+        repo.append_market_bars([late])
+
+
+
+def test_database_rejects_new_legacy_confidence_outcome_labels():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    issued = datetime.now(timezone.utc) - timedelta(hours=2)
+    with repo._connect() as conn:
+        with pytest.raises(Exception, match="new legacy verdict-confidence rows cannot receive manual outcome labels"):
+            with conn.transaction():
+                conn.execute(
+                    """INSERT INTO forecast_predictions
+                       (model_id, signal_id, issued_at, probability, input_sha256,
+                        forecast_kind, outcome, resolved_at)
+                       VALUES (%s,%s,%s,%s,%s,'LEGACY_VERDICT_CONFIDENCE',1,%s)""",
+                    ("legacy-label-" + uuid.uuid4().hex,
+                     "legacy-signal-" + uuid.uuid4().hex,
+                     issued, 0.7, "sha256:" + "a" * 64,
+                     issued + timedelta(hours=1)),
+                )
+
+
+
+def test_market_forecast_rejects_reference_close_not_matching_persisted_bar():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    issued = datetime.now(timezone.utc) - timedelta(hours=2)
+    reference_at = issued - timedelta(hours=1, seconds=5)
+    symbol = "BADREF" + uuid.uuid4().hex[:6].upper()
+    repo.append_market_bars([
+        MarketBar(symbol, "H1", reference_at, 1.0, 1.2, 0.9, 1.1),
+    ])
+    with pytest.raises(ValueError, match="does not match an immutable persisted market bar"):
+        repo.record_forecasts([{
+            "model_id": "m-" + uuid.uuid4().hex,
+            "signal_id": "s-" + uuid.uuid4().hex,
+            "issued_at": issued, "probability": 0.6,
+            "input_sha256": "sha256:" + "f" * 64,
+            "forecast_kind": "NEXT_BAR_MARKET_EVENT",
+            "target_policy_version": "next-available-bar-close-above-reference-v1",
+            "target_event": "NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE",
+            "symbol": symbol, "timeframe": "H1",
+            "reference_at": reference_at, "reference_close": 1.1234,
+        }])
+
+
+
+def test_forecast_batch_capture_is_atomic_and_rejects_conflicting_replays():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    model_id = "batch-model-" + uuid.uuid4().hex
+    issued = datetime.now(timezone.utc)
+    first_id = "batch-signal-" + uuid.uuid4().hex
+    second_id = "batch-signal-" + uuid.uuid4().hex
+    records = [
+        {"model_id": model_id, "signal_id": first_id, "issued_at": issued,
+         "probability": 0.63, "input_sha256": "sha256:" + "a" * 64},
+        {"model_id": model_id, "signal_id": second_id, "issued_at": issued,
+         "probability": 0.71, "input_sha256": "sha256:" + "b" * 64},
+    ]
+    assert repo.record_forecasts(records) == {
+        "inserted": 2, "identical_replays": 0, "total": 2
+    }
+    assert repo.record_forecasts(records) == {
+        "inserted": 0, "identical_replays": 2, "total": 2
+    }
+
+    uncommitted_id = "batch-signal-" + uuid.uuid4().hex
+    conflicting_batch = [
+        {"model_id": model_id, "signal_id": uncommitted_id, "issued_at": issued,
+         "probability": 0.55, "input_sha256": "sha256:" + "c" * 64},
+        dict(records[1], probability=0.72),
+    ]
+    with pytest.raises(ValueError, match="conflicting replay"):
+        repo.record_forecasts(conflicting_batch)
+
+    with repo._connect() as connection:
+        inserted = connection.execute(
+            "SELECT 1 FROM forecast_predictions WHERE model_id=%s AND signal_id=%s",
+            (model_id, uncommitted_id),
+        ).fetchone()
+    assert inserted is None
+
+
+def test_forecast_batch_rejects_duplicate_keys_and_unverified_probability_inputs_before_db():
+    def unexpected_connect(_dsn):
+        raise AssertionError("invalid batch must be rejected before database access")
+
+    repo = PostgresRepository("postgresql://unused/unused", connect_fn=unexpected_connect)
+    record = {
+        "model_id": "model-a", "signal_id": "signal-a",
+        "issued_at": datetime.now(timezone.utc), "probability": 0.7,
+        "input_sha256": "sha256:" + "d" * 64,
+    }
+    with pytest.raises(ValueError, match="duplicate"):
+        repo.record_forecasts([record, dict(record)])
+    for bad_probability in (True, "0.7", float("nan"), float("inf"), -0.1, 1.1):
+        with pytest.raises(ValueError, match="probability"):
+            repo.record_forecasts([dict(record, probability=bad_probability)])
+    with pytest.raises(ValueError, match="must be strings"):
+        repo.record_forecasts([dict(record, model_id=17)])
+    with pytest.raises(ValueError, match="must be strings"):
+        repo.record_forecasts([dict(record, signal_id=17)])
+
 
 def test_persisted_kill_switch_defaults_active_and_appends_audit_events():
     repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
@@ -214,3 +414,23 @@ def test_persist_event_once_rejects_lossy_or_non_json_values_before_database_acc
     with pytest.raises(ValueError, match="consumer_name"):
         repo.persist_event_once(valid, consumer_name=17)
 
+
+
+
+def test_concurrent_identical_market_bar_ingestion_is_idempotent():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    symbol = "RACE" + uuid.uuid4().hex[:8].upper()
+    stamp = datetime.now(timezone.utc) - timedelta(hours=4)
+    bar = MarketBar(symbol, "H1", stamp, 1.0, 1.2, 0.9, 1.1,
+                    tick_volume=120, spread_points=7, source="concurrent-test")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: repo.append_market_bars([bar]), range(2)))
+
+    assert sum(result["inserted"] for result in results) == 1
+    assert sum(result["identical_duplicates"] for result in results) == 1
+    assert all(result["total"] == 1 for result in results)
+    stored = repo.get_recent_market_bars(symbol, "H1", limit=21)
+    assert len(stored) == 1
+    assert stored[0].close == pytest.approx(1.1)

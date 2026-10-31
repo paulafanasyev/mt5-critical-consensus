@@ -10,7 +10,7 @@ import csv
 import importlib
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from statistics import pstdev
 from typing import Any, Iterable, Mapping, Sequence
@@ -216,8 +216,18 @@ def fetch_mt5_bars(
         raise RuntimeError("MetaTrader5 Python package is required on the MT5 Windows host") from exc
     initialized = mt5.initialize(path=terminal_path) if terminal_path else mt5.initialize()
     if not initialized:
-        raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
+        error = mt5.last_error()
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+        raise RuntimeError(f"MT5 initialize failed: {error}")
     try:
+        terminal = mt5.terminal_info()
+        if terminal is None:
+            raise RuntimeError(f"MT5 terminal_info failed: {mt5.last_error()}")
+        if not bool(getattr(terminal, "connected", False)):
+            raise RuntimeError("MT5 terminal is open but not connected to a trade server")
         if not mt5.symbol_select(symbol, True):
             raise RuntimeError(f"MT5 could not select symbol {symbol}: {mt5.last_error()}")
         tf_constant = getattr(mt5, _MT5_TIMEFRAME_NAMES[timeframe], None)
@@ -240,6 +250,137 @@ def fetch_mt5_bars(
         return validate_bar_series(output, symbol=symbol, timeframe=timeframe)
     finally:
         mt5.shutdown()
+
+
+
+
+_FORECAST_BAR_DURATIONS = {
+    "M1": timedelta(minutes=1),
+    "M5": timedelta(minutes=5),
+    "M15": timedelta(minutes=15),
+    "M30": timedelta(minutes=30),
+    "H1": timedelta(hours=1),
+    "H4": timedelta(hours=4),
+    "D1": timedelta(days=1),
+    "W1": timedelta(days=7),
+}
+
+
+def forecast_bar_duration(timeframe: str) -> timedelta:
+    """Return the fixed close interval used by the objective next-bar target policy."""
+    key = str(timeframe).strip().upper()
+    try:
+        return _FORECAST_BAR_DURATIONS[key]
+    except KeyError as exc:
+        raise ValueError(
+            "objective next-bar forecast policy does not support this timeframe"
+        ) from exc
+
+
+def detect_potential_bar_gaps(
+    bars: Iterable[MarketBar], *, gap_tolerance_seconds: float = 2.0,
+) -> list[dict[str, Any]]:
+    """Report every suspicious timestamp gap; never infer or suppress broker sessions.
+
+    Bars are normalized to UTC before comparison. A gap touching Saturday/Sunday is
+    separately classified, but is still reported: without a broker-specific session
+    calendar (including holidays and DST rules), suppressing the whole interval could
+    hide missing bars after the market reopens.
+    """
+    rows = validate_bar_series(bars, min_bars=1)
+    if (isinstance(gap_tolerance_seconds, bool)
+            or not isinstance(gap_tolerance_seconds, (int, float))
+            or not math.isfinite(float(gap_tolerance_seconds))
+            or not 0 <= float(gap_tolerance_seconds) <= 60):
+        raise ValueError("gap_tolerance_seconds must be finite and in [0,60]")
+    if len(rows) < 2:
+        return []
+
+    duration = forecast_bar_duration(rows[0].timeframe)
+    tolerance = timedelta(seconds=float(gap_tolerance_seconds))
+    gaps: list[dict[str, Any]] = []
+    for previous, current in zip(rows, rows[1:]):
+        elapsed = current.time - previous.time
+        if elapsed <= duration + tolerance:
+            continue
+        day = previous.time.date()
+        crosses_weekend = False
+        while day <= current.time.date():
+            if day.weekday() >= 5:
+                crosses_weekend = True
+                break
+            day += timedelta(days=1)
+        gaps.append({
+            "symbol": previous.symbol,
+            "timeframe": previous.timeframe,
+            "previous_bar_utc": previous.time.isoformat(),
+            "next_bar_utc": current.time.isoformat(),
+            "elapsed_seconds": elapsed.total_seconds(),
+            "nominal_periods_elapsed": int(elapsed // duration),
+            "crosses_weekend": crosses_weekend,
+            "session_calendar_status": "NOT_CONFIGURED",
+            "status": (
+                "WEEKEND_SPANNING_GAP_REQUIRES_SESSION_REVIEW"
+                if crosses_weekend else "POTENTIAL_GAP_REQUIRES_SESSION_REVIEW"
+            ),
+        })
+    return gaps
+
+
+def retain_completed_bars(
+    bars: Iterable[MarketBar], *, now: datetime | None = None,
+    finalization_grace_seconds: float = 2.0, min_bars: int = 21,
+) -> list[MarketBar]:
+    """Exclude a still-forming MT5 bar before building a reference forecast snapshot."""
+    rows = validate_bar_series(bars, min_bars=1)
+    current = _as_utc(now or datetime.now(UTC))
+    if (isinstance(finalization_grace_seconds, bool)
+            or not isinstance(finalization_grace_seconds, (int, float))
+            or not math.isfinite(float(finalization_grace_seconds))
+            or not 0 <= float(finalization_grace_seconds) <= 60):
+        raise ValueError("finalization_grace_seconds must be finite and in [0,60]")
+    grace = timedelta(seconds=float(finalization_grace_seconds))
+    duration = forecast_bar_duration(rows[-1].timeframe)
+    completed = [bar for bar in rows if bar.time + duration + grace <= current]
+    if len(completed) < min_bars:
+        raise ValueError(
+            f"insufficient completed bars for forecast snapshot: need {min_bars}, received {len(completed)}"
+        )
+    return completed
+
+
+def build_next_bar_forecast_contract(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Specify the binary event independently of each agent's subjective verdict confidence."""
+    if not isinstance(snapshot, Mapping):
+        raise ValueError("market snapshot must be an object")
+    symbol = str(snapshot.get("symbol", "")).strip().upper()
+    timeframe = str(snapshot.get("timeframe", "")).strip().upper()
+    reference_at = snapshot.get("as_of")
+    reference_close = _finite_price(snapshot.get("last_close"), "reference_close")
+    if not symbol or not reference_at or reference_close <= 0:
+        raise ValueError("market snapshot cannot define a next-bar forecast target")
+    parsed_reference_at = datetime.fromisoformat(str(reference_at).replace("Z", "+00:00"))
+    if parsed_reference_at.tzinfo is None or parsed_reference_at.utcoffset() is None:
+        raise ValueError("forecast reference timestamp must include a timezone")
+    forecast_bar_duration(timeframe)
+    return {
+        "target_policy_version": "next-available-bar-close-above-reference-v1",
+        "target_event": "NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE",
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "reference_at": parsed_reference_at.astimezone(UTC).isoformat(),
+        "reference_close": reference_close,
+        "definition": (
+            "Outcome is 1 only when the close of the first persisted market bar whose "
+            "bar_time is strictly after the individual agent issue timestamp is greater "
+            "than reference_close; flat or lower closes are 0. A bar already opened before "
+            "the agent issued its forecast is never used. The target bar must be complete."
+        ),
+        "provenance_limit": (
+            "Resolution proves deterministic agreement with an immutable locally persisted "
+            "market bar; it does not independently authenticate broker-feed completeness or accuracy."
+        ),
+    }
 
 
 def build_market_snapshot(bars: Iterable[MarketBar], *, min_bars: int = 21) -> dict[str, Any]:
