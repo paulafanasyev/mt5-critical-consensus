@@ -65,6 +65,24 @@ async def test_market_history_agents_forecast_calibration_audit_and_kill_switch(
     assert collected["status"] == "READY_FOR_REVIEW"
     assert collected["trade_allowed"] is False
 
+    # The raw subjective confidence is captured at issue time, with its exact input
+    # hash, before an outcome exists. It is not promoted to a calibrated probability.
+    forecast_observations = [
+        {
+            "model_id": verdict["provider_identity"],
+            "signal_id": signal_id + "::" + verdict["verdict_id"],
+            "issued_at": verdict["created_at"],
+            "probability": verdict["confidence"],
+            "input_sha256": verdict["input_hash"],
+        }
+        for verdict in collected["verdicts"]
+    ]
+    captured = repo.record_forecasts(forecast_observations)
+    assert captured == {"inserted": 4, "identical_replays": 0, "total": 4}
+    assert repo.record_forecasts(forecast_observations) == {
+        "inserted": 0, "identical_replays": 4, "total": 4
+    }
+
     model_id = "synthetic-test-model-" + uuid.uuid4().hex[:8]
     csv_path = tmp_path / "resolved.csv"
     fields = ["model_id", "signal_id", "issued_at", "resolved_at", "probability", "outcome"]
