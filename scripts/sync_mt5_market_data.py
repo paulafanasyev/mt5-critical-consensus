@@ -131,7 +131,13 @@ def main() -> int:
         "ingestion": ingest,
         "forecast_resolution": resolution,
         "market_history_integrity": {
+            "status": (
+                "POTENTIAL_GAPS_REQUIRING_REVIEW"
+                if potential_gaps else "NO_SUSPICIOUS_GAPS_IN_SCANNED_WINDOW"
+            ),
             "bars_scanned": len(gap_scan_bars),
+            "scan_from_utc": gap_scan_bars[0].time.isoformat() if gap_scan_bars else None,
+            "scan_to_utc": gap_scan_bars[-1].time.isoformat() if gap_scan_bars else None,
             "scan_scope": (
                 "last_5000_persisted_bars_plus_new_closed_bars"
                 if existing else "initial_bootstrap_batch_only"
