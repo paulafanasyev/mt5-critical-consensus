@@ -109,3 +109,29 @@ def test_generated_demo_source_compiles_in_metaeditor(tmp_path):
     assert result["errors"] == 0
     assert Path(result["ex5"]).is_file()
     assert Path(result["ex5"]).stat().st_size > 0
+
+def test_compile_source_uses_documented_metaeditor_include_switch(tmp_path, monkeypatch):
+    builder = _builder()
+    source = tmp_path / "CriticalConsensusEA_Demo.mq5"
+    source.write_text("// test source", encoding="utf-8")
+    include_dir = tmp_path / "MQL5"
+    include_dir.mkdir()
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        source.with_suffix(".log").write_text(
+            "Result: 0 errors, 0 warnings, 1 ms elapsed\\n", encoding="utf-16"
+        )
+        source.with_suffix(".ex5").write_bytes(b"compiled-ex5")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(builder.subprocess, "run", fake_run)
+    result = builder.compile_source(
+        source, metaeditor=tmp_path / "metaeditor64.exe", include_dir=include_dir
+    )
+
+    assert result["errors"] == 0
+    assert f"/include:{include_dir}" in captured["args"]
+    assert not any(str(arg).startswith("/inc:") for arg in captured["args"])
+
