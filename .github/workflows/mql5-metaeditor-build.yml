@@ -80,25 +80,66 @@ jobs:
           "MetaEditor file version: $version"
           "MetaEditor file version: $version" >> $env:GITHUB_STEP_SUMMARY
 
-      - name: Generate and compile demo EA with MetaEditor
+      - name: Generate, compile and record demo EA provenance
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          python scripts/build_demo_ea.py --compile --metaeditor "$env:METAEDITOR_PATH" --include-dir "$env:MT5_INSTALL_DIR\MQL5" --out "artifacts\demo_ea"
-          if ($LASTEXITCODE -ne 0) {
+          New-Item -ItemType Directory -Path "artifacts\demo_ea" -Force | Out-Null
+          $buildOutput = python scripts/build_demo_ea.py --compile --metaeditor "$env:METAEDITOR_PATH" --include-dir "$env:MT5_INSTALL_DIR\MQL5" --out "artifacts\demo_ea"
+          $buildExit = $LASTEXITCODE
+          $buildText = ($buildOutput | Out-String).Trim()
+          if ($buildExit -ne 0) {
+            Write-Host $buildText
             throw "The demo EA generation or MetaEditor compilation failed."
           }
+          $buildResultPath = "artifacts\demo_ea\build-result.json"
+          $buildText | Set-Content -LiteralPath $buildResultPath -Encoding utf8
+          $buildResult = $buildText | ConvertFrom-Json
           $binary = "artifacts\demo_ea\CriticalConsensusEA_Demo.ex5"
           $source = "artifacts\demo_ea\CriticalConsensusEA_Demo.mq5"
           $log = "artifacts\demo_ea\CriticalConsensusEA_Demo.log"
-          foreach ($file in @($binary, $source, $log)) {
+          foreach ($file in @($binary, $source, $log, $buildResultPath)) {
             if (-not (Test-Path $file) -or (Get-Item $file).Length -eq 0) {
               throw "Expected build output is missing or empty: $file"
             }
           }
-          $hash = (Get-FileHash $binary -Algorithm SHA256).Hash
-          "Demo EA EX5 SHA-256: $hash" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          Get-Content $log -Tail 20
+          if ($buildResult.compiled -ne $true -or $buildResult.gate_enabled -ne $true -or $buildResult.errors -ne 0) {
+            throw "Build result does not prove a clean demo-enabled compilation."
+          }
+          $sourceText = Get-Content -LiteralPath $source -Raw
+          if ($sourceText -notmatch '(?m)^const bool ENABLE_DEMO_EXECUTION = true;) {
+            throw "Generated demo EA does not contain the expected single enabled demo gate."
+          }
+          if ($sourceText -notmatch '(?m)^input bool AllowLiveExecution = false;') {
+            throw "Generated EA does not keep live execution disabled by default."
+          }
+          $metaVersion = (Get-Item $env:METAEDITOR_PATH).VersionInfo.FileVersion
+          $resultLine = Get-Content -LiteralPath $log | Where-Object { $_ -match '^Result:' } | Select-Object -Last 1
+          if (-not $resultLine) { throw "MetaEditor result line is missing from the compiler log." }
+          $sourceHash = (Get-FileHash $source -Algorithm SHA256).Hash
+          $binaryHash = (Get-FileHash $binary -Algorithm SHA256).Hash
+          $logHash = (Get-FileHash $log -Algorithm SHA256).Hash
+          $manifest = [ordered]@{
+            schema_version = 1
+            source_commit = $env:GITHUB_SHA
+            workflow_run_id = $env:GITHUB_RUN_ID
+            metaeditor_version = $metaVersion
+            compiler_result_line = $resultLine
+            errors = [int]$buildResult.errors
+            warnings = [int]$buildResult.warnings
+            demo_execution_gate_enabled = [bool]$buildResult.gate_enabled
+            live_execution_default_disabled = $true
+            source_sha256 = $sourceHash
+            ex5_sha256 = $binaryHash
+            compiler_log_sha256 = $logHash
+            ex5_size_bytes = (Get-Item $binary).Length
+          }
+          $manifestPath = "artifacts\demo_ea\build-manifest.json"
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -Encoding utf8
+          "Demo EA EX5 SHA-256: $binaryHash" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "Build manifest:" | Add-Content $env:GITHUB_STEP_SUMMARY
+          Get-Content -LiteralPath $manifestPath | Add-Content $env:GITHUB_STEP_SUMMARY
+          Get-Content -LiteralPath $log -Tail 20
 
       - name: Upload compiled demo EA and compiler evidence
         uses: actions/upload-artifact@v4
@@ -108,5 +149,7 @@ jobs:
             artifacts/demo_ea/CriticalConsensusEA_Demo.mq5
             artifacts/demo_ea/CriticalConsensusEA_Demo.ex5
             artifacts/demo_ea/CriticalConsensusEA_Demo.log
+            artifacts/demo_ea/build-result.json
+            artifacts/demo_ea/build-manifest.json
           if-no-files-found: error
           retention-days: 14
