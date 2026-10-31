@@ -16,7 +16,7 @@ import yaml
 from critical_consensus.agent_runtime import collect_agent_verdicts
 from critical_consensus.decision_bundle import build_decision_bundle, write_decision_bundle
 from critical_consensus.pipeline import evaluate_signal_bundle
-from critical_consensus.market_data import build_market_snapshot
+from critical_consensus.market_data import (build_market_snapshot, build_next_bar_forecast_contract,\n                                            retain_completed_bars)
 from redis.asyncio import Redis
 
 from critical_consensus.persistence import PostgresRepository
@@ -33,7 +33,10 @@ async def run(args) -> int:
     repo = PostgresRepository()
     repo.migrate()
     bars = await asyncio.to_thread(repo.get_recent_market_bars, args.symbol, args.timeframe, args.bars)
+    # MT5 may return the still-forming current bar. Never use it as a reference close.
+    bars = retain_completed_bars(bars, min_bars=21)
     snapshot = build_market_snapshot(bars)
+    forecast_contract = build_next_bar_forecast_contract(snapshot)
     snapshot_hash = canonical_signal_hash(snapshot)
     source_registry = yaml.safe_load(
         (ROOT / "config" / "source_registry.yaml").read_text(encoding="utf-8")
@@ -75,6 +78,7 @@ async def run(args) -> int:
         "signal_id": signal_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "market_snapshot": snapshot,
+        "forecast_contract": forecast_contract,
         "source_documents": source_documents,
         "source_independence_groups": source_context.get("independence_groups", []),
         "available_evidence_refs": available_evidence_refs,
@@ -138,8 +142,15 @@ async def run(args) -> int:
                 "model_id": model_id,
                 "signal_id": signal_id + "::" + verdict_id,
                 "issued_at": verdict.get("created_at"),
-                "probability": verdict.get("confidence"),
+                "probability": verdict.get("next_bar_up_probability"),
                 "input_sha256": verdict.get("input_hash"),
+                "forecast_kind": "NEXT_BAR_MARKET_EVENT",
+                "target_policy_version": forecast_contract["target_policy_version"],
+                "target_event": forecast_contract["target_event"],
+                "symbol": forecast_contract["symbol"],
+                "timeframe": forecast_contract["timeframe"],
+                "reference_at": forecast_contract["reference_at"],
+                "reference_close": forecast_contract["reference_close"],
             })
     if forecast_records:
         try:
@@ -150,8 +161,12 @@ async def run(args) -> int:
                     "signal_id": observation["signal_id"],
                     "issued_at": observation["issued_at"],
                     "input_sha256": observation["input_sha256"],
-                    "meaning": "raw subjective confidence in this agent verdict; not calibrated",
-                    "persistence": "PERSISTED",
+                    "meaning": "probability of NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE; subjective verdict confidence is separate",
+                    "target_policy_version": forecast_contract["target_policy_version"],
+                    "target_event": forecast_contract["target_event"],
+                    "reference_at": forecast_contract["reference_at"],
+                    "reference_close": forecast_contract["reference_close"],
+                    "persistence": "PERSISTED_UNRESOLVED",
                 }
         except Exception as exc:
             result["status"] = "GATHER_MORE"
@@ -303,7 +318,7 @@ async def run(args) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--symbol", required=True)
-    parser.add_argument("--timeframe", required=True, choices=["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"])
+    parser.add_argument("--timeframe", required=True, choices=["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1"])
     parser.add_argument("--bars", type=int, default=200)
     parser.add_argument("--timeout", type=float, default=15.0)
     parser.add_argument("--review-cycle-timeout", type=float, default=120.0)
