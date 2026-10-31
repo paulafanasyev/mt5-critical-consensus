@@ -83,7 +83,19 @@ def _validate_result(
     if (event_probability is None or not math.isfinite(event_probability)
             or not 0 <= event_probability <= 1):
         blockers.append("OBJECTIVE_FORECAST_PROBABILITY_INVALID")
-    if result.get("forecast_contract") != signal.get("forecast_contract"):
+    expected_contract = signal.get("forecast_contract")
+    if (not isinstance(expected_contract, Mapping)
+            or expected_contract.get("target_policy_version") != "next-available-bar-close-above-reference-v1"
+            or expected_contract.get("target_event") != "NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE"
+            or not str(expected_contract.get("symbol", "")).strip()
+            or not str(expected_contract.get("timeframe", "")).strip()
+            or isinstance(expected_contract.get("reference_close"), bool)
+            or not isinstance(expected_contract.get("reference_close"), (int, float))
+            or not math.isfinite(float(expected_contract.get("reference_close")))
+            or float(expected_contract.get("reference_close")) <= 0
+            or not _valid_stamp(expected_contract.get("reference_at"))):
+        blockers.append("OBJECTIVE_FORECAST_CONTRACT_MISSING_OR_INVALID")
+    if result.get("forecast_contract") != expected_contract:
         blockers.append("OBJECTIVE_FORECAST_CONTRACT_MISMATCH")
     if str(result.get("verdict", "")).upper() not in {"APPROVE", "ABSTAIN", "REJECT", "VETO", "HOLD"}:
         blockers.append("VERDICT_INVALID")
