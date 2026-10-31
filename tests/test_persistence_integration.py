@@ -18,6 +18,17 @@ from critical_consensus.source_provenance import source_id_for_capture
 pytestmark = pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="TEST_DATABASE_URL not configured")
 
 
+def test_database_clock_returns_utc_time_and_session_timezone():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    clock = repo.get_database_clock()
+    assert isinstance(clock["now_utc"], datetime)
+    assert clock["now_utc"].tzinfo is not None
+    assert clock["now_utc"].utcoffset() == timedelta(0)
+    assert isinstance(clock["session_timezone"], str)
+    assert clock["session_timezone"].strip()
+
+
 def test_postgres_migrations_immutable_bars_and_idempotent_event():
     repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
     repo.migrate()
