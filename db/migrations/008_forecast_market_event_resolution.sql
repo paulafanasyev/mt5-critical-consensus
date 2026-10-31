@@ -138,17 +138,14 @@ BEGIN
        ) THEN
       RAISE EXCEPTION 'forecast resolution requires matching immutable market-bar evidence';
     END IF;
-    IF NEW.resolved_at < NEW.resolved_bar_time +
-       CASE NEW.timeframe
-         WHEN 'M1' THEN INTERVAL '1 minute'
-         WHEN 'M5' THEN INTERVAL '5 minutes'
-         WHEN 'M15' THEN INTERVAL '15 minutes'
-         WHEN 'M30' THEN INTERVAL '30 minutes'
-         WHEN 'H1' THEN INTERVAL '1 hour'
-         WHEN 'H4' THEN INTERVAL '4 hours'
-         WHEN 'D1' THEN INTERVAL '1 day'
-         WHEN 'W1' THEN INTERVAL '7 days'
-       END THEN
+    IF (NEW.timeframe = 'M1' AND NEW.resolved_at < NEW.resolved_bar_time + INTERVAL '1 minute')
+       OR (NEW.timeframe = 'M5' AND NEW.resolved_at < NEW.resolved_bar_time + INTERVAL '5 minutes')
+       OR (NEW.timeframe = 'M15' AND NEW.resolved_at < NEW.resolved_bar_time + INTERVAL '15 minutes')
+       OR (NEW.timeframe = 'M30' AND NEW.resolved_at < NEW.resolved_bar_time + INTERVAL '30 minutes')
+       OR (NEW.timeframe = 'H1' AND NEW.resolved_at < NEW.resolved_bar_time + INTERVAL '1 hour')
+       OR (NEW.timeframe = 'H4' AND NEW.resolved_at < NEW.resolved_bar_time + INTERVAL '4 hours')
+       OR (NEW.timeframe = 'D1' AND NEW.resolved_at < NEW.resolved_bar_time + INTERVAL '1 day')
+       OR (NEW.timeframe = 'W1' AND NEW.resolved_at < NEW.resolved_bar_time + INTERVAL '7 days') THEN
       RAISE EXCEPTION 'target market bar is not yet complete';
     END IF;
   END IF;
