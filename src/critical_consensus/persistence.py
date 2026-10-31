@@ -595,21 +595,19 @@ class PostgresRepository:
         """Attempt due outcomes without assigning labels to missing or incomplete bars."""
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 5000:
             raise ValueError("limit must be an integer in [1,5000]")
-        clauses = ["forecast_kind='NEXT_BAR_MARKET_EVENT'", "outcome IS NULL"]
-        params: list[Any] = []
-        if symbol:
-            clauses.append("symbol=%s")
-            params.append(str(symbol).strip().upper())
-        if timeframe:
-            timeframe_value = str(timeframe).strip().upper()
+        symbol_value = str(symbol).strip().upper() if symbol else None
+        timeframe_value = str(timeframe).strip().upper() if timeframe else None
+        if timeframe_value:
             forecast_bar_duration(timeframe_value)
-            clauses.append("timeframe=%s")
-            params.append(timeframe_value)
-        params.append(limit)
-        query = (
-            "SELECT model_id, signal_id FROM forecast_predictions WHERE "
-            + " AND ".join(clauses)
-            + " ORDER BY issued_at, model_id, signal_id LIMIT %s"
+        query = """SELECT model_id, signal_id
+                   FROM forecast_predictions
+                   WHERE forecast_kind=%s AND outcome IS NULL
+                     AND (%s IS NULL OR symbol=%s)
+                     AND (%s IS NULL OR timeframe=%s)
+                   ORDER BY issued_at, model_id, signal_id LIMIT %s"""
+        params = (
+            "NEXT_BAR_MARKET_EVENT", symbol_value, symbol_value,
+            timeframe_value, timeframe_value, limit,
         )
         with self._connect() as conn:
             rows = conn.execute(query, tuple(params)).fetchall()
