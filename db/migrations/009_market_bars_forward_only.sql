@@ -3,6 +3,8 @@
 CREATE OR REPLACE FUNCTION reject_late_market_bar_insert()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+  PERFORM pg_advisory_xact_lock(hashtext(NEW.symbol), hashtext(NEW.timeframe));
+
   IF EXISTS (
     SELECT 1 FROM market_bars
     WHERE symbol = NEW.symbol
