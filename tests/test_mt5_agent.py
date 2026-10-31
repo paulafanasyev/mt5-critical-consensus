@@ -891,6 +891,155 @@ def test_bound_fill_refuses_a_fill_sitting_exactly_on_the_stop():
     assert final is None and info["stop_distance_at_fill"] == 0.0
 
 
+class _MovingQuote(FakeBackend):
+    """The quote the signal saw and the quote a fill would get are not the same market."""
+
+    tick_calls = 0
+    shift = 0.00010
+
+    def tick(self, symbol: str) -> Tick:
+        tick = super().tick(symbol)
+        self.tick_calls += 1
+        if self.tick_calls < 2:
+            return tick
+        return Tick(symbol=tick.symbol, bid=tick.bid + self.shift, ask=tick.ask + self.shift,
+                    server_time=tick.server_time,
+                    server_utc_offset_seconds=tick.server_utc_offset_seconds)
+
+
+def _observed_trade(backend: FakeBackend, **overrides):
+    """A cycle that stops at the signal — the state an external executor starts from."""
+    agent = agent_for(backend, make_policy(mode="observe", **overrides))
+    result = agent.run_cycle()
+    assert result.status == STATUS_OBSERVED, result.blockers
+    assert result.proposal is not None and result.sizing is not None
+    return agent, result.proposal, result.sizing
+
+
+def test_post_approval_gates_accept_the_trade_the_cycle_just_produced():
+    backend = FakeBackend()
+    agent, proposal, sizing = _observed_trade(backend)
+    blockers, info = agent.post_approval_gates(proposal, sizing)
+    assert blockers == ()
+    assert info["fill_price"] == pytest.approx(proposal["entry_price"])
+    assert info["final_volume"] == pytest.approx(sizing["volume"])
+    assert info["final_risk_value"] <= sizing["risk_value"] + 1e-9
+    assert backend.calls.count("account") >= 1 and backend.calls.count("tick") >= 2
+
+
+def test_post_approval_gates_journal_nothing(tmp_path):
+    backend = FakeBackend()
+    journal = DecisionJournal(tmp_path / "gates.db")
+    agent = MT5Agent(backend=backend, policy=make_policy(mode="observe"), journal=journal,
+                     clock=lambda: backend.clock)
+    result = agent.run_cycle()
+    before = len(journal.events(limit=None, event_type="agent_cycle"))
+    agent.post_approval_gates(result.proposal, result.sizing)
+    assert len(journal.events(limit=None, event_type="agent_cycle")) == before
+    journal.close()
+
+
+def test_post_approval_gates_refuse_a_market_that_moved_past_the_approved_entry():
+    backend = _MovingQuote()
+    backend.shift = 0.0005
+    agent, proposal, sizing = _observed_trade(backend)
+    blockers, info = agent.post_approval_gates(proposal, sizing)
+    assert blockers == ("PRICE_MOVED_DURING_CONFIRMATION",)
+    assert info["max_slippage"] == pytest.approx(proposal["risk_distance"] * 0.10)
+
+
+def test_post_approval_gates_re_size_for_a_small_move_without_raising_the_lot():
+    backend = _MovingQuote()
+    backend.shift = 0.00010
+    agent, proposal, sizing = _observed_trade(backend)
+    blockers, info = agent.post_approval_gates(proposal, sizing)
+    assert blockers == ()
+    assert info["final_volume"] <= sizing["volume"]
+    assert info["slippage"] == pytest.approx(0.00010)
+
+
+def test_post_approval_gates_refuse_a_quote_that_went_stale_after_the_signal():
+    backend = FakeBackend()
+    agent, proposal, sizing = _observed_trade(backend)
+    backend.quote_offset_seconds = 60.0
+    assert agent.post_approval_gates(proposal, sizing)[0] == ("QUOTE_STALE",)
+
+
+def test_post_approval_gates_refuse_a_spread_that_widened_after_the_signal():
+    backend = FakeBackend()
+    agent, proposal, sizing = _observed_trade(backend)
+    tight = agent_for(backend, make_policy(mode="observe", **{"risk__max_spread_points": 5}))
+    assert tight.post_approval_gates(proposal, sizing)[0] == ("SPREAD_ABOVE_LIMIT",)
+
+
+def test_post_approval_gates_refuse_when_the_kill_switch_is_active():
+    backend = FakeBackend()
+    agent, proposal, sizing = _observed_trade(backend)
+    halted = agent_for(backend, make_policy(mode="observe", **{"kill_switch__active": True,
+                                                               "kill_switch__reason": "manual"}))
+    assert halted.post_approval_gates(proposal, sizing)[0] == ("KILL_SWITCH_ACTIVE",)
+    assert backend.calls.count("account") == 1
+
+
+def test_post_approval_gates_refuse_when_the_window_closed_after_the_signal():
+    backend = FakeBackend()
+    agent, proposal, sizing = _observed_trade(backend)
+    closed = agent_for(backend, make_policy(mode="observe",
+                                            **{"schedule__window_start_minute_utc": 0,
+                                               "schedule__window_end_minute_utc": 1}))
+    assert closed.post_approval_gates(proposal, sizing)[0] == ("OUTSIDE_TRADING_WINDOW",)
+
+
+def test_post_approval_gates_refuse_a_position_the_signal_did_not_see():
+    backend = FakeBackend()
+    agent, proposal, sizing = _observed_trade(backend)
+    backend.open_positions = [PositionSnapshot(ticket=9, symbol="EURUSD", direction="BUY",
+                                               volume=0.1, entry_price=1.2, stop_loss=1.19,
+                                               take_profit=1.25,
+                                               open_time=datetime(2026, 1, 10, tzinfo=UTC))]
+    blockers, info = agent.post_approval_gates(proposal, sizing)
+    assert {"POSITION_CAP_REACHED", "SYMBOL_ALREADY_OPEN"} <= set(blockers)
+    assert info["open_positions"] == 1
+
+
+def test_post_approval_gates_count_a_loss_banked_after_the_signal():
+    backend = FakeBackend()
+    agent, proposal, sizing = _observed_trade(backend)
+    backend.realized_daily_pnl = -200.0
+    assert agent.post_approval_gates(proposal, sizing)[0] \
+        == ("REALIZED_DAILY_LOSS_LIMIT_REACHED",)
+
+
+def test_post_approval_gates_check_the_broker_stops_level_at_the_fill():
+    backend = FakeBackend()
+    agent, proposal, sizing = _observed_trade(backend)
+    # The broker widened its stops level between the signal and the send: the approved stop and
+    # target are now both unexecutable, and only a check at the fill can see it.
+    backend.symbol_specs["EURUSD"] = replace(SPEC, stops_level_points=700)
+    blockers, _info = agent.post_approval_gates(proposal, sizing)
+    assert set(blockers) == {"STOP_INSIDE_BROKER_STOPS_LEVEL", "TARGET_INSIDE_BROKER_STOPS_LEVEL"}
+
+
+def test_post_approval_gates_refuse_a_broken_proposal():
+    backend = FakeBackend()
+    agent, proposal, sizing = _observed_trade(backend)
+    assert agent.post_approval_gates({"direction": "BUY"}, {})[0] == ("PROPOSAL_UNREADABLE",)
+    assert agent.post_approval_gates(proposal, {"volume": "0.05"})[0] == ("PROPOSAL_UNREADABLE",)
+    assert agent.post_approval_gates({**proposal, "evaluated_at": "yesterday"}, sizing)[0] \
+        == ("PROPOSAL_UNREADABLE",)
+    assert agent.post_approval_gates({**proposal, "direction": "HOLD"}, sizing)[0] \
+        == ("PROPOSAL_UNREADABLE",)
+    assert agent.post_approval_gates({**proposal, "symbol": "GBPUSD"}, sizing)[0] \
+        == ("PROPOSAL_SYMBOL_MISMATCH",)
+
+
+def test_post_approval_gates_refuse_a_live_account_identity():
+    backend = FakeBackend()
+    agent, proposal, sizing = _observed_trade(backend)
+    backend.account_info = replace(backend.account_info, trade_mode="real")
+    assert agent.post_approval_gates(proposal, sizing)[0] == ("ACCOUNT_NOT_DEMO",)
+
+
 def test_journal_detects_tampering(tmp_path):
     journal = DecisionJournal(tmp_path / "journal.db")
     journal.record("agent_cycle", {"status": "OBSERVED"})

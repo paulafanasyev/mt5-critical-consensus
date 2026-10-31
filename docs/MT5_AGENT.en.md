@@ -163,8 +163,14 @@ Gates that must all hold before a command exists:
    (`account.require_demo: true`), and `expected_login`/`expected_server` must match.
 2. The policy mode must be `paper` (or `observe`), and `auto` is impossible without the demo
    requirement.
-3. The quote is re-read before a command is built: entry, stop/target geometry, the broker
-   `stops_level`, spread and tick age are all checked against fresh data.
+3. The quote is re-read twice. Before anyone is asked, entry, stop/target geometry, the broker
+   `stops_level`, the volume cap and available margin are checked against fresh data. After the
+   answer, `MT5Agent.post_approval_gates` re-reads the terminal and applies the whole set a paper
+   fill gets — the kill switch, account identity, equity and daily-loss baselines, the trading
+   window and the blackout, the position cap and the open book, quote age, spread, the slippage
+   bound against the approved entry, risk/reward at the fill, the re-sized lot, margin and the
+   stops level — and the command is built from the price and the lot those gates return, never
+   from the pre-approval quote.
 4. Volume must sit inside the broker's `volume_min`/`volume_step`/`volume_max`, below
    `--max-volume` (at most 0.20) and inside available margin; the advisor's own `MaxVolume` input
    is 0.20 as well.

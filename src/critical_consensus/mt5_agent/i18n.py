@@ -136,6 +136,10 @@ CODE_LABELS: dict[str, tuple[str, str, str]] = {
         "Предложение относится к другому инструменту и не может быть отправлено",
         "The proposal belongs to another instrument and cannot be sent",
         "Đề xuất thuộc về một mã khác và không thể được gửi"),
+    "PROPOSAL_UNREADABLE": (
+        "В предложении нет полей, из которых собирается ордер",
+        "The proposal lacks the fields an order is built from",
+        "Đề xuất thiếu các trường để dựng một lệnh"),
     "RISK_REWARD_BELOW_MINIMUM": ("Соотношение прибыль/риск ниже минимума",
                                   "Reward-to-risk is below the policy minimum",
                                   "Tỷ lệ lợi nhuận/rủi ro dưới mức tối thiểu"),

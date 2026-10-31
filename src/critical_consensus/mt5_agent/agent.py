@@ -120,6 +120,62 @@ def _realized_daily_loss(backend: MT5Backend) -> float | None:
     return -value if value < 0 else 0.0
 
 
+def _iso_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None else None
+
+
+def _proposal_from_dict(raw: Mapping[str, Any]) -> Proposal | None:
+    """Rebuild the proposal its own cycle journaled; a missing field is a broken input."""
+    symbol, timeframe, direction = (raw.get(key) for key in ("symbol", "timeframe", "direction"))
+    if not isinstance(symbol, str) or not isinstance(timeframe, str) \
+            or direction not in ("BUY", "SELL"):
+        return None
+    evaluated_at = _iso_datetime(raw.get("evaluated_at"))
+    prices = [_number(raw.get(key)) for key in ("entry_price", "stop_loss", "take_profit",
+                                               "risk_distance", "reward_distance", "risk_reward",
+                                               "atr", "confidence")]
+    reasons = raw.get("reasons")
+    if evaluated_at is None or any(price is None for price in prices) \
+            or not isinstance(reasons, (list, tuple)) \
+            or not all(isinstance(reason, str) for reason in reasons):
+        return None
+    return Proposal(symbol=symbol, timeframe=timeframe, direction=direction,
+                    evaluated_at=evaluated_at, entry_price=prices[0], stop_loss=prices[1],
+                    take_profit=prices[2], risk_distance=prices[3], reward_distance=prices[4],
+                    risk_reward=prices[5], atr=prices[6], confidence=prices[7],
+                    reasons=tuple(reasons))
+
+
+def _sized_order_from_dict(raw: Mapping[str, Any]) -> SizedOrder | None:
+    fields = [_number(raw.get(key)) for key in ("volume", "risk_value", "risk_fraction",
+                                                "risk_per_lot", "margin_required")]
+    if any(field is None for field in fields) or fields[0] <= 0:
+        return None
+    return SizedOrder(*[float(field) for field in fields])
+
+
+def _fill_geometry_blockers(trade: Proposal, fill: float, spec: SymbolSpec) -> tuple[str, ...]:
+    """At the price the broker would actually fill at, the order must still be executable."""
+    blockers: list[str] = []
+    if trade.direction == "BUY" and not trade.stop_loss < fill < trade.take_profit:
+        blockers.append(codes.BUY_GEOMETRY_INVALID)
+    elif trade.direction == "SELL" and not trade.take_profit < fill < trade.stop_loss:
+        blockers.append(codes.SELL_GEOMETRY_INVALID)
+    stops = spec.stops_level_points
+    if stops:
+        if abs(fill - trade.stop_loss) / spec.point < stops:
+            blockers.append(codes.STOP_INSIDE_BROKER_STOPS_LEVEL)
+        if abs(trade.take_profit - fill) / spec.point < stops:
+            blockers.append(codes.TARGET_INSIDE_BROKER_STOPS_LEVEL)
+    return tuple(blockers)
+
+
 def _position_stop_risk(spec: SymbolSpec, position: PositionSnapshot) -> float | None:
     """Account-currency loss if this position's stop is taken, or ``None`` when unmeasurable."""
     if position.stop_loss <= 0:
@@ -311,22 +367,123 @@ class MT5Agent:
                                          open_positions=len(positions),
                                          extra={"requote": requote_info})
 
+    def post_approval_gates(self, proposal: Mapping[str, Any],
+                            sizing: Mapping[str, Any]) -> tuple[tuple[str, ...], dict[str, Any]]:
+        """Re-run every gate on a trade an external executor is about to send.
+
+        ``run_cycle`` stops at ``STATUS_OBSERVED`` for a policy that never opens a paper
+        position, so the requote and re-binding a paper fill gets would otherwise never reach
+        a broker order. This is the same check, called with the proposal and sizing dicts the
+        cycle just handed out: it re-reads the terminal, refuses a moved or unaffordable
+        market, and returns the price and volume the command may carry. It journals nothing —
+        the executor owns the audit trail of its own command.
+
+        ``({}, info)`` means the trade is still valid at ``info["fill_price"]`` for
+        ``info["final_volume"]``; a non-empty blocker tuple means it must not be sent.
+        """
+        policy = self._policy
+        # Tick values and stops levels move between reads; a cached spec is only valid for the
+        # cycle that read it.
+        self._spec_cache.clear()
+        moment = self._clock()
+        if not isinstance(moment, datetime) or moment.tzinfo is None or moment.utcoffset() is None:
+            return (codes.CLOCK_NOT_UTC_AWARE,), {}
+        moment = moment.astimezone(UTC)
+        if policy.kill_switch_active:
+            return (codes.KILL_SWITCH_ACTIVE,), {}
+
+        trade = _proposal_from_dict(proposal)
+        approved = _sized_order_from_dict(sizing)
+        if trade is None or approved is None:
+            return (codes.PROPOSAL_UNREADABLE,), {}
+        if trade.symbol != policy.symbol:
+            return (codes.PROPOSAL_SYMBOL_MISMATCH,), {}
+
+        blockers: list[str] = []
+        account, code, _exc = self._account_read()
+        if account is None:
+            return (code,), {}
+        blockers.extend(self._identity_blockers(account))
+
+        equity = account.equity
+        limits = _equity_limits(self._backend, equity)
+        if limits is None:
+            return (codes.EQUITY_BASELINES_UNAVAILABLE,), {}
+        day_start, peak = limits
+        daily_budget = day_start * policy.risk.max_daily_loss_fraction
+        if (day_start - equity) >= daily_budget:
+            blockers.append(codes.DAILY_LOSS_LIMIT_REACHED)
+        realized_loss = _realized_daily_loss(self._backend)
+        if realized_loss is None:
+            return (codes.EQUITY_BASELINES_UNAVAILABLE,), {}
+        if realized_loss >= daily_budget:
+            blockers.append(codes.REALIZED_DAILY_LOSS_LIMIT_REACHED)
+        if (peak - equity) >= peak * policy.risk.max_drawdown_fraction:
+            blockers.append(codes.DRAWDOWN_LIMIT_REACHED)
+        if not policy.window.contains(moment):
+            blockers.append(codes.OUTSIDE_TRADING_WINDOW)
+        blackout = policy.blackout_blocker(moment)
+        if blackout:
+            blockers.append(blackout)
+        if blockers:
+            return (tuple(sorted(set(blockers))), {})
+
+        positions, code, _exc = self._positions_read()
+        if positions is None:
+            return (code,), {}
+        cap_blockers = self._position_cap_blockers(positions)
+        if cap_blockers:
+            return (cap_blockers, {"open_positions": len(positions)})
+
+        requote_blockers, fresh_tick, fill_spec = self._requote(moment)
+        if requote_blockers:
+            return requote_blockers, {}
+        assert fresh_tick is not None and fill_spec is not None
+
+        risk_blockers = self._open_book_blockers(positions, equity=equity,
+                                                 daily_budget=daily_budget,
+                                                 realized_loss=realized_loss)
+        if risk_blockers:
+            return (risk_blockers, {"open_positions": len(positions)})
+
+        fill_blockers, final_order, info = self._bound_fill(
+            proposal=trade, approved=approved, tick=fresh_tick, spec=fill_spec,
+            risk_equity=min(equity, account.balance), leverage=account.leverage,
+            margin_available=account.margin_free,
+            open_stop_risk=self._aggregate_stop_risk(positions), daily_budget=daily_budget,
+            realized_loss=realized_loss)
+        info["open_positions"] = len(positions)
+        if fill_blockers:
+            return (fill_blockers, info)
+        assert final_order is not None
+        geometry_blockers = _fill_geometry_blockers(trade, float(info["fill_price"]), fill_spec)
+        if geometry_blockers:
+            return (geometry_blockers, info)
+        info["final_risk_fraction"] = final_order.risk_fraction
+        return ((), info)
+
     # ------------------------------------------------------------------ helpers
     def _finish_blocked(self, moment: datetime, code: str, exc: Exception,
                         equity: float | None = None) -> CycleResult:
         return self._finish(codes.STATUS_BLOCKED, (code,), None, None, None, moment,
                             equity=equity, extra={"error_kind": type(exc).__name__})
 
-    def _read_account(self, moment: datetime) -> AccountInfo | CycleResult:
+    def _account_read(self) -> tuple[AccountInfo | None, str, Exception | None]:
         try:
             account = self._backend.account()
         except Exception as exc:  # a terminal that will not answer must not trade
-            return self._finish_blocked(moment, codes.ACCOUNT_READ_FAILED, exc)
+            return None, codes.ACCOUNT_READ_FAILED, exc
         if not isinstance(account, AccountInfo):
             # A backend that answers with None or a dict is broken, not flat: journal the
             # failure instead of crashing on the first attribute read.
-            return self._finish_blocked(moment, codes.ACCOUNT_READ_FAILED,
-                                        TypeError("backend.account() must return AccountInfo"))
+            return None, codes.ACCOUNT_READ_FAILED, \
+                TypeError("backend.account() must return AccountInfo")
+        return account, "", None
+
+    def _read_account(self, moment: datetime) -> AccountInfo | CycleResult:
+        account, code, exc = self._account_read()
+        if account is None:
+            return self._finish_blocked(moment, code, exc)
         return account
 
     def _identity_blockers(self, account: AccountInfo) -> list[str]:
@@ -348,25 +505,32 @@ class MT5Agent:
             blockers.append(codes.ACCOUNT_LEVERAGE_INVALID)
         return blockers
 
-    def _read_positions(self, moment: datetime) -> list[PositionSnapshot] | CycleResult | None:
+    def _positions_read(self) -> tuple[list[PositionSnapshot] | None, str, Exception | None]:
         try:
             positions = self._backend.positions()
         except Exception as exc:
-            return self._finish_blocked(moment, codes.POSITION_READ_FAILED, exc)
+            return None, codes.POSITION_READ_FAILED, exc
         if positions is None:
             # "The terminal did not answer" and "the account is flat" are different facts; only
             # the second one may release the position cap.
-            return self._finish(codes.STATUS_BLOCKED, (codes.POSITION_CAP_COUNT_UNKNOWN,), None,
-                                None, None, moment)
+            return None, codes.POSITION_CAP_COUNT_UNKNOWN, None
         if not isinstance(positions, (list, tuple)):
-            return self._finish(codes.STATUS_BLOCKED, (codes.POSITION_READ_FAILED,), None, None,
-                                None, moment)
+            return None, codes.POSITION_READ_FAILED, \
+                TypeError("backend.positions() must return a list")
         if not all(isinstance(position, PositionSnapshot) for position in positions):
             # Iterating a list of dicts would raise AttributeError after the cap was already
             # evaluated; a malformed position list is an unreadable book.
-            return self._finish(codes.STATUS_BLOCKED, (codes.POSITION_READ_FAILED,), None, None,
-                                None, moment)
-        return list(positions)
+            return None, codes.POSITION_READ_FAILED, \
+                TypeError("backend.positions() must return PositionSnapshot objects")
+        return list(positions), "", None
+
+    def _read_positions(self, moment: datetime) -> list[PositionSnapshot] | CycleResult | None:
+        positions, code, exc = self._positions_read()
+        if positions is None:
+            if exc is not None:
+                return self._finish_blocked(moment, code, exc)
+            return self._finish(codes.STATUS_BLOCKED, (code,), None, None, None, moment)
+        return positions
 
     def _position_cap_blockers(self, positions: list[PositionSnapshot]) -> tuple[str, ...]:
         cap = self._policy.risk.max_open_positions

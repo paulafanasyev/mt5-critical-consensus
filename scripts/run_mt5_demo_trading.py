@@ -11,9 +11,12 @@ reconciliation.
 Hard gates before a command is built: the terminal account must be demo, the policy
 must require a demo account, the fresh quote must still match the approved entry,
 geometry and broker stops levels must hold, the volume must be inside the broker's
-step/min/max and the runner's cap, and the margin must be funded. The EA independently
-re-checks every one of those plus the kill switch, the TTL and its own compile-time
-demo gate.
+step/min/max and the runner's cap, and the margin must be funded. After the operator
+answers, the agent's own post-approval gates are re-run on the proposal — quote age,
+spread, slippage bound, risk/reward at the fill, re-sizing and the additive daily
+budget — and the command carries the price and volume those gates produced. The EA
+independently re-checks every one of those plus the kill switch, the TTL and its own
+compile-time demo gate.
 """
 from __future__ import annotations
 
@@ -70,6 +73,11 @@ STATE_UNCONFIRMED = "UNCONFIRMED"
 STATE_REFUSED = "REFUSED"
 STATE_DUPLICATE = "DUPLICATE"
 STATE_STOPPED = "STOPPED"
+
+# ``MT5Agent.post_approval_gates``: proposal and sizing dicts in, blockers and the fill the
+# command may carry out. An executor built without it cannot send anything.
+PostApprovalGates = Callable[[Mapping[str, Any], Mapping[str, Any]],
+                             tuple[tuple[str, ...], Mapping[str, Any]]]
 
 
 # --------------------------------------------------------------------- identities
@@ -388,6 +396,7 @@ class DemoExecutor:
 
     def __init__(self, *, queue: Any, journal: DecisionJournal, terminal: Any,
                  policy: AgentPolicy, language: str, run_id: str,
+                 post_approval_gates: PostApprovalGates,
                  symbol: str | None = None,
                  ttl_seconds: int = DEFAULT_TTL_SECONDS,
                  fill_timeout_seconds: int = 30, poll_seconds: float = 1.0,
@@ -406,6 +415,7 @@ class DemoExecutor:
         self._symbol = str(symbol or policy.symbol).upper()
         self._language = language
         self._run_id = run_id
+        self._gates = post_approval_gates
         self._ttl = ttl_seconds
         self._fill_timeout = fill_timeout_seconds
         self._poll = poll_seconds
@@ -463,12 +473,12 @@ class DemoExecutor:
                            reason=describe(codes.MARKET_DATA_READ_FAILED, self._language)))
             return self._outcome(STATE_REFUSED, reason=codes.MARKET_DATA_READ_FAILED,
                                  broker_order_sent=False)
-        volume = float(sizing["volume"])
+        proposed_volume = float(sizing["volume"])
         live, blockers = price_gates(proposal, tick, spec,
                                      max_slippage_points=self._max_slippage)
-        blockers.extend(volume_gates(volume, spec, max_volume=self._max_volume))
+        blockers.extend(volume_gates(proposed_volume, spec, max_volume=self._max_volume))
         try:
-            margin = spec.margin_requirement(volume, account.leverage, live)
+            margin = spec.margin_requirement(proposed_volume, account.leverage, live)
         except ValueError:
             margin = math.inf
         if margin > account.margin_free:
@@ -489,13 +499,34 @@ class DemoExecutor:
             return self._outcome(STATE_REFUSED, reason=codes.OPERATOR_DECLINED,
                                  broker_order_sent=False)
 
+        gate_blockers, gate_info = self._gates(proposal, sizing)
+        blockers = tuple(sorted(set(gate_blockers)))
+        fill_price = _number(gate_info.get("fill_price"))
+        final_volume = _number(gate_info.get("final_volume"))
+        if not blockers and (fill_price is None or final_volume is None):
+            # A gate that passes without naming a price and a lot has handed the order builder
+            # nothing to build from; that is a broken input, not a licence to reuse the
+            # pre-approval quote the operator was shown.
+            blockers = (codes.PROPOSAL_UNREADABLE,)
+        if not blockers:
+            # The demo cap and the broker's step are the runner's own promise, so they are
+            # checked against the lot the agent finally sized, not the one the cycle proposed.
+            blockers = tuple(sorted(set(volume_gates(final_volume, spec,
+                                                     max_volume=self._max_volume))))
+        if blockers:
+            reason = ",".join(blockers)
+            self._say(text("runner.refused", self._language,
+                           reason=", ".join(describe(code, self._language) for code in blockers)))
+            return self._outcome(STATE_REFUSED, reason=reason, broker_order_sent=False)
+
         command_id = uuid.uuid4().hex
-        order_id = client_order_id_for(self._run_id, proposal, volume)
+        order_id = client_order_id_for(self._run_id, proposal, final_volume)
         command = build_command(
             command_id=command_id, client_order_id=order_id,
             permission_id=permission_id_for(self._run_id, self._policy.version),
             signal_id=signal_id_for(proposal), instrument=self._symbol,
-            direction=str(proposal["direction"]), size=volume, expected_price=live,
+            direction=str(proposal["direction"]), size=final_volume,
+            expected_price=float(fill_price),
             sl=float(proposal["stop_loss"]), tp=float(proposal["take_profit"]),
             user_decision_id=decision_id_for(command_id, "APPROVE"),
             now=now, ttl_seconds=self._ttl)
@@ -521,12 +552,15 @@ class DemoExecutor:
             else "OPERATOR",
             "execution_mode": self._policy.execution_mode,
             "bridge_base_url": getattr(self._queue, "base_url", ""),
+            # What the agent's post-approval gates measured at the moment of sending: the fill
+            # the command prices from, the lot it re-sized to, and the risk that lot carries.
+            "post_approval_gates": dict(gate_info),
             "broker_order_sent": False,
             "stage": "queued",
         })
         self._say(text("runner.queued", self._language, command_id=command_id,
                        direction=str(proposal["direction"]), symbol=str(proposal["symbol"]),
-                       volume=f"{volume:.2f}"))
+                       volume=f"{final_volume:.2f}"))
 
         if not self._wait_for_serve(command):
             self._say(text("runner.expired", self._language))
@@ -770,14 +804,15 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
                 approver = _make_approver(language=language, state=operator_state,
                                           digits=specs[symbol].digits, out=sys.stderr,
                                           source=sys.stdin)
+            agent = MT5Agent(backend=terminal, policy=per_policy, journal=journal)
             executor = DemoExecutor(queue=bridge, journal=journal, terminal=terminal,
                                     policy=per_policy, language=language, run_id=run_id,
+                                    post_approval_gates=agent.post_approval_gates,
                                     symbol=symbol, ttl_seconds=args.ttl_seconds,
                                     fill_timeout_seconds=args.fill_timeout,
                                     max_volume=args.max_volume, approver=approver,
                                     operator_state=operator_state)
-            agents[symbol] = (MT5Agent(backend=terminal, policy=per_policy, journal=journal),
-                              executor)
+            agents[symbol] = (agent, executor)
         try:
             bridge.start()
         except OSError as exc:

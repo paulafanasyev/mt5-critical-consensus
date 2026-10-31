@@ -142,7 +142,16 @@ def proposal(*, direction: str = "BUY", entry: float = 1.10000, sl: float = 1.09
 
 def sizing(volume: float = 0.05, equity: float = 10_000.0) -> dict:
     return {"volume": volume, "risk_value": volume * 100.0, "risk_fraction": 0.0005,
-            "risk_per_lot": 100.0, "equity": equity}
+            "risk_per_lot": 100.0, "margin_required": volume * 4000.0, "equity": equity}
+
+
+def pass_gates(terminal: FakeTerminal) -> runner.PostApprovalGates:
+    """Stand in for ``MT5Agent.post_approval_gates``: the market has not moved since the signal."""
+    def gates(proposal, sizing):
+        tick = terminal.tick(str(proposal["symbol"]))
+        return (), {"fill_price": tick.ask if proposal["direction"] == "BUY" else tick.bid,
+                    "final_volume": float(sizing["volume"])}
+    return gates
 
 
 def entry_deal(*, order_id: str, magic: int = runner.MAGIC_NUMBER, symbol: str = "EURUSD",
@@ -167,6 +176,7 @@ def make_executor(*, journal: DecisionJournal, queue: FakeQueue | None = None,
                   clock: Clock | None = None, fill_timeout: int = 5,
                   max_volume: float = runner.MAX_DEMO_VOLUME, out=None,
                   language: str = "ru", ttl: int = 60,
+                  gates: runner.PostApprovalGates | None = None,
                   symbol: str | None = None) -> tuple[runner.DemoExecutor,
                                                       FakeQueue, FakeTerminal, Clock]:
     clock = clock or Clock()
@@ -177,6 +187,7 @@ def make_executor(*, journal: DecisionJournal, queue: FakeQueue | None = None,
         policy=policy or make_policy(execution_mode="auto"), language=language,
         run_id="run-1", symbol=symbol, ttl_seconds=ttl, fill_timeout_seconds=fill_timeout,
         poll_seconds=1.0, max_volume=max_volume, approver=approver,
+        post_approval_gates=gates or pass_gates(terminal),
         operator_state=state, clock=clock, sleep=clock.sleep, out=out)
     return executor, queue, terminal, clock
 
@@ -400,6 +411,79 @@ def test_a_duplicate_id_stops_the_run_and_claims_neither_fill_nor_failure(journa
     assert outcome.queued is False
     assert outcome.stop_run and outcome.requires_reconciliation
     assert [p["broker_order_sent"] for p in payloads(journal, runner.OUTCOME_EVENT)] == [None]
+
+
+# ------------------------------------------------------------- post-approval gates
+def test_gate_blockers_refuse_before_the_command_is_queued(journal):
+    executor, queue, _, _ = make_executor(journal=journal,
+                                          gates=lambda _p, _s: (("QUOTE_STALE",), {}))
+    outcome = executor.offer(proposal(), sizing())
+    assert outcome.state == runner.STATE_REFUSED and outcome.reason == codes.QUOTE_STALE
+    assert outcome.queued is False and queue.commands == []
+    assert payloads(journal, runner.COMMAND_EVENT) == []
+    assert [p["broker_order_sent"] for p in payloads(journal, runner.OUTCOME_EVENT)] == [False]
+
+
+def test_a_gate_that_passes_without_naming_a_fill_is_a_refusal(journal):
+    executor, queue, _, _ = make_executor(journal=journal, gates=lambda _p, _s: ((), {}))
+    outcome = executor.offer(proposal(), sizing())
+    assert outcome.state == runner.STATE_REFUSED
+    assert outcome.reason == codes.PROPOSAL_UNREADABLE
+    assert queue.commands == []
+
+
+def test_the_demo_cap_applies_to_the_lot_the_agent_resized_to(journal):
+    executor, queue, _, _ = make_executor(
+        journal=journal,
+        gates=lambda _p, _s: ((), {"fill_price": 1.10010, "final_volume": 0.25}))
+    outcome = executor.offer(proposal(), sizing(volume=0.05))
+    assert outcome.state == runner.STATE_REFUSED
+    assert "VOLUME_ABOVE_DEMO_CAP" in outcome.reason
+    assert queue.commands == []
+
+
+def test_the_command_carries_the_fill_and_lot_the_agent_gates_approved(journal):
+    order_id = runner.client_order_id_for("run-1", proposal(), 0.03)
+    terminal = FakeTerminal(deals=[entry_deal(order_id=order_id, price=1.10030, volume=0.03)])
+    executor, queue, _, _ = make_executor(
+        journal=journal, terminal=terminal,
+        gates=lambda _p, _s: ((), {"fill_price": 1.10030, "final_volume": 0.03,
+                                   "slippage": 0.00020, "risk_reward_at_fill": 1.9}))
+    outcome = executor.offer(proposal(), sizing(volume=0.05))
+    assert outcome.state == runner.STATE_FILLED
+    command = queue.commands[0]
+    # Not the pre-approval quote, and not the lot the cycle proposed: what the gates re-sized.
+    assert command["size"] == 0.03 and command["expected_price"] == 1.10030
+    assert command["client_order_id"] == order_id
+    queued = payloads(journal, runner.COMMAND_EVENT)[0]
+    assert queued["size"] == 0.03
+    assert queued["post_approval_gates"]["risk_reward_at_fill"] == 1.9
+
+
+def test_the_agent_gates_run_after_the_operator_answers(journal):
+    seen = []
+
+    def approve(_proposal, _sizing):
+        seen.append("operator")
+        return True
+
+    def gates(_proposal, _sizing):
+        seen.append("gates")
+        return (), {"fill_price": 1.10010, "final_volume": 0.05}
+
+    executor, _, _, _ = make_executor(journal=journal,
+                                      policy=make_policy(execution_mode="confirm"),
+                                      approver=approve, gates=gates)
+    executor.offer(proposal(), sizing())
+    assert seen == ["operator", "gates"]
+
+
+def test_an_executor_without_the_agent_gates_cannot_be_built(journal):
+    # Wiring the agent's post-approval gates is not optional: an executor that lacks them
+    # would queue a command on the strength of a pre-approval quote.
+    with pytest.raises(TypeError):
+        runner.DemoExecutor(queue=FakeQueue(), journal=journal, terminal=FakeTerminal(),
+                            policy=make_policy(), language="ru", run_id="run-1")
 
 
 def test_a_busy_queue_is_a_refusal_before_anything_was_queued(journal):
@@ -647,6 +731,9 @@ def test_acknowledging_the_uncertain_startup_is_journaled_and_the_run_continues(
             return SimpleNamespace(status=codes.STATUS_NO_SIGNAL, blockers=(),
                                    proposal=None, sizing=None, recorded_at=NOW.isoformat())
 
+        def post_approval_gates(self, _proposal, _sizing):
+            return (), {}
+
     monkeypatch.setattr(runner, "MT5Agent", StubAgent)
     code = runner._run(run_args(tmp_path, acknowledge_uncertain=True),
                        make_policy(execution_mode="auto"), "en", TOKEN, "run-1", terminal)
@@ -723,6 +810,9 @@ def test_the_run_covers_every_requested_instrument(tmp_path, monkeypatch, capsys
         def run_cycle(self, **_kwargs):
             return SimpleNamespace(status=codes.STATUS_NO_SIGNAL, blockers=(),
                                    proposal=None, sizing=None, recorded_at=NOW.isoformat())
+
+        def post_approval_gates(self, _proposal, _sizing):
+            return (), {}
 
     monkeypatch.setattr(runner, "MT5Agent", StubAgent)
     code = runner._run(run_args(tmp_path),

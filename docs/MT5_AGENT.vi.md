@@ -161,8 +161,13 @@ Các cổng phải đồng thời thỏa trước khi một lệnh tồn tại:
    (`account.require_demo: true`), và `expected_login`/`expected_server` phải khớp.
 2. Chế độ chính sách phải là `paper` (hoặc `observe`), và `auto` là bất khả thi nếu không có yêu
    cầu demo.
-3. Báo giá được đọc lại trước khi dựng lệnh: điểm vào, hình học stop/take, `stops_level` của broker,
-   spread và tuổi tick đều được kiểm trên dữ liệu tươi mới.
+3. Báo giá được đọc lại hai lần. Trước khi hỏi người vận hành, điểm vào, hình học stop/take,
+   `stops_level` của broker, khối lượng và margin khả dụng được kiểm trên dữ liệu tươi mới. Sau khi
+   có trả lời, `MT5Agent.post_approval_gates` đọc lại terminal và áp dụng toàn bộ bộ cổng mà một
+   lệnh khớp paper nhận được — công tắc ngừng, danh tính tài khoản, mốc equity và lỗ trong
+   ngày, cửa sổ giao dịch và ngày bị chặn, giới hạn vị thế và sổ đang mở, tuổi tick, spread, ngưỡng trượt giá so với điểm
+   vào đã phê duyệt, risk/reward tại giá khớp, lot được tính lại, margin và stops level — và lệnh
+   được dựng từ giá cùng lot mà bộ cổng trả về, không phải từ báo giá trước xác nhận.
 4. Khối lượng phải nằm trong `volume_min`/`volume_step`/`volume_max` của broker, dưới `--max-volume`
    (tối đa 0.20) và trong margin khả dụng; tham số `MaxVolume` của chính advisor cũng là 0.20.
 5. Cầu nối giữ một lệnh đang chờ, đòi `X-Bridge-Key` (24–256 ký tự), áp TTL 5–600 s, và không bao
