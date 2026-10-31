@@ -111,9 +111,13 @@ def test_forecast_batch_rejects_duplicate_keys_and_unverified_probability_inputs
     }
     with pytest.raises(ValueError, match="duplicate"):
         repo.record_forecasts([record, dict(record)])
-    for bad_probability in (True, float("nan"), float("inf"), -0.1, 1.1):
+    for bad_probability in (True, "0.7", float("nan"), float("inf"), -0.1, 1.1):
         with pytest.raises(ValueError, match="probability"):
             repo.record_forecasts([dict(record, probability=bad_probability)])
+    with pytest.raises(ValueError, match="must be strings"):
+        repo.record_forecasts([dict(record, model_id=17)])
+    with pytest.raises(ValueError, match="must be strings"):
+        repo.record_forecasts([dict(record, signal_id=17)])
 
 
 def test_persisted_kill_switch_defaults_active_and_appends_audit_events():
