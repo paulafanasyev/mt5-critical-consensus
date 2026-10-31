@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import math
 import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+
+from .market_data import forecast_bar_duration
 
 
 PROTOCOL_VERSION = "walk-forward-platt-v1"
@@ -28,6 +31,18 @@ class Forecast:
     resolved_at: datetime
     probability: float
     outcome: int
+    target_policy_version: str | None = None
+    target_event: str | None = None
+    symbol: str | None = None
+    timeframe: str | None = None
+    input_sha256: str | None = None
+    reference_at: datetime | None = None
+    reference_close: float | None = None
+    resolved_bar_time: datetime | None = None
+    resolved_bar_close: float | None = None
+    resolution_source: str | None = None
+    resolution_evidence_sha256: str | None = None
+    resolution_evidence: Mapping[str, Any] | None = None
 
 
 def _timestamp(raw: str, field: str) -> datetime:
@@ -68,7 +83,103 @@ def parse_forecast_row(row: Mapping[str, Any], line_number: int = 0) -> Forecast
         if not math.isfinite(numeric_outcome) or numeric_outcome not in (0.0, 1.0):
             raise ValueError(f"row {line_number}: outcome must be 0 or 1")
         outcome = int(numeric_outcome)
-    return Forecast(model_id, signal_id, issued, resolved, probability, outcome)
+
+    metadata_fields = (
+        "input_sha256", "target_policy_version", "target_event", "symbol", "timeframe",
+        "reference_at", "reference_close", "resolved_bar_time", "resolved_bar_close",
+        "resolution_source", "resolution_evidence_sha256", "resolution_evidence",
+    )
+    present = {name for name in metadata_fields if row.get(name) not in (None, "")}
+    if not present:
+        return Forecast(model_id, signal_id, issued, resolved, probability, outcome)
+    missing = sorted(set(metadata_fields) - present)
+    if missing:
+        raise ValueError(f"row {line_number}: incomplete market-resolution evidence fields: {', '.join(missing)}")
+
+    input_sha256 = str(row["input_sha256"]).strip()
+    evidence_sha256 = str(row["resolution_evidence_sha256"]).strip()
+    for name, digest in (("input_sha256", input_sha256), ("resolution_evidence_sha256", evidence_sha256)):
+        if (len(digest) != 71 or not digest.startswith("sha256:")
+                or any(ch not in "0123456789abcdef" for ch in digest[7:])):
+            raise ValueError(f"row {line_number}: {name} is invalid")
+    target_policy = str(row["target_policy_version"]).strip()
+    target_event = str(row["target_event"]).strip()
+    if (target_policy != "next-available-bar-close-above-reference-v1"
+            or target_event != "NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE"):
+        raise ValueError(f"row {line_number}: unsupported target policy or event")
+    symbol = str(row["symbol"]).strip().upper()
+    timeframe = str(row["timeframe"]).strip().upper()
+    try:
+        forecast_bar_duration(timeframe)
+    except ValueError as exc:
+        raise ValueError(f"row {line_number}: unsupported timeframe for objective target") from exc
+    reference_at = _timestamp(row["reference_at"], "reference_at")
+    resolved_bar_time = _timestamp(row["resolved_bar_time"], "resolved_bar_time")
+    if not reference_at < issued < resolved_bar_time:
+        raise ValueError(f"row {line_number}: reference/issue/target-bar time ordering is invalid")
+    try:
+        reference_close = float(row["reference_close"])
+        resolved_bar_close = float(row["resolved_bar_close"])
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"row {line_number}: bar close values must be numeric") from exc
+    if (not math.isfinite(reference_close) or reference_close <= 0
+            or not math.isfinite(resolved_bar_close) or resolved_bar_close <= 0):
+        raise ValueError(f"row {line_number}: bar close values must be positive and finite")
+    resolution_source = str(row["resolution_source"]).strip()
+    if not symbol or not resolution_source:
+        raise ValueError(f"row {line_number}: symbol and resolution_source are required")
+    if outcome != int(resolved_bar_close > reference_close):
+        raise ValueError(f"row {line_number}: outcome does not match the declared market-event rule")
+
+    raw_evidence = row["resolution_evidence"]
+    try:
+        evidence = json.loads(raw_evidence) if isinstance(raw_evidence, str) else raw_evidence
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(f"row {line_number}: resolution_evidence is not valid JSON") from exc
+    if not isinstance(evidence, Mapping):
+        raise ValueError(f"row {line_number}: resolution_evidence must be a JSON object")
+    canonical_evidence = json.dumps(
+        dict(evidence), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False,
+    )
+    actual_evidence_sha256 = "sha256:" + hashlib.sha256(canonical_evidence.encode("utf-8")).hexdigest()
+    if actual_evidence_sha256 != evidence_sha256:
+        raise ValueError(f"row {line_number}: resolution evidence hash mismatch")
+
+    reference_bar = evidence.get("reference_bar")
+    target_bar = evidence.get("target_bar")
+    resolution = evidence.get("resolution")
+    if not isinstance(reference_bar, Mapping) or not isinstance(target_bar, Mapping) or not isinstance(resolution, Mapping):
+        raise ValueError(f"row {line_number}: resolution evidence omits reference/target details")
+    try:
+        evidence_checks = (
+            evidence.get("protocol") == "market-bar-resolution-v1",
+            evidence.get("target_policy_version") == target_policy,
+            evidence.get("target_event") == target_event,
+            evidence.get("model_id") == model_id,
+            evidence.get("signal_id") == signal_id,
+            evidence.get("input_sha256") == input_sha256,
+            reference_bar.get("symbol") == symbol,
+            reference_bar.get("timeframe") == timeframe,
+            _timestamp(reference_bar.get("bar_time"), "evidence.reference_bar.bar_time") == reference_at,
+            math.isclose(float(reference_bar.get("close")), reference_close, rel_tol=0.0, abs_tol=1e-12),
+            _timestamp(target_bar.get("bar_time"), "evidence.target_bar.bar_time") == resolved_bar_time,
+            math.isclose(float(target_bar.get("close")), resolved_bar_close, rel_tol=0.0, abs_tol=1e-12),
+            str(target_bar.get("source", "")) == resolution_source,
+            int(resolution.get("outcome")) == outcome,
+            _timestamp(resolution.get("recorded_at"), "evidence.resolution.recorded_at") == resolved,
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"row {line_number}: malformed resolution evidence fields") from exc
+    if not all(evidence_checks):
+        raise ValueError(f"row {line_number}: resolution evidence does not match forecast CSV fields")
+
+    return Forecast(
+        model_id, signal_id, issued, resolved, probability, outcome,
+        target_policy, target_event, symbol, timeframe, input_sha256,
+        reference_at, reference_close, resolved_bar_time, resolved_bar_close,
+        resolution_source, evidence_sha256, dict(evidence),
+    )
 
 
 def load_forecasts_csv(path: str | Path) -> list[Forecast]:
@@ -219,7 +330,7 @@ def _bootstrap_mean_ci(values: Sequence[float], *, iterations: int = 2000, seed:
 
 
 def _validate_forecasts(rows: Sequence[Forecast]) -> None:
-    """Reject malformed in-memory rows just as strictly as CSV-loaded forecasts."""
+    """Reject malformed rows and ensure evidence-backed labels match the declared event."""
     seen: set[tuple[str, str]] = set()
     for index, row in enumerate(rows, start=1):
         if not isinstance(row, Forecast):
@@ -232,8 +343,7 @@ def _validate_forecasts(rows: Sequence[Forecast]) -> None:
             raise ValueError(f"forecast {index}: duplicate model_id/signal_id forecast")
         seen.add(key)
         for field, stamp in (("issued_at", row.issued_at), ("resolved_at", row.resolved_at)):
-            if (not isinstance(stamp, datetime) or stamp.tzinfo is None
-                    or stamp.utcoffset() is None):
+            if not isinstance(stamp, datetime) or stamp.tzinfo is None or stamp.utcoffset() is None:
                 raise ValueError(f"forecast {index}: {field} must include a timezone")
         if row.resolved_at <= row.issued_at:
             raise ValueError(f"forecast {index}: resolved_at must be later than issued_at")
@@ -247,8 +357,24 @@ def _validate_forecasts(rows: Sequence[Forecast]) -> None:
             raise ValueError(f"forecast {index}: probability must be finite and in [0,1]")
         if isinstance(row.outcome, bool) or not isinstance(row.outcome, int) or row.outcome not in (0, 1):
             raise ValueError(f"forecast {index}: outcome must be integer 0 or 1")
-
-
+        if row.target_policy_version is None:
+            continue
+        if (row.target_policy_version != "next-available-bar-close-above-reference-v1"
+                or row.target_event != "NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE"
+                or not row.symbol or not row.timeframe or not row.input_sha256
+                or row.reference_at is None or row.resolved_bar_time is None
+                or row.reference_close is None or row.resolved_bar_close is None
+                or not row.resolution_source or not row.resolution_evidence_sha256
+                or not isinstance(row.resolution_evidence, Mapping)):
+            raise ValueError(f"forecast {index}: objective market-event evidence is incomplete")
+        if not row.reference_at < row.issued_at < row.resolved_bar_time:
+            raise ValueError(f"forecast {index}: target event time ordering is invalid")
+        if row.resolved_bar_time + forecast_bar_duration(row.timeframe) > row.resolved_at:
+            raise ValueError(f"forecast {index}: target bar was not complete at resolution time")
+        if (not math.isfinite(float(row.reference_close)) or float(row.reference_close) <= 0
+                or not math.isfinite(float(row.resolved_bar_close)) or float(row.resolved_bar_close) <= 0
+                or row.outcome != int(float(row.resolved_bar_close) > float(row.reference_close))):
+            raise ValueError(f"forecast {index}: resolved outcome does not match target-bar closes")
 def evaluate_walk_forward(
     forecasts: Iterable[Forecast], *, min_train_samples: int = 30,
     min_class_samples: int = 5, refit_interval: int = 25,
@@ -264,8 +390,18 @@ def evaluate_walk_forward(
     report: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "provenance_status": "NOT_VERIFIED_BY_SCRIPT",
-        "important_limit": "Only use forecasts captured before outcomes were known; this report does not prove capture-time provenance and does not measure trading profitability.",
+        "provenance_status": (
+            "SELF_CONSISTENT_PERSISTED_MARKET_BAR_EVIDENCE_NOT_BROKER_AUTHENTICATED"
+            if all(row.target_policy_version == "next-available-bar-close-above-reference-v1"
+                   and isinstance(row.resolution_evidence, Mapping)
+                   for row in rows)
+            else "NOT_VERIFIED_BY_SCRIPT"
+        ),
+        "important_limit": (
+            "The report can verify self-consistency of the exported local market-bar evidence, but it does not "
+            "independently authenticate broker-feed accuracy/completeness, establish statistical independence, "
+            "measure trading profitability or prove future performance."
+        ),
         "settings": {"min_train_samples": min_train_samples, "min_class_samples": min_class_samples,
                      "refit_interval": refit_interval, "high_confidence_threshold": 0.95,
                      "reliability_bins": 10},
@@ -323,9 +459,16 @@ def evaluate_walk_forward(
                 "sample_status": "PRELIMINARY_REVIEW_ONLY" if len(calibrated_rows) >= 50 else "NOT_PROVEN",
             },
         }
+    enough_out_of_sample = any(
+        model["walk_forward"]["calibrated_oos_count"] >= 50 for model in report["models"].values()
+    )
+    has_self_consistent_evidence = (
+        report["provenance_status"]
+        == "SELF_CONSISTENT_PERSISTED_MARKET_BAR_EVIDENCE_NOT_BROKER_AUTHENTICATED"
+    )
     report["overall_status"] = (
         "PRELIMINARY_REVIEW_ONLY"
-        if any(model["walk_forward"]["calibrated_oos_count"] >= 50 for model in report["models"].values())
+        if enough_out_of_sample and has_self_consistent_evidence
         else "NOT_PROVEN"
     )
     return report
