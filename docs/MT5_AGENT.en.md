@@ -6,6 +6,12 @@ The agent reads terminal state, applies fail-closed risk gates and writes every 
 journal. It **never sends an order**: no module in `critical_consensus.mt5_agent` calls a trading
 function, and a test enforces that rather than a promise.
 
+Order sending exists only outside the package. The demo path
+(`scripts/mt5_demo_bridge.py`, `scripts/run_mt5_demo_trading.py`, `scripts/build_demo_ea.py`,
+`scripts/setup_demo_terminal.py` plus a compiled expert advisor) is described in "Demo execution
+over the loopback bridge". It works **only against a demo account** and still does not move the
+system any closer to real money.
+
 Other languages: [Русский](MT5_AGENT.md) · [Tiếng Việt](MT5_AGENT.vi.md).
 
 ## Evidence status (read before use)
@@ -13,7 +19,7 @@ Other languages: [Русский](MT5_AGENT.md) · [Tiếng Việt](MT5_AGENT.vi
 | Claim | Status | Evidence |
 |---|---|---|
 | A policy loads only with known keys; a live mode is rejected | **PROVEN** | `test_live_mode_and_unknown_keys_are_rejected` |
-| One agent cycle applies its gates in a fixed order and blocks on any failure | **PROVEN** | 62 tests in `tests/test_mt5_agent.py`, 59 in `tests/test_mt5_agent_invariants.py`, 32 in `tests/test_mt5_agent_i18n.py` |
+| One agent cycle applies its gates in a fixed order and blocks on any failure | **PROVEN** | 62 tests in `tests/test_mt5_agent.py`, 59 in `tests/test_mt5_agent_invariants.py`, 37 in `tests/test_mt5_agent_i18n.py` |
 | Every blocker code the agent emits is declared, and has a label in all three languages | **PROVEN** | `test_every_emitted_blocker_is_a_declared_code`, `test_every_journaled_code_has_a_non_empty_label_in_all_three_languages` |
 | The paper broker cannot see future bars and fills the stop before the target inside one bar | **PROVEN** | `test_paper_broker_hides_future_bars`, `test_paper_broker_fills_stop_before_target_in_the_same_bar` |
 | Volume comes from the stop distance and the symbol specification, capped by risk *and* margin | **PROVEN** | `test_sizing_never_exceeds_the_risk_budget`, `test_sizing_caps_volume_by_margin_and_not_only_by_risk` |
@@ -21,9 +27,13 @@ Other languages: [Русский](MT5_AGENT.md) · [Tiếng Việt](MT5_AGENT.vi
 | No journal record claims a sent broker order | **PROVEN** | `test_agent_never_reports_a_broker_order`, `test_package_source_contains_no_order_sending_surface` |
 | `confirm` mode opens a position only on an explicit operator yes, and `auto` refuses a non-demo policy | **PROVEN** | `test_confirm_mode_without_an_approver_never_opens_a_position`, `test_automatic_execution_requires_a_demo_account_even_in_the_library` |
 | The `LiveMT5Backend` adapter maps terminal replies and subtracts the server offset | **PROVEN against a stubbed package** | `test_live_backend_*`, `test_cli_live_source_subtracts_the_server_offset` |
-| Reading a real MT5 terminal on this machine | **NOT PROVEN** | there is no `MetaTrader5` package and no `terminal64.exe` on this host, so nothing was read from a real terminal |
+| Reading a real MT5 terminal on this host | **PROVEN** | 2026-10-31: `MetaTrader5` 5.0.6231, `terminal64.exe` build 6296, demo account 10013404855 on `MetaQuotes-Demo` (balance 10.00 USD, leverage 100), live specifications and 120 H1 bars for EURUSD/GBPUSD/AUDUSD/NZDUSD/XAUUSD/XAGUSD; server offset 7200 s |
+| The demo EA compiles and installs into the terminal | **PROVEN** | 2026-10-31: `scripts/build_demo_ea.py` flipped exactly one gate line in a generated copy, MetaEditor reported 0 errors and 0 warnings, and `MQL5/Experts/CriticalConsensusEA_Demo.ex5` (37780 bytes) was installed |
+| The terminal configuration allows algo trading and loopback WebRequest | **PROVEN** | 2026-10-31: `Config/common.ini` carries `Enabled=1`, `WebRequest=1`, `WebRequestUrl=http://127.0.0.1:8000`, still UTF-16 LE with BOM and CRLF, byte-verified against a backup |
+| The EA actually polls the bridge (a real `WebRequest` from a chart) | **NOT PROVEN** | requires attaching the advisor to a chart by hand; `MQL5/Logs` contains no `OnInit` line from the demo EA. `WebRequest` does not execute in the Strategy Tester — that is an MT5 limitation, not a gap in this code |
+| A demo order executed by the broker | **NOT PROVEN** | on 2026-10-31 the market was closed (last EURUSD tick 2026-10-30T21:00:00Z), so every cycle blocked on `QUOTE_STALE`; no command was ever queued and every journal record says `broker_order_sent: false` |
 | Strategy profitability, and any trade-success rate | **NOT PROVEN** | backtest on a synthetic series; `confidence` is a heuristic score, not a calibrated probability. A 98% success rate is neither measured here nor achievable by this code |
-| Execution on a real or a broker demo account | **NOT PROVEN and not implemented** | the Python package and the CLI contain no order-sending call, by design; the MQL5 reference template has a gated `OrderSend` (see "Deliberately not modelled") |
+| Execution on a real account | **NOT PROVEN and not implemented** | the Python package and the CLI contain no order-sending call, by design; the demo path refuses anything but a demo account (`AllowLiveExecution=false`, `require_demo`, the `ACCOUNT_TRADE_MODE` check), and a policy with `mode: live` is rejected at load |
 
 The local preview used while writing this document replays a **synthetic** EURUSD H1 series
 (a seeded random walk with trends); it is not committed as an artifact, and the tests generate the
@@ -47,6 +57,17 @@ the current package cannot execute it either way.
 | `mt5_agent/codes.py` | the single registry of statuses and blockers |
 | `scripts/run_mt5_agent.py` | CLI: `run` (csv/live, auto/confirm, ru/en/vi), `report`, `reset --confirm` |
 | `config/mt5_agent.example.yaml` | commented policy example |
+
+Everything that can put an order into the world lives apart from that package, and only for demo:
+
+| Component | Purpose |
+|---|---|
+| `scripts/mt5_demo_bridge.py` | loopback-only HTTP bridge: two GETs (`/v1/risk/kill-switch`, `/v1/execution/next`), `X-Bridge-Key` check, one pending command, TTL, fsynced idempotency tombstones, never logs the token or a command body |
+| `scripts/run_mt5_demo_trading.py` | the only component that can build a command: takes the agent's decision, re-checks every gate, queues it in the bridge and reconciles against the broker's own deal history; never retries an uncertain send |
+| `scripts/build_demo_ea.py` | produces `CriticalConsensusEA_Demo.mq5` by flipping exactly one compile-time gate line, optionally compiles it with MetaEditor and installs the `.ex5` |
+| `scripts/setup_demo_terminal.py` | dry run by default: refuses while the terminal runs, patches `[Experts]` in `Config/common.ini`, installs the built EA; decides nothing about an order |
+| `scripts/operator_answers.py` | whole-line answer parsing (`да`/`vâng`/`y`) shared by the CLI and the demo runner |
+| `mql5/CriticalConsensusEA.mq5` | the advisor source; in this repository the gate is always `false`, and the static checker pins that default |
 
 ## Gate order of one cycle
 
@@ -125,7 +146,80 @@ Whole lines only: `y` opens this one, `n` skips it, `a` stops asking for the res
 `tất` is not an answer, so it can never be mistaken for "yes to everything". With no keyboard attached every proposal is declined as unconfirmed, and
 the run continues so the audit trail still exists. `--execution auto|confirm` overrides the policy
 for one run and is re-validated, so the demo-only rule holds either way. Positions are simulated
-locally in both modes; there is no broker order in either.
+locally in both modes; there is no broker order in either. `run_mt5_agent.py` is that program; the
+demo execution runner is a different one and is described next.
+
+## Demo execution over the loopback bridge
+
+The chain is single-path and its order is fixed: the `mt5_agent` package decides and sizes (it
+cannot send), `run_mt5_demo_trading.py` re-checks that decision and queues exactly one command in
+`mt5_demo_bridge.py`, the advisor polls the bridge over `WebRequest` on `127.0.0.1` and calls
+`OrderSend` against a demo account, and the runner reconciles the result against the broker's own
+deal history by magic number `8172026` and the `CC:<id>` comment.
+
+Gates that must all hold before a command exists:
+
+1. The terminal account must be a demo (`ACCOUNT_TRADE_MODE`), the policy must require one
+   (`account.require_demo: true`), and `expected_login`/`expected_server` must match.
+2. The policy mode must be `paper` (or `observe`), and `auto` is impossible without the demo
+   requirement.
+3. The quote is re-read before a command is built: entry, stop/target geometry, the broker
+   `stops_level`, spread and tick age are all checked against fresh data.
+4. Volume must sit inside the broker's `volume_min`/`volume_step`/`volume_max`, below
+   `--max-volume` (at most 0.20) and inside available margin; the advisor's own `MaxVolume` input
+   is 0.20 as well.
+5. The bridge holds one pending command, demands `X-Bridge-Key` (24–256 characters), applies a
+   5–600 s TTL, and never serves the same `command_id` twice. `client_order_id` is deterministic,
+   so restarting the runner does not create a second order.
+6. In `confirm` mode a whole operator line is required (`да`/`vâng`/`y`); a fragment is not an
+   answer.
+7. The advisor re-checks all of the above independently, plus the kill switch through a fresh GET,
+   the TTL, its compile-time `ENABLE_DEMO_EXECUTION` gate, `AllowLiveExecution`, the symbol, the
+   volume and the stops, and it writes its idempotency tombstones before sending.
+8. An uncertain result (command served, no fill observed) stops the run and needs an explicit
+   `--acknowledge-uncertain`; there is no code path that re-sends.
+
+### Live observation on 2026-10-31 (`--symbols all`, real terminal)
+
+Thirteen instruments were requested; the broker offers seven. The outcome of one cycle: **0
+commands queued, 0 filled, `broker_order_sent: false` in every record, journal chain valid**.
+
+| Instrument | Result | Why that is correct |
+|---|---|---|
+| EURUSD, GBPUSD, AUDUSD, NZDUSD, XAUUSD, XAGUSD | `BLOCKED` → `QUOTE_STALE` | last tick 2026-10-30T21:00:00Z; the market was closed for the weekend |
+| US500 | `BLOCKED` → `MARKET_DATA_READ_FAILED` | `MT5 returned no tick for US500` — the specification reads, no quote exists |
+| USDJPY, USDCAD, USDCHF, EURGBP | skipped before the cycle | `pays profit in JPY/CAD/CHF/GBP, not in the account currency USD` — sizing in account currency would be wrong |
+| NAS100, BTCUSD | skipped before the cycle | `MT5 could not select symbol …` — not offered by this broker |
+
+Quote age cannot be negotiated away: `max_quote_age_seconds` is only accepted between 1 and 300, so
+a Saturday series always yields `QUOTE_STALE`. That is deliberate.
+
+The reason this account would not have executed even with the market open is arithmetic on the live
+specifications and the live H1 bars (a calculation, not a measured refusal): the risk budget is
+`0.005 × min(equity, balance) = 0.05 USD` at a 10.00 USD balance, while the risk of the broker's
+minimum lot is 3.27 USD on EURUSD, 3.35 on GBPUSD, 1.93 on AUDUSD, 1.98 on NZDUSD, 3.97 on XAUUSD
+and 4.24 on XAGUSD. Every symbol would stop at `MINIMUM_LOT_EXCEEDS_RISK_BUDGET`. A 10 USD demo
+account cannot host a single policy-compliant trade; at 10 000 USD the same 0.5% gives a 50 USD
+budget and those numbers pass.
+
+### Running it
+
+```powershell
+# 1. the terminal must be CLOSED: MT5 rewrites common.ini when it exits
+python scripts/setup_demo_terminal.py                       # dry run: what would change
+python scripts/setup_demo_terminal.py --apply               # build, install, allow loopback WebRequest
+# 2. start the terminal, log into the demo account, attach CriticalConsensusEA_Demo to a chart by hand
+# 3. turn the AutoTrading button on and keep the runner alive
+$env:MT5_BRIDGE_TOKEN = "<24-256 characters>"
+python scripts/run_mt5_demo_trading.py --policy agent_data/live_demo_policy.yaml `
+  --db agent_data/mt5_demo.db --symbols all --cycles 0 --execution confirm --verbose
+```
+
+`--cycles 0` means "keep going until the process is stopped". If the advisor is not attached, the
+commands simply expire under the TTL — the journal reports them honestly as `expired`, and no order
+reaches the broker. The AutoTrading button and `[Experts] Enabled=1` are two different switches: the
+GUI button turns off everything, so `setup_demo_terminal.py` has to be re-run after any toggle made
+inside the terminal.
 
 ## Languages
 
@@ -275,6 +369,14 @@ and the account identity, not the symbol specification.
 6. Start with `mode: observe` — the cycle records the decision but opens nothing.
 7. Then `mode: paper` with `--source live` or a CSV export.
 8. Check `report`: `verified_chain.valid` must be `true` and `broker_order_sent` must be `false`.
+9. A small demo balance never reaches execution: at 10 USD with
+   `risk_per_trade_fraction: 0.005` the risk budget is 0.05 USD, while the minimum lot of any of
+   the symbols above risks 1.93–4.24 USD (see "Demo execution over the loopback bridge"), so the
+   cycle stops at `MINIMUM_LOT_EXCEEDS_RISK_BUDGET`. Either open a 10 000 USD demo or raise the
+   risk fraction knowingly and re-check the budget.
+10. Only then is it worth preparing the terminal for demo execution:
+    `python scripts/setup_demo_terminal.py` (dry run), then `--apply` with the terminal closed,
+    then attaching `CriticalConsensusEA_Demo` to a chart by hand and switching AutoTrading on.
 
 ## Deliberately not modelled
 
@@ -288,6 +390,15 @@ and the account identity, not the symbol specification.
   reference template does contain an `OrderSend` call, but it sits behind the compile-time constant
   `ENABLE_DEMO_EXECUTION = false` (and a `AllowLiveExecution` input that must stay false), so it is
   unreachable without a source change and recompile; the Python agent never calls that template.
+- The demo path in `scripts/` is not an exception to that rule: neither
+  `run_mt5_demo_trading.py` nor `mt5_demo_bridge.py` contains a single MT5 trading call (a grep for
+  `order_send|trade_|OrderSend` finds nothing). Python only holds an HTTP command alive until its
+  TTL; the advisor inside the terminal is what can turn it into an order, which is why "Python sent
+  an order" is impossible in this system even for demo.
+- Not modelled and not measured: partial fills, a requote after `Done`, slippage relative to the
+  approved entry, and a connection loss between the advisor and the bridge. All there is for those
+  is the tombstones, the bridge's exact-ID record and a manual reconciliation against the deal
+  history.
 - No `mode: live`: the policy rejects it at load.
 - The agent is not part of the authorization pipeline: `pipeline.evaluate_signal_bundle`, the
   Certainty Gate and human authorization remain the only (still closed) paths toward an order.

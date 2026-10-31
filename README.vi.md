@@ -129,15 +129,27 @@ nhận đề xuất. `--execution confirm` (mặc định) hỏi `y/n/a/q` trư�
 chỉ được phép trên tài khoản demo; `--language ru|en|vi` đổi toàn bộ giao diện (Nga, Anh, Việt), còn
 nhật ký chỉ lưu mã máy.
 
-Đọc terminal thật trên máy phát triển này là **CHƯA XÁC MINH**: không có package `MetaTrader5` và
-không có `terminal64.exe`, nên `--source live` chỉ được kiểm với module giả lập, còn các con số
-chạy thử đến từ nến tổng hợp và **không phải** ước tính lợi nhuận. Hướng dẫn kiểm tra trên Windows
-VPS của bạn: [docs/MT5_AGENT.vi.md](docs/MT5_AGENT.vi.md) (bản tiếng Nga: [docs/MT5_AGENT.md](docs/MT5_AGENT.md),
+Đọc terminal thật trên máy này là **ĐÃ XÁC MINH từ 2026-10-31**: `MetaTrader5` 5.0.6231,
+`terminal64.exe` build 6296, tài khoản demo 10013404855 trên `MetaQuotes-Demo` (số dư 10.00 USD),
+specification thật và 120 nến H1 của EURUSD/GBPUSD/AUDUSD/NZDUSD/XAUUSD/XAGUSD. Các con số trong
+test vẫn là chuỗi tổng hợp và **không phải** ước tính lợi nhuận.
+
+Lệnh chỉ có thể đi vào terminal qua con đường demo nằm ngoài package:
+`scripts/run_mt5_demo_trading.py` đặt đúng một lệnh vào cầu loopback
+`scripts/mt5_demo_bridge.py`, còn `OrderSend` do expert advisor bên trong terminal gọi; trong các
+script Python không có bất kỳ lời gọi giao dịch MT5 nào. EA demo được biên dịch
+(`scripts/build_demo_ea.py`: MetaEditor báo 0 lỗi, 0 cảnh báo) và cài vào terminal, còn
+`scripts/setup_demo_terminal.py` chuẩn bị host cho việc đó (mặc định là dry-run, yêu cầu terminal
+đang đóng, sửa `[Experts]` trong `Config/common.ini` và lưu bản backup). **Vẫn CHƯA XÁC MINH và
+cần thao tác tay:** gắn expert advisor vào biểu đồ và một lệnh demo thật từ broker — ngày
+2026-10-31 thị trường đóng cửa nên mọi vòng lặp chặn ở `QUOTE_STALE`, và số dư 10 USD không đủ cho
+một giao dịch đúng chính sách rủi ro 0.5% (một lô tối thiểu rủi ro 1.93–4.24 USD). Hướng dẫn đầy đủ
+và quan sát thực tế: [docs/MT5_AGENT.vi.md](docs/MT5_AGENT.vi.md) (bản tiếng Nga: [docs/MT5_AGENT.md](docs/MT5_AGENT.md),
 bản tiếng Anh: [docs/MT5_AGENT.en.md](docs/MT5_AGENT.en.md)).
 
 ## Những gì chưa có chức năng production
 
-Đây chưa phải hệ thống giao dịch hoàn chỉnh. Chưa có API key/model thật cho chín agent bắt buộc và nguồn market/news độc lập đã xác nhận. Peer-review/challenge service và provider callback đã được nối, nhưng hoạt động thực tế chưa được kiểm chứng cho đến khi có khóa và chạy trên tín hiệu thật. Chưa có metric dissent/false-certainty đã xác nhận và hiệu chuẩn out-of-sample có nhãn. Walk-forward evaluator và lưu forecast đã được triển khai, nhưng chưa thu được kết quả hiệu chuẩn thực. CLI Chief Gate đầy đủ chỉ nhận evidence packet nội bộ, yêu cầu review attestation được ký riêng, không tạo review/challenge, không làm giả credibility nguồn và không nhận human approval. Chưa có TOTP/signature verifier riêng, triển khai production worker/API và dispatch lệnh thật. Không kết nối tài khoản thật. MQL5 chưa được xác nhận bằng biên dịch MetaEditor hoặc demo account; kiểm tra tĩnh không thay thế các thử nghiệm đó.
+Đây chưa phải hệ thống giao dịch hoàn chỉnh. Chưa có API key/model thật cho chín agent bắt buộc và nguồn market/news độc lập đã xác nhận. Peer-review/challenge service và provider callback đã được nối, nhưng hoạt động thực tế chưa được kiểm chứng cho đến khi có khóa và chạy trên tín hiệu thật. Chưa có metric dissent/false-certainty đã xác nhận và hiệu chuẩn out-of-sample có nhãn. Walk-forward evaluator và lưu forecast đã được triển khai, nhưng chưa thu được kết quả hiệu chuẩn thực. CLI Chief Gate đầy đủ chỉ nhận evidence packet nội bộ, yêu cầu review attestation được ký riêng, không tạo review/challenge, không làm giả credibility nguồn và không nhận human approval. Chưa có TOTP/signature verifier riêng, triển khai production worker/API và dispatch lệnh thật. Không kết nối tài khoản thật. EA demo đã được MetaEditor biên dịch với 0 lỗi, 0 cảnh báo và đã cài vào terminal (2026-10-31), nhưng chưa lần nào in `OnInit` ra log của expert advisor — nghĩa là việc gắn vào biểu đồ và một lệnh demo thật vẫn CHƯA XÁC MINH; kiểm tra tĩnh không thay thế các thử nghiệm đó.
 
 ## Invariant chuẩn tắc
 

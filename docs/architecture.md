@@ -34,7 +34,7 @@ flowchart TB
     PG -->|DENY| STOP[No order]
     PG -->|REQUIRE_HUMAN| UA[Human approval + live 2FA/signature]
     UA -->|reject/expired| STOP
-    UA -->|one-time allow, nonce consumed| EX[Planned execution bridge / MQL5 EA — disabled in scaffold]
+    UA -->|one-time allow, nonce consumed| EX[Pipeline execution bridge / MQL5 EA — not wired in scaffold]
     EX --> RECON[Fill + positions reconciliation]
     RECON --> AUD[(Append-only audit + immutable object storage)]
     CG --> AUD
@@ -48,6 +48,14 @@ flowchart TB
   TS[(PostgreSQL 16: market data)] --> ING
   PGDB[(PostgreSQL decisions / audit / nonce tombstones)] <--> AUD
   MT5[MT5 terminal / broker] <--> EX
+  subgraph D[Demo-only path: separate process, outside the pipeline]
+    AGE[mt5_agent cycle decision] --> DEMO[run_mt5_demo_trading.py<br/>re-checks every gate, queues one command]
+    DEMO --> BRG[Loopback bridge on 127.0.0.1<br/>X-Bridge-Key, one pending command, TTL, fsynced tombstones]
+    BRG -->|GET /v1/risk/kill-switch<br/>GET /v1/execution/next| DEA[CriticalConsensusEA_Demo advisor]
+    DEA -->|demo order only; live refused| MTD[(MT5 demo terminal / broker)]
+    DEMO --> RECON2[Reconciliation against the broker's own deal history]
+    RECON2 --> AUD2[(Append-only SQLite journal)]
+  end
 ```
 
 ## Реализация в текущем каркасе
@@ -64,8 +72,8 @@ flowchart TB
 - Human review packet содержит все peer reviews, dissenting opinions, полный challenge ledger, ChiefReasoning, source reports, risk snapshot и tail-risk fields. В persisted-risk пути пакет несёт именно терминальный снимок, который проверил gate, вместе с `risk_snapshot_validation` и `risk_reconciliation` и явным `risk_snapshot_source`; клиентская сводка используется только в offline-режиме и помечается как `client_supplied_unverified`. Пакет никогда не авторизует исполнение.
 - Одно подтверждение ограничено дважды: одноразовый nonce на оператора и отдельный insert-only tombstone (`authorization_permissions`, миграция 006), ключ которого — серверный хэш параметров ордера, а не клиентский `permission_id`. Переименование разрешения или повтор nonce не проходит; без durable permission store authorization не выполняется.
 - API endpoint проверки authorization отключён (HTTP 423), пока отсутствуют persistent server-side permission state и настоящий криптографический 2FA/signature verifier.
-- PostgreSQL persistence stores immutable market history, forecast labels, risk/kill-switch snapshots and full decision/audit runs. The Redis worker script persists valid events before ACK; parse-invalid/poison events are dead-lettered to `cc:dead-letter:v1` on first delivery and only then ACKed, while handler failures stay pending and are reclaimed (`XAUTOCLAIM`) on each loop, so they are retried up to `max_attempts=3` deliveries before being dead-lettered. A production-managed worker service is not deployed. The provider-backed anonymized peer-review and challenge-resolution runner exists and is unit-tested, but it has not been exercised against real independent provider endpoints and its confidence values remain uncalibrated. Trusted source ingestion/registry, historical calibration/health datasets, TOTP/signature provider, broker order dispatcher and MetaEditor/MT5 forward testing remain unimplemented or unverified.
-- Execution-related endpoints intentionally cannot publish, fetch or send an order command. The diagram includes the future production boundary, not an enabled path.
+- PostgreSQL persistence stores immutable market history, forecast labels, risk/kill-switch snapshots and full decision/audit runs. The Redis worker script persists valid events before ACK; parse-invalid/poison events are dead-lettered to `cc:dead-letter:v1` on first delivery and only then ACKed, while handler failures stay pending and are reclaimed (`XAUTOCLAIM`) on each loop, so they are retried up to `max_attempts=3` deliveries before being dead-lettered. A production-managed worker service is not deployed. The provider-backed anonymized peer-review and challenge-resolution runner exists and is unit-tested, but it has not been exercised against real independent provider endpoints and its confidence values remain uncalibrated. Trusted source ingestion/registry, historical calibration/health datasets and a TOTP/signature provider remain unimplemented. The policy pipeline has no broker order dispatcher and no endpoint that can fetch an order command. The only path that can reach a broker at all is a separate demo-only loopback bridge (`scripts/mt5_demo_bridge.py`, `scripts/run_mt5_demo_trading.py` and the `CriticalConsensusEA_Demo` advisor, documented in `docs/MT5_AGENT*.md`): it is outside the permission pipeline, refuses any account that is not a demo, and its status as of 2026-10-31 is compile/install and terminal allowlist **PROVEN**, a real chart `WebRequest` and a broker-filled demo order **NOT PROVEN** (the market was closed on 2026-10-31, so every cycle blocked on `QUOTE_STALE`). Forward testing of that transport is not possible in the Strategy Tester: `WebRequest` does not execute there — an MT5 limitation, not a gap in this code.
+- Execution-related endpoints intentionally cannot publish, fetch or send an order command. The diagram includes the future production boundary, not an enabled path. `/v1/execution/next` on the policy API answers `204 No Content` and `/v1/execution/submit`, `/v1/permission/check` and `/v1/authorization/check` answer HTTP 423; the demo bridge happens to expose the same two GET paths, but it is a different process bound to `127.0.0.1`, it is not the policy API and no policy-API decision feeds it.
 
 ## Invariants
 
@@ -73,7 +81,7 @@ flowchart TB
 - `PASS` у CertaintyGate означает только передачу на ChiefAgent; `CONFIRM` ChiefAgent означает только разрешение перейти к PermissionGate.
 - PermissionGate не выдаёт исполнение: он либо возвращает `REQUIRE_HUMAN`, либо `DENY`, и ни один результат не делает `trade_allowed=True`; authorization формирует одноразовое разрешение, но не создаёт ордер. `/v1/execution/next` отвечает `204 No Content`, а `/v1/execution/submit`, `/v1/permission/check` и `/v1/authorization/check` — HTTP 423.
 - Каждый `nonce` авторизации расходуется ровно один раз через `authorization_store` (`InMemoryNonceStore` или `PostgresNonceStore` с insert-only tombstones: атомарный INSERT, без обновлений/удалений в обработке запроса; ручная очистка только после `expires_at` и retention-окна); повтор того же nonce получает `AUTHORIZATION_NONCE_REPLAYED`. Без store authorization не выдаётся.
-- Исполнительный мост перепроверяет TTL, client_order_id, slippage, SL/TP, состояние счёта и текущие позиции непосредственно перед операцией.
+- Исполнительный мост перепроверяет TTL, client_order_id, slippage, SL/TP, состояние счёта и текущие позиции непосредственно перед операцией. В каркасе это делает только demo-путь: `run_mt5_demo_trading.py` перед постановкой команды заново прогоняет все гейты и после исполнения сверяется с историей сделок самого брокера (неопределённый результат не ретраится), а EA принимает команду лишь при `mode: demo`, `decision: APPROVE`, явном `user_approved`, `ACCOUNT_TRADE_MODE_DEMO`, разрешённом алгоритмическом трейдинге, целом `expires_at_epoch` не далее `MaxCommandTtlSeconds` от `TimeGMT()`, и пишет два tombstone — по `command_id` и по `client_order_id`. Мост pipeline не реализован.
 - При неопределённом результате вызова брокера не выполняется слепой retry; запускается reconcile.
 
 ## Область MVP

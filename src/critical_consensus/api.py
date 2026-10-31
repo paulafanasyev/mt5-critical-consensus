@@ -93,7 +93,7 @@ def require_bridge_key(x_bridge_key: str | None = Header(default=None, alias="X-
 
 app = FastAPI(
     title="Critical Consensus Policy API",
-    version="0.4.0",
+    version="0.5.0",
     description="Policy checks only; order execution is disabled in this reference scaffold.",
 )
 

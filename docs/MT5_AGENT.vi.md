@@ -6,6 +6,11 @@ Tài liệu này mô tả tầng **agent MetaTrader 5**, nằm cạnh pipeline
 Agent **không gửi lệnh**: trong package `critical_consensus.mt5_agent` không có bất kỳ lời gọi
 hàm giao dịch nào, và điều này được kiểm bằng test chứ không phải bằng lời hứa.
 
+Gửi lệnh chỉ tồn tại bên ngoài package. Đường demo (`scripts/mt5_demo_bridge.py`,
+`scripts/run_mt5_demo_trading.py`, `scripts/build_demo_ea.py`, `scripts/setup_demo_terminal.py` cùng
+một expert advisor đã biên dịch) được mô tả trong mục «Thực thi demo qua cầu nối loopback». Nó chạy
+**chỉ với tài khoản demo** và vẫn không đưa hệ thống lại gần tiền thật hơn chút nào.
+
 Ngôn ngữ khác: [English](MT5_AGENT.en.md) · [Русский](MT5_AGENT.md).
 
 ## Trạng thái bằng chứng (đọc trước khi dùng)
@@ -13,7 +18,7 @@ Ngôn ngữ khác: [English](MT5_AGENT.en.md) · [Русский](MT5_AGENT.md).
 | Tuyên bố | Trạng thái | Bằng chứng |
 |---|---|---|
 | Chính sách chỉ nhận khoá đã biết, chế độ live bị từ chối | **ĐÃ XÁC MINH** | `test_live_mode_and_unknown_keys_are_rejected` |
-| Một vòng lặp đi qua các cổng theo thứ tự cố định và bị chặn khi có bất kỳ lỗi nào | **ĐÃ XÁC MINH** | 62 test trong `tests/test_mt5_agent.py`, 59 trong `tests/test_mt5_agent_invariants.py`, 32 trong `tests/test_mt5_agent_i18n.py` |
+| Một vòng lặp đi qua các cổng theo thứ tự cố định và bị chặn khi có bất kỳ lỗi nào | **ĐÃ XÁC MINH** | 62 test trong `tests/test_mt5_agent.py`, 59 trong `tests/test_mt5_agent_invariants.py`, 37 trong `tests/test_mt5_agent_i18n.py` |
 | Mọi lý do chặn mà agent thực sự phát ra đều nằm trong danh sách mã và có nhãn ở cả ba ngôn ngữ | **ĐÃ XÁC MINH** | `test_every_emitted_blocker_is_a_declared_code`, `test_every_journaled_code_has_a_non_empty_label_in_all_three_languages` |
 | Paper broker không nhìn thấy nến tương lai; trong cùng một nến, stop được khớp trước take-profit | **ĐÃ XÁC MINH** | `test_paper_broker_hides_future_bars`, `test_paper_broker_fills_stop_before_target_in_the_same_bar` |
 | Khối lượng tính từ khoảng cách stop và đặc tả symbol, bị giới hạn bởi cả rủi ro **và** margin | **ĐÃ XÁC MINH** | `test_sizing_never_exceeds_the_risk_budget`, `test_sizing_caps_volume_by_margin_and_not_only_by_risk` |
@@ -21,9 +26,13 @@ Ngôn ngữ khác: [English](MT5_AGENT.en.md) · [Русский](MT5_AGENT.md).
 | Không bản ghi nhật ký nào báo đã gửi lệnh cho broker | **ĐÃ XÁC MINH** | `test_agent_never_reports_a_broker_order`, `test_package_source_contains_no_order_sending_surface` |
 | Chế độ `confirm` chỉ mở vị thế khi người vận hành trả lời "có" rõ ràng, còn `auto` từ chối chính sách dùng tài khoản không phải demo | **ĐÃ XÁC MINH** | `test_confirm_mode_without_an_approver_never_opens_a_position`, `test_automatic_execution_requires_a_demo_account_even_in_the_library` |
 | `LiveMT5Backend` ánh xạ đúng phản hồi terminal và trừ offset giờ của server | **ĐÃ XÁC MINH bằng package giả lập** | `test_live_backend_*`, `test_cli_live_source_subtracts_the_server_offset` |
-| Đọc terminal MT5 thật trên máy này | **CHƯA XÁC MINH** | máy này không cài package `MetaTrader5` và không có `terminal64.exe`, nên không đọc được gì từ terminal thật |
+| Đọc terminal MT5 thật trên máy này | **ĐÃ XÁC MINH** | 2026-10-31: `MetaTrader5` 5.0.6231, `terminal64.exe` build 6296, tài khoản demo 10013404855 trên `MetaQuotes-Demo` (số dư 10.00 USD, đòn bẩy 100), các đặc tả thật và 120 nến H1 cho EURUSD/GBPUSD/AUDUSD/NZDUSD/XAUUSD/XAGUSD; offset server 7200 s |
+| EA demo biên dịch và cài được vào terminal | **ĐÃ XÁC MINH** | 2026-10-31: `scripts/build_demo_ea.py` lật đúng một dòng cổng trong một bản sao được sinh ra, MetaEditor báo 0 lỗi và 0 cảnh báo, và `MQL5/Experts/CriticalConsensusEA_Demo.ex5` (37780 byte) đã được cài |
+| Cấu hình terminal cho phép giao dịch thuật toán và WebRequest loopback | **ĐÃ XÁC MINH** | 2026-10-31: `Config/common.ini` mang `Enabled=1`, `WebRequest=1`, `WebRequestUrl=http://127.0.0.1:8000`, vẫn là UTF-16 LE kèm BOM và CRLF, đã xác minh theo byte so với một bản sao lưu |
+| EA thực sự thăm dò cầu nối (một `WebRequest` thật từ một biểu đồ) | **CHƯA XÁC MINH** | đòi hỏi phải gắn advisor vào một biểu đồ bằng tay; `MQL5/Logs` không chứa dòng `OnInit` nào từ EA demo. `WebRequest` không chạy trong Strategy Tester — đó là giới hạn của MT5, không phải lỗ hổng trong mã này |
+| Một lệnh demo được broker thực thi | **CHƯA XÁC MINH** | ngày 2026-10-31 thị trường đóng cửa (tick EURUSD cuối cùng 2026-10-30T21:00:00Z), nên mọi vòng lặp bị chặn ở `QUOTE_STALE`; không lệnh nào từng được xếp hàng và mọi bản ghi nhật ký đều ghi `broker_order_sent: false` |
 | Lợi nhuận của chiến lược và tỉ lệ lệnh thắng | **CHƯA XÁC MINH** | backtest trên chuỗi tổng hợp; `confidence` là điểm heuristic, không phải xác suất đã hiệu chuẩn. Tỉ lệ thắng 98% không được đo ở đây và mã này không thể đạt được |
-| Thực thi trên tài khoản thật hoặc tài khoản demo của broker | **CHƯA XÁC MINH và không được triển khai** | package Python và CLI không có lời gọi gửi lệnh nào, theo thiết kế; template tham chiếu MQL5 có `OrderSend` nằm sau cổng (xem «Cố ý không mô hình hoá») |
+| Thực thi trên tài khoản thật | **CHƯA XÁC MINH và không được triển khai** | package Python và CLI không chứa lời gọi gửi lệnh nào, theo thiết kế; đường demo từ chối mọi thứ không phải tài khoản demo (`AllowLiveExecution=false`, `require_demo`, bước kiểm `ACCOUNT_TRADE_MODE`), và một chính sách có `mode: live` bị từ chối khi tải |
 
 Bản xem trước cục bộ dùng khi viết tài liệu này phát lại chuỗi EURUSD H1 **tổng hợp** (random walk
 có trend, có seed); nó không được commit như một artifact, và các test tạo cùng chuỗi đó bằng helper
@@ -47,6 +56,17 @@ thực thi quyết định đó theo cả hai chiều.
 | `mt5_agent/codes.py` | danh sách mã trạng thái và lý do chặn duy nhất |
 | `scripts/run_mt5_agent.py` | CLI: `run` (csv/live, auto/confirm, ru/en/vi), `report`, `reset --confirm` |
 | `config/mt5_agent.example.yaml` | ví dụ chính sách có chú thích |
+
+Mọi thứ có thể đặt một lệnh ra thế giới đều nằm tách khỏi package đó, và chỉ dành cho demo:
+
+| Thành phần | Vai trò |
+|---|---|
+| `scripts/mt5_demo_bridge.py` | cầu nối HTTP chỉ-loopback: hai GET (`/v1/risk/kill-switch`, `/v1/execution/next`), kiểm tra `X-Bridge-Key`, một lệnh đang chờ, TTL, các tombstone idempotency đã fsync, không bao giờ ghi log token hay nội dung lệnh |
+| `scripts/run_mt5_demo_trading.py` | thành phần duy nhất có thể dựng một lệnh: lấy quyết định của agent, kiểm lại mọi cổng, xếp hàng nó trong cầu nối và đối chiếu với chính lịch giao dịch của broker; không bao giờ thử lại một lần gửi không chắc chắn |
+| `scripts/build_demo_ea.py` | sinh ra `CriticalConsensusEA_Demo.mq5` bằng cách lật đúng một dòng cổng compile-time, tùy chọn biên dịch nó bằng MetaEditor và cài `.ex5` |
+| `scripts/setup_demo_terminal.py` | mặc định là dry run: từ chối khi terminal đang chạy, vá `[Experts]` trong `Config/common.ini`, cài EA đã build; không quyết định điều gì về một lệnh |
+| `scripts/operator_answers.py` | phân tích câu trả lời cả dòng (`да`/`vâng`/`y`) dùng chung cho CLI và runner demo |
+| `mql5/CriticalConsensusEA.mq5` | mã nguồn advisor; trong repository này cổng luôn là `false`, và bộ kiểm tĩnh cố định giá trị mặc định đó |
 
 ## Thứ tự một vòng lặp
 
@@ -126,6 +146,77 @@ bao giờ bị hiểu nhầm thành "đồng ý tất cả". Không có bàn ph�
 nhận, và lượt chạy vẫn tiếp tục để nhật ký không bị thiếu. `--execution auto|confirm` ghi đè chính
 sách cho một lượt chạy và được kiểm lại, nên quy tắc "chỉ demo" vẫn đúng trong cả hai trường hợp.
 Vị thế được mô phỏng cục bộ ở cả hai chế độ; không có lệnh broker nào trong cả hai.
+
+## Thực thi demo qua cầu nối loopback
+
+Chuỗi liên kết đi theo một đường duy nhất và thứ tự của nó là cố định: package `mt5_agent` quyết
+định và tính khối lượng (nó không thể gửi), `run_mt5_demo_trading.py` kiểm lại quyết định đó và xếp
+đúng một lệnh vào `mt5_demo_bridge.py`, advisor thăm dò cầu nối qua `WebRequest` trên `127.0.0.1`
+và gọi `OrderSend` trên một tài khoản demo, còn runner đối chiếu kết quả với chính lịch giao dịch
+của broker theo magic number `8172026` và chú thích `CC:<id>`.
+
+Các cổng phải đồng thời thỏa trước khi một lệnh tồn tại:
+
+1. Tài khoản terminal phải là demo (`ACCOUNT_TRADE_MODE`), chính sách phải yêu cầu điều đó
+   (`account.require_demo: true`), và `expected_login`/`expected_server` phải khớp.
+2. Chế độ chính sách phải là `paper` (hoặc `observe`), và `auto` là bất khả thi nếu không có yêu
+   cầu demo.
+3. Báo giá được đọc lại trước khi dựng lệnh: điểm vào, hình học stop/take, `stops_level` của broker,
+   spread và tuổi tick đều được kiểm trên dữ liệu tươi mới.
+4. Khối lượng phải nằm trong `volume_min`/`volume_step`/`volume_max` của broker, dưới `--max-volume`
+   (tối đa 0.20) và trong margin khả dụng; tham số `MaxVolume` của chính advisor cũng là 0.20.
+5. Cầu nối giữ một lệnh đang chờ, đòi `X-Bridge-Key` (24–256 ký tự), áp TTL 5–600 s, và không bao
+   giờ phục vụ cùng một `command_id` hai lần. `client_order_id` tất định, nên khởi động lại runner
+   không tạo ra lệnh thứ hai.
+6. Ở chế độ `confirm` cần cả một dòng trả lời của người vận hành (`да`/`vâng`/`y`); một mảnh không
+   phải câu trả lời.
+7. Advisor độc lập kiểm lại tất cả điều trên, cộng công tắc ngừng lệnh qua một GET mới, TTL, cổng
+   compile-time `ENABLE_DEMO_EXECUTION` của nó, `AllowLiveExecution`, symbol, khối lượng và các
+   stop, và nó ghi các tombstone idempotency trước khi gửi.
+8. Một kết quả không chắc chắn (lệnh đã được phục vụ, không thấy khớp) dừng lượt chạy và cần
+   `--acknowledge-uncertain` rõ ràng; không có đường mã nào gửi lại.
+
+### Quan sát trực tiếp ngày 2026-10-31 (`--symbols all`, terminal thật)
+
+13 công cụ đã được yêu cầu; broker cung cấp 7. Kết quả của một vòng lặp: **0 lệnh được xếp hàng,
+0 lệnh được khớp, `broker_order_sent: false` trong mọi bản ghi, chuỗi nhật ký hợp lệ**.
+
+| Công cụ | Kết quả | Vì sao đúng |
+|---|---|---|
+| EURUSD, GBPUSD, AUDUSD, NZDUSD, XAUUSD, XAGUSD | `BLOCKED` → `QUOTE_STALE` | tick cuối cùng 2026-10-30T21:00:00Z; thị trường đóng cửa suốt cuối tuần |
+| US500 | `BLOCKED` → `MARKET_DATA_READ_FAILED` | `MT5 returned no tick for US500` — đặc tả đọc được, không có báo giá nào |
+| USDJPY, USDCAD, USDCHF, EURGBP | bỏ qua trước vòng lặp | `pays profit in JPY/CAD/CHF/GBP, not in the account currency USD` — tính khối lượng theo tiền tệ tài khoản sẽ sai |
+| NAS100, BTCUSD | bỏ qua trước vòng lặp | `MT5 could not select symbol …` — broker này không cung cấp |
+
+Không thể mặc cả để bỏ qua tuổi báo giá: `max_quote_age_seconds` chỉ được chấp nhận trong khoảng từ
+1 tới 300, nên một chuỗi ngày Thứ Bảy luôn cho `QUOTE_STALE`. Đó là chủ ý.
+
+Lý do tài khoản này vẫn sẽ không thực thi ngay cả khi thị trường mở là phép tính trên các đặc tả
+thật và các nến H1 thật (một phép tính, không phải một sự từ chối đã đo): ngân sách rủi ro
+`0.005 × min(equity, balance) = 0.05 USD` ở số dư 10.00 USD, trong khi rủi ro của lot tối thiểu theo
+broker là 3.27 USD trên EURUSD, 3.35 trên GBPUSD, 1.93 trên AUDUSD, 1.98 trên NZDUSD, 3.97 trên
+XAUUSD và 4.24 trên XAGUSD. Mọi symbol đều dừng ở `MINIMUM_LOT_EXCEEDS_RISK_BUDGET`. Một tài khoản
+demo 10 USD không chứa nổi một lệnh đơn lẻ đúng chính sách; ở 10 000 USD thì cùng 0.5% cho ngân
+sách 50 USD và những con số đó lọt qua.
+
+### Cách chạy nó
+
+```powershell
+# 1. terminal phải ở trạng thái ĐÓNG: MT5 ghi lại common.ini khi nó thoát
+python scripts/setup_demo_terminal.py                       # dry run: điều gì sẽ thay đổi
+python scripts/setup_demo_terminal.py --apply               # build, cài, cho phép WebRequest loopback
+# 2. khởi động terminal, đăng nhập tài khoản demo, gắn CriticalConsensusEA_Demo vào một biểu đồ bằng tay
+# 3. bật nút AutoTrading và giữ runner sống
+$env:MT5_BRIDGE_TOKEN = "<24-256 ký tự>"
+python scripts/run_mt5_demo_trading.py --policy agent_data/live_demo_policy.yaml `
+  --db agent_data/mt5_demo.db --symbols all --cycles 0 --execution confirm --verbose
+```
+
+`--cycles 0` nghĩa là «cứ chạy cho tới khi tiến trình bị dừng». Nếu advisor không được gắn, các
+lệnh đơn giản hết hạn dưới TTL — nhật ký báo chúng một cách trung thực là `expired`, và không lệnh
+nào tới được broker. Nút AutoTrading và `[Experts] Enabled=1` là hai công tắc khác nhau: nút GUI tắt
+mọi thứ, nên phải chạy lại `setup_demo_terminal.py` sau bất kỳ lần bật/tắt nào thực hiện bên trong
+terminal.
 
 ## Ngôn ngữ
 
@@ -269,6 +360,14 @@ symbol.
 6. Bắt đầu với `mode: observe` — vòng lặp ghi quyết định nhưng không mở gì.
 7. Sau đó `mode: paper` với `--source live` hoặc file CSV.
 8. Xem `report`: `verified_chain.valid` phải là `true` và `broker_order_sent` phải là `false`.
+9. Số dư demo quá nhỏ thì không bao giờ chạm tới bước thực thi: ở 10 USD với
+   `risk_per_trade_fraction: 0.005` ngân sách rủi ro là 0.05 USD, trong khi lot tối thiểu của bất kỳ
+   symbol nào ở trên đều rủi ro 1.93–4.24 USD (xem «Thực thi demo qua cầu nối loopback»), nên vòng
+   lặp dừng ở `MINIMUM_LOT_EXCEEDS_RISK_BUDGET`. Hãy mở một tài khoản demo 10 000 USD hoặc nâng tỉ
+   lệ rủi ro một cách có ý thức và kiểm lại ngân sách.
+10. Chỉ khi đó mới đáng chuẩn bị terminal cho việc thực thi demo:
+    `python scripts/setup_demo_terminal.py` (dry run), rồi `--apply` khi terminal đã đóng, rồi gắn
+    `CriticalConsensusEA_Demo` vào một biểu đồ bằng tay và bật AutoTrading.
 
 ## Cố ý không mô hình hoá
 
@@ -282,6 +381,14 @@ symbol.
   **có** lời gọi `OrderSend`, nhưng nó nằm sau hằng số compile-time `ENABLE_DEMO_EXECUTION = false`
   (và sau tham số `AllowLiveExecution` buộc phải là false), nên không thể tới được nếu không sửa
   mã nguồn và biên dịch lại; agent Python không bao giờ gọi template đó.
+- Đường demo trong `scripts/` không phải ngoại lệ của quy tắc đó: cả `run_mt5_demo_trading.py` lẫn
+  `mt5_demo_bridge.py` đều không chứa một lời gọi giao dịch MT5 nào (grep cho
+  `order_send|trade_|OrderSend` không tìm thấy gì). Python chỉ giữ một lệnh HTTP sống tới hết TTL
+  của nó; advisor bên trong terminal mới là thứ có thể biến nó thành một lệnh, và đó là lý do
+  "Python đã gửi một lệnh" là bất khả thi trong hệ thống này, kể cả với demo.
+- Không mô hình hoá và không đo: khớp một phần, requote sau `Done`, trượt giá so với điểm vào đã
+  duyệt, và mất kết nối giữa advisor và cầu nối. Tất cả những gì có cho các trường hợp đó là các
+  tombstone, bản ghi đúng-ID của cầu nối và một bước đối chiếu thủ công với lịch giao dịch.
 - Không có `mode: live`: chính sách từ chối ngay khi tải.
 - Agent không phải một phần của cơ chế cấp phép: `pipeline.evaluate_signal_bundle`, Certainty Gate
   và phê duyệt con người vẫn là những con đường duy nhất (và vẫn đang đóng) tới một lệnh thật.
