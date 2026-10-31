@@ -284,8 +284,9 @@ def detect_potential_bar_gaps(
     """Report suspicious timestamp gaps without assuming a broker's trading calendar.
 
     Weekend-spanning intervals are included by default because some instruments trade
-    continuously. Suppression is opt-in only after the broker session is verified.
-    Other gaps are advisory: holidays and maintenance sessions need operator review.
+    continuously. Opt-in suppression ignores only a normal weekend-sized gap (up to
+    timeframe duration plus three days); extended gaps remain visible. Other gaps are
+    advisory: holidays and maintenance sessions need operator review.
     """
     rows = validate_bar_series(bars, min_bars=1)
     if (isinstance(gap_tolerance_seconds, bool)
@@ -311,7 +312,7 @@ def detect_potential_bar_gaps(
                     crosses_weekend = True
                     break
                 day += timedelta(days=1)
-        if crosses_weekend:
+        if crosses_weekend and elapsed <= duration + timedelta(days=3):
             continue
         gaps.append({
             "symbol": previous.symbol,
