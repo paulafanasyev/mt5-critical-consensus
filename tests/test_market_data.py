@@ -5,8 +5,10 @@ import pytest
 
 import critical_consensus.market_data as market_data
 
-from critical_consensus.market_data import (MarketBar, build_market_snapshot, build_next_bar_forecast_contract,
-    read_mt5_csv, retain_completed_bars, validate_bar_series)
+from critical_consensus.market_data import (
+    MarketBar, build_market_snapshot, build_next_bar_forecast_contract,
+    detect_potential_bar_gaps, read_mt5_csv, retain_completed_bars, validate_bar_series,
+)
 from critical_consensus.persistence import PostgresRepository
 
 
@@ -143,6 +145,7 @@ def test_live_mt5_adapter_uses_utc_read_only_calls_and_always_shuts_down(monkeyp
     fake = SimpleNamespace(
         TIMEFRAME_H1=60,
         initialize=lambda **kwargs: calls.append(("initialize", kwargs)) or True,
+        terminal_info=lambda: SimpleNamespace(connected=True),
         symbol_select=lambda symbol, enabled: calls.append(("symbol_select", symbol, enabled)) or True,
         copy_rates_range=lambda symbol, timeframe, start, end: (
             calls.append(("copy_rates_range", symbol, timeframe, start, end)) or [
@@ -177,6 +180,7 @@ def test_live_mt5_adapter_shuts_down_when_rate_fetch_fails(monkeypatch):
     fake = SimpleNamespace(
         TIMEFRAME_M1=1,
         initialize=lambda **kwargs: True,
+        terminal_info=lambda: SimpleNamespace(connected=True),
         symbol_select=lambda symbol, enabled: True,
         copy_rates_range=lambda *args: None,
         shutdown=lambda: calls.append("shutdown"),
@@ -192,3 +196,74 @@ def test_live_mt5_adapter_shuts_down_when_rate_fetch_fails(monkeypatch):
     assert calls == ["shutdown"]
 
 
+
+
+
+def test_live_mt5_adapter_shutdowns_after_initialize_failure(monkeypatch):
+    calls = []
+    fake = SimpleNamespace(
+        initialize=lambda **kwargs: False,
+        shutdown=lambda: calls.append("shutdown"),
+        last_error=lambda: (-10004, "no connection"),
+    )
+    monkeypatch.setattr(market_data.importlib, "import_module", lambda name: fake)
+    with pytest.raises(RuntimeError, match="initialize failed"):
+        market_data.fetch_mt5_bars(
+            "EURUSD", "M1",
+            datetime(2026, 10, 31, tzinfo=timezone.utc),
+            datetime(2026, 11, 1, tzinfo=timezone.utc),
+        )
+    assert calls == ["shutdown"]
+
+
+def test_live_mt5_adapter_rechecks_terminal_connection_before_reading(monkeypatch):
+    calls = []
+    fake = SimpleNamespace(
+        initialize=lambda **kwargs: True,
+        terminal_info=lambda: SimpleNamespace(connected=False),
+        symbol_select=lambda *args: calls.append("symbol_select") or True,
+        shutdown=lambda: calls.append("shutdown"),
+        last_error=lambda: (-10004, "disconnected"),
+    )
+    monkeypatch.setattr(market_data.importlib, "import_module", lambda name: fake)
+    with pytest.raises(RuntimeError, match="not connected"):
+        market_data.fetch_mt5_bars(
+            "EURUSD", "M1",
+            datetime(2026, 10, 31, tzinfo=timezone.utc),
+            datetime(2026, 11, 1, tzinfo=timezone.utc),
+        )
+    assert "symbol_select" not in calls
+    assert calls == ["shutdown"]
+
+
+def test_potential_gap_detector_flags_weekday_missing_interval():
+    data = [
+        MarketBar("EURUSD", "H1", datetime(2026, 10, 26, 10, tzinfo=timezone.utc),
+                  1.0, 1.1, 0.9, 1.05),
+        MarketBar("EURUSD", "H1", datetime(2026, 10, 26, 11, tzinfo=timezone.utc),
+                  1.05, 1.15, 0.95, 1.1),
+        MarketBar("EURUSD", "H1", datetime(2026, 10, 26, 13, tzinfo=timezone.utc),
+                  1.1, 1.2, 1.0, 1.15),
+    ]
+    gaps = detect_potential_bar_gaps(data)
+    assert len(gaps) == 1
+    assert gaps[0]["previous_bar_utc"] == data[1].time.isoformat()
+    assert gaps[0]["next_bar_utc"] == data[2].time.isoformat()
+    assert gaps[0]["nominal_periods_elapsed"] == 2
+    assert gaps[0]["status"] == "POTENTIAL_GAP_REQUIRES_SESSION_REVIEW"
+
+
+def test_potential_gap_detector_ignores_weekend_market_closure():
+    data = [
+        MarketBar("EURUSD", "H1", datetime(2026, 10, 30, 21, tzinfo=timezone.utc),
+                  1.0, 1.1, 0.9, 1.05),
+        MarketBar("EURUSD", "H1", datetime(2026, 11, 2, 0, tzinfo=timezone.utc),
+                  1.05, 1.15, 0.95, 1.1),
+    ]
+    assert detect_potential_bar_gaps(data) == []
+    assert len(detect_potential_bar_gaps(data, ignore_weekend_closures=False)) == 1
+
+
+def test_potential_gap_detector_rejects_invalid_tolerance():
+    with pytest.raises(ValueError, match="gap_tolerance_seconds"):
+        detect_potential_bar_gaps(bars(2), gap_tolerance_seconds=float("nan"))
