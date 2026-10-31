@@ -1209,6 +1209,60 @@ def test_equity_baselines_are_the_first_day_equity_and_the_running_peak():
     assert terminal.peak_equity == 11_050.0
 
 
+def test_risk_baselines_survive_runner_restart_and_are_scoped_to_the_broker_account(tmp_path):
+    database = tmp_path / "risk-baselines.db"
+    day = date(2026, 10, 30)
+
+    def account(*, login: int, server: str, equity: float) -> AccountInfo:
+        return AccountInfo(login=login, server=server, currency="USD", balance=equity,
+                           equity=equity, margin_free=equity, leverage=100,
+                           trade_mode="demo")
+
+    first_journal = DecisionJournal(database, run_id="first-process")
+    first = bare_terminal()
+    first.attach_journal(first_journal)
+    first._server_day = lambda: day
+    first.account = lambda: account(login=501, server="Broker-Demo", equity=10_000.0)
+    assert first.day_start_equity == 10_000.0
+
+    # A new intraday high must be committed before the risk gate can use it.
+    first.account = lambda: account(login=501, server="Broker-Demo", equity=10_500.0)
+    assert first.peak_equity == 10_500.0
+    first_journal.close()
+
+    # A fresh process with lower equity must recover both the original day start and peak.
+    second_journal = DecisionJournal(database, run_id="second-process")
+    restarted = bare_terminal()
+    restarted.attach_journal(second_journal)
+    restarted._server_day = lambda: day
+    restarted.account = lambda: account(login=501, server="Broker-Demo", equity=9_700.0)
+    assert restarted.day_start_equity == 10_000.0
+    assert restarted.peak_equity == 10_500.0
+
+    # A different broker account must not inherit the first account's risk history.
+    other_account = bare_terminal()
+    other_account.attach_journal(second_journal)
+    other_account._server_day = lambda: day
+    other_account.account = lambda: account(login=502, server="Other-Demo", equity=20_000.0)
+    assert other_account.day_start_equity == 20_000.0
+    assert other_account.peak_equity == 20_000.0
+    second_journal.close()
+
+
+def test_corrupt_risk_baseline_journal_fails_closed(tmp_path):
+    journal = DecisionJournal(tmp_path / "corrupt-risk-baselines.db", run_id="run-1")
+    terminal = bare_terminal()
+    terminal.attach_journal(journal)
+    terminal._server_day = lambda: date(2026, 10, 30)
+    terminal.account = lambda: AccountInfo(
+        login=501, server="Broker-Demo", currency="USD", balance=10_000.0,
+        equity=10_000.0, margin_free=10_000.0, leverage=100, trade_mode="demo")
+    journal.chain_status = lambda: {"valid": False, "reason": "TEST_CORRUPTION"}
+    with pytest.raises(RuntimeError, match="journal integrity"):
+        _ = terminal.day_start_equity
+    journal.close()
+
+
 def test_realized_daily_pnl_comes_from_closed_deals_of_this_magic_only():
     terminal = bare_terminal()
     now_stamp = datetime.now(UTC).timestamp()
