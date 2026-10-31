@@ -132,11 +132,11 @@ Export only database-resolved objective market-event forecasts; legacy subjectiv
 
 ```powershell
 python scripts/export_resolved_forecasts.py --output .\\resolved-forecasts.csv
-python scripts/evaluate_calibration.py .\\resolved-forecasts.csv --output .\\calibration-report.json
+python scripts/evaluate_calibration_db.py --output .\\calibration-report.json
 python scripts/store_calibration_report.py .\\calibration-report.json
 ```
 
-The evaluator rejects incomplete or tampered evidence metadata, checks the canonical resolution-evidence hash and verifies that the declared outcome matches the reference and target closes. Legacy CSV rows without the new evidence contract can be parsed for diagnostics but force provenance status to `NOT_VERIFIED_BY_SCRIPT` and cannot advance the overall status beyond `NOT_PROVEN`.
+The evaluator rejects incomplete or tampered evidence metadata, checks the canonical resolution-evidence hash and verifies that the declared outcome matches the reference and target closes. Legacy CSV rows without the new evidence contract can be parsed for diagnostics but force provenance status to `NOT_VERIFIED_BY_SCRIPT` and cannot advance the overall status beyond `NOT_PROVEN`. The database-native evaluator reads directly from `forecast_predictions` joined to `forecast_resolution_events`, re-validates every evidence payload, and hashes the exact exported ledger rows. It is the only evaluator allowed to label provenance `DATABASE_LEDGER_SELF_CONSISTENT_NOT_BROKER_AUTHENTICATED`; the CSV evaluator is diagnostic-only and always reports `NOT_VERIFIED_BY_SCRIPT`.
 
 The walk-forward evaluator fits Platt scaling only on earlier forecasts whose outcomes were resolved before the next test block. It reports Brier score, log loss, reliability bins, ECE, high-confidence false-certainty rate, sample counts and deterministic paired-bootstrap intervals. Too few observations or an interval that does not show improvement remains `NOT_PROVEN`. The policy's minimum sample requirements still apply independently.
 
