@@ -455,6 +455,32 @@ def _persisted_demo_risk_evidence(bundle, *, kill_switch_active=False, binding_o
     return state, snapshot
 
 
+def test_persisted_kill_switch_denies_before_incomplete_bundle_is_requested():
+    result = run_pipeline(
+        {},
+        require_persisted_risk=True,
+        kill_switch_state={
+            "kill_switch_active": True,
+            "status": "PERSISTED",
+            "updated_at": NOW.isoformat(),
+            "updated_by": "pytest-operator",
+            "reason": "emergency stop",
+        },
+    )
+    assert result["status"] == "DENY"
+    assert "KILL_SWITCH_ACTIVE_OR_INVALID" in result["blockers"]
+    assert result["trade_allowed"] is False
+    assert result["audit_chain_valid"] is True
+
+
+def test_missing_persisted_kill_switch_denies_before_bundle_validation():
+    result = run_pipeline({}, require_persisted_risk=True, kill_switch_state=None)
+    assert result["status"] == "DENY"
+    assert "KILL_SWITCH_STATE_UNKNOWN" in result["blockers"]
+    assert result["trade_allowed"] is False
+    assert result["audit_chain_valid"] is True
+
+
 def test_persisted_pipeline_permission_requires_global_kill_switch_inactive():
     bundle = make_bundle()
     state, snapshot = _persisted_demo_risk_evidence(bundle, kill_switch_active=True)
