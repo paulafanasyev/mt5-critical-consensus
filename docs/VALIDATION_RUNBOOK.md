@@ -12,6 +12,16 @@ $env:DATABASE_URL = "postgresql://USER:PASSWORD@127.0.0.1:5432/mt5cc"
 python scripts/import_mt5_history.py --live-terminal --symbol EURUSD --timeframe H1 --from-utc 2026-10-01T00:00:00Z --to-utc 2026-10-30T00:00:00Z
 ```
 
+For repeated synchronization, use the incremental cycle. The first run needs a bootstrap timestamp; later runs resume from the latest persisted bar. It imports only completed bars and attempts resolution after ingestion:
+
+```powershell
+python scripts/sync_mt5_market_data.py --symbol EURUSD --timeframe H1 --bootstrap-from-utc 2026-10-01T00:00:00Z
+# Subsequent Task Scheduler runs omit --bootstrap-from-utc:
+python scripts/sync_mt5_market_data.py --symbol EURUSD --timeframe H1
+```
+
+Schedule the second command on the Windows MT5 host at a suitable interval (for example, every five minutes for H1 monitoring). This is a read-only data synchronization and forecast-resolution job; it does not submit orders.
+
 The connector only calls `initialize`, `symbol_select`, `copy_rates_range`, and `shutdown`. It contains no order submission calls. For CSV export, specify the broker/server timezone explicitly:
 
 ```powershell
