@@ -572,9 +572,11 @@ def test_help_survives_a_cp1252_pipe(tmp_path, script, arguments):
     assert "язык" in combined
 
 
-def test_a_setup_refusal_reaches_a_legacy_stderr_as_localized_text(monkeypatch):
+def test_a_setup_refusal_reaches_a_legacy_stderr_as_localized_text(monkeypatch, tmp_path):
     import setup_demo_terminal
 
+    monkeypatch.setattr(setup_demo_terminal, "default_data_dir",
+                        lambda *args, **kwargs: tmp_path)
     monkeypatch.setattr(setup_demo_terminal, "running_terminals",
                         lambda *args, **kwargs: ["terminal64.exe"])
     captured = io.BytesIO()
