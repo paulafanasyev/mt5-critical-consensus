@@ -185,28 +185,40 @@ Các cổng phải đồng thời thỏa trước khi một lệnh tồn tại:
 
 Công tắc ngừng là một tệp, không phải một biến: `kill_switch.json` nằm cạnh các tombstone. Một bản
 ghi lưu thay đổi cuối cùng của công tắc (`kill_switch_active`, `kill_switch_reason`, `actor_id`,
-`updated_at`, `event_hash`), được viết lại toàn bộ qua một tệp tạm cộng `os.replace` và fsync. Runner khởi tạo nó từ `kill_switch.active: true` trong chính sách, người vận hành bật nó qua HTTP, advisor
-đọc nó trong mỗi lần poll, còn runner đọc nó hai lần cho mỗi offer — trước mọi lần đọc thị trường và
-ngay trước khi dựng một lệnh. Vì vậy `scripts/activate_kill_switch.ps1` đã được tài liệu hóa cũng
-dừng được đường này, và một lần bật trước khi khởi động lại vẫn còn hiệu lực sau khi khởi động lại.
+`updated_at`, `event_hash`), được viết lại toàn bộ qua một tệp tạm cộng `os.replace` và fsync. Advisor
+đọc bản ghi đó trong mỗi lần poll, còn runner đọc nó hai lần cho mỗi offer — trước mọi lần đọc thị
+trường và ngay trước khi dựng một lệnh. Cả hai đều đọc lại tệp chứ không giữ một bản sao trong bộ
+nhớ, nên người vận hành bật hoặc tắt công tắc ngay trong lúc một lượt chạy đang sống, và lần đọc kế
+tiếp đã là câu trả lời mới. Vì vậy `scripts/activate_kill_switch.ps1` đã được tài liệu hóa cũng dừng
+được đường này, và một lần bật trước khi khởi động lại vẫn còn hiệu lực sau khi khởi động lại.
 
 - Bật chỉ cần khóa của cầu nối: `POST /v1/risk/kill-switch` với thân
   `{"active": true, "reason": …}` và header `X-Bridge-Key`. Câu trả lời mang `status: "PERSISTED"`,
-  `updated_at` và `event_hash` — đúng những gì đoạn PowerShell đó kiểm tra. Một yêu cầu mà thân không đọc được
-  thành đối tượng JSON, có `active` không phải boolean hoặc có các trường ghi chú không phải chuỗi bị
-  từ chối với 400 và không thay đổi gì; thân dài hơn 4096 byte được đọc hết ra khỏi socket rồi bị từ
-  chối với 413, để khách hàng nhận được phán quyết thay vì một kết nối bị đứt.
+  `updated_at` và `event_hash` — đúng những gì đoạn PowerShell đó kiểm tra; ngoài ra nó còn đòi một
+  hash 64 ký tự và rồi tự thực hiện đúng phép GET mà advisor thực hiện, nên một lần bật mà trạng thái
+  được poll không đồng tình sẽ bị báo là thất bại. Một yêu cầu mà thân không
+  đọc được thành đối tượng JSON, có `active` không phải boolean hoặc có các trường ghi chú không phải
+  chuỗi bị từ chối với 400 và không thay đổi gì; thân dài hơn 4096 byte được rút hết ra khỏi socket
+  (tối đa 1 MiB) rồi bị từ chối với 413, để khách hàng nhận được phán quyết thay vì một kết nối bị
+  đứt. Một khách hàng im lặng giữa chừng yêu cầu bị ngắt sau 10 giây, thay vì giữ một luồng xử lý.
 - Tắt cần bí mật thứ hai: `MT5_KILL_SWITCH_ADMIN_TOKEN` dài ít nhất 32 ký tự, khác `MT5_BRIDGE_TOKEN`,
   gửi trong `X-Kill-Switch-Admin`. Thiếu admin token hoặc trùng với khóa cầu nối là 503, sai là 403;
   cả hai trường hợp công tắc vẫn bật. Khi không có runner nào đang sống,
-  `python scripts/run_mt5_demo_trading.py --release-kill-switch` đọc đúng tệp đó, lấy admin token từ
-  môi trường và ghi lệnh tắt.
-- Một trạng thái không đọc được không bao giờ được coi là đã tắt: `kill_switch.json` hỏng hoặc không
-  đọc được khiến runner từ chối và khiến GET của advisor trả 503, mà advisor coi là chặn. Một lần bật
-  không ghi được xuống đĩa vẫn bật trong bộ nhớ (câu trả lời nói `MEMORY_ONLY`), còn một lần tắt không
-  ghi được để công tắc ở trạng thái bật.
-- Một lần dừng bên trong lượt chạy — `STOPPED`, một lần gửi không xác nhận — bật đúng bản ghi bền đó,
-  nên kết thúc tiến trình không kết thúc lệnh dừng.
+  `python scripts/run_mt5_demo_trading.py --policy <policy.yaml> --db <journal.db>
+  --release-kill-switch` đọc đúng tệp đó, lấy admin token từ môi trường và ghi trạng thái tắt;
+  `--policy` và `--db` bắt buộc với mọi lần gọi, kể cả lần này.
+- Không có gì mặc định là an toàn. Một trạng thái không đọc được không bao giờ được coi là đã tắt: nếu
+  không có bản ghi nào, câu trả lời là `{"kill_switch_active": true, "kill_switch_reason":
+  "NOT_SEEDED"}`; `kill_switch.json` hỏng hoặc không đọc được khiến runner từ chối ngay trước khi bắt
+  đầu và khiến GET của advisor trả 503; một bản ghi từng tồn tại rồi biến mất — tức là tệp bị xóa —
+  cũng là 503 chứ không phải một khởi đầu sạch. Vì vậy xóa tệp trạng thái không thể tắt công tắc.
+- Lượt chạy đầu tiên không tìm thấy bản ghi sẽ viết một bản ghi từ mục `kill_switch` trong chính sách,
+  vì ý định của người vận hành sống ở đó; còn bản ghi do người vận hành POST hoặc do một lượt chạy bị
+  dừng để lại thì không bao giờ bị ghi đè, bởi một công tắc ai đó đã bật nặng hơn một chính sách quên
+  nó. Điều duy nhất giữ trong bộ nhớ là một lần bật không ghi xuống đĩa được: nó vẫn chặn (câu trả lời
+  nói `MEMORY_ONLY`), còn một lần tắt không ghi được để công tắc ở trạng thái bật.
+- Mọi kết quả dừng một lượt chạy — "stop" ở bước xác nhận, một lần gửi không xác nhận, một id lệnh bị
+  trùng — bật đúng bản ghi bền đó, nên kết thúc tiến trình không kết thúc lệnh dừng.
 
 ### Quan sát trực tiếp ngày 2026-10-31 (`--symbols all`, terminal thật)
 

@@ -1,10 +1,12 @@
 """The demo runner is the only component that can cause an order; its gates are tested as such."""
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import subprocess
 import sys
+import threading
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -22,7 +24,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import run_mt5_demo_trading as runner  # noqa: E402
-from mt5_demo_bridge import BridgeError  # noqa: E402
+from mt5_demo_bridge import BridgeError, NEXT_COMMAND_PATH  # noqa: E402
 from operator_answers import ApprovalState  # noqa: E402
 
 UTC = timezone.utc
@@ -143,6 +145,62 @@ class StubAgent:
 
     def post_approval_gates(self, _proposal, _sizing):
         return (), {}
+
+
+class OfferingAgent(StubAgent):
+    """An agent that has a signal and a market that has not moved, so a run reaches the queue.
+
+    ``_run`` wires the executor's gates from the agent it builds here, so this is the seam
+    between the run loop and ``DemoExecutor.offer``: nothing short of an agent that offers
+    drives a real command through the real bridge.
+    """
+
+    def run_cycle(self, **_kwargs):
+        return SimpleNamespace(status=codes.STATUS_OBSERVED, blockers=(),
+                               proposal=proposal(), sizing=sizing(),
+                               recorded_at=NOW.isoformat())
+
+    def post_approval_gates(self, _proposal, signal_sizing):
+        return (), {"fill_price": 1.10010, "final_volume": float(signal_sizing["volume"])}
+
+
+class EAQueryingBridge(runner.DemoBridge):
+    """The bridge with the advisor attached, polling ``/v1/execution/next`` over a real socket.
+
+    A command is only served by the HTTP layer, so a run that reaches a broker deal here has
+    gone through the queue, the tombstone write and the ``served_at`` the executor waits on,
+    exactly as it does against MetaTrader.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.commands_served: list[dict] = []
+        self._stop_polling = threading.Event()
+
+    def start(self) -> "EAQueryingBridge":
+        super().start()
+        threading.Thread(target=self._poll_commands, daemon=True).start()
+        return self
+
+    def _poll_commands(self) -> None:
+        while not self._stop_polling.wait(0.05):
+            connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
+            try:
+                connection.request("GET", NEXT_COMMAND_PATH,
+                                   headers={"Host": f"127.0.0.1:{self.port}",
+                                            "X-Bridge-Key": self._token})
+                response = connection.getresponse()
+                body = response.read()
+                if response.status == 200:
+                    self.commands_served.append(json.loads(body))
+            except OSError:
+                return
+            finally:
+                connection.close()
+
+    def stop(self):
+        self._stop_polling.set()
+        return super().stop()
 
 
 def proposal(*, direction: str = "BUY", entry: float = 1.10000, sl: float = 1.09000,
@@ -696,7 +754,7 @@ def test_a_stop_written_by_one_process_blocks_the_next(tmp_path, journal):
 
 def test_the_runners_own_halt_is_durable(tmp_path):
     store = runner.KillSwitchStore(tmp_path / "kill_switch.json")
-    runner._arm_stop(store, language="en", reason="EURUSD:STOPPED")
+    runner._set_stop(store, language="en", reason="EURUSD:STOPPED")
     assert runner.stop_is_armed(runner.KillSwitchStore(tmp_path / "kill_switch.json").payload)
 
 
@@ -707,9 +765,16 @@ def test_a_halt_that_cannot_be_written_still_blocks(tmp_path, monkeypatch, capsy
         raise OSError("disk full")
 
     monkeypatch.setattr(runner.KillSwitchStore, "_write", refuse)
-    runner._arm_stop(store, language="en", reason="EURUSD:STOPPED")
+    runner._set_stop(store, language="en", reason="EURUSD:STOPPED")
     assert runner.stop_is_armed(store.payload)
     assert "OSError" in capsys.readouterr().err
+
+
+def test_a_state_file_that_was_never_written_blocks_rather_than_passes(tmp_path):
+    """A fresh path is not a released switch: nothing has ever said trading is allowed."""
+    store = runner.KillSwitchStore(tmp_path / "kill_switch.json")
+    assert store.read() is None
+    assert runner.stop_is_armed(store.payload)
 
 
 def test_releasing_a_persisted_stop_from_the_cli_needs_the_admin_secret(tmp_path, monkeypatch):
@@ -727,9 +792,10 @@ def test_releasing_a_persisted_stop_from_the_cli_needs_the_admin_secret(tmp_path
     monkeypatch.setenv(runner.ADMIN_TOKEN_ENV, "a" * 32)
     assert runner._release_kill_switch(args, "en", TOKEN) == 0
     assert runner.KillSwitchStore(path).read()["kill_switch_active"] is False
-    # The process that armed the stop keeps blocking: its own arm is never forgotten because
-    # another writer touched the file, which is why this release is for the gap between runs.
-    assert runner.stop_is_armed(store.payload)
+    # The release is obeyed by the process that armed it too, without a restart: the file is
+    # the authority on every read, so no running bridge or runner can be stuck on its own
+    # last word. The one thing a process does hold in memory is an arm that never reached disk.
+    assert not runner.stop_is_armed(store.payload)
 
 
 # ----------------------------------------------------------------------- CLI contract
@@ -987,6 +1053,107 @@ def test_a_stop_left_by_an_earlier_run_blocks_the_next_one(tmp_path, monkeypatch
     captured = capsys.readouterr()
     assert "The emergency stop is armed (operator halt)" in captured.err
     assert json.loads(captured.out)["kill_switch_armed"] is True
+
+
+def _run_with_real_bridge(tmp_path, monkeypatch, capsys, *, policy, terminal):
+    """Drive ``_run`` end to end: the real bridge on a real socket, the agent that offers."""
+    monkeypatch.setattr(runner, "MT5Agent", OfferingAgent)
+    built: list[runner.DemoBridge] = []
+
+    class Tracked(EAQueryingBridge):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            built.append(self)
+
+    monkeypatch.setattr(runner, "DemoBridge", Tracked)
+    code = runner._run(run_args(tmp_path, fill_timeout=1), policy, "en", TOKEN, "run-1",
+                       terminal, ["EURUSD"])
+    captured = capsys.readouterr()
+    summary = json.loads(captured.out) if captured.out.strip() else None
+    return code, summary, captured.err, built[0] if built else None
+
+
+def test_a_run_that_reaches_the_queue_is_served_and_matched_to_a_broker_deal(
+        tmp_path, monkeypatch, capsys):
+    """The whole demo chain in one test: signal, gates, queue, socket, serve, deal, fill.
+
+    Every wiring mistake between the run loop and the executor shows up here: the command
+    only reaches ``FILLED`` if the run handed the executor the agent's gates, the real
+    bridge as its queue, and an unarmed reading of the durable stop.
+    """
+    order_id = runner.client_order_id_for("run-1", proposal(), 0.05)
+    terminal = FakeTerminal(deals=[entry_deal(order_id=order_id)])
+    capsys.readouterr()
+    code, summary, _err, bridge = _run_with_real_bridge(
+        tmp_path, monkeypatch, capsys, policy=make_policy(execution_mode="auto"),
+        terminal=terminal)
+    assert code == 0
+    assert summary["commands_queued"] == 1 and summary["filled"] == 1
+    assert summary["broker_order_sent"] is True and summary["halted"] is False
+    assert summary["kill_switch_armed"] is False
+    assert len(bridge.commands_served) == 1
+    served = bridge.commands_served[0]
+    assert served["instrument"] == "EURUSD" and served["size"] == 0.05
+    assert served["expected_price"] == 1.10010 and served["mode"] == "demo"
+    journal = DecisionJournal(tmp_path / "journal.db", run_id="run-1")
+    try:
+        outcomes = payloads(journal, runner.OUTCOME_EVENT)
+        assert outcomes[-1]["state"] == runner.STATE_FILLED
+        assert outcomes[-1]["broker_order_sent"] is True
+        assert payloads(journal, runner.SERVED_EVENT)[0]["command_id"] == served["command_id"]
+    finally:
+        journal.close()
+
+
+def test_a_run_with_the_stop_armed_never_puts_a_command_in_the_queue(
+        tmp_path, monkeypatch, capsys):
+    """The stop the run reads is the durable file, not a variable the loop forgot to check.
+
+    A run launched stopped must refuse before the market read, so the journal shows a
+    refusal naming the stop and no command is ever built.
+    """
+    order_id = runner.client_order_id_for("run-1", proposal(), 0.05)
+    terminal = FakeTerminal(deals=[entry_deal(order_id=order_id)])
+    policy = make_policy(execution_mode="auto", kill_switch__active=True,
+                         kill_switch__reason="operator halt")
+    capsys.readouterr()
+    code, summary, err, bridge = _run_with_real_bridge(tmp_path, monkeypatch, capsys,
+                                                       policy=policy, terminal=terminal)
+    assert code == 0
+    assert summary["commands_queued"] == 0 and summary["refused"] == 1
+    assert summary["filled"] == 0 and summary["broker_order_sent"] is False
+    assert summary["kill_switch_armed"] is True
+    assert bridge is not None and bridge.commands_served == []
+    journal = DecisionJournal(tmp_path / "journal.db", run_id="run-1")
+    try:
+        assert payloads(journal, runner.COMMAND_EVENT) == []
+        refused = payloads(journal, runner.OUTCOME_EVENT)[-1]
+        assert refused["state"] == runner.STATE_REFUSED
+        assert refused["reason"] == codes.KILL_SWITCH_ACTIVE
+        assert refused["broker_order_sent"] is False
+    finally:
+        journal.close()
+    assert "The emergency stop is armed (operator halt)" in err
+
+
+def test_a_served_command_that_shows_no_deal_arms_the_stop_for_the_next_process(
+        tmp_path, monkeypatch, capsys):
+    """An uncertain send is a durable stop, not a line in this process's log."""
+    terminal = FakeTerminal(deals=[])
+    capsys.readouterr()
+    code, summary, _err, bridge = _run_with_real_bridge(
+        tmp_path, monkeypatch, capsys, policy=make_policy(execution_mode="auto"),
+        terminal=terminal)
+    assert code == 0 and summary["halted"] is True
+    assert summary["commands_queued"] == 1 and summary["unconfirmed"] == 1
+    assert summary["requires_manual_reconciliation"] is True
+    assert summary["kill_switch_armed"] is True
+    assert len(bridge.commands_served) == 1
+    armed = json.loads((tmp_path / "kill_switch.json").read_text(encoding="utf-8"))
+    assert armed["kill_switch_active"] is True
+    assert armed["kill_switch_reason"] == f"EURUSD:{runner.STATE_UNCONFIRMED}"
+    # A brand-new process reads the same blocker without being told about it.
+    assert runner.stop_is_armed(runner.KillSwitchStore(tmp_path / "kill_switch.json").payload)
 
 
 def test_a_stop_file_that_cannot_be_read_stops_the_run_before_it_starts(tmp_path, monkeypatch,

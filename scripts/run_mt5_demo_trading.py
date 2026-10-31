@@ -19,10 +19,12 @@ independently re-checks every one of those plus the kill switch, the TTL and its
 compile-time demo gate.
 
 The emergency stop is a file, not a variable: ``kill_switch.json`` next to the tombstones
-is seeded from the policy, armed by an authenticated POST to the bridge or by this
-runner's own halt, and released only with the separate admin token. Both this process and
-the EA read that same record, so a stop that an operator pulled survives a restart, and a
-stop state that cannot be read counts as armed.
+is armed by an authenticated POST to the bridge or by this runner's own halt, seeded from
+the policy on a first run that finds no record, and released only with the separate admin
+token. Both this process and the EA read that same record on every cycle, so a stop an
+operator pulled survives a restart, a stop released elsewhere is obeyed here, and anything
+other than a provably inactive record -- unreadable, deleted, or never written -- counts as
+armed.
 """
 from __future__ import annotations
 
@@ -756,11 +758,11 @@ def _validate_run_args(args: argparse.Namespace, language: str) -> None:
         raise ValueError(text("cli.live_bars", language))
 
 
-def _arm_stop(switch: KillSwitchStore, *, language: str, reason: str,
-              actor: str = "runner") -> None:
-    """Pull the same durable stop an operator can, so a halt outlives this process."""
+def _set_stop(switch: KillSwitchStore, *, language: str, reason: str,
+              actor: str = "runner", active: bool = True) -> None:
+    """Pull or release the same durable stop an operator can, so it outlives this process."""
     try:
-        switch.record(active=True, actor_id=actor, reason=reason, now=datetime.now(UTC))
+        switch.record(active=active, actor_id=actor, reason=reason, now=datetime.now(UTC))
     except (BridgeError, OSError) as exc:
         code = getattr(exc, "code", None) or type(exc).__name__
         print(text("runner.kill_switch_state_lost", language, error=str(code)), file=sys.stderr)
@@ -813,11 +815,13 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
     except BridgeError as exc:
         print(text("out.error", language, reason=f"{exc.code} ({switch_path})"), file=sys.stderr)
         return 2
-    if policy.kill_switch_active:
-        # The policy arms the same record an operator POST arms, so a run launched with an
-        # active switch blocks the EA and this process from the first cycle. A write that
-        # fails still leaves the switch armed in memory, which is the safe half.
-        _arm_stop(switch, language=language, actor="policy",
+    if switch.read() is None:
+        # No durable record exists for this path yet, so this run leaves one: the state file
+        # is what makes a later deletion a corruption rather than a fresh start. A record an
+        # operator POSTed or an earlier halted run wrote is never overwritten here, because a
+        # stop somebody pulled outranks a policy that forgot it.
+        _set_stop(switch, language=language, actor="policy",
+                  active=bool(policy.kill_switch_active),
                   reason=str(policy.kill_switch_reason or "POLICY"))
     try:
         account = terminal.account()
@@ -954,7 +958,7 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
                         if outcome.stop_run:
                             # Durable, not a variable: a halt over an unknown send must still
                             # block the EA after this process exits and the next one starts.
-                            _arm_stop(switch, language=language,
+                            _set_stop(switch, language=language,
                                       reason=f"{symbol}:{outcome.state}")
                             halted = True
                             halted_by = symbol

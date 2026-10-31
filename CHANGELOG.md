@@ -19,6 +19,48 @@ operator answer, and an executor that cannot even be built without the gates).
 - Docs: `docs/MT5_AGENT.en.md`/`.md`/`.vi` gained "The emergency stop on the demo path" (the file, the two secrets, the fail-closed reads, the durable halt) and corrected bridge/runner rows; `docs/VALIDATION_RUNBOOK.md` §6.1 states the one write the bridge takes and §7 now carries the arm/release commands with where the state lives; `docs/architecture.md` draws the operator POST and the `kill_switch.json` edges inside the demo subgraph.
 - Tests: 707 passed, 10 skipped (DB/Redis), up from 666 — `tests/test_mt5_demo_bridge.py` 74 (durable arm and release, cross-process durability through a restart, the second secret in both directions, memory-only arm, corrupt file as refusal at construction, note cleaning, only-the-kill-switch-path writes, drained bodies behind 400/401/403/405/413) and `tests/test_mt5_demo_runner.py` 98 (armed before any market read, a stop pulled during the operator answer, five unreadable stop states all blocking, a raising reader as armed, an executor that cannot be built without a stop reader, a bridge arm blocking the next process, the runner's own halt being durable, a policy seed landing in the file and blocking the next run, a corrupt file refusing both the run and the release, and the CLI release refusing without the admin secret).
 
+### Round 11 re-review: the stop cannot be disarmed by deleting a file, and the run loop is now tested through
+
+Two independent hostile reviews of the above scored it 6/10 each and found three defects that were
+real: absence of the state file was served as *disarmed*, the in-process arm was sticky, and nothing
+drove `DemoExecutor.offer` through the real `_run`.
+
+- `KillSwitchStore`: **absence is not consent**. A path with no record is now served as
+  `{"kill_switch_active": true, "kill_switch_reason": "NOT_SEEDED"}` instead of a disarmed default, and
+  a record that this process has seen (or written) and that then disappears is
+  `KILL_SWITCH_FILE_CORRUPT` — the same 503 the advisor treats as blocked. Deleting `kill_switch.json`
+  cannot disarm the EA or the runner in either direction, in this process or a new one.
+- The sticky `_armed` override is gone: the file is re-read on every check, so a stop released by the
+  CLI or by a second bridge is obeyed by a running runner and a running EA without a restart. The only
+  thing kept in memory is an **arm whose disk write failed** (`_unwritten`), which keeps blocking until
+  some write lands — losing a stop the operator just pulled is worse than holding one too long.
+- `scripts/run_mt5_demo_trading.py`: `_arm_stop` → `_set_stop(active=…)`, and `_run` now always leaves
+  a record when none exists (seeded from the policy's `kill_switch` section) instead of writing only
+  when the policy says stopped — which is also what makes a later deletion count as corruption. An
+  existing record is never overwritten: a stop somebody pulled outranks a policy that forgot it.
+- Transport: every handler socket is bounded by `timeout = REQUEST_TIMEOUT_SECONDS` (10 s), so a client
+  that stops mid-send — the very moment the bridge now spends draining a body before it answers —
+  cannot pin a handler thread.
+- `scripts/activate_kill_switch.ps1` verifies the answer it documents: a 64-character `event_hash` and an
+  `updated_at` must be present, and the script then performs the same `GET /v1/risk/kill-switch` the
+  advisor performs and fails if that read does not report the stop armed.
+- Docs: the emergency-stop sections in all three languages, `docs/VALIDATION_RUNBOOK.md` §7 and
+  `docs/ROLLBACK.md` no longer claim that a release made outside a running bridge needs a restart; they
+  state the unseeded/deleted-file rule, the seed-only-when-absent rule, the 1 MiB drain bound, the 10 s
+  socket timeout, the outcomes that arm durably (operator "stop", unconfirmed send, duplicate id), the
+  required `--policy`/`--db` flags on `--release-kill-switch`, a two-header HTTP release example, and
+  where each hash log lives (database event log on the API path, `event_hash` over the four fields on
+  the demo path).
+- Tests: 715 passed, 10 skipped, up from 707 — `tests/test_mt5_demo_bridge.py` 78 (a record deleted
+  after being known is a refusal both in-process and to the EA, an unseeded store blocks, a release
+  written elsewhere is seen without a restart, a refusal waits for the bytes the request declared —
+  asserted with `select()` on a raw socket mid-send — and a stalled client is dropped), and
+  `tests/test_mt5_demo_runner.py` 102 (three end-to-end runs through the real bridge with an EA stand-in
+  polling `/v1/execution/next` over a real socket: signal → gates → queue → serve → broker deal →
+  `FILLED`; a run launched with the stop armed building no command at all, which is the mutation the
+  reviewers proved used to leave 98/98 green; and a served-but-unconfirmed send leaving the durable
+  armed record for the next process).
+
 ## 0.5.0 — 2026-10-31
 
 - New demo-only execution path, deliberately kept outside the order-free `critical_consensus.mt5_agent` package. `scripts/mt5_demo_bridge.py` serves exactly two GETs (`/v1/risk/kill-switch`, `/v1/execution/next`) on `127.0.0.1` only: `X-Bridge-Key` compared in constant time against a 24–256 character `[A-Za-z0-9._~-]` token from `MT5_BRIDGE_TOKEN`, a Host allowlist, any `Origin` refused, one pending command, TTL 5–600 s, identifiers constrained to `[A-Za-z0-9._:-]{1,128}`, fsynced idempotency tombstones written before a command is served, and no logging of the token or of a command body. `scripts/run_mt5_demo_trading.py` is the only component in the repository that can produce an order command; it re-checks demo account mode, the policy's `require_demo`, the pinned login/server, a freshly re-read quote, entry geometry against the broker `stops_level`, volume inside `volume_min`/`volume_step`/`volume_max` and under `--max-volume` (0.20, the same ceiling as the advisor's own `MaxVolume` input), funded margin and slippage ≤ 20 points before queueing, reconciles against the broker's own deal history by magic `8172026` and the `CC:` comment prefix, and stops the run on a served-but-unconfirmed command until `--acknowledge-uncertain`. There is no retry path anywhere in it, and it contains no MT5 trading call.

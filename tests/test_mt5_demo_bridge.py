@@ -13,6 +13,8 @@ import functools
 import http.client
 import importlib.util
 import json
+import select
+import socket
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -189,7 +191,8 @@ def test_started_bridge_binds_loopback_and_reports_its_url(make_bridge):
     assert bridge.base_url == f"http://127.0.0.1:{bridge.port}"
     status, body, _ = _request(bridge, "GET", _bridge().KILL_SWITCH_PATH)
     assert status == 200
-    assert _json(body)["kill_switch_active"] is False
+    # A switch nobody has ever written is a blocker, not a pass: absence is not consent.
+    assert _json(body) == {"kill_switch_active": True, "kill_switch_reason": "NOT_SEEDED"}
 
 
 # --------------------------------------------------------------------- validation
@@ -448,6 +451,7 @@ def test_a_query_string_does_not_change_the_route(make_bridge, clock):
     status, body, _ = _request(bridge, "GET", module.NEXT_COMMAND_PATH + "?probe=secret")
     assert status == 200
     assert _json(body)["command_id"] == "cmd-1"
+    assert log, "nothing was logged, so the assertion below proves nothing"
     assert all("probe" not in line and "secret" not in line and TOKEN not in line
                for line in log)
 
@@ -584,6 +588,62 @@ def test_an_empty_or_huge_stop_body_is_refused_after_being_read(make_bridge):
     assert bridge._switch.read() is None
 
 
+def _headers(bridge, method: str, path: str, *, length: int) -> bytes:
+    """A hand-written request line, so a test can control when the body bytes arrive."""
+    return (f"{method} {path} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{bridge.port}\r\n"
+            f"X-Bridge-Key: {TOKEN}\r\n"
+            f"Content-Length: {length}\r\n\r\n").encode("ascii")
+
+
+def test_a_refusal_waits_for_the_body_the_request_declared(make_bridge):
+    """The verdict arrives only after the declared bytes have left the client.
+
+    An answer written over a body still in flight is a reset, not an answer, and an
+    operator whose stop request dies on a reset has no way to tell whether the stop
+    happened. So the declared length is drained first, however long it is.
+    """
+    module = _bridge()
+    bridge = make_bridge().start()
+    body = b"{" * 8000  # past the cap, so the bridge must read it all before answering
+    connection = socket.create_connection(("127.0.0.1", bridge.port), timeout=5)
+    try:
+        connection.sendall(_headers(bridge, "POST", module.KILL_SWITCH_PATH, length=len(body)))
+        connection.sendall(body[:4000])
+        readable, _, _ = select.select([connection], [], [], 0.3)
+        assert not readable, "the bridge answered while the client was still sending"
+        connection.sendall(body[4000:])
+        reply = bytearray()
+        while b"\r\n\r\n" not in reply:
+            piece = connection.recv(4096)
+            if not piece:
+                break
+            reply += piece
+    finally:
+        connection.close()
+    assert b" 413 " in reply, bytes(reply)
+    assert bridge._switch.read() is None
+
+
+def test_a_client_that_stops_mid_request_is_dropped_not_waited_on(make_bridge, monkeypatch):
+    """A stalled client cannot pin a handler thread, because every socket read is bounded.
+
+    The body is drained before any answer, which is also the moment a client that never
+    finishes sending could hold the bridge open for good.
+    """
+    module = _bridge()
+    monkeypatch.setattr(module, "REQUEST_TIMEOUT_SECONDS", 0.5)
+    bridge = make_bridge().start()
+    connection = socket.create_connection(("127.0.0.1", bridge.port), timeout=5)
+    try:
+        connection.sendall(_headers(bridge, "POST", module.KILL_SWITCH_PATH, length=4096))
+        connection.sendall(b"{" * 10)
+        assert connection.recv(1) == b"", "the bridge kept the stalled connection open"
+    finally:
+        connection.close()
+    assert bridge._switch.read() is None
+
+
 def test_the_stop_needs_the_bridge_key_and_a_loopback_host(make_bridge):
     module = _bridge()
     bridge = make_bridge().start()
@@ -681,7 +741,7 @@ def test_stop_state_round_trips_through_the_file(tmp_path, clock):
     path = tmp_path / "kill_switch.json"
     store = module.KillSwitchStore(path)
     assert store.read() is None
-    assert store.payload() == {"kill_switch_active": False, "kill_switch_reason": "NOT_ARMED"}
+    assert store.payload() == {"kill_switch_active": True, "kill_switch_reason": "NOT_SEEDED"}
     first = store.record(active=True, actor_id="operator", reason="risk", now=clock())
     assert _json(path.read_bytes())["kill_switch_active"] is True
     second = module.KillSwitchStore(path)
@@ -689,6 +749,41 @@ def test_stop_state_round_trips_through_the_file(tmp_path, clock):
     assert second.read()["event_hash"] == first["event_hash"]
     second.record(active=False, actor_id="admin", reason="checked", now=clock())
     assert module.KillSwitchStore(path).payload()["kill_switch_active"] is False
+
+
+def test_a_record_that_was_written_and_then_deleted_is_a_refusal(tmp_path, clock):
+    """Deleting the state file cannot be a way to disarm anything.
+
+    A process that has seen a record treats its disappearance as corruption, and a process
+    that never saw one reads an armed switch, so neither direction ends in trading.
+    """
+    module = _bridge()
+    path = tmp_path / "kill_switch.json"
+    store = module.KillSwitchStore(path)
+    store.record(active=False, actor_id="admin", reason="checked", now=clock())
+    path.unlink()
+    with pytest.raises(module.BridgeError) as error:
+        store.read()
+    assert error.value.code == "KILL_SWITCH_FILE_CORRUPT"
+    assert "removed" in str(error.value)
+    # And a brand-new process reading the same absent path is blocked, not released.
+    assert module.KillSwitchStore(path).payload()["kill_switch_active"] is True
+
+
+def test_a_stop_released_elsewhere_is_seen_without_a_restart(tmp_path, clock):
+    """The file is the authority on every read, so a release is not trapped in one process.
+
+    The opposite half is already covered: an arm whose write failed stays in memory, because
+    losing a stop the operator just pulled is worse than holding one too long.
+    """
+    module = _bridge()
+    path = tmp_path / "kill_switch.json"
+    watcher = module.KillSwitchStore(path)
+    watcher.record(active=True, actor_id="operator", reason="circuit breaker", now=clock())
+    assert watcher.payload()["kill_switch_active"] is True
+    module.KillSwitchStore(path).record(active=False, actor_id="admin", reason="checked",
+                                        now=clock())
+    assert watcher.payload() == {"kill_switch_active": False, "kill_switch_reason": "checked"}
 
 
 @pytest.mark.parametrize("reason, expected", [

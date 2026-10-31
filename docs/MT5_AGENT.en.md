@@ -189,30 +189,42 @@ Gates that must all hold before a command exists:
 
 The stop is a file, not a variable: `kill_switch.json`, written next to the tombstones. One record
 holds the last switch change (`kill_switch_active`, `kill_switch_reason`, `actor_id`, `updated_at`,
-`event_hash`), rewritten whole through a temporary file plus `os.replace` and fsynced. The runner
-seeds it from `kill_switch.active: true` in the policy, an operator arms it over HTTP, the advisor
-reads it on every poll and the runner reads it twice per offer — before any market read and
-immediately before a command is built. So the documented
-`scripts/activate_kill_switch.ps1` stops this path too, and a stop pulled before a restart is still
-pulled after it.
+`event_hash`), rewritten whole through a temporary file plus `os.replace` and fsynced. The advisor
+reads that record on every poll and the runner reads it twice per offer — before any market read and
+immediately before a command is built — and both re-read the file rather than a copy in memory, so an
+operator arms or releases it while a run is in progress and the next read is the new answer. So the
+documented `scripts/activate_kill_switch.ps1` stops this path too, and a stop pulled before a restart
+is still pulled after it.
 
 - Arming needs the bridge key only: `POST /v1/risk/kill-switch` with `{"active": true, "reason": …}`
   and `X-Bridge-Key`. The answer carries `status: "PERSISTED"`, `updated_at` and `event_hash`, which
-  is exactly what that script checks. A request whose body cannot be read as a JSON object, whose
+  is what that script checks — it also requires a 64-character hash and then performs the same GET the
+  advisor performs, so a stop the polled state does not agree with is reported as a failure.
+  A request whose body cannot be read as a JSON object, whose
   `active` is not a real boolean or whose note fields are not strings is refused with 400 and
-  changes nothing; a body larger than 4096 bytes is read out of the socket and refused with 413, so
-  the client always gets a verdict instead of a reset.
+  changes nothing; a body larger than 4096 bytes is drained out of the socket (up to 1 MiB) and
+  refused with 413, so the client always gets a verdict instead of a reset. A client that stops
+  mid-send is dropped after 10 s rather than holding a handler thread.
 - Releasing needs a second secret: `MT5_KILL_SWITCH_ADMIN_TOKEN`, at least 32 characters, different
   from `MT5_BRIDGE_TOKEN`, supplied in `X-Kill-Switch-Admin`. A missing or reused admin token is 503
   and a wrong one is 403; either way the stop stays armed. While no runner is alive,
-  `python scripts/run_mt5_demo_trading.py --release-kill-switch` reads the same file, takes the
-  admin token from the environment and writes the disarm.
-- A state that cannot be read is never treated as disarmed: a corrupt or unreadable `kill_switch.json`
-  makes the runner refuse and makes the advisor's GET answer 503, which the advisor treats as blocked.
-  An arm whose disk write fails is still armed in memory (the answer says `MEMORY_ONLY`), and a
+  `python scripts/run_mt5_demo_trading.py --policy <policy.yaml> --db <journal.db>
+  --release-kill-switch` reads the same file, takes the admin token from the environment and writes
+  the disarm; `--policy` and `--db` are required by every invocation, including this one.
+- Absence is not consent. A state that cannot be read is never treated as disarmed: no record at all
+  is served as `{"kill_switch_active": true, "kill_switch_reason": "NOT_SEEDED"}`, a corrupt or
+  unreadable `kill_switch.json` makes the runner refuse before it starts and makes the advisor's GET
+  answer 503 (which the advisor treats as blocked), and a record that existed and then disappeared —
+  a deleted file — is the same 503, never a fresh start. Deleting the state file therefore cannot
+  disarm anything.
+- The first run that finds no record writes one from `kill_switch` in the policy, which is where an
+  operator's stated intent lives; a record an operator POSTed or an earlier halted run wrote is never
+  overwritten, because a stop somebody pulled outranks a policy that forgot it. The one thing held in
+  memory is an arm whose disk write failed: it keeps blocking (the answer says `MEMORY_ONLY`), and a
   disarm whose write fails leaves the stop armed.
-- A halt inside the run — `STOPPED`, an unconfirmed send — arms the same durable record, so
-  finishing the process does not finish the stop.
+- Every outcome that stops a run arms the same durable record — an operator's "stop" at the
+  confirmation prompt, an unconfirmed send, a duplicate command id — so finishing the process does
+  not finish the stop.
 
 ### Live observation on 2026-10-31 (`--symbols all`, real terminal)
 

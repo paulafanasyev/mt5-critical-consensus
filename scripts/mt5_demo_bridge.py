@@ -5,7 +5,8 @@ one-shot order command. This module serves those two GETs, with a
 header token, a single pending command, a short TTL and durable idempotency tombstones.
 It also implements one authenticated POST on the kill-switch path, because an emergency
 stop that no operator can reach is not an emergency stop: that write flips and durably
-records the switch state the EA reads, and it can never create or change a command.
+records the switch state the EA reads, and it can never create or change a command. A
+switch state that cannot be read, or was never written at all, is served as armed.
 It never binds a non-loopback address, never accepts a write on the command path, and
 never logs the token or the command body.
 
@@ -41,11 +42,17 @@ MIN_TTL_SECONDS = 5
 KILL_SWITCH_PATH = "/v1/risk/kill-switch"
 NEXT_COMMAND_PATH = "/v1/execution/next"
 KILL_SWITCH_STATE_FILENAME = "kill_switch.json"
+# Served when no switch record exists yet. It is a blocker, not a label: the reason text
+# is what an operator sees first when the state file was deleted or never seeded.
+UNSEEDED_REASON = "NOT_SEEDED"
 MAX_REQUEST_BYTES = 4096
 MAX_NOTE_CHARS = 180
 # The most a refused request is drained out of. Refusals are answered only after the body is
 # consumed, because an answer written over unread bytes is a reset, not an answer.
 MAX_BODY_DRAIN_BYTES = 1 << 20
+# A handler socket that stops talking would otherwise hold its thread forever. The body is
+# read before any answer, so a stalled or slow client can pin every handler on a busy bridge.
+REQUEST_TIMEOUT_SECONDS = 10.0
 REQUIRED_KEYS = (
     "command_id", "client_order_id", "permission_id", "signal_id", "instrument",
     "direction", "size", "expected_price", "sl", "tp", "mode", "user_decision_id",
@@ -248,13 +255,16 @@ class KillSwitchStore:
 
     One JSON object holding the last switch change, rewritten whole through a temporary
     file plus ``os.replace`` and fsynced, so a crash cannot leave the switch half-written
-    and a restart cannot silently forget an operator's stop. An unreadable file is a
-    refusal, never a default: a switch whose state cannot be read must not be treated as
-    disarmed.
+    and a restart cannot silently forget an operator's stop. Absence is not consent: a
+    state that cannot be read, and a state that was never written at all, are both
+    blockers, never a default of ``disarmed``. Deleting the file therefore cannot release
+    anything -- a process that knows the file existed refuses when it disappears, and a
+    process that has never seen one reads an armed switch.
 
-    The file is re-read unless this process armed the switch itself, which keeps the two
-    failure directions apart: an arm made here is never forgotten because another writer
-    touched the file, while an arm made elsewhere is always seen.
+    The file is the authority on every read, so a stop released by another process is
+    seen by this one on the next poll. The single exception is an arm whose write failed:
+    it is held in memory until some write lands, because losing the stop the operator just
+    pulled is worse than holding one too long.
     """
 
     _FIELDS = ("kill_switch_active", "kill_switch_reason", "actor_id", "updated_at",
@@ -263,7 +273,10 @@ class KillSwitchStore:
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
         self._lock = threading.Lock()
-        self._armed: dict[str, Any] | None = None
+        self._unwritten: dict[str, Any] | None = None
+        # Whether this process has ever seen a state record, on disk or written here.
+        # Once it has, the record going missing is corruption, not a fresh start.
+        self._known = self._path.exists()
         # Read once here so a state that cannot be understood is refused before anything
         # starts serving, rather than discovered mid-cycle by a caller that only asked
         # whether the switch is armed.
@@ -275,6 +288,8 @@ class KillSwitchStore:
 
     def _load(self) -> dict[str, Any] | None:
         if not self._path.exists():
+            if self._known:
+                raise BridgeError("KILL_SWITCH_FILE_CORRUPT", "state file removed")
             return None
         raw = self._path.read_text(encoding="utf-8")
         if not raw.strip():
@@ -291,15 +306,18 @@ class KillSwitchStore:
 
     def read(self) -> dict[str, Any] | None:
         with self._lock:
-            if self._armed is not None:
-                return dict(self._armed)
+            if self._unwritten is not None:
+                return dict(self._unwritten)
             return self._load()
 
     def payload(self) -> dict[str, Any]:
         """What the EA polls: the armed flag and the reason, and nothing else."""
         record = self.read()
         if record is None:
-            return {"kill_switch_active": False, "kill_switch_reason": "NOT_ARMED"}
+            # Nothing has ever been written here. An unseeded switch is treated as pulled,
+            # the way the production risk table defaults its column to active: an operator
+            # who wants commands flowing has to say so in a record, not by deleting one.
+            return {"kill_switch_active": True, "kill_switch_reason": UNSEEDED_REASON}
         return {"kill_switch_active": bool(record["kill_switch_active"]),
                 "kill_switch_reason": record["kill_switch_reason"]}
 
@@ -310,7 +328,7 @@ class KillSwitchStore:
         Both failure directions are unsafe in opposite ways, so the ordering differs: an
         arm lands in memory before the disk attempt, so a write that fails still blocks
         trading, while a disarm touches disk first, so a failed write leaves the switch
-        armed.
+        armed. A successful write ends the memory override either way.
         """
         if not isinstance(active, bool):
             raise BridgeError("KILL_SWITCH_ACTIVE_FIELD_INVALID")
@@ -325,11 +343,9 @@ class KillSwitchStore:
                                                     for key in self._FIELDS[:4]))
         with self._lock:
             if active:
-                self._armed = dict(record)
-                self._write(record)
-            else:
-                self._write(record)
-                self._armed = None
+                self._unwritten = dict(record)
+            self._write(record)
+            self._unwritten = None
         return dict(record)
 
     def _write(self, record: Mapping[str, Any]) -> None:
@@ -341,6 +357,8 @@ class KillSwitchStore:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, self._path)
+        # From this moment the state exists, so its later disappearance is corruption.
+        self._known = True
 
 
 @dataclass
@@ -420,6 +438,10 @@ class DemoBridge:
         class Handler(BaseHTTPRequestHandler):
             server_version = "CriticalConsensusDemoBridge/1"
             sys_version = ""
+            # Every socket read and write is bounded, because a request is answered only
+            # after its body is consumed: a client that stops mid-send would otherwise hold
+            # this handler thread open indefinitely, and enough of them starve the bridge.
+            timeout = REQUEST_TIMEOUT_SECONDS
             _body: bytes | None = None
             _body_status = 0
             _body_error = ""
