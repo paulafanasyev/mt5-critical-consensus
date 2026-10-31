@@ -1,5 +1,5 @@
 #property strict
-#property version   "0.10"
+#property version   "0.100"
 #property description "Demo-only reference bridge. Disabled by default; live execution is blocked."
 
 input string BridgeUrl = "http://127.0.0.1:8000/v1/execution/next";
