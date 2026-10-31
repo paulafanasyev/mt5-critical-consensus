@@ -89,7 +89,7 @@ jobs:
             if ($probeOutput) {
               "MetaEditorProbeOutput=$($probeOutput -join ' | ')" | Add-Content -Path $report
             }
-            $probeLog = "$probe.log"
+            $probeLog = [System.IO.Path]::ChangeExtension($probe, ".log")
             if (-not (Test-Path $probeLog)) {
               $foundLogs = Get-ChildItem -Path $installRoot,$env:RUNNER_TEMP -Filter "*.log" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
               "CompilerLogsFound=$($foundLogs -join ';')" | Add-Content -Path $report
@@ -112,7 +112,7 @@ jobs:
             if ($compileOutput) {
               "MetaEditorOutput=$($compileOutput -join ' | ')" | Add-Content -Path $report
             }
-            $log = "$target.log"
+            $log = [System.IO.Path]::ChangeExtension($target, ".log")
             if (-not (Test-Path $log)) {
               throw "MetaEditor did not create a compiler log. Process exit code: $($compile.ExitCode)"
             }
@@ -141,9 +141,9 @@ jobs:
         with:
           name: mql5-metaeditor-compile-evidence
           path: |
-            **/CriticalConsensusEA.mq5.log
+            **/CriticalConsensusEA.log
             **/CriticalConsensusEA.ex5
-            **/MetaEditorSmoke.mq5.log
+            **/MetaEditorSmoke.log
             **/MetaEditorSmoke.ex5
             ${{ runner.temp }}/mt5-install-diagnostics.txt
           if-no-files-found: warn
