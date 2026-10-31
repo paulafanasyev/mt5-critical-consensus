@@ -43,6 +43,10 @@ def main() -> int:
                         help="required only when this symbol/timeframe has no persisted history")
     parser.add_argument("--terminal-path", help="optional MetaTrader 5 terminal executable path")
     parser.add_argument("--resolve-limit", type=positive_int, default=500)
+    parser.add_argument(
+        "--ignore-weekend-closures", action="store_true",
+        help="ignore weekend-spanning gaps only when this instrument's broker session is verified to close on weekends",
+    )
     parser.add_argument("--finalization-grace-seconds", type=float, default=2.0)
     args = parser.parse_args()
     if (not isinstance(args.finalization_grace_seconds, (int, float))
@@ -91,7 +95,12 @@ def main() -> int:
         if latest_persisted is None or bar.time > latest_persisted
     ]
     gap_scan_bars = (existing + new_finalized)[-5000:]
-    potential_gaps = detect_potential_bar_gaps(gap_scan_bars) if len(gap_scan_bars) >= 2 else []
+    potential_gaps = (
+        detect_potential_bar_gaps(
+            gap_scan_bars, ignore_weekend_closures=args.ignore_weekend_closures,
+        )
+        if len(gap_scan_bars) >= 2 else []
+    )
     ingest = repo.append_market_bars(finalized) if finalized else {
         "inserted": 0, "identical_duplicates": 0, "total": 0,
     }
@@ -122,6 +131,7 @@ def main() -> int:
                 "Advisory only. Weekend-spanning intervals are ignored; other gaps may "
                 "reflect broker sessions or holidays and require operator review."
             ),
+            "weekend_gaps_ignored": args.ignore_weekend_closures,
             "automatic_backfill": False,
         },
         "trade_allowed": False,
