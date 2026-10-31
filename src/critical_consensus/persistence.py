@@ -298,8 +298,11 @@ class PostgresRepository:
         for index, forecast in enumerate(forecasts):
             if not isinstance(forecast, Mapping):
                 raise ValueError(f"forecast {index} must be an object")
-            model_id = str(forecast.get("model_id", "")).strip()
-            signal_id = str(forecast.get("signal_id", "")).strip()
+            raw_model_id = forecast.get("model_id")
+            raw_signal_id = forecast.get("signal_id")
+            if not isinstance(raw_model_id, str) or not isinstance(raw_signal_id, str):
+                raise ValueError(f"forecast {index} model_id and signal_id must be strings")
+            model_id, signal_id = raw_model_id.strip(), raw_signal_id.strip()
             if not model_id or not signal_id:
                 raise ValueError(f"forecast {index} requires model_id and signal_id")
             key = (model_id, signal_id)
@@ -308,8 +311,8 @@ class PostgresRepository:
             seen.add(key)
             issued = _timestamp(forecast.get("issued_at"), "issued_at")
             raw_probability = forecast.get("probability")
-            if isinstance(raw_probability, bool):
-                raise ValueError("probability must be finite numeric data, not a boolean")
+            if isinstance(raw_probability, bool) or not isinstance(raw_probability, (int, float)):
+                raise ValueError("probability must be a numeric value, not a string or boolean")
             try:
                 probability = float(raw_probability)
             except (TypeError, ValueError, OverflowError) as exc:
