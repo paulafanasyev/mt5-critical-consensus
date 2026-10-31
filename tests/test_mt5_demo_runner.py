@@ -1194,6 +1194,7 @@ def bare_terminal() -> runner.DemoTerminal:
     terminal._peak = None
     terminal._day = None
     terminal._day_start = None
+    terminal._journal = None
     terminal._offset = 0
     return terminal
 
