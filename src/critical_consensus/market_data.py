@@ -278,15 +278,14 @@ def forecast_bar_duration(timeframe: str) -> timedelta:
 
 
 def detect_potential_bar_gaps(
-    bars: Iterable[MarketBar], *, ignore_weekend_closures: bool = False,
-    gap_tolerance_seconds: float = 2.0,
+    bars: Iterable[MarketBar], *, gap_tolerance_seconds: float = 2.0,
 ) -> list[dict[str, Any]]:
-    """Report suspicious timestamp gaps without assuming a broker's trading calendar.
+    """Report every suspicious timestamp gap; never infer or suppress broker sessions.
 
-    Weekend-spanning intervals are included by default because some instruments trade
-    continuously. Opt-in suppression ignores only a normal weekend-sized gap (up to
-    timeframe duration plus three days); extended gaps remain visible. Other gaps are
-    advisory: holidays and maintenance sessions need operator review.
+    Bars are normalized to UTC before comparison. A gap touching Saturday/Sunday is
+    separately classified, but is still reported: without a broker-specific session
+    calendar (including holidays and DST rules), suppressing the whole interval could
+    hide missing bars after the market reopens.
     """
     rows = validate_bar_series(bars, min_bars=1)
     if (isinstance(gap_tolerance_seconds, bool)
@@ -304,16 +303,13 @@ def detect_potential_bar_gaps(
         elapsed = current.time - previous.time
         if elapsed <= duration + tolerance:
             continue
+        day = previous.time.date()
         crosses_weekend = False
-        if ignore_weekend_closures:
-            day = previous.time.date() + timedelta(days=1)
-            while day <= current.time.date():
-                if day.weekday() >= 5:
-                    crosses_weekend = True
-                    break
-                day += timedelta(days=1)
-        if crosses_weekend and elapsed <= duration + timedelta(days=3):
-            continue
+        while day <= current.time.date():
+            if day.weekday() >= 5:
+                crosses_weekend = True
+                break
+            day += timedelta(days=1)
         gaps.append({
             "symbol": previous.symbol,
             "timeframe": previous.timeframe,
@@ -321,7 +317,12 @@ def detect_potential_bar_gaps(
             "next_bar_utc": current.time.isoformat(),
             "elapsed_seconds": elapsed.total_seconds(),
             "nominal_periods_elapsed": int(elapsed // duration),
-            "status": "POTENTIAL_GAP_REQUIRES_SESSION_REVIEW",
+            "crosses_weekend": crosses_weekend,
+            "session_calendar_status": "NOT_CONFIGURED",
+            "status": (
+                "WEEKEND_SPANNING_GAP_REQUIRES_SESSION_REVIEW"
+                if crosses_weekend else "POTENTIAL_GAP_REQUIRES_SESSION_REVIEW"
+            ),
         })
     return gaps
 

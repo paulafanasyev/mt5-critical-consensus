@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from datetime import datetime, timedelta, timezone
 
@@ -413,3 +414,23 @@ def test_persist_event_once_rejects_lossy_or_non_json_values_before_database_acc
     with pytest.raises(ValueError, match="consumer_name"):
         repo.persist_event_once(valid, consumer_name=17)
 
+
+
+
+def test_concurrent_identical_market_bar_ingestion_is_idempotent():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    symbol = "RACE" + uuid.uuid4().hex[:8].upper()
+    stamp = datetime.now(timezone.utc) - timedelta(hours=4)
+    bar = MarketBar(symbol, "H1", stamp, 1.0, 1.2, 0.9, 1.1,
+                    tick_volume=120, spread_points=7, source="concurrent-test")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: repo.append_market_bars([bar]), range(2)))
+
+    assert sum(result["inserted"] for result in results) == 1
+    assert sum(result["identical_duplicates"] for result in results) == 1
+    assert all(result["total"] == 1 for result in results)
+    stored = repo.get_recent_market_bars(symbol, "H1", limit=21)
+    assert len(stored) == 1
+    assert stored[0].close == pytest.approx(1.1)

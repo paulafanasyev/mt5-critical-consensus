@@ -1,5 +1,6 @@
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -253,17 +254,32 @@ def test_potential_gap_detector_flags_weekday_missing_interval():
     assert gaps[0]["status"] == "POTENTIAL_GAP_REQUIRES_SESSION_REVIEW"
 
 
-def test_potential_gap_detector_ignores_weekend_market_closure():
+def test_potential_gap_detector_never_suppresses_weekend_spanning_intervals():
     data = [
-        MarketBar("EURUSD", "H1", datetime(2026, 10, 30, 21, tzinfo=timezone.utc),
+        MarketBar("EURUSD", "H1", datetime(2026, 10, 30, 20, tzinfo=timezone.utc),
                   1.0, 1.1, 0.9, 1.05),
-        MarketBar("EURUSD", "H1", datetime(2026, 11, 2, 0, tzinfo=timezone.utc),
+        # Monday afternoon is deliberately late: it must not be hidden as a "normal" weekend.
+        MarketBar("EURUSD", "H1", datetime(2026, 11, 2, 14, tzinfo=timezone.utc),
                   1.05, 1.15, 0.95, 1.1),
     ]
-    # By default, do not assume this instrument closes over weekends.
-    assert len(detect_potential_bar_gaps(data)) == 1
-    # Suppression is opt-in only after the broker session is verified.
-    assert detect_potential_bar_gaps(data, ignore_weekend_closures=True) == []
+    gaps = detect_potential_bar_gaps(data)
+    assert len(gaps) == 1
+    assert gaps[0]["crosses_weekend"] is True
+    assert gaps[0]["session_calendar_status"] == "NOT_CONFIGURED"
+    assert gaps[0]["status"] == "WEEKEND_SPANNING_GAP_REQUIRES_SESSION_REVIEW"
+
+
+def test_gap_detector_handles_repeated_local_hour_at_dst_fall_back_in_utc():
+    zone = ZoneInfo("Europe/Berlin")
+    first_0200 = datetime(2026, 10, 25, 2, 0, tzinfo=zone, fold=0)
+    second_0200 = datetime(2026, 10, 25, 2, 0, tzinfo=zone, fold=1)
+    data = [
+        MarketBar("EURUSD", "H1", first_0200, 1.0, 1.1, 0.9, 1.05),
+        MarketBar("EURUSD", "H1", second_0200, 1.05, 1.15, 0.95, 1.1),
+    ]
+    assert data[0].time == datetime(2026, 10, 25, 0, tzinfo=timezone.utc)
+    assert data[1].time == datetime(2026, 10, 25, 1, tzinfo=timezone.utc)
+    assert detect_potential_bar_gaps(data) == []
 
 
 def test_potential_gap_detector_rejects_invalid_tolerance():
@@ -272,14 +288,15 @@ def test_potential_gap_detector_rejects_invalid_tolerance():
 
 
 
-def test_weekend_suppression_does_not_hide_extended_or_missing_weekly_history():
+def test_weekend_spanning_gaps_and_missing_weekly_history_remain_visible():
     extended = [
         MarketBar("EURUSD", "H1", datetime(2026, 10, 23, 20, tzinfo=timezone.utc),
                   1.0, 1.1, 0.9, 1.05),
         MarketBar("EURUSD", "H1", datetime(2026, 11, 2, 0, tzinfo=timezone.utc),
                   1.05, 1.15, 0.95, 1.1),
     ]
-    assert len(detect_potential_bar_gaps(extended, ignore_weekend_closures=True)) == 1
+    assert len(detect_potential_bar_gaps(extended)) == 1
+    assert detect_potential_bar_gaps(extended)[0]["crosses_weekend"] is True
 
     missing_week = [
         MarketBar("EURUSD", "W1", datetime(2026, 10, 5, tzinfo=timezone.utc),
@@ -287,7 +304,7 @@ def test_weekend_suppression_does_not_hide_extended_or_missing_weekly_history():
         MarketBar("EURUSD", "W1", datetime(2026, 10, 19, tzinfo=timezone.utc),
                   1.05, 1.15, 0.95, 1.1),
     ]
-    assert len(detect_potential_bar_gaps(missing_week, ignore_weekend_closures=True)) == 1
+    assert len(detect_potential_bar_gaps(missing_week)) == 1
 
 
 

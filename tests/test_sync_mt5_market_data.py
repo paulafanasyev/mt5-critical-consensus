@@ -159,32 +159,53 @@ def test_sync_reports_potential_gap_but_does_not_backfill_automatically(monkeypa
 
 
 
-def test_weekend_gap_suppression_requires_and_honors_explicit_flag(monkeypatch, capsys):
-    friday = MarketBar(
-        "EURUSD", "H1", datetime(2026, 10, 23, 20, tzinfo=timezone.utc),
-        1.0, 1.1, 0.9, 1.05,
-    )
-    monday = MarketBar(
-        "EURUSD", "H1", datetime(2026, 10, 26, 0, tzinfo=timezone.utc),
-        1.05, 1.15, 0.95, 1.1,
-    )
-    repo = FakeRepository([friday, monday])
-    seen = []
-    monkeypatch.setattr(MODULE, "PostgresRepository", lambda: repo)
-    monkeypatch.setattr(MODULE, "fetch_mt5_bars", lambda *args, **kwargs: [])
-    monkeypatch.setattr(MODULE, "retain_completed_bars", lambda bars, **kwargs: list(bars))
+def test_sync_rejects_unsafe_weekend_gap_suppression_flag(monkeypatch, capsys):
+    def unexpected_repository():
+        raise AssertionError("deprecated option must fail before connecting to PostgreSQL")
 
-    def detector(bars, *, ignore_weekend_closures):
-        seen.append(ignore_weekend_closures)
-        return []
-
-    monkeypatch.setattr(MODULE, "detect_potential_bar_gaps", detector)
+    monkeypatch.setattr(MODULE, "PostgresRepository", unexpected_repository)
     monkeypatch.setattr("sys.argv", [
         "sync_mt5_market_data.py", "--symbol", "EURUSD", "--timeframe", "H1",
         "--ignore-weekend-closures",
     ])
+    with pytest.raises(SystemExit) as error:
+        MODULE.main()
+    assert error.value.code == 2
+    assert "--ignore-weekend-closures" in capsys.readouterr().err
+
+
+def test_sync_recovers_on_next_invocation_after_mt5_outage(monkeypatch, capsys):
+    latest = datetime.now(timezone.utc) - timedelta(hours=4)
+    new_bar = MarketBar(
+        "EURUSD", "H1", latest + timedelta(hours=1),
+        1.0, 1.1, 0.9, 1.05,
+    )
+    repo = FakeRepository([MarketBar(
+        "EURUSD", "H1", latest, 1.0, 1.1, 0.9, 1.05,
+    )])
+    attempts = {"count": 0}
+
+    def fetch_then_recover(*args, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("temporary MT5 disconnect")
+        return [new_bar]
+
+    monkeypatch.setattr(MODULE, "PostgresRepository", lambda: repo)
+    monkeypatch.setattr(MODULE, "fetch_mt5_bars", fetch_then_recover)
+    monkeypatch.setattr(MODULE, "retain_completed_bars", lambda bars, **kwargs: list(bars))
+    monkeypatch.setattr("sys.argv", [
+        "sync_mt5_market_data.py", "--symbol", "EURUSD", "--timeframe", "H1",
+    ])
+
+    with pytest.raises(RuntimeError, match="temporary MT5 disconnect"):
+        MODULE.main()
+    assert repo.appended == []
+    assert repo.resolved == []
 
     assert MODULE.main() == 0
     payload = __import__("json").loads(capsys.readouterr().out)
-    assert seen == [True]
-    assert payload["market_history_integrity"]["weekend_gaps_ignored"] is True
+    assert attempts["count"] == 2
+    assert repo.appended == [new_bar]
+    assert len(repo.resolved) == 1
+    assert payload["ingestion"]["inserted"] == 1

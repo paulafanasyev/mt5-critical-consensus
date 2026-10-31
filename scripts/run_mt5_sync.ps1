@@ -11,8 +11,7 @@ param(
     [string]$TerminalPath,
     [string]$BootstrapFromUtc,
     [string]$PythonExe = "python",
-    [string]$LogDirectory = ".\logs",
-    [switch]$IgnoreWeekendClosures
+    [string]$LogDirectory = ".\logs"
 )
 
 $ErrorActionPreference = "Stop"
@@ -53,10 +52,6 @@ try {
     if (-not [string]::IsNullOrWhiteSpace($BootstrapFromUtc)) {
         $syncArgs += @("--bootstrap-from-utc", $BootstrapFromUtc)
     }
-    if ($IgnoreWeekendClosures) {
-        $syncArgs += "--ignore-weekend-closures"
-    }
-
     Write-Host "Preflight passed. Starting read-only market-data sync and due-forecast resolution."
     & $pythonCommand.Source @syncArgs 2>&1 | Tee-Object -FilePath $logPath -Append
     if ($LASTEXITCODE -ne 0) {
