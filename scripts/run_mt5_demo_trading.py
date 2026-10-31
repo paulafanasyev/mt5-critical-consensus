@@ -17,6 +17,12 @@ spread, slippage bound, risk/reward at the fill, re-sizing and the additive dail
 budget — and the command carries the price and volume those gates produced. The EA
 independently re-checks every one of those plus the kill switch, the TTL and its own
 compile-time demo gate.
+
+The emergency stop is a file, not a variable: ``kill_switch.json`` next to the tombstones
+is seeded from the policy, armed by an authenticated POST to the bridge or by this
+runner's own halt, and released only with the separate admin token. Both this process and
+the EA read that same record, so a stop that an operator pulled survives a restart, and a
+stop state that cannot be read counts as armed.
 """
 from __future__ import annotations
 
@@ -42,8 +48,9 @@ from critical_consensus.mt5_agent import (AgentPolicy, DecisionJournal, MT5Agent
                                           load_policy)
 from critical_consensus.mt5_agent.backend import LiveMT5Backend
 from critical_consensus.mt5_agent.i18n import describe, normalize_language, text
-from mt5_demo_bridge import (BRIDGE_TOKEN_ENV, IDENTIFIER_PATTERN, BridgeError, DemoBridge,
-                             validate_token)
+from mt5_demo_bridge import (ADMIN_TOKEN_ENV, BRIDGE_TOKEN_ENV, IDENTIFIER_PATTERN,
+                             BridgeError, DemoBridge, KillSwitchStore,
+                             kill_switch_state_path, release_refusal, validate_token)
 from operator_answers import ApprovalState
 from run_mt5_agent import EXECUTION_CHOICES, _make_approver
 
@@ -75,7 +82,8 @@ STATE_DUPLICATE = "DUPLICATE"
 STATE_STOPPED = "STOPPED"
 
 # ``MT5Agent.post_approval_gates``: proposal and sizing dicts in, blockers and the fill the
-# command may carry out. An executor built without it cannot send anything.
+# command may carry out. It and the durable kill-switch reader are the two dependencies an
+# executor cannot be built without, because they are the only authorities on "may I send".
 PostApprovalGates = Callable[[Mapping[str, Any], Mapping[str, Any]],
                              tuple[tuple[str, ...], Mapping[str, Any]]]
 
@@ -379,16 +387,23 @@ class Outcome:
     queued: bool = False
 
 
-@dataclass
-class RunState:
-    """Bridge kill-switch state for the EA; flipped before the runner stops."""
+KillSwitchRead = Callable[[], Mapping[str, Any]]
 
-    active: bool = False
-    reason: str = "RUNNER"
 
-    def payload(self) -> dict[str, Any]:
-        return {"kill_switch_active": bool(self.active),
-                "kill_switch_reason": str(self.reason) or "RUNNER"}
+def stop_is_armed(read: KillSwitchRead | None) -> bool:
+    """The durable emergency stop both this process and the EA read.
+
+    Anything other than a provably inactive switch blocks: a missing reader, a raising
+    one, or a payload without a boolean flag cannot be shown to be safe, and the EA fails
+    closed on the same read.
+    """
+    if read is None:
+        return True
+    try:
+        state = read()
+    except Exception:
+        return True
+    return not isinstance(state, Mapping) or state.get("kill_switch_active") is not False
 
 
 class DemoExecutor:
@@ -397,6 +412,7 @@ class DemoExecutor:
     def __init__(self, *, queue: Any, journal: DecisionJournal, terminal: Any,
                  policy: AgentPolicy, language: str, run_id: str,
                  post_approval_gates: PostApprovalGates,
+                 kill_switch: KillSwitchRead,
                  symbol: str | None = None,
                  ttl_seconds: int = DEFAULT_TTL_SECONDS,
                  fill_timeout_seconds: int = 30, poll_seconds: float = 1.0,
@@ -416,6 +432,7 @@ class DemoExecutor:
         self._language = language
         self._run_id = run_id
         self._gates = post_approval_gates
+        self._kill_switch = kill_switch
         self._ttl = ttl_seconds
         self._fill_timeout = fill_timeout_seconds
         self._poll = poll_seconds
@@ -457,8 +474,18 @@ class DemoExecutor:
                        requires_reconciliation=requires_reconciliation, queued=queued)
 
     # -------------------------------------------------------------------- offer
+    def _stop_refusal(self) -> Outcome:
+        self._say(text("runner.refused", self._language,
+                       reason=describe(codes.KILL_SWITCH_ACTIVE, self._language)))
+        return self._outcome(STATE_REFUSED, reason=codes.KILL_SWITCH_ACTIVE,
+                             broker_order_sent=False)
+
     def offer(self, proposal: Mapping[str, Any], sizing: Mapping[str, Any]) -> Outcome:
         now = self._now()
+        if stop_is_armed(self._kill_switch):
+            # Before anything else, and before any market read: the operator's stop outranks
+            # every gate below because it is a decision, not a measurement.
+            return self._stop_refusal()
         if str(proposal.get("symbol", "")).upper() != self._symbol:
             # A proposal for another instrument must never be routed through this executor:
             # its spec, tick and reconciliation window all belong to ``self._symbol``.
@@ -519,6 +546,11 @@ class DemoExecutor:
                            reason=", ".join(describe(code, self._language) for code in blockers)))
             return self._outcome(STATE_REFUSED, reason=reason, broker_order_sent=False)
 
+        if stop_is_armed(self._kill_switch):
+            # The confirmation prompt and the gate run both take time, so a stop pulled while
+            # the operator was answering still has to reach the queue. This is the last read
+            # before anything can leave this process.
+            return self._stop_refusal()
         command_id = uuid.uuid4().hex
         order_id = client_order_id_for(self._run_id, proposal, final_volume)
         command = build_command(
@@ -671,6 +703,8 @@ def _build_parser(language: str) -> argparse.ArgumentParser:
     parser.add_argument("--timeout-ms", type=int, default=60_000)
     parser.add_argument("--acknowledge-uncertain", action="store_true",
                         help=text("cli.acknowledge_uncertain", language))
+    parser.add_argument("--release-kill-switch", action="store_true",
+                        help=text("cli.release_kill_switch", language))
     parser.add_argument("--verbose", action="store_true", help=text("cli.verbose", language))
     return parser
 
@@ -722,13 +756,69 @@ def _validate_run_args(args: argparse.Namespace, language: str) -> None:
         raise ValueError(text("cli.live_bars", language))
 
 
+def _arm_stop(switch: KillSwitchStore, *, language: str, reason: str,
+              actor: str = "runner") -> None:
+    """Pull the same durable stop an operator can, so a halt outlives this process."""
+    try:
+        switch.record(active=True, actor_id=actor, reason=reason, now=datetime.now(UTC))
+    except (BridgeError, OSError) as exc:
+        code = getattr(exc, "code", None) or type(exc).__name__
+        print(text("runner.kill_switch_state_lost", language, error=str(code)), file=sys.stderr)
+
+
+def _release_kill_switch(args: argparse.Namespace, language: str, token: str) -> int:
+    """Lift a persisted stop outside a run, guarded by the separate admin secret.
+
+    The bridge only answers while a runner is alive, so an operator who armed the stop and
+    then stopped the process would otherwise have one way left: editing JSON by hand. This
+    is that way, with the admin secret taken from the environment like every other
+    credential here.
+    """
+    path = kill_switch_state_path(args.tombstones)
+    try:
+        switch = KillSwitchStore(path)
+    except BridgeError as exc:
+        print(text("out.error", language, reason=f"{exc.code} ({path})"), file=sys.stderr)
+        return 2
+    admin = os.environ.get(ADMIN_TOKEN_ENV, "")
+    # A command line carries no header, so here the environment value is both the configured
+    # admin token and the proof that it was offered; the reuse and length rules still apply.
+    refusal = release_refusal(admin_token=admin, bridge_token=token, supplied=admin)
+    if refusal:
+        print(text("runner.kill_switch_release_refused", language, reason=refusal),
+              file=sys.stderr)
+        return 2
+    try:
+        record = switch.record(active=False, actor_id=os.environ.get("USERNAME", "operator"),
+                               reason="released from the command line",
+                               now=datetime.now(UTC))
+    except (BridgeError, OSError) as exc:
+        code = getattr(exc, "code", None) or type(exc).__name__
+        print(text("runner.kill_switch_release_refused", language, reason=str(code)),
+              file=sys.stderr)
+        return 2
+    print(text("runner.kill_switch_released", language, file=str(path),
+               updated_at=record["updated_at"]), file=sys.stderr)
+    return 0
+
+
 def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: str,
          run_id: str, terminal: DemoTerminal,
          symbols: list[str] | None = None) -> int:
     bridge: DemoBridge | None = None
     journal: DecisionJournal | None = None
-    state = RunState(active=bool(policy.kill_switch_active),
-                     reason=str(policy.kill_switch_reason or "POLICY"))
+    switch_path = kill_switch_state_path(args.tombstones)
+    try:
+        switch = KillSwitchStore(switch_path)
+    except BridgeError as exc:
+        print(text("out.error", language, reason=f"{exc.code} ({switch_path})"), file=sys.stderr)
+        return 2
+    if policy.kill_switch_active:
+        # The policy arms the same record an operator POST arms, so a run launched with an
+        # active switch blocks the EA and this process from the first cycle. A write that
+        # fails still leaves the switch armed in memory, which is the safe half.
+        _arm_stop(switch, language=language, actor="policy",
+                  reason=str(policy.kill_switch_reason or "POLICY"))
     try:
         account = terminal.account()
         if not account.is_demo:
@@ -744,7 +834,7 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
         journal = DecisionJournal(args.db, run_id=run_id)
         try:
             bridge = DemoBridge(token=token, tombstones_path=args.tombstones,
-                                kill_switch=state.payload, host="127.0.0.1",
+                                kill_switch_store=switch, host="127.0.0.1",
                                 port=args.bridge_port, command_ttl_seconds=args.ttl_seconds)
         except (BridgeError, OSError) as exc:
             print(text("out.error", language, reason=str(exc)), file=sys.stderr)
@@ -808,6 +898,7 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
             executor = DemoExecutor(queue=bridge, journal=journal, terminal=terminal,
                                     policy=per_policy, language=language, run_id=run_id,
                                     post_approval_gates=agent.post_approval_gates,
+                                    kill_switch=switch.payload,
                                     symbol=symbol, ttl_seconds=args.ttl_seconds,
                                     fill_timeout_seconds=args.fill_timeout,
                                     max_volume=args.max_volume, approver=approver,
@@ -825,6 +916,10 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
         print(text("runner.symbols_line", language, active=", ".join(active),
                    unavailable=", ".join(sorted(unavailable)) or "-"), file=sys.stderr)
         print(text("runner.ea_hint", language), file=sys.stderr)
+        if stop_is_armed(switch.payload):
+            print(text("runner.kill_switch_armed", language,
+                       reason=str(switch.payload().get("kill_switch_reason") or "")),
+                  file=sys.stderr)
 
         statuses = (codes.STATUS_BLOCKED, codes.STATUS_NO_SIGNAL, codes.STATUS_OBSERVED,
                     codes.STATUS_PAPER_OPENED)
@@ -857,8 +952,10 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
                         if outcome.state in tally:
                             tally[outcome.state] += 1
                         if outcome.stop_run:
-                            state.active = True
-                            state.reason = f"{symbol}:{outcome.state}"
+                            # Durable, not a variable: a halt over an unknown send must still
+                            # block the EA after this process exits and the next one starts.
+                            _arm_stop(switch, language=language,
+                                      reason=f"{symbol}:{outcome.state}")
                             halted = True
                             halted_by = symbol
                             print(text("runner.stopped_uncertain", language),
@@ -906,6 +1003,8 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
             "unconfirmed": total(STATE_UNCONFIRMED),
             "refused": total(STATE_REFUSED), "duplicate": total(STATE_DUPLICATE),
             "halted": halted, "halted_by": halted_by,
+            "kill_switch_armed": stop_is_armed(switch.payload),
+            "kill_switch_reason": str(switch.payload().get("kill_switch_reason") or ""),
             "broker_order_sent": filled > 0,
             "requires_manual_reconciliation": total(STATE_UNCONFIRMED) > 0
             or total(STATE_DUPLICATE) > 0,
@@ -963,6 +1062,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     run_id = args.run_id or f"demo-{uuid.uuid4().hex[:8]}"
+    if args.release_kill_switch:
+        # Lifting a stop is not a trade: no terminal, no journal, no bridge, no cycle runs.
+        return _release_kill_switch(args, language, token)
     try:
         terminal = DemoTerminal(server_utc_offset_seconds=policy.server_utc_offset_seconds,
                                 terminal_path=args.terminal_path, timeout_ms=args.timeout_ms)

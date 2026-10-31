@@ -76,18 +76,34 @@ def _command(now: datetime, *, command_id: str = "cmd-1", client_order_id: str =
 
 
 def _request(bridge, method: str, path: str, *, key: str | None = TOKEN,
-             headers: dict | None = None):
+             headers: dict | None = None, body: str | None = None):
     connection = http.client.HTTPConnection("127.0.0.1", bridge.port, timeout=5)
     request_headers = {} if headers is None else dict(headers)
     if key is not None:
         request_headers["X-Bridge-Key"] = key
-    connection.request(method, path, headers=request_headers)
+    if body is not None:
+        request_headers.setdefault("Content-Type", "application/json")
+        request_headers["Content-Length"] = str(len(body.encode("utf-8")))
+    connection.request(method, path, body=body, headers=request_headers)
     response = connection.getresponse()
-    body = response.read()
+    payload = response.read()
     status = response.status
     response_headers = {name.lower(): value for name, value in response.getheaders()}
     connection.close()
-    return status, body, response_headers
+    return status, payload, response_headers
+
+
+def _post(bridge, path: str, payload, *, key: str | None = TOKEN,
+          headers: dict | None = None, raw: str | None = None):
+    """Send a POST the way an operator's script does: JSON body, bridge key in a header."""
+    body = raw if raw is not None else json.dumps(payload)
+    return _request(bridge, "POST", path, key=key, headers=headers, body=body)
+
+
+def _arm(store, *, reason: str = "operator", active: bool = True):
+    store.record(active=active, actor_id="test", reason=reason, now=datetime(
+        2026, 10, 31, 12, 0, tzinfo=UTC))
+    return store
 
 
 def _json(body: bytes):
@@ -104,13 +120,16 @@ def make_bridge(tmp_path, clock):
     created = []
 
     def factory(**kwargs):
+        store = kwargs.pop("kill_switch_store", None) or _bridge().KillSwitchStore(
+            tmp_path / "kill_switch.json")
         options = {
             "token": TOKEN,
             "tombstones_path": tmp_path / "tombstones.jsonl",
-            "kill_switch": lambda: {"kill_switch_active": False, "kill_switch_reason": ""},
+            "kill_switch_store": store,
             "host": "127.0.0.1",
             "port": 0,
             "command_ttl_seconds": 120,
+            "admin_token": lambda: "",
             "clock": clock,
         }
         options.update(kwargs)
@@ -135,24 +154,31 @@ def test_token_shape_is_enforced():
 
 def test_bridge_refuses_a_non_loopback_bind_and_bad_port(tmp_path, clock):
     module = _bridge()
+    store = module.KillSwitchStore(tmp_path / "kill_switch.json")
     for host in ("0.0.0.0", "::", "10.0.0.5", "example.com"):
         with pytest.raises(module.BridgeError) as error:
             module.DemoBridge(token=TOKEN, tombstones_path=tmp_path / "t.jsonl",
-                              kill_switch=lambda: {"kill_switch_active": False},
-                              host=host, port=0, clock=clock)
+                              kill_switch_store=store, host=host, port=0, clock=clock)
         assert error.value.code == "BRIDGE_HOST_NOT_LOOPBACK"
     for port in (-1, 70000, True, "8000"):
         with pytest.raises(module.BridgeError) as error:
             module.DemoBridge(token=TOKEN, tombstones_path=tmp_path / "t.jsonl",
-                              kill_switch=lambda: {"kill_switch_active": False},
-                              host="127.0.0.1", port=port, clock=clock)
+                              kill_switch_store=store, host="127.0.0.1", port=port,
+                              clock=clock)
         assert error.value.code == "BRIDGE_PORT_INVALID"
     for ttl in (4, 601, True, 1.5):
         with pytest.raises(module.BridgeError) as error:
             module.DemoBridge(token=TOKEN, tombstones_path=tmp_path / "t.jsonl",
-                              kill_switch=lambda: {"kill_switch_active": False},
-                              host="127.0.0.1", port=0, command_ttl_seconds=ttl, clock=clock)
+                              kill_switch_store=store, host="127.0.0.1", port=0,
+                              command_ttl_seconds=ttl, clock=clock)
         assert error.value.code == "BRIDGE_TTL_INVALID"
+    for broken in (None, tmp_path / "kill_switch.json",
+                   module.KillSwitchStore):
+        # A bridge that cannot reach the durable stop is not allowed to start at all.
+        with pytest.raises(module.BridgeError) as error:
+            module.DemoBridge(token=TOKEN, tombstones_path=tmp_path / "t.jsonl",
+                              kill_switch_store=broken, host="127.0.0.1", port=0, clock=clock)
+        assert error.value.code == "KILL_SWITCH_STORE_REQUIRED"
 
 
 def test_started_bridge_binds_loopback_and_reports_its_url(make_bridge):
@@ -305,8 +331,8 @@ def test_requeueing_a_served_command_is_refused(make_bridge, clock):
 def test_a_served_command_stays_served_after_a_restart(tmp_path, clock):
     module = _bridge()
     path = tmp_path / "tombstones.jsonl"
-    first = module.DemoBridge(token=TOKEN, tombstones_path=path,
-                              kill_switch=lambda: {"kill_switch_active": False},
+    store = module.KillSwitchStore(tmp_path / "kill_switch.json")
+    first = module.DemoBridge(token=TOKEN, tombstones_path=path, kill_switch_store=store,
                               host="127.0.0.1", port=0, clock=clock).start()
     try:
         first.enqueue(_command(clock()))
@@ -315,7 +341,8 @@ def test_a_served_command_stays_served_after_a_restart(tmp_path, clock):
         first.stop()
 
     second = module.DemoBridge(token=TOKEN, tombstones_path=path,
-                               kill_switch=lambda: {"kill_switch_active": False},
+                               kill_switch_store=module.KillSwitchStore(
+                                   tmp_path / "kill_switch.json"),
                                host="127.0.0.1", port=0, clock=clock).start()
     try:
         with pytest.raises(module.BridgeError) as error:
@@ -426,43 +453,38 @@ def test_a_query_string_does_not_change_the_route(make_bridge, clock):
 
 
 # ------------------------------------------------------------------ kill switch
-def test_kill_switch_payload_is_served(make_bridge):
+def test_kill_switch_payload_is_served(make_bridge, tmp_path, clock):
     module = _bridge()
-    bridge = make_bridge(
-        kill_switch=lambda: {"kill_switch_active": True, "kill_switch_reason": "operator"}).start()
+    store = _arm(module.KillSwitchStore(tmp_path / "armed.json"), reason="operator")
+    bridge = make_bridge(kill_switch_store=store).start()
     status, body, headers = _request(bridge, "GET", module.KILL_SWITCH_PATH)
     assert status == 200
     assert headers["cache-control"] == "no-store"
     assert _json(body) == {"kill_switch_active": True, "kill_switch_reason": "operator"}
 
 
-def test_kill_switch_failures_are_503(make_bridge):
+def test_an_unreadable_state_is_never_served_as_disarmed(make_bridge, tmp_path):
     module = _bridge()
-
-    def explode():
-        raise RuntimeError("journal unavailable")
-
-    bridge = make_bridge(kill_switch=explode).start()
-    status, body, _ = _request(bridge, "GET", module.KILL_SWITCH_PATH)
-    assert status == 503
-    assert _json(body) == {"error": "kill_switch_unavailable"}
-
-    bad_bridge = make_bridge(kill_switch=lambda: {"kill_switch_active": "yes"}).start()
-    status, body, _ = _request(bad_bridge, "GET", module.KILL_SWITCH_PATH)
-    assert status == 503
-
-    nested = make_bridge(
-        kill_switch=lambda: {"kill_switch_active": False, "detail": {"x": 1}}).start()
-    status, _, _ = _request(nested, "GET", module.KILL_SWITCH_PATH)
-    assert status == 503
+    path = tmp_path / "kill_switch.json"
+    store = module.KillSwitchStore(path)
+    bridge = make_bridge(kill_switch_store=store).start()
+    for broken in ("", "not json at all", "[]", '{"kill_switch_active": "yes"}',
+                   '{"kill_switch_active": true, "kill_switch_reason": {"x": 1}}'):
+        path.write_text(broken, encoding="utf-8")
+        status, body, _ = _request(bridge, "GET", module.KILL_SWITCH_PATH)
+        assert status == 503, broken
+        assert _json(body) == {"error": "kill_switch_unavailable"}
 
 
-def test_kill_switch_strings_are_made_parseable(make_bridge):
+def test_kill_switch_strings_are_made_parseable(make_bridge, tmp_path):
+    """A hand-edited reason must still parse in the advisor's strict JSON reader."""
     module = _bridge()
-    bridge = make_bridge(kill_switch=lambda: {
-        "kill_switch_active": False,
-        "kill_switch_reason": 'operator said "stop"\\now\nimmediately',
-    }).start()
+    path = tmp_path / "kill_switch.json"
+    path.write_text(json.dumps({"kill_switch_active": False,
+                                "kill_switch_reason": 'operator said "stop"\\now\nimmediately',
+                                "actor_id": "hand", "updated_at": "2026-10-31T12:00:00+00:00",
+                                "event_hash": "0" * 64}), encoding="utf-8")
+    bridge = make_bridge(kill_switch_store=module.KillSwitchStore(path)).start()
     status, body, _ = _request(bridge, "GET", module.KILL_SWITCH_PATH)
     assert status == 200
     payload = _json(body)
@@ -470,6 +492,232 @@ def test_kill_switch_strings_are_made_parseable(make_bridge):
     reason = payload["kill_switch_reason"]
     assert '"' not in reason and "\\" not in reason
     assert not any(ord(char) < 0x20 for char in reason)
+
+
+# --------------------------------------------------------------------- stop write
+def test_an_authorized_post_arms_the_stop_the_ea_reads(make_bridge, clock):
+    module = _bridge()
+    bridge = make_bridge().start()
+    status, body, _ = _post(bridge, module.KILL_SWITCH_PATH,
+                            {"active": True, "actor_id": "paula", "reason": "circuit breaker"})
+    assert status == 200
+    record = _json(body)
+    assert record["kill_switch_active"] is True
+    assert record["status"] == "PERSISTED"
+    assert record["actor_id"] == "paula"
+    assert len(record["event_hash"]) == 64
+    assert datetime.fromisoformat(record["updated_at"]) == clock()
+    # The same state the advisor polls, not a second copy that can drift.
+    status, polled, _ = _request(bridge, "GET", module.KILL_SWITCH_PATH)
+    assert _json(polled) == {"kill_switch_active": True,
+                             "kill_switch_reason": "circuit breaker"}
+
+
+def test_the_stop_is_durable_and_outlives_the_bridge(tmp_path, clock):
+    module = _bridge()
+    path = tmp_path / "kill_switch.json"
+    store = module.KillSwitchStore(path)
+    bridge = module.DemoBridge(token=TOKEN, tombstones_path=tmp_path / "tombstones.jsonl",
+                               kill_switch_store=store, host="127.0.0.1", port=0,
+                               clock=clock).start()
+    try:
+        _post(bridge, module.KILL_SWITCH_PATH, {"active": True, "reason": "crash risk"})
+    finally:
+        bridge.stop()
+    # A new process reading the file is blocked too: the stop was never a variable.
+    reopened = module.DemoBridge(token=TOKEN, tombstones_path=tmp_path / "tombstones.jsonl",
+                                 kill_switch_store=module.KillSwitchStore(path),
+                                 host="127.0.0.1", port=0, clock=clock).start()
+    try:
+        status, body, _ = _request(reopened, "GET", module.KILL_SWITCH_PATH)
+        assert _json(body) == {"kill_switch_active": True, "kill_switch_reason": "crash risk"}
+        assert "crash risk" in path.read_text(encoding="utf-8")
+    finally:
+        reopened.stop()
+
+
+def test_a_stop_request_defaults_to_armed_and_survives_awkward_wording(make_bridge):
+    module = _bridge()
+    bridge = make_bridge().start()
+    status, body, _ = _post(bridge, module.KILL_SWITCH_PATH, {})
+    assert status == 200 and _json(body)["kill_switch_active"] is True
+    # An operator's wording is prose; the advisor's parser is strict. Clean the text,
+    # never refuse the stop over it.
+    status, body, _ = _post(bridge, module.KILL_SWITCH_PATH,
+                            {"reason": 'скажу "стоп"\\и ещё\nперенос', "actor_id": "x" * 400})
+    assert status == 200
+    record = _json(body)
+    assert '"' not in record["kill_switch_reason"] and "\\" not in record["kill_switch_reason"]
+    assert len(record["actor_id"]) <= module.MAX_NOTE_CHARS
+    status, polled, _ = _request(bridge, "GET", module.KILL_SWITCH_PATH)
+    assert status == 200
+
+
+@pytest.mark.parametrize(("raw", "code"), [
+    ('{"active": "true"}', "active_is_not_true_or_false"),
+    ('{"active": 1}', "active_is_not_true_or_false"),
+    ('{"reason": 5}', "note_is_not_a_string"),
+    ('{"actor_id": []}', "note_is_not_a_string"),
+    ("[]", "body_is_not_a_json_object"),
+    ("not json", "body_is_not_a_json_object"),
+])
+def test_a_malformed_stop_request_changes_nothing(make_bridge, raw, code):
+    module = _bridge()
+    bridge = make_bridge().start()
+    status, payload, _ = _post(bridge, module.KILL_SWITCH_PATH, None, raw=raw)
+    assert status == 400
+    assert _json(payload)["error"] == code
+    # An unusable request never releases a stop, and never arms one either.
+    assert bridge._switch.read() is None
+
+
+def test_an_empty_or_huge_stop_body_is_refused_after_being_read(make_bridge):
+    module = _bridge()
+    bridge = make_bridge().start()
+    # Nothing in the body, so nothing that could be a stop; and a body far past the cap is
+    # drained out of the socket before the 413, so the client learns the verdict instead of
+    # losing the connection to a reset.
+    status, body, _ = _request(bridge, "POST", module.KILL_SWITCH_PATH)
+    assert status == 400 and _json(body) == {"error": "body_required"}
+    status, body, _ = _request(bridge, "POST", module.KILL_SWITCH_PATH, body="{}" * 4000)
+    assert status == 413 and _json(body) == {"error": "body_too_large"}
+    assert bridge._switch.read() is None
+
+
+def test_the_stop_needs_the_bridge_key_and_a_loopback_host(make_bridge):
+    module = _bridge()
+    bridge = make_bridge().start()
+    for key in (None, "", "b" * 43):
+        status, body, _ = _post(bridge, module.KILL_SWITCH_PATH, {"active": True}, key=key)
+        assert status == 401 and _json(body) == {"error": "unauthorized"}
+    status, body, _ = _post(bridge, module.KILL_SWITCH_PATH, {"active": True},
+                            headers={"Origin": "http://evil.example"})
+    assert status == 401
+    assert bridge._switch.read() is None
+    # A cross-site host header is refused before the stop is even attempted.
+    status, body, _ = _post(bridge, module.KILL_SWITCH_PATH, {"active": True},
+                            headers={"Host": "localhost:1"})
+    assert status == 403 and _json(body) == {"error": "host_not_allowed"}
+
+
+def test_only_the_kill_switch_path_accepts_a_write(make_bridge, clock):
+    module = _bridge()
+    bridge = make_bridge().start()
+    bridge.enqueue(_command(clock()))
+    for path in (module.NEXT_COMMAND_PATH, "/v1/execution/submit", "/unknown"):
+        status, body, _ = _post(bridge, path, {"active": True})
+        assert status == 405, path
+        assert _json(body) == {"error": "method_not_allowed"}
+    # A queue with a command in it is still untouchable from the outside.
+    status, body, _ = _request(bridge, "GET", module.NEXT_COMMAND_PATH)
+    assert status == 200 and _json(body)["command_id"] == "cmd-1"
+    for verb in ("PUT", "PATCH", "DELETE"):
+        status, _, _ = _request(bridge, verb, module.KILL_SWITCH_PATH, body="{}")
+        assert status == 405, verb
+
+
+def test_releasing_a_stop_needs_a_second_secret(make_bridge):
+    module = _bridge()
+    secret = "a" * 24
+    bridge = make_bridge(admin_token=lambda: secret).start()
+    _post(bridge, module.KILL_SWITCH_PATH, {"active": True, "reason": "armed"})
+    # Misconfigured: the release is refused and the switch stays armed.
+    status, body, _ = _post(bridge, module.KILL_SWITCH_PATH, {"active": False})
+    assert status == 503
+    assert _json(body) == {"error": "KILL_SWITCH_ADMIN_TOKEN_UNCONFIGURED",
+                           "kill_switch_active": True}
+    bridge_same_secret = make_bridge(admin_token=lambda: TOKEN, token=TOKEN).start()
+    status, body, _ = _post(bridge_same_secret, module.KILL_SWITCH_PATH, {"active": False})
+    assert status == 503
+    assert "REUSES_BRIDGE_TOKEN" in _json(body)["error"]
+    bridge._admin_token = lambda: "b" * 32
+    status, body, _ = _post(bridge, module.KILL_SWITCH_PATH, {"active": False})
+    assert status == 403
+    assert _json(body) == {"error": "KILL_SWITCH_ADMIN_AUTHENTICATION_REQUIRED",
+                           "kill_switch_active": True}
+    status, body, _ = _post(bridge, module.KILL_SWITCH_PATH, {"active": False},
+                            headers={module.ADMIN_HEADER: "wrong" * 20})
+    assert status == 403
+    status, body, _ = _post(bridge, module.KILL_SWITCH_PATH, {"active": False},
+                            headers={module.ADMIN_HEADER: "b" * 32})
+    assert status == 200 and _json(body)["kill_switch_active"] is False
+    status, polled, _ = _request(bridge, "GET", module.KILL_SWITCH_PATH)
+    assert _json(polled)["kill_switch_active"] is False
+
+
+def test_an_arm_that_cannot_be_written_is_still_an_arm(make_bridge, monkeypatch):
+    module = _bridge()
+    bridge = make_bridge().start()
+    monkeypatch.setattr(module.KillSwitchStore, "_write",
+                        lambda self, record: (_ for _ in ()).throw(OSError("disk full")))
+    status, body, _ = _post(bridge, module.KILL_SWITCH_PATH, {"active": True,
+                                                              "reason": "disk problem"})
+    assert status == 503
+    assert _json(body) == {"kill_switch_active": True, "kill_switch_reason": "disk problem",
+                           "error": "OSError", "status": "MEMORY_ONLY"}
+    # The EA still reads the stop: an unwritable file must not un-arm the process.
+    status, polled, _ = _request(bridge, "GET", module.KILL_SWITCH_PATH)
+    assert _json(polled)["kill_switch_active"] is True
+    assert bridge.state.reasons["OSError"] == 1
+
+
+def test_a_release_that_cannot_be_written_leaves_the_stop_armed(make_bridge, monkeypatch):
+    module = _bridge()
+    secret = "b" * 32
+    bridge = make_bridge(admin_token=lambda: secret).start()
+    _post(bridge, module.KILL_SWITCH_PATH, {"active": True, "reason": "armed"})
+    monkeypatch.setattr(module.KillSwitchStore, "_write",
+                        lambda self, record: (_ for _ in ()).throw(OSError("disk full")))
+    status, body, _ = _post(bridge, module.KILL_SWITCH_PATH, {"active": False},
+                            headers={module.ADMIN_HEADER: secret})
+    assert status == 503
+    assert _json(body)["status"] == "NOT_CHANGED"
+    status, polled, _ = _request(bridge, "GET", module.KILL_SWITCH_PATH)
+    assert _json(polled)["kill_switch_active"] is True
+
+
+def test_stop_state_round_trips_through_the_file(tmp_path, clock):
+    module = _bridge()
+    path = tmp_path / "kill_switch.json"
+    store = module.KillSwitchStore(path)
+    assert store.read() is None
+    assert store.payload() == {"kill_switch_active": False, "kill_switch_reason": "NOT_ARMED"}
+    first = store.record(active=True, actor_id="operator", reason="risk", now=clock())
+    assert _json(path.read_bytes())["kill_switch_active"] is True
+    second = module.KillSwitchStore(path)
+    assert second.payload() == {"kill_switch_active": True, "kill_switch_reason": "risk"}
+    assert second.read()["event_hash"] == first["event_hash"]
+    second.record(active=False, actor_id="admin", reason="checked", now=clock())
+    assert module.KillSwitchStore(path).payload()["kill_switch_active"] is False
+
+
+@pytest.mark.parametrize("reason, expected", [
+    ('quoted "stop" and \\backslash', "quoted stop and backslash"),
+    ("line\nbreak\tand tab", "line break and tab"),
+    ("   padded   ", "padded"),
+    ("", "ARMED"),
+    (None, "ARMED"),
+    ({"nested": 1}, "ARMED"),
+    ("x" * 400, "x" * 180),
+])
+def test_a_stop_note_is_cleaned_not_refused(tmp_path, clock, reason, expected):
+    module = _bridge()
+    record = module.KillSwitchStore(tmp_path / "kill_switch.json").record(
+        active=True, actor_id="operator", reason=reason, now=clock())
+    assert record["kill_switch_reason"] == expected
+    assert '"' not in record["kill_switch_reason"] and "\\" not in record["kill_switch_reason"]
+    assert not any(ord(char) < 0x20 for char in record["kill_switch_reason"])
+
+
+def test_a_corrupt_stop_file_is_a_refusal_not_a_default(tmp_path):
+    module = _bridge()
+    path = tmp_path / "kill_switch.json"
+    for broken in ("", "   ", "not json at all", "[]", '{"kill_switch_active": "yes"}',
+                   '{"kill_switch_active": true}'):
+        path.write_text(broken, encoding="utf-8")
+        with pytest.raises(module.BridgeError) as error:
+            module.KillSwitchStore(path)
+        assert error.value.code == "KILL_SWITCH_FILE_CORRUPT", broken
 
 
 # ------------------------------------------------------------------- tombstones

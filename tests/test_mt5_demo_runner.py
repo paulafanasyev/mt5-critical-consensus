@@ -131,6 +131,20 @@ class FakeTerminal:
         return [dict(deal) for deal in self.deals]
 
 
+class StubAgent:
+    """A stand-in for ``MT5Agent``: a usable market with no setup, so the run only drives itself."""
+
+    def __init__(self, **kwargs):
+        self.policy = kwargs["policy"]
+
+    def run_cycle(self, **_kwargs):
+        return SimpleNamespace(status=codes.STATUS_NO_SIGNAL, blockers=(),
+                               proposal=None, sizing=None, recorded_at=NOW.isoformat())
+
+    def post_approval_gates(self, _proposal, _sizing):
+        return (), {}
+
+
 def proposal(*, direction: str = "BUY", entry: float = 1.10000, sl: float = 1.09000,
              tp: float = 1.12000, symbol: str = "EURUSD") -> dict:
     return {"symbol": symbol, "timeframe": "H1", "direction": direction,
@@ -170,6 +184,12 @@ def journal(tmp_path):
     decision_log.close()
 
 
+def armed_stop(active: bool = True):
+    """A stand-in for ``KillSwitchStore.payload``: what the runner reads before it trades."""
+    return lambda: ({"kill_switch_active": True, "kill_switch_reason": "operator"} if active
+                    else {"kill_switch_active": False, "kill_switch_reason": "NOT_ARMED"})
+
+
 def make_executor(*, journal: DecisionJournal, queue: FakeQueue | None = None,
                   terminal: FakeTerminal | None = None, policy=None,
                   approver=None, state: ApprovalState | None = None,
@@ -177,6 +197,7 @@ def make_executor(*, journal: DecisionJournal, queue: FakeQueue | None = None,
                   max_volume: float = runner.MAX_DEMO_VOLUME, out=None,
                   language: str = "ru", ttl: int = 60,
                   gates: runner.PostApprovalGates | None = None,
+                  kill_switch=armed_stop(False),
                   symbol: str | None = None) -> tuple[runner.DemoExecutor,
                                                       FakeQueue, FakeTerminal, Clock]:
     clock = clock or Clock()
@@ -187,7 +208,7 @@ def make_executor(*, journal: DecisionJournal, queue: FakeQueue | None = None,
         policy=policy or make_policy(execution_mode="auto"), language=language,
         run_id="run-1", symbol=symbol, ttl_seconds=ttl, fill_timeout_seconds=fill_timeout,
         poll_seconds=1.0, max_volume=max_volume, approver=approver,
-        post_approval_gates=gates or pass_gates(terminal),
+        post_approval_gates=gates or pass_gates(terminal), kill_switch=kill_switch,
         operator_state=state, clock=clock, sleep=clock.sleep, out=out)
     return executor, queue, terminal, clock
 
@@ -608,6 +629,109 @@ def test_auto_mode_never_calls_the_approver(journal):
     assert outcome.state in (runner.STATE_UNCONFIRMED, runner.STATE_FILLED)
 
 
+# ------------------------------------------------------------------- emergency stop
+def test_an_armed_stop_refuses_before_any_market_read(journal):
+    executor, queue, _, _ = make_executor(
+        journal=journal, kill_switch=armed_stop(True),
+        terminal=FakeTerminal(read_error=RuntimeError("terminal down")))
+    outcome = executor.offer(proposal(), sizing())
+    assert outcome.state == runner.STATE_REFUSED and outcome.reason == codes.KILL_SWITCH_ACTIVE
+    assert outcome.queued is False and queue.commands == []
+
+
+def test_a_stop_pulled_while_the_operator_was_answering_still_reaches_the_queue(journal):
+    flipped = {"armed": False}
+
+    def confirm(proposal, plan):
+        flipped["armed"] = True
+        return True
+
+    executor, queue, _, _ = make_executor(
+        journal=journal, kill_switch=lambda: {"kill_switch_active": flipped["armed"]},
+        policy=make_policy(execution_mode="confirm"), approver=confirm)
+    outcome = executor.offer(proposal(), sizing())
+    assert outcome.state == runner.STATE_REFUSED and outcome.reason == codes.KILL_SWITCH_ACTIVE
+    assert queue.commands == []
+    # A command that was never built must not leave identifiers in the journal either.
+    last = payloads(journal, runner.OUTCOME_EVENT)[-1]
+    assert last["command_id"] == "" and last["client_order_id"] == ""
+
+
+@pytest.mark.parametrize("state", [None, {}, "armed", {"kill_switch_active": "yes"},
+                                   {"kill_switch_active": None}])
+def test_a_stop_that_cannot_be_proven_inactive_blocks(journal, state):
+    executor, queue, _, _ = make_executor(journal=journal, kill_switch=lambda: state)
+    outcome = executor.offer(proposal(), sizing())
+    assert outcome.state == runner.STATE_REFUSED and queue.commands == []
+
+
+def test_a_stop_state_that_cannot_be_read_counts_as_armed(journal):
+    def explode():
+        raise RuntimeError("the state file is unreadable")
+
+    executor, queue, _, _ = make_executor(journal=journal, kill_switch=explode)
+    outcome = executor.offer(proposal(), sizing())
+    assert outcome.state == runner.STATE_REFUSED and outcome.reason == codes.KILL_SWITCH_ACTIVE
+    assert queue.commands == []
+
+
+def test_an_executor_cannot_be_built_without_a_stop_reader(journal):
+    with pytest.raises(TypeError):
+        runner.DemoExecutor(queue=FakeQueue(), journal=journal, terminal=FakeTerminal(),
+                            policy=make_policy(execution_mode="auto"), language="ru",
+                            run_id="run-1", post_approval_gates=pass_gates(FakeTerminal()))
+
+
+def test_a_stop_written_by_one_process_blocks_the_next(tmp_path, journal):
+    """The file is the whole contract: an arm outlives the bridge that recorded it."""
+    path = tmp_path / "kill_switch.json"
+    runner.KillSwitchStore(path).record(active=True, actor_id="operator", reason="halt",
+                                        now=NOW)
+    reopened = runner.KillSwitchStore(path)
+    assert runner.stop_is_armed(reopened.payload)
+    executor, queue, _, _ = make_executor(journal=journal, kill_switch=reopened.payload)
+    outcome = executor.offer(proposal(), sizing())
+    assert outcome.state == runner.STATE_REFUSED and queue.commands == []
+
+
+def test_the_runners_own_halt_is_durable(tmp_path):
+    store = runner.KillSwitchStore(tmp_path / "kill_switch.json")
+    runner._arm_stop(store, language="en", reason="EURUSD:STOPPED")
+    assert runner.stop_is_armed(runner.KillSwitchStore(tmp_path / "kill_switch.json").payload)
+
+
+def test_a_halt_that_cannot_be_written_still_blocks(tmp_path, monkeypatch, capsys):
+    store = runner.KillSwitchStore(tmp_path / "kill_switch.json")
+
+    def refuse(self, record):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runner.KillSwitchStore, "_write", refuse)
+    runner._arm_stop(store, language="en", reason="EURUSD:STOPPED")
+    assert runner.stop_is_armed(store.payload)
+    assert "OSError" in capsys.readouterr().err
+
+
+def test_releasing_a_persisted_stop_from_the_cli_needs_the_admin_secret(tmp_path, monkeypatch):
+    path = tmp_path / "kill_switch.json"
+    store = runner.KillSwitchStore(path)
+    store.record(active=True, actor_id="operator", reason="halt", now=NOW)
+    args = args_namespace(tombstones=str(tmp_path / "served.jsonl"))
+    monkeypatch.delenv(runner.ADMIN_TOKEN_ENV, raising=False)
+    assert runner._release_kill_switch(args, "en", TOKEN) == 2
+    assert store.read()["kill_switch_active"] is True
+    # The bridge key alone must never lift a stop, even when it is long enough.
+    monkeypatch.setenv(runner.ADMIN_TOKEN_ENV, TOKEN)
+    assert runner._release_kill_switch(args, "en", TOKEN) == 2
+    assert store.read()["kill_switch_active"] is True
+    monkeypatch.setenv(runner.ADMIN_TOKEN_ENV, "a" * 32)
+    assert runner._release_kill_switch(args, "en", TOKEN) == 0
+    assert runner.KillSwitchStore(path).read()["kill_switch_active"] is False
+    # The process that armed the stop keeps blocking: its own arm is never forgotten because
+    # another writer touched the file, which is why this release is for the gap between runs.
+    assert runner.stop_is_armed(store.payload)
+
+
 # ----------------------------------------------------------------------- CLI contract
 def args_namespace(**overrides) -> SimpleNamespace:
     base = dict(db="journal.db", tombstones="served.jsonl", bridge_port=8000,
@@ -802,18 +926,6 @@ def test_a_proposal_for_another_instrument_is_never_routed(journal):
 def test_the_run_covers_every_requested_instrument(tmp_path, monkeypatch, capsys):
     terminal = FakeTerminal(specs={"EURUSD": SPEC, "XAUUSD": GOLD},
                             unavailable={"BTCUSD"})
-
-    class StubAgent:
-        def __init__(self, **kwargs):
-            self.policy = kwargs["policy"]
-
-        def run_cycle(self, **_kwargs):
-            return SimpleNamespace(status=codes.STATUS_NO_SIGNAL, blockers=(),
-                                   proposal=None, sizing=None, recorded_at=NOW.isoformat())
-
-        def post_approval_gates(self, _proposal, _sizing):
-            return (), {}
-
     monkeypatch.setattr(runner, "MT5Agent", StubAgent)
     code = runner._run(run_args(tmp_path),
                        make_policy(execution_mode="auto"), "en", TOKEN, "run-1", terminal,
@@ -843,6 +955,59 @@ def test_a_run_with_no_available_instrument_is_refused(tmp_path, capsys):
                        ["EURUSD", "XAUUSD"])
     assert code == 3
     assert "None of the requested instruments" in capsys.readouterr().err
+
+
+def test_a_policy_that_arrives_stopped_seeds_the_durable_stop(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(runner, "MT5Agent", StubAgent)
+    policy = make_policy(execution_mode="auto", kill_switch__active=True,
+                         kill_switch__reason="operator halt")
+    assert runner._run(run_args(tmp_path), policy, "en", TOKEN, "run-1", FakeTerminal(),
+                       ["EURUSD"]) == 0
+    captured = capsys.readouterr()
+    assert "The emergency stop is armed (operator halt)" in captured.err
+    summary = json.loads(captured.out)
+    assert summary["kill_switch_armed"] is True
+    assert summary["kill_switch_reason"] == "operator halt"
+    assert summary["commands_queued"] == 0
+    # The stop is a file beside the tombstones, so it outlives this run.
+    assert "operator halt" in (tmp_path / "kill_switch.json").read_text(encoding="utf-8")
+
+
+def test_a_stop_left_by_an_earlier_run_blocks_the_next_one(tmp_path, monkeypatch, capsys):
+    """A policy that no longer mentions the stop cannot lift the one an operator pulled."""
+    monkeypatch.setattr(runner, "MT5Agent", StubAgent)
+    armed = make_policy(execution_mode="auto", kill_switch__active=True,
+                        kill_switch__reason="operator halt")
+    assert runner._run(run_args(tmp_path), armed, "en", TOKEN, "run-1", FakeTerminal(),
+                       ["EURUSD"]) == 0
+    capsys.readouterr()
+    clean = make_policy(execution_mode="auto")
+    assert runner._run(run_args(tmp_path), clean, "en", TOKEN, "run-2", FakeTerminal(),
+                       ["EURUSD"]) == 0
+    captured = capsys.readouterr()
+    assert "The emergency stop is armed (operator halt)" in captured.err
+    assert json.loads(captured.out)["kill_switch_armed"] is True
+
+
+def test_a_stop_file_that_cannot_be_read_stops_the_run_before_it_starts(tmp_path, monkeypatch,
+                                                                        capsys):
+    (tmp_path / "kill_switch.json").write_text("not json at all", encoding="utf-8")
+    monkeypatch.setattr(runner, "MT5Agent", StubAgent)
+    code = runner._run(run_args(tmp_path), make_policy(execution_mode="auto"), "en", TOKEN,
+                       "run-1", FakeTerminal(), ["EURUSD"])
+    assert code == 2
+    captured = capsys.readouterr()
+    assert "KILL_SWITCH_FILE_CORRUPT" in captured.err
+    assert not (tmp_path / "journal.db").exists()
+
+
+def test_a_stop_file_that_cannot_be_read_cannot_be_released(tmp_path, monkeypatch):
+    path = tmp_path / "kill_switch.json"
+    path.write_text('{"kill_switch_active": tru', encoding="utf-8")
+    monkeypatch.setenv(runner.ADMIN_TOKEN_ENV, "a" * 32)
+    monkeypatch.delenv("USERNAME", raising=False)
+    args = args_namespace(tombstones=str(tmp_path / "served.jsonl"))
+    assert runner._release_kill_switch(args, "en", TOKEN) == 2
 
 
 # ------------------------------------------------------------------------ DemoTerminal

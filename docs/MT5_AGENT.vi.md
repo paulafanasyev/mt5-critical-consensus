@@ -61,8 +61,8 @@ Mọi thứ có thể đặt một lệnh ra thế giới đều nằm tách kh�
 
 | Thành phần | Vai trò |
 |---|---|
-| `scripts/mt5_demo_bridge.py` | cầu nối HTTP chỉ-loopback: hai GET (`/v1/risk/kill-switch`, `/v1/execution/next`), kiểm tra `X-Bridge-Key`, một lệnh đang chờ, TTL, các tombstone idempotency đã fsync, không bao giờ ghi log token hay nội dung lệnh |
-| `scripts/run_mt5_demo_trading.py` | thành phần duy nhất có thể dựng một lệnh: lấy quyết định của agent, kiểm lại mọi cổng, xếp hàng nó trong cầu nối và đối chiếu với chính lịch giao dịch của broker; không bao giờ thử lại một lần gửi không chắc chắn |
+| `scripts/mt5_demo_bridge.py` | cầu nối HTTP chỉ-loopback: hai GET (`/v1/risk/kill-switch`, `/v1/execution/next`) và đúng một POST — chỉ trên đường dẫn kill-switch, kiểm tra `X-Bridge-Key`, tệp `kill_switch.json` bền mà cả runner lẫn advisor cùng đọc, một lệnh đang chờ, TTL, các tombstone idempotency đã fsync, không bao giờ ghi log token hay nội dung lệnh |
+| `scripts/run_mt5_demo_trading.py` | thành phần duy nhất có thể dựng một lệnh: lấy quyết định của agent, từ chối khi công tắc ngừng đang bật, kiểm lại mọi cổng, xếp hàng nó trong cầu nối và đối chiếu với chính lịch giao dịch của broker; không bao giờ thử lại một lần gửi không chắc chắn |
 | `scripts/build_demo_ea.py` | sinh ra `CriticalConsensusEA_Demo.mq5` bằng cách lật đúng một dòng cổng compile-time, tùy chọn biên dịch nó bằng MetaEditor và cài `.ex5` |
 | `scripts/setup_demo_terminal.py` | mặc định là dry run: từ chối khi terminal đang chạy, vá `[Experts]` trong `Config/common.ini`, cài EA đã build; không quyết định điều gì về một lệnh |
 | `scripts/operator_answers.py` | phân tích câu trả lời cả dòng (`да`/`vâng`/`y`) dùng chung cho CLI và runner demo |
@@ -180,6 +180,33 @@ Các cổng phải đồng thời thỏa trước khi một lệnh tồn tại:
    stop, và nó ghi các tombstone idempotency trước khi gửi.
 8. Một kết quả không chắc chắn (lệnh đã được phục vụ, không thấy khớp) dừng lượt chạy và cần
    `--acknowledge-uncertain` rõ ràng; không có đường mã nào gửi lại.
+
+### Công tắc ngừng khẩn cấp trên đường demo
+
+Công tắc ngừng là một tệp, không phải một biến: `kill_switch.json` nằm cạnh các tombstone. Một bản
+ghi lưu thay đổi cuối cùng của công tắc (`kill_switch_active`, `kill_switch_reason`, `actor_id`,
+`updated_at`, `event_hash`), được viết lại toàn bộ qua một tệp tạm cộng `os.replace` và fsync. Runner khởi tạo nó từ `kill_switch.active: true` trong chính sách, người vận hành bật nó qua HTTP, advisor
+đọc nó trong mỗi lần poll, còn runner đọc nó hai lần cho mỗi offer — trước mọi lần đọc thị trường và
+ngay trước khi dựng một lệnh. Vì vậy `scripts/activate_kill_switch.ps1` đã được tài liệu hóa cũng
+dừng được đường này, và một lần bật trước khi khởi động lại vẫn còn hiệu lực sau khi khởi động lại.
+
+- Bật chỉ cần khóa của cầu nối: `POST /v1/risk/kill-switch` với thân
+  `{"active": true, "reason": …}` và header `X-Bridge-Key`. Câu trả lời mang `status: "PERSISTED"`,
+  `updated_at` và `event_hash` — đúng những gì đoạn PowerShell đó kiểm tra. Một yêu cầu mà thân không đọc được
+  thành đối tượng JSON, có `active` không phải boolean hoặc có các trường ghi chú không phải chuỗi bị
+  từ chối với 400 và không thay đổi gì; thân dài hơn 4096 byte được đọc hết ra khỏi socket rồi bị từ
+  chối với 413, để khách hàng nhận được phán quyết thay vì một kết nối bị đứt.
+- Tắt cần bí mật thứ hai: `MT5_KILL_SWITCH_ADMIN_TOKEN` dài ít nhất 32 ký tự, khác `MT5_BRIDGE_TOKEN`,
+  gửi trong `X-Kill-Switch-Admin`. Thiếu admin token hoặc trùng với khóa cầu nối là 503, sai là 403;
+  cả hai trường hợp công tắc vẫn bật. Khi không có runner nào đang sống,
+  `python scripts/run_mt5_demo_trading.py --release-kill-switch` đọc đúng tệp đó, lấy admin token từ
+  môi trường và ghi lệnh tắt.
+- Một trạng thái không đọc được không bao giờ được coi là đã tắt: `kill_switch.json` hỏng hoặc không
+  đọc được khiến runner từ chối và khiến GET của advisor trả 503, mà advisor coi là chặn. Một lần bật
+  không ghi được xuống đĩa vẫn bật trong bộ nhớ (câu trả lời nói `MEMORY_ONLY`), còn một lần tắt không
+  ghi được để công tắc ở trạng thái bật.
+- Một lần dừng bên trong lượt chạy — `STOPPED`, một lần gửi không xác nhận — bật đúng bản ghi bền đó,
+  nên kết thúc tiến trình không kết thúc lệnh dừng.
 
 ### Quan sát trực tiếp ngày 2026-10-31 (`--symbols all`, terminal thật)
 

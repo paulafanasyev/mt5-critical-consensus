@@ -322,6 +322,10 @@ TEXT: dict[str, tuple[str, str, str]] = {
         "продолжить, приняв неопределённые команды к ручной сверке",
         "continue while accepting uncertain earlier commands for manual reconciliation",
         "tiếp tục, chấp nhận các lệnh chưa rõ để đối soát thủ công"),
+    "cli.release_kill_switch": (
+        "снять аварийную остановку в файле состояния и выйти (нужен отдельный админ-токен)",
+        "release the persisted emergency stop and exit (needs the separate admin token)",
+        "tắt khẩn dừng đã lưu rồi thoát (cần token admin riêng)"),
     "cli.reconcile_window": ("сколько часов назад проверять отданные команды",
                              "how many hours back to reconcile served commands",
                              "đối soát lệnh đã giao trong bao nhiêu giờ gần đây"),
@@ -512,6 +516,30 @@ TEXT: dict[str, tuple[str, str, str]] = {
         "Нужен MT5_BRIDGE_TOKEN: 24..256 символов [A-Za-z0-9._~-].",
         "MT5_BRIDGE_TOKEN is required: 24..256 characters of [A-Za-z0-9._~-].",
         "Cần MT5_BRIDGE_TOKEN: 24..256 ký tự thuộc [A-Za-z0-9._~-]."),
+    "runner.kill_switch_armed": (
+        "Аварийная остановка активна ({reason}); ни один новый ордер не будет отправлен,"
+        " пока её не снимут.",
+        "The emergency stop is armed ({reason}); no new order will be sent until it is"
+        " released.",
+        "Khẩn dừng đang bật ({reason}); không lệnh mới nào được gửi cho tới khi tắt lại."),
+    "runner.kill_switch_state_lost": (
+        "Состояние аварийной остановки не записано ({error}); она остаётся активной в этом"
+        " процессе, но переживёт ли она перезапуск — неизвестно.",
+        "The emergency-stop state could not be written ({error}); it stays armed in this"
+        " process, but whether it survives a restart is unknown.",
+        "Không ghi được trạng thái khẩn dừng ({error}); nó vẫn bật trong tiến trình này,"
+        " nhưng có sống qua khởi động lại hay không thì chưa rõ."),
+    "runner.kill_switch_released": (
+        "Аварийная остановка снята; {file}, {updated_at}.",
+        "The emergency stop is released; {file}, {updated_at}.",
+        "Khẩn dừng đã tắt; {file}, {updated_at}."),
+    "runner.kill_switch_release_refused": (
+        "Снятие не принято: {reason}. Нужен отдельный MT5_KILL_SWITCH_ADMIN_TOKEN от 32"
+        " символов, не равный MT5_BRIDGE_TOKEN.",
+        "Release refused: {reason}. A separate MT5_KILL_SWITCH_ADMIN_TOKEN of at least 32"
+        " characters, different from MT5_BRIDGE_TOKEN, is required.",
+        "Từ chối tắt: {reason}. Cần MT5_KILL_SWITCH_ADMIN_TOKEN riêng từ 32 ký tự và khác"
+        " MT5_BRIDGE_TOKEN."),
     "runner.queued": (
         "Команда {command_id} поставлена в очередь: {direction} {symbol}, объём {volume}.",
         "Command {command_id} queued: {direction} {symbol}, volume {volume}.",

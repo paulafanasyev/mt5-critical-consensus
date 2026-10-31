@@ -62,8 +62,8 @@ Everything that can put an order into the world lives apart from that package, a
 
 | Component | Purpose |
 |---|---|
-| `scripts/mt5_demo_bridge.py` | loopback-only HTTP bridge: two GETs (`/v1/risk/kill-switch`, `/v1/execution/next`), `X-Bridge-Key` check, one pending command, TTL, fsynced idempotency tombstones, never logs the token or a command body |
-| `scripts/run_mt5_demo_trading.py` | the only component that can build a command: takes the agent's decision, re-checks every gate, queues it in the bridge and reconciles against the broker's own deal history; never retries an uncertain send |
+| `scripts/mt5_demo_bridge.py` | loopback-only HTTP bridge: two GETs (`/v1/risk/kill-switch`, `/v1/execution/next`), one authenticated POST on the kill-switch path and no other write, `X-Bridge-Key` check, the durable `kill_switch.json` the runner and the advisor both read, one pending command, TTL, fsynced idempotency tombstones, never logs the token or a command body |
+| `scripts/run_mt5_demo_trading.py` | the only component that can build a command: takes the agent's decision, refuses while the durable stop is armed, re-checks every gate, queues it in the bridge and reconciles against the broker's own deal history; never retries an uncertain send |
 | `scripts/build_demo_ea.py` | produces `CriticalConsensusEA_Demo.mq5` by flipping exactly one compile-time gate line, optionally compiles it with MetaEditor and installs the `.ex5` |
 | `scripts/setup_demo_terminal.py` | dry run by default: refuses while the terminal runs, patches `[Experts]` in `Config/common.ini`, installs the built EA; decides nothing about an order |
 | `scripts/operator_answers.py` | whole-line answer parsing (`да`/`vâng`/`y`) shared by the CLI and the demo runner |
@@ -184,6 +184,35 @@ Gates that must all hold before a command exists:
    volume and the stops, and it writes its idempotency tombstones before sending.
 8. An uncertain result (command served, no fill observed) stops the run and needs an explicit
    `--acknowledge-uncertain`; there is no code path that re-sends.
+
+### The emergency stop on the demo path
+
+The stop is a file, not a variable: `kill_switch.json`, written next to the tombstones. One record
+holds the last switch change (`kill_switch_active`, `kill_switch_reason`, `actor_id`, `updated_at`,
+`event_hash`), rewritten whole through a temporary file plus `os.replace` and fsynced. The runner
+seeds it from `kill_switch.active: true` in the policy, an operator arms it over HTTP, the advisor
+reads it on every poll and the runner reads it twice per offer — before any market read and
+immediately before a command is built. So the documented
+`scripts/activate_kill_switch.ps1` stops this path too, and a stop pulled before a restart is still
+pulled after it.
+
+- Arming needs the bridge key only: `POST /v1/risk/kill-switch` with `{"active": true, "reason": …}`
+  and `X-Bridge-Key`. The answer carries `status: "PERSISTED"`, `updated_at` and `event_hash`, which
+  is exactly what that script checks. A request whose body cannot be read as a JSON object, whose
+  `active` is not a real boolean or whose note fields are not strings is refused with 400 and
+  changes nothing; a body larger than 4096 bytes is read out of the socket and refused with 413, so
+  the client always gets a verdict instead of a reset.
+- Releasing needs a second secret: `MT5_KILL_SWITCH_ADMIN_TOKEN`, at least 32 characters, different
+  from `MT5_BRIDGE_TOKEN`, supplied in `X-Kill-Switch-Admin`. A missing or reused admin token is 503
+  and a wrong one is 403; either way the stop stays armed. While no runner is alive,
+  `python scripts/run_mt5_demo_trading.py --release-kill-switch` reads the same file, takes the
+  admin token from the environment and writes the disarm.
+- A state that cannot be read is never treated as disarmed: a corrupt or unreadable `kill_switch.json`
+  makes the runner refuse and makes the advisor's GET answer 503, which the advisor treats as blocked.
+  An arm whose disk write fails is still armed in memory (the answer says `MEMORY_ONLY`), and a
+  disarm whose write fails leaves the stop armed.
+- A halt inside the run — `STOPPED`, an unconfirmed send — arms the same durable record, so
+  finishing the process does not finish the stop.
 
 ### Live observation on 2026-10-31 (`--symbols all`, real terminal)
 
