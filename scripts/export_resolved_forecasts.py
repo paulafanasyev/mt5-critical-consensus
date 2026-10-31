@@ -9,7 +9,7 @@ from pathlib import Path
 from critical_consensus.persistence import PostgresRepository
 
 
-FIELDS = ["model_id", "signal_id", "issued_at", "resolved_at", "probability", "outcome", "target_policy_version", "target_event", "symbol", "timeframe", "reference_at", "reference_close", "resolved_bar_time", "resolved_bar_close", "resolution_source", "resolution_evidence_sha256", "resolution_evidence"]
+FIELDS = ["model_id", "signal_id", "issued_at", "resolved_at", "probability", "outcome", "input_sha256", "target_policy_version", "target_event", "symbol", "timeframe", "reference_at", "reference_close", "resolved_bar_time", "resolved_bar_close", "resolution_source", "resolution_evidence_sha256", "resolution_evidence"]
 
 
 def main() -> int:
