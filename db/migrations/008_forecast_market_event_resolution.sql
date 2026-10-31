@@ -111,6 +111,22 @@ CREATE TRIGGER forecast_resolution_events_no_delete
   FOR EACH ROW EXECUTE FUNCTION reject_forecast_resolution_mutation();
 REVOKE UPDATE, DELETE, TRUNCATE ON forecast_resolution_events FROM PUBLIC;
 
+CREATE OR REPLACE FUNCTION reject_new_legacy_forecast_labels()
+RETURNS trigger LANGUAGE plpgsql AS $
+BEGIN
+  IF NEW.forecast_kind = 'LEGACY_VERDICT_CONFIDENCE'
+     AND (NEW.outcome IS NOT NULL OR NEW.resolved_at IS NOT NULL) THEN
+    RAISE EXCEPTION 'new legacy verdict-confidence rows cannot receive manual outcome labels';
+  END IF;
+  RETURN NEW;
+END;
+$;
+
+DROP TRIGGER IF EXISTS forecast_predictions_reject_legacy_label_insert ON forecast_predictions;
+CREATE TRIGGER forecast_predictions_reject_legacy_label_insert
+  BEFORE INSERT ON forecast_predictions
+  FOR EACH ROW EXECUTE FUNCTION reject_new_legacy_forecast_labels();
+
 CREATE OR REPLACE FUNCTION protect_forecast_predictions()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
