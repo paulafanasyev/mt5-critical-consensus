@@ -1,6 +1,9 @@
 from datetime import datetime, timezone, timedelta
+from types import SimpleNamespace
 
 import pytest
+
+import critical_consensus.market_data as market_data
 
 from critical_consensus.market_data import (MarketBar, build_market_snapshot, build_next_bar_forecast_contract,
     read_mt5_csv, retain_completed_bars, validate_bar_series)
@@ -130,5 +133,62 @@ def test_forecast_rejects_reference_bar_not_finalized_before_issue_without_datab
             "reference_at": issued - timedelta(hours=1),
             "reference_close": 1.1,
         }])
+
+
+
+
+
+def test_live_mt5_adapter_uses_utc_read_only_calls_and_always_shuts_down(monkeypatch):
+    calls = []
+    fake = SimpleNamespace(
+        TIMEFRAME_H1=60,
+        initialize=lambda **kwargs: calls.append(("initialize", kwargs)) or True,
+        symbol_select=lambda symbol, enabled: calls.append(("symbol_select", symbol, enabled)) or True,
+        copy_rates_range=lambda symbol, timeframe, start, end: (
+            calls.append(("copy_rates_range", symbol, timeframe, start, end)) or [
+                {"time": 1790848800, "open": 1.0, "high": 1.2, "low": 0.9,
+                 "close": 1.1, "tick_volume": 100, "spread": 8},
+                {"time": 1790852400, "open": 1.1, "high": 1.3, "low": 1.0,
+                 "close": 1.2, "tick_volume": 110, "spread": 9},
+            ]
+        ),
+        shutdown=lambda: calls.append(("shutdown",)),
+        last_error=lambda: (-1, "mock error"),
+    )
+    monkeypatch.setattr(market_data.importlib, "import_module", lambda name: fake)
+    start = datetime(2026, 10, 31, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 10, 31, 3, tzinfo=timezone.utc)
+    result = market_data.fetch_mt5_bars("eurusd", "H1", start, end, terminal_path="C:/MT5/terminal64.exe")
+
+    assert len(result) == 2
+    assert result[0].symbol == "EURUSD"
+    assert result[0].source == "MetaTrader5.copy_rates_range"
+    assert ("initialize", {"path": "C:/MT5/terminal64.exe"}) in calls
+    request = next(call for call in calls if call[0] == "copy_rates_range")
+    assert request[1:3] == ("EURUSD", 60)
+    assert request[3].utcoffset().total_seconds() == 0
+    assert request[4].utcoffset().total_seconds() == 0
+    assert calls[-1] == ("shutdown",)
+    assert not any("order" in name.lower() for name, *_ in calls)
+
+
+def test_live_mt5_adapter_shuts_down_when_rate_fetch_fails(monkeypatch):
+    calls = []
+    fake = SimpleNamespace(
+        TIMEFRAME_M1=1,
+        initialize=lambda **kwargs: True,
+        symbol_select=lambda symbol, enabled: True,
+        copy_rates_range=lambda *args: None,
+        shutdown=lambda: calls.append("shutdown"),
+        last_error=lambda: (-2, "history unavailable"),
+    )
+    monkeypatch.setattr(market_data.importlib, "import_module", lambda name: fake)
+    with pytest.raises(RuntimeError, match="copy_rates_range failed"):
+        market_data.fetch_mt5_bars(
+            "EURUSD", "M1",
+            datetime(2026, 10, 31, tzinfo=timezone.utc),
+            datetime(2026, 11, 1, tzinfo=timezone.utc),
+        )
+    assert calls == ["shutdown"]
 
 
