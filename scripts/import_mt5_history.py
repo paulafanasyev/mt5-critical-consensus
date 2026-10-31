@@ -23,7 +23,7 @@ def main() -> int:
     source.add_argument("--csv", type=Path, help="MT5 OHLC CSV export; the file is not modified")
     source.add_argument("--live-terminal", action="store_true", help="query the installed MT5 terminal read-only")
     parser.add_argument("--symbol", required=True)
-    parser.add_argument("--timeframe", required=True, choices=["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"])
+    parser.add_argument("--timeframe", required=True, choices=["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1"])
     parser.add_argument("--source-timezone", help="required for naive CSV dates, e.g. Europe/Helsinki or UTC")
     parser.add_argument("--from-utc", type=parse_aware, help="required for --live-terminal")
     parser.add_argument("--to-utc", type=parse_aware, help="required for --live-terminal")
