@@ -51,8 +51,9 @@ def _valid_stamp(value: Any) -> datetime | None:
 
 
 def _validate_result(
-    result: Mapping[str, Any], spec: AgentSpec, signal_id: str, expected_input_hash: str,
-    *, allowed_evidence_refs: set[str], now: datetime, max_future_skew_seconds: int = 30,
+    result: Mapping[str, Any], spec: AgentSpec, signal: Mapping[str, Any],
+    signal_id: str, expected_input_hash: str, *,
+    allowed_evidence_refs: set[str], now: datetime, max_future_skew_seconds: int = 30,
 ) -> list[str]:
     blockers: list[str] = []
     if str(result.get("agent_id", "")).strip() != spec.agent_id:
@@ -241,7 +242,7 @@ async def collect_agent_verdicts(
             if not isinstance(result, Mapping):
                 return spec, None, "AGENT_RESULT_NOT_OBJECT"
             reasons = _validate_result(
-                result, spec, signal_id, expected_input_hash,
+                result, spec, signal, signal_id, expected_input_hash,
                 allowed_evidence_refs=allowed_evidence_refs, now=current,
             )
             if reasons:
