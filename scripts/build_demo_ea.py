@@ -97,7 +97,7 @@ def compile_source(source: Path, *, metaeditor: Path, include_dir: Path,
                    timeout: int = 300) -> dict:
     log_path = source.with_suffix(".log")
     completed = subprocess.run(
-        [str(metaeditor), f"/compile:{source}", f"/log:{log_path}", f"/inc:{include_dir}"],
+        [str(metaeditor), f"/compile:{source}", f"/log:{log_path}", f"/include:{include_dir}"],
         capture_output=True, text=True, timeout=timeout, check=False)
     # MetaEditor may not have written the log yet when the process exits; poll briefly.
     errors = warnings = None
