@@ -1,0 +1,144 @@
+name: mt5-demo-terminal-readonly-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: "Comma-separated broker symbols to inspect (no orders are submitted)"
+        required: true
+        default: "EURUSD"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mt5-demo-terminal-readonly-smoke
+  cancel-in-progress: false
+
+jobs:
+  read-only-demo-terminal:
+    name: Read-only MT5 demo account and quotes (Windows)
+    runs-on: windows-2022
+    timeout-minutes: 35
+    steps:
+      - name: Check for demo account secrets without printing them
+        id: demo_credentials
+        shell: pwsh
+        env:
+          MT5_DEMO_LOGIN: ${{ secrets.MT5_DEMO_LOGIN }}
+          MT5_DEMO_PASSWORD: ${{ secrets.MT5_DEMO_PASSWORD }}
+          MT5_DEMO_SERVER: ${{ secrets.MT5_DEMO_SERVER }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $missing = @()
+          if ([string]::IsNullOrWhiteSpace($env:MT5_DEMO_LOGIN)) { $missing += "MT5_DEMO_LOGIN" }
+          if ([string]::IsNullOrWhiteSpace($env:MT5_DEMO_PASSWORD)) { $missing += "MT5_DEMO_PASSWORD" }
+          if ([string]::IsNullOrWhiteSpace($env:MT5_DEMO_SERVER)) { $missing += "MT5_DEMO_SERVER" }
+          $login = 0
+          if (-not [int]::TryParse($env:MT5_DEMO_LOGIN, [ref]$login) -or $login -le 0) {
+            if (-not ($missing -contains "MT5_DEMO_LOGIN")) { $missing += "MT5_DEMO_LOGIN (must be a positive integer)" }
+          }
+          if ($missing.Count -gt 0) {
+            "ready=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            "## MT5 demo terminal smoke: NOT PROVEN" | Add-Content $env:GITHUB_STEP_SUMMARY
+            "The check did not start. Configure these repository Actions secrets: $($missing -join ', ')." | Add-Content $env:GITHUB_STEP_SUMMARY
+            "No terminal was connected and no trading request was sent." | Add-Content $env:GITHUB_STEP_SUMMARY
+          } else {
+            "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            "Demo credentials are configured (values are not printed)." | Write-Host
+          }
+
+      - name: Check out source
+        if: steps.demo_credentials.outputs.ready == 'true'
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        if: steps.demo_credentials.outputs.ready == 'true'
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install MetaTrader 5 Python package
+        if: steps.demo_credentials.outputs.ready == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed" }
+          python -m pip install MetaTrader5
+          if ($LASTEXITCODE -ne 0) { throw "MetaTrader5 Python package installation failed" }
+
+      - name: Download signed MetaTrader 5 installer
+        if: steps.demo_credentials.outputs.ready == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Join-Path $env:RUNNER_TEMP "mt5setup.exe"
+          Invoke-WebRequest -Uri "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile $installer
+          if (-not (Test-Path $installer) -or (Get-Item $installer).Length -lt 100000) {
+            throw "The official MetaTrader installer download is missing or unexpectedly small."
+          }
+          $signature = Get-AuthenticodeSignature $installer
+          if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notlike "*MetaQuotes*") {
+            throw "The MetaTrader installer Authenticode signature is not valid for MetaQuotes."
+          }
+          Write-Host "MetaTrader installer signature is valid."
+
+      - name: Install MetaTrader terminal in isolated runner
+        if: steps.demo_credentials.outputs.ready == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installDir = Join-Path $env:RUNNER_TEMP "MT5"
+          New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+          $installer = Join-Path $env:RUNNER_TEMP "mt5setup.exe"
+          $arguments = '/auto /path:"' + $installDir + '"'
+          $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
+          Write-Host "Bootstrap installer exit code: $($process.ExitCode)"
+          $terminal = Join-Path $installDir "terminal64.exe"
+          $deadline = (Get-Date).AddMinutes(5)
+          while (-not (Test-Path $terminal) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 5
+          }
+          if (-not (Test-Path $terminal)) {
+            Write-Host "Install directory diagnostics:"
+            if (Test-Path $installDir) {
+              Get-ChildItem $installDir -Force -Recurse -ErrorAction SilentlyContinue |
+                Select-Object -First 40 FullName, Length | Format-Table
+            }
+            throw "MetaTrader terminal64.exe was not installed."
+          }
+          $version = (Get-Item $terminal).VersionInfo.FileVersion
+          "MT5_TERMINAL_EXE=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "MetaTrader terminal file version: $version" | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: Run read-only demo-account and quote probe
+        id: mt5_probe
+        if: steps.demo_credentials.outputs.ready == 'true'
+        shell: pwsh
+        env:
+          MT5_DEMO_LOGIN: ${{ secrets.MT5_DEMO_LOGIN }}
+          MT5_DEMO_PASSWORD: ${{ secrets.MT5_DEMO_PASSWORD }}
+          MT5_DEMO_SERVER: ${{ secrets.MT5_DEMO_SERVER }}
+          MT5_SMOKE_SYMBOLS: ${{ inputs.symbols }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Path "artifacts" -Force | Out-Null
+          python scripts/mt5_terminal_readonly_smoke.py --terminal-path "$env:MT5_TERMINAL_EXE" --symbols "$env:MT5_SMOKE_SYMBOLS" 2>&1 |
+            Tee-Object -FilePath "artifacts/mt5-readonly-smoke.log"
+          if ($LASTEXITCODE -ne 0) {
+            "## MT5 demo terminal smoke: FAILED / NOT PROVEN" | Add-Content $env:GITHUB_STEP_SUMMARY
+            Get-Content "artifacts/mt5-readonly-smoke.log" | Add-Content $env:GITHUB_STEP_SUMMARY
+            throw "Read-only MetaTrader demo terminal probe failed."
+          }
+          "## MT5 demo terminal smoke: VERIFIED" | Add-Content $env:GITHUB_STEP_SUMMARY
+          Get-Content "artifacts/mt5-readonly-smoke.log" | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload sanitized read-only probe evidence
+        if: always() && steps.demo_credentials.outputs.ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mt5-demo-terminal-readonly-smoke
+          path: artifacts/mt5-readonly-smoke.log
+          if-no-files-found: ignore
+          retention-days: 7
