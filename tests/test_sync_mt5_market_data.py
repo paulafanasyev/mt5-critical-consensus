@@ -174,6 +174,76 @@ def test_sync_rejects_unsafe_weekend_gap_suppression_flag(monkeypatch, capsys):
     assert "--ignore-weekend-closures" in capsys.readouterr().err
 
 
+def test_postgres_outage_during_migration_fails_before_mt5_read(monkeypatch):
+    repo = FakeRepository([])
+
+    def database_unavailable():
+        raise RuntimeError("PostgreSQL unavailable during migration")
+
+    def unexpected_mt5_read(*args, **kwargs):
+        raise AssertionError("MT5 must not be read while PostgreSQL setup is unavailable")
+
+    repo.migrate = database_unavailable
+    monkeypatch.setattr(MODULE, "PostgresRepository", lambda: repo)
+    monkeypatch.setattr(MODULE, "fetch_mt5_bars", unexpected_mt5_read)
+    monkeypatch.setattr("sys.argv", [
+        "sync_mt5_market_data.py", "--symbol", "EURUSD", "--timeframe", "H1",
+        "--bootstrap-from-utc", "2026-10-01T00:00:00Z",
+    ])
+
+    with pytest.raises(RuntimeError, match="PostgreSQL unavailable"):
+        MODULE.main()
+    assert repo.appended == []
+    assert repo.resolved == []
+
+
+def test_sync_recovers_on_next_invocation_after_postgres_write_outage(monkeypatch, capsys):
+    latest = datetime.now(timezone.utc) - timedelta(hours=4)
+    old_bar = MarketBar("EURUSD", "H1", latest, 1.0, 1.1, 0.9, 1.05)
+    new_bar = MarketBar(
+        "EURUSD", "H1", latest + timedelta(hours=1),
+        1.0, 1.1, 0.9, 1.05,
+    )
+
+    class RecoverableRepository(FakeRepository):
+        def __init__(self, existing):
+            super().__init__(existing)
+            self.append_attempts = 0
+
+        def append_market_bars(self, bars):
+            self.append_attempts += 1
+            if self.append_attempts == 1:
+                raise RuntimeError("temporary PostgreSQL write outage")
+            batch = list(bars)
+            result = super().append_market_bars(batch)
+            known = {bar.time for bar in self.existing}
+            self.existing = sorted(
+                self.existing + [bar for bar in batch if bar.time not in known],
+                key=lambda bar: bar.time,
+            )
+            return result
+
+    repo = RecoverableRepository([old_bar])
+    monkeypatch.setattr(MODULE, "PostgresRepository", lambda: repo)
+    monkeypatch.setattr(MODULE, "fetch_mt5_bars", lambda *args, **kwargs: [new_bar])
+    monkeypatch.setattr(MODULE, "retain_completed_bars", lambda bars, **kwargs: list(bars))
+    monkeypatch.setattr("sys.argv", [
+        "sync_mt5_market_data.py", "--symbol", "EURUSD", "--timeframe", "H1",
+    ])
+
+    with pytest.raises(RuntimeError, match="temporary PostgreSQL write outage"):
+        MODULE.main()
+    assert repo.appended == []
+    assert repo.resolved == []
+
+    assert MODULE.main() == 0
+    payload = __import__("json").loads(capsys.readouterr().out)
+    assert repo.append_attempts == 2
+    assert repo.appended == [new_bar]
+    assert len(repo.resolved) == 1
+    assert payload["ingestion"]["inserted"] == 1
+
+
 def test_sync_recovers_on_next_invocation_after_mt5_outage(monkeypatch, capsys):
     latest = datetime.now(timezone.utc) - timedelta(hours=4)
     new_bar = MarketBar(
