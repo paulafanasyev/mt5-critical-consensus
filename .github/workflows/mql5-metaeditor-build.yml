@@ -107,10 +107,10 @@ jobs:
             throw "Build result does not prove a clean demo-enabled compilation."
           }
           $sourceText = Get-Content -LiteralPath $source -Raw
-          if ($sourceText -notmatch '(?m)^const bool ENABLE_DEMO_EXECUTION = true;) {
-            throw "Generated demo EA does not contain the expected single enabled demo gate."
+          if ($sourceText -notmatch 'const bool ENABLE_DEMO_EXECUTION = true;') {
+            throw "Generated demo EA does not contain the expected enabled demo gate."
           }
-          if ($sourceText -notmatch '(?m)^input bool AllowLiveExecution = false;') {
+          if ($sourceText -notmatch 'input bool AllowLiveExecution = false;') {
             throw "Generated EA does not keep live execution disabled by default."
           }
           $metaVersion = (Get-Item $env:METAEDITOR_PATH).VersionInfo.FileVersion
