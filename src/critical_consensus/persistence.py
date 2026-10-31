@@ -626,12 +626,13 @@ class PostgresRepository:
         return {"attempted": len(results), "status_counts": counts, "results": results}
 
     def export_resolved_forecasts(self, *, model_id: str | None = None) -> list[dict[str, Any]]:
-        """Export only objective next-bar forecasts with stored resolution evidence."""
+        """Export only objective next-bar forecasts with the exact append-only evidence payload."""
         query = """SELECT f.model_id, f.signal_id, f.issued_at, f.resolved_at,
-                          f.probability, f.outcome, f.target_policy_version, f.target_event,
+                          f.probability, f.outcome, f.input_sha256,
+                          f.target_policy_version, f.target_event, f.symbol, f.timeframe,
                           f.reference_at, f.reference_close, f.resolved_bar_time,
                           f.resolved_bar_close, f.resolution_source,
-                          f.resolution_evidence_sha256
+                          f.resolution_evidence_sha256, e.evidence
                    FROM forecast_predictions f
                    JOIN forecast_resolution_events e
                      ON e.model_id=f.model_id AND e.signal_id=f.signal_id
@@ -644,15 +645,31 @@ class PostgresRepository:
         query += " ORDER BY f.issued_at, f.model_id, f.signal_id"
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
-        return [{
-            "model_id": row[0], "signal_id": row[1], "issued_at": row[2].isoformat(),
-            "resolved_at": row[3].isoformat(), "probability": float(row[4]),
-            "outcome": int(row[5]), "target_policy_version": row[6],
-            "target_event": row[7], "reference_at": row[8].isoformat(),
-            "reference_close": float(row[9]), "resolved_bar_time": row[10].isoformat(),
-            "resolved_bar_close": float(row[11]), "resolution_source": row[12],
-            "resolution_evidence_sha256": row[13],
-        } for row in rows]
+        output = []
+        for row in rows:
+            evidence = row[17]
+            if isinstance(evidence, Mapping):
+                evidence_json = _canonical(dict(evidence))
+            elif isinstance(evidence, (str, bytes, bytearray)):
+                evidence_json = evidence.decode("utf-8") if isinstance(evidence, (bytes, bytearray)) else evidence
+                parsed = json.loads(evidence_json)
+                if not isinstance(parsed, Mapping):
+                    raise RuntimeError("forecast resolution evidence is not a JSON object")
+                evidence_json = _canonical(dict(parsed))
+            else:
+                raise RuntimeError("forecast resolution evidence is missing or has an unsupported type")
+            output.append({
+                "model_id": row[0], "signal_id": row[1], "issued_at": row[2].isoformat(),
+                "resolved_at": row[3].isoformat(), "probability": float(row[4]),
+                "outcome": int(row[5]), "input_sha256": row[6],
+                "target_policy_version": row[7], "target_event": row[8],
+                "symbol": row[9], "timeframe": row[10],
+                "reference_at": row[11].isoformat(), "reference_close": float(row[12]),
+                "resolved_bar_time": row[13].isoformat(), "resolved_bar_close": float(row[14]),
+                "resolution_source": row[15], "resolution_evidence_sha256": row[16],
+                "resolution_evidence": evidence_json,
+            })
+        return output
 
     def store_calibration_report(self, report: Mapping[str, Any]) -> dict[str, str | bool]:
         if not isinstance(report, Mapping) or not isinstance(report.get("dataset"), Mapping):
