@@ -341,10 +341,10 @@ class PostgresRepository:
                     raise ValueError("objective forecast target contract is missing or unsupported")
                 symbol = raw_symbol.strip().upper()
                 timeframe = raw_timeframe.strip().upper()
-                forecast_bar_duration(timeframe)
+                reference_duration = forecast_bar_duration(timeframe)
                 reference_at = _timestamp(forecast.get("reference_at"), "reference_at")
-                if reference_at >= issued:
-                    raise ValueError("reference_at must precede the agent issue timestamp")
+                if reference_at + reference_duration + timedelta(seconds=2) > issued:
+                    raise ValueError("reference market bar must be fully finalized before agent issue time")
                 raw_reference_close = forecast.get("reference_close")
                 if (isinstance(raw_reference_close, bool)
                         or not isinstance(raw_reference_close, (int, float))):
