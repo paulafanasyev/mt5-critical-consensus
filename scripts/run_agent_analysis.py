@@ -14,6 +14,8 @@ from pathlib import Path
 import yaml
 
 from critical_consensus.agent_runtime import collect_agent_verdicts
+from critical_consensus.decision_bundle import build_decision_bundle, write_decision_bundle
+from critical_consensus.pipeline import evaluate_signal_bundle
 from critical_consensus.market_data import build_market_snapshot
 from redis.asyncio import Redis
 
@@ -33,6 +35,10 @@ async def run(args) -> int:
     bars = await asyncio.to_thread(repo.get_recent_market_bars, args.symbol, args.timeframe, args.bars)
     snapshot = build_market_snapshot(bars)
     snapshot_hash = canonical_signal_hash(snapshot)
+    source_registry = yaml.safe_load(
+        (ROOT / "config" / "source_registry.yaml").read_text(encoding="utf-8")
+    ) or {}
+    source_records = []
     if len(args.source_id) < 2 or len(args.source_id) > 12:
         source_context = {
             "status": "GATHER_MORE",
@@ -40,9 +46,6 @@ async def run(args) -> int:
             "documents": [], "available_evidence_refs": [],
         }
     else:
-        source_registry = yaml.safe_load(
-            (ROOT / "config" / "source_registry.yaml").read_text(encoding="utf-8")
-        ) or {}
         source_records = await asyncio.to_thread(repo.get_source_evidence, args.source_id)
         source_context = await asyncio.to_thread(
             build_source_context,
@@ -152,6 +155,46 @@ async def run(args) -> int:
             ]))
             result["trade_allowed"] = False
 
+    # Continue the verified agent/review evidence into deterministic gates. Missing
+    # Chief reasoning, calibration history, permission metadata and human approval
+    # remain missing: this adapter never manufactures them.
+    decision_bundle = build_decision_bundle(signal, result)
+    decision_evaluation_error = None
+    decision_persistence = None
+    try:
+        decision_certainty_policy = yaml.safe_load(
+            (ROOT / "config" / "certainty_thresholds.yaml").read_text(encoding="utf-8")
+        ) or {}
+        decision_permission_matrix = yaml.safe_load(
+            (ROOT / "config" / "permission_matrix.yaml").read_text(encoding="utf-8")
+        ) or {}
+        decision_evaluation = evaluate_signal_bundle(
+            decision_bundle,
+            decision_certainty_policy,
+            decision_permission_matrix,
+            require_persisted_sources=True,
+            source_evidence_records=source_records,
+            source_registry=source_registry,
+        )
+        decision_persistence = await asyncio.to_thread(
+            repo.persist_pipeline_result,
+            decision_evaluation,
+            signal_input_sha256=decision_bundle["signal_input_hash"],
+        )
+    except Exception as exc:
+        # Do not expose database URLs, provider errors or exception messages.
+        decision_evaluation_error = type(exc).__name__
+        decision_evaluation = {
+            "status": "GATHER_MORE",
+            "blockers": ["DETERMINISTIC_PIPELINE_OR_AUDIT_PERSISTENCE_FAILED"],
+            "audit_chain_valid": False,
+            "trade_allowed": False,
+        }
+
+    decision_bundle_path = None
+    if args.decision_bundle_output:
+        decision_bundle_path = str(write_decision_bundle(args.decision_bundle_output, decision_bundle))
+
     event = {
         "event_id": "agent-collection-" + uuid.uuid4().hex,
         "event_type": "AGENT_COLLECTION_RESULT",
@@ -184,15 +227,29 @@ async def run(args) -> int:
                                          "independence_groups": source_context.get("independence_groups", []),
                                          "blockers": source_context.get("blockers", [])},
                       "collection": result,
-                      "pipeline_stage": "AGENT_COLLECTION_AND_PEER_REVIEW",
-                      "deterministic_Chief_Gate_invoked": False,
+                      "pipeline_stage": "AGENT_REVIEW_AND_DETERMINISTIC_GATES",
+                      "deterministic_pipeline": {
+                          "status": decision_evaluation.get("status"),
+                          "blockers": decision_evaluation.get("blockers", []),
+                          "audit_chain_valid": decision_evaluation.get("audit_chain_valid", False),
+                          "decision_id": (decision_persistence or {}).get("decision_id"),
+                          "audit_persisted": decision_persistence is not None,
+                          "trade_allowed": False,
+                      },
+                      "decision_pipeline_error": decision_evaluation_error,
+                      "decision_bundle_output": decision_bundle_path,
+                      "chief_reasoning_supplied": "chief_reasoning" in decision_bundle,
                       "human_authorization_processed": False,
+                      "order_created": False,
+                      "trade_allowed": False,
                       "audit_event_id": event["event_id"], "redis_publication": redis_status},
                      indent=2, ensure_ascii=False))
     if result.get("status") != "READY_FOR_CHIEF":
         return 2
-    # READY_FOR_CHIEF means only that the evidence-backed peer-review/challenge ledger is complete.
-    # Certainty Gate, deterministic Chief reasoning, Permission Gate and user authorization are separate.
+    # Exit success only when all deterministic gates reached human review and the
+    # analysis event was published. A peer-review-only READY_FOR_CHIEF is not PASS.
+    if decision_evaluation.get("status") != "REQUIRE_HUMAN":
+        return 2
     return 0 if redis_status.get("status") == "PUBLISHED" else 3
 
 
@@ -208,6 +265,10 @@ def main() -> int:
                         help="exact persisted trusted source ID; repeat at least twice for distinct publishers")
     parser.add_argument("--minimum-agents", type=int, default=4)
     parser.add_argument("--minimum-independence-groups", type=int, default=3)
+    parser.add_argument(
+        "--decision-bundle-output", type=Path, default=None,
+        help="optional atomic export of the exact evidence packet passed to deterministic gates",
+    )
     args = parser.parse_args()
     if args.bars < 21 or args.bars > 5000:
         parser.error("--bars must be between 21 and 5000")
