@@ -131,8 +131,6 @@ jobs:
 
             # Persist exact compiler evidence for upload. The MetaEditor executable may return
             # process code 1 even after a successful GUI compile; the validated log + EX5 are authoritative.
-            Copy-Item $probeLog (Join-Path $env:RUNNER_TEMP "MetaEditorSmoke.log") -Force
-            Copy-Item $probeEx5 (Join-Path $env:RUNNER_TEMP "MetaEditorSmoke.ex5") -Force
             Copy-Item $log (Join-Path $env:RUNNER_TEMP "CriticalConsensusEA.log") -Force
             Copy-Item $ex5 (Join-Path $env:RUNNER_TEMP "CriticalConsensusEA.ex5") -Force
             Write-Host "PASS: MetaEditor produced CriticalConsensusEA.ex5 with zero compiler errors."
