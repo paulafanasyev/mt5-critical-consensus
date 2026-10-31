@@ -25,6 +25,12 @@ class FakeRepository:
     def migrate(self):
         self.migrated = True
 
+    def get_database_clock(self):
+        return {
+            "now_utc": datetime.now(timezone.utc),
+            "session_timezone": "UTC",
+        }
+
     def get_recent_market_bars(self, symbol, timeframe, limit):
         assert limit == 5000
         return self.existing
@@ -56,6 +62,9 @@ def test_incremental_sync_with_no_new_bars_is_a_safe_noop(monkeypatch, capsys):
     assert repo.appended == []
     assert payload["received_bars"] == 0
     assert payload["ingestion"]["inserted"] == 0
+    assert payload["clock"]["finalization_clock_source"] == "postgresql_server_clock"
+    assert payload["clock"]["database_session_timezone"] == "UTC"
+    assert payload["clock"]["application_database_skew_seconds"] >= 0
     assert len(repo.resolved) == 1
     assert repo.resolved[0]["symbol"] == "EURUSD"
     assert payload["trade_allowed"] is False
