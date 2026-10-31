@@ -281,39 +281,83 @@ class PostgresRepository:
         by_id = {str(row[0]): dict(zip(columns, row)) for row in rows}
         return [by_id[item] for item in ids if item in by_id]
 
+    def record_forecasts(self, forecasts: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+        """Atomically persist raw model-confidence observations before any outcomes are known.
+
+        A conflicting replay aborts the entire batch. These probabilities are raw model
+        confidence observations, not calibrated probabilities or trading-performance claims.
+        """
+        if (not isinstance(forecasts, Sequence)
+                or isinstance(forecasts, (str, bytes, bytearray))):
+            raise ValueError("forecasts must be a sequence of objects")
+        if not forecasts:
+            return {"inserted": 0, "identical_replays": 0, "total": 0}
+
+        prepared: list[tuple[str, str, datetime, float, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for index, forecast in enumerate(forecasts):
+            if not isinstance(forecast, Mapping):
+                raise ValueError(f"forecast {index} must be an object")
+            model_id = str(forecast.get("model_id", "")).strip()
+            signal_id = str(forecast.get("signal_id", "")).strip()
+            if not model_id or not signal_id:
+                raise ValueError(f"forecast {index} requires model_id and signal_id")
+            key = (model_id, signal_id)
+            if key in seen:
+                raise ValueError("forecast batch contains duplicate model_id/signal_id keys")
+            seen.add(key)
+            issued = _timestamp(forecast.get("issued_at"), "issued_at")
+            raw_probability = forecast.get("probability")
+            if isinstance(raw_probability, bool):
+                raise ValueError("probability must be finite numeric data, not a boolean")
+            try:
+                probability = float(raw_probability)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("probability must be finite numeric data") from exc
+            if not math.isfinite(probability) or not 0 <= probability <= 1:
+                raise ValueError("probability must be finite and in [0,1]")
+            input_sha256 = forecast.get("input_sha256")
+            if (not isinstance(input_sha256, str) or len(input_sha256) != 71
+                    or not input_sha256.startswith("sha256:")
+                    or any(ch not in "0123456789abcdef" for ch in input_sha256[7:])):
+                raise ValueError("input_sha256 must use sha256:<64 lowercase hex characters>")
+            prepared.append((model_id, signal_id, issued, probability, input_sha256))
+
+        inserted_count = replay_count = 0
+        with self._connect() as conn:
+            for model_id, signal_id, issued, probability, input_sha256 in prepared:
+                inserted = conn.execute(
+                    """INSERT INTO forecast_predictions(model_id, signal_id, issued_at, probability, input_sha256)
+                       VALUES (%s,%s,%s,%s,%s) ON CONFLICT (model_id, signal_id) DO NOTHING
+                       RETURNING signal_id""",
+                    (model_id, signal_id, issued, probability, input_sha256),
+                ).fetchone()
+                if inserted:
+                    inserted_count += 1
+                    continue
+                old = conn.execute(
+                    """SELECT issued_at, probability, input_sha256 FROM forecast_predictions
+                       WHERE model_id=%s AND signal_id=%s""", (model_id, signal_id)
+                ).fetchone()
+                if old is None:
+                    raise RuntimeError("forecast conflict row disappeared")
+                if (old[0] != issued
+                        or not math.isclose(float(old[1]), probability, rel_tol=0.0, abs_tol=0.0)
+                        or old[2] != input_sha256):
+                    raise ValueError("conflicting replay for immutable issued forecast")
+                replay_count += 1
+        return {"inserted": inserted_count, "identical_replays": replay_count, "total": len(prepared)}
+
     def record_forecast(
         self, *, model_id: str, signal_id: str, issued_at: datetime | str,
         probability: float, input_sha256: str,
     ) -> bool:
-        """Persist a probability at issue time; returns False for an identical replay."""
-        model_id, signal_id = str(model_id).strip(), str(signal_id).strip()
-        if not model_id or not signal_id:
-            raise ValueError("model_id and signal_id are required")
-        issued = _timestamp(issued_at, "issued_at")
-        if isinstance(probability, bool) or not math.isfinite(float(probability)) or not 0 <= float(probability) <= 1:
-            raise ValueError("probability must be finite and in [0,1]")
-        if not isinstance(input_sha256, str) or len(input_sha256) != 71 or not input_sha256.startswith("sha256:"):
-            raise ValueError("input_sha256 must use sha256:<64 hex characters>")
-        if any(ch not in "0123456789abcdef" for ch in input_sha256[7:]):
-            raise ValueError("input_sha256 must contain lowercase hex")
-        with self._connect() as conn:
-            inserted = conn.execute(
-                """INSERT INTO forecast_predictions(model_id, signal_id, issued_at, probability, input_sha256)
-                   VALUES (%s,%s,%s,%s,%s) ON CONFLICT (model_id, signal_id) DO NOTHING
-                   RETURNING signal_id""",
-                (model_id, signal_id, issued, float(probability), input_sha256),
-            ).fetchone()
-            if inserted:
-                return True
-            old = conn.execute(
-                """SELECT issued_at, probability, input_sha256 FROM forecast_predictions
-                   WHERE model_id=%s AND signal_id=%s""", (model_id, signal_id)
-            ).fetchone()
-            if old is None:
-                raise RuntimeError("forecast conflict row disappeared")
-            if old[0] != issued or not math.isclose(float(old[1]), float(probability), rel_tol=0.0, abs_tol=0.0) or old[2] != input_sha256:
-                raise ValueError("conflicting replay for immutable issued forecast")
-            return False
+        """Persist one raw confidence observation; False means an identical replay."""
+        result = self.record_forecasts([{
+            "model_id": model_id, "signal_id": signal_id, "issued_at": issued_at,
+            "probability": probability, "input_sha256": input_sha256,
+        }])
+        return result["inserted"] == 1
 
     def resolve_forecast(self, *, model_id: str, signal_id: str, resolved_at: datetime | str, outcome: int) -> bool:
         """Label a prior forecast once the outcome is known; conflicting relabels fail closed."""
