@@ -144,3 +144,35 @@ def test_sync_reports_potential_gap_but_does_not_backfill_automatically(monkeypa
     assert integrity["potential_gaps"][0]["status"] == "POTENTIAL_GAP_REQUIRES_SESSION_REVIEW"
     assert integrity["automatic_backfill"] is False
     assert repo.appended == [next_bar]
+
+
+
+def test_weekend_gap_suppression_requires_and_honors_explicit_flag(monkeypatch, capsys):
+    friday = MarketBar(
+        "EURUSD", "H1", datetime(2026, 10, 23, 20, tzinfo=timezone.utc),
+        1.0, 1.1, 0.9, 1.05,
+    )
+    monday = MarketBar(
+        "EURUSD", "H1", datetime(2026, 10, 26, 0, tzinfo=timezone.utc),
+        1.05, 1.15, 0.95, 1.1,
+    )
+    repo = FakeRepository([friday, monday])
+    seen = []
+    monkeypatch.setattr(MODULE, "PostgresRepository", lambda: repo)
+    monkeypatch.setattr(MODULE, "fetch_mt5_bars", lambda *args, **kwargs: [])
+    monkeypatch.setattr(MODULE, "retain_completed_bars", lambda bars, **kwargs: list(bars))
+
+    def detector(bars, *, ignore_weekend_closures):
+        seen.append(ignore_weekend_closures)
+        return []
+
+    monkeypatch.setattr(MODULE, "detect_potential_bar_gaps", detector)
+    monkeypatch.setattr("sys.argv", [
+        "sync_mt5_market_data.py", "--symbol", "EURUSD", "--timeframe", "H1",
+        "--ignore-weekend-closures",
+    ])
+
+    assert MODULE.main() == 0
+    payload = __import__("json").loads(capsys.readouterr().out)
+    assert seen == [True]
+    assert payload["market_history_integrity"]["weekend_gaps_ignored"] is True
