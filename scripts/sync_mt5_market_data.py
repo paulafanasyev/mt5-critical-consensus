@@ -31,6 +31,9 @@ def main() -> int:
     parser.add_argument("--resolve-limit", type=int, default=500)
     parser.add_argument("--finalization-grace-seconds", type=float, default=2.0)
     args = parser.parse_args()
+    if (not isinstance(args.finalization_grace_seconds, (int, float))
+            or not 0 <= args.finalization_grace_seconds <= 60):
+        parser.error("--finalization-grace-seconds must be finite and in [0,60]")
 
     repo = PostgresRepository()
     repo.migrate()
