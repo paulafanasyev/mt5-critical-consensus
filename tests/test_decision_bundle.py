@@ -98,3 +98,18 @@ def test_write_decision_bundle_round_trips_json_atomically(tmp_path):
     assert written == target
     assert json.loads(target.read_text(encoding="utf-8")) == bundle
     assert list(target.parent.glob(".decision.json.*.tmp")) == []
+
+
+def test_handoff_enters_deterministic_pipeline_but_stays_fail_closed_without_missing_gates():
+    from critical_consensus.pipeline import evaluate_signal_bundle
+
+    signal, collection = _fixture()
+    bundle = build_decision_bundle(signal, collection)
+
+    result = evaluate_signal_bundle(bundle, {"certainty_thresholds": {}}, {})
+
+    assert result["status"] == "GATHER_MORE"
+    assert result["audit_chain_valid"] is True
+    assert result["trade_allowed"] is False
+    assert "AUTHORIZED_ONCE" != result["status"]
+    assert "order_command" not in result
