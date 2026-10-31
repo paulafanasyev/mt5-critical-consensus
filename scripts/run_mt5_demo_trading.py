@@ -342,9 +342,10 @@ class DemoTerminal(LiveMT5Backend):
 
     def _record_baselines(self, account: Any, day: Any, equity: float,
                           day_start: float, peak: float) -> None:
-        if self._journal is None:
+        journal = getattr(self, "_journal", None)
+        if journal is None:
             return
-        self._journal.record(RISK_BASELINE_EVENT, {
+        journal.record(RISK_BASELINE_EVENT, {
             "account_login": int(account.login),
             "account_server": str(account.server),
             "server_day": day.isoformat(),
