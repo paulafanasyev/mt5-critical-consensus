@@ -283,8 +283,9 @@ def detect_potential_bar_gaps(
 ) -> list[dict[str, Any]]:
     """Report suspicious timestamp gaps without assuming a broker's trading calendar.
 
-    Weekend-spanning intervals are ignored by default. Other gaps are advisory only:
-    broker holidays, daily maintenance and instrument-specific sessions need review.
+    Weekend-spanning intervals are included by default because some instruments trade
+    continuously. Suppression is opt-in only after the broker session is verified.
+    Other gaps are advisory: holidays and maintenance sessions need operator review.
     """
     rows = validate_bar_series(bars, min_bars=1)
     if (isinstance(gap_tolerance_seconds, bool)
