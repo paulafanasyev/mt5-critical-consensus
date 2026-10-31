@@ -8,7 +8,7 @@ on:
         required: true
         default: "EURUSD"
   pull_request:
-    types: [ready_for_review]
+    types: [ready_for_review, synchronize]
 
 permissions:
   contents: read
@@ -19,6 +19,7 @@ concurrency:
 
 jobs:
   read-only-demo-terminal:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false }}
     name: Read-only MT5 demo account and quotes (Windows)
     runs-on: windows-2022
     timeout-minutes: 35
