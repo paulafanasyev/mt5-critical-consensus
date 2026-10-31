@@ -126,7 +126,8 @@ BEGIN
        OR NEW.resolved_bar_close IS NULL OR NEW.resolved_bar_close <= 0
        OR NEW.resolution_source IS NULL OR length(trim(NEW.resolution_source)) = 0
        OR NEW.resolution_evidence_sha256 !~ '^sha256:[0-9a-f]{64}$'
-       OR NEW.outcome <> CASE WHEN NEW.resolved_bar_close > OLD.reference_close THEN 1 ELSE 0 END
+       OR (NEW.outcome = 1 AND NEW.resolved_bar_close <= OLD.reference_close)
+       OR (NEW.outcome = 0 AND NEW.resolved_bar_close > OLD.reference_close)
        OR NOT EXISTS (
          SELECT 1 FROM forecast_resolution_events e
          WHERE e.model_id = OLD.model_id AND e.signal_id = OLD.signal_id
