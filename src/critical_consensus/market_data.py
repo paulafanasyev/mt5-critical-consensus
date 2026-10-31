@@ -278,7 +278,7 @@ def forecast_bar_duration(timeframe: str) -> timedelta:
 
 
 def detect_potential_bar_gaps(
-    bars: Iterable[MarketBar], *, ignore_weekend_closures: bool = True,
+    bars: Iterable[MarketBar], *, ignore_weekend_closures: bool = False,
     gap_tolerance_seconds: float = 2.0,
 ) -> list[dict[str, Any]]:
     """Report suspicious timestamp gaps without assuming a broker's trading calendar.
