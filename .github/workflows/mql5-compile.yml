@@ -78,9 +78,14 @@ jobs:
             $target = Join-Path $experts "CriticalConsensusEA.mq5"
             Copy-Item $source $target -Force
 
-            $compileArguments = @('/compile:"' + $target + '"', "/log")
-            $compile = Start-Process -FilePath $editor -ArgumentList $compileArguments -PassThru -Wait
-            "MetaEditorExitCode=$($compile.ExitCode)" | Add-Content -Path $report
+            # The requested installation path has no spaces; invoke the native compiler
+            # directly so PowerShell does not re-quote /compile arguments through Start-Process.
+            $compileOutput = & $editor "/compile:$target" "/log" 2>&1
+            $compileExitCode = $LASTEXITCODE
+            "MetaEditorExitCode=$compileExitCode" | Add-Content -Path $report
+            if ($compileOutput) {
+              "MetaEditorOutput=$($compileOutput -join ' | ')" | Add-Content -Path $report
+            }
             $log = "$target.log"
             if (-not (Test-Path $log)) {
               throw "MetaEditor did not create a compiler log. Process exit code: $($compile.ExitCode)"
