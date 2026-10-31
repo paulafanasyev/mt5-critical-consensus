@@ -216,8 +216,18 @@ def fetch_mt5_bars(
         raise RuntimeError("MetaTrader5 Python package is required on the MT5 Windows host") from exc
     initialized = mt5.initialize(path=terminal_path) if terminal_path else mt5.initialize()
     if not initialized:
-        raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
+        error = mt5.last_error()
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+        raise RuntimeError(f"MT5 initialize failed: {error}")
     try:
+        terminal = mt5.terminal_info()
+        if terminal is None:
+            raise RuntimeError(f"MT5 terminal_info failed: {mt5.last_error()}")
+        if not bool(getattr(terminal, "connected", False)):
+            raise RuntimeError("MT5 terminal is open but not connected to a trade server")
         if not mt5.symbol_select(symbol, True):
             raise RuntimeError(f"MT5 could not select symbol {symbol}: {mt5.last_error()}")
         tf_constant = getattr(mt5, _MT5_TIMEFRAME_NAMES[timeframe], None)
@@ -265,6 +275,53 @@ def forecast_bar_duration(timeframe: str) -> timedelta:
         raise ValueError(
             "objective next-bar forecast policy does not support this timeframe"
         ) from exc
+
+
+def detect_potential_bar_gaps(
+    bars: Iterable[MarketBar], *, ignore_weekend_closures: bool = True,
+    gap_tolerance_seconds: float = 2.0,
+) -> list[dict[str, Any]]:
+    """Report suspicious timestamp gaps without assuming a broker's trading calendar.
+
+    Weekend-spanning intervals are ignored by default. Other gaps are advisory only:
+    broker holidays, daily maintenance and instrument-specific sessions need review.
+    """
+    rows = validate_bar_series(bars, min_bars=1)
+    if (isinstance(gap_tolerance_seconds, bool)
+            or not isinstance(gap_tolerance_seconds, (int, float))
+            or not math.isfinite(float(gap_tolerance_seconds))
+            or not 0 <= float(gap_tolerance_seconds) <= 60):
+        raise ValueError("gap_tolerance_seconds must be finite and in [0,60]")
+    if len(rows) < 2:
+        return []
+
+    duration = forecast_bar_duration(rows[0].timeframe)
+    tolerance = timedelta(seconds=float(gap_tolerance_seconds))
+    gaps: list[dict[str, Any]] = []
+    for previous, current in zip(rows, rows[1:]):
+        elapsed = current.time - previous.time
+        if elapsed <= duration + tolerance:
+            continue
+        crosses_weekend = False
+        if ignore_weekend_closures:
+            day = previous.time.date() + timedelta(days=1)
+            while day <= current.time.date():
+                if day.weekday() >= 5:
+                    crosses_weekend = True
+                    break
+                day += timedelta(days=1)
+        if crosses_weekend:
+            continue
+        gaps.append({
+            "symbol": previous.symbol,
+            "timeframe": previous.timeframe,
+            "previous_bar_utc": previous.time.isoformat(),
+            "next_bar_utc": current.time.isoformat(),
+            "elapsed_seconds": elapsed.total_seconds(),
+            "nominal_periods_elapsed": int(elapsed // duration),
+            "status": "POTENTIAL_GAP_REQUIRES_SESSION_REVIEW",
+        })
+    return gaps
 
 
 def retain_completed_bars(
