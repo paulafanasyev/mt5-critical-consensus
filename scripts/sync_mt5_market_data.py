@@ -97,7 +97,7 @@ def main() -> int:
         bar for bar in finalized
         if latest_persisted is None or bar.time > latest_persisted
     ]
-    gap_scan_bars = (existing + new_finalized)[-5000:]
+    gap_scan_bars = existing + new_finalized
     potential_gaps = (
         detect_potential_bar_gaps(
             gap_scan_bars, ignore_weekend_closures=args.ignore_weekend_closures,
