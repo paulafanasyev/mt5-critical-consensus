@@ -304,7 +304,7 @@ class DemoTerminal(LiveMT5Backend):
         return (datetime.now(UTC) + timedelta(seconds=self.server_utc_offset_seconds)).date()
 
     def _restore_baselines(self, account: Any, day: Any, equity: float) -> tuple[float, float, bool]:
-        journal = self._journal
+        journal = getattr(self, "_journal", None)
         if journal is None:
             # The standalone adapter remains useful in isolated unit tests. The actual
             # demo runner attaches its journal before constructing agents or executors.
