@@ -260,8 +260,10 @@ def test_potential_gap_detector_ignores_weekend_market_closure():
         MarketBar("EURUSD", "H1", datetime(2026, 11, 2, 0, tzinfo=timezone.utc),
                   1.05, 1.15, 0.95, 1.1),
     ]
-    assert detect_potential_bar_gaps(data) == []
-    assert len(detect_potential_bar_gaps(data, ignore_weekend_closures=False)) == 1
+    # By default, do not assume this instrument closes over weekends.
+    assert len(detect_potential_bar_gaps(data)) == 1
+    # Suppression is opt-in only after the broker session is verified.
+    assert detect_potential_bar_gaps(data, ignore_weekend_closures=True) == []
 
 
 def test_potential_gap_detector_rejects_invalid_tolerance():
