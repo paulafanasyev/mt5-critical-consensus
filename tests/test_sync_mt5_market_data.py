@@ -148,7 +148,10 @@ def test_sync_reports_potential_gap_but_does_not_backfill_automatically(monkeypa
     assert MODULE.main() == 0
     payload = __import__("json").loads(capsys.readouterr().out)
     integrity = payload["market_history_integrity"]
+    assert integrity["status"] == "POTENTIAL_GAPS_REQUIRING_REVIEW"
     assert integrity["bars_scanned"] == 3
+    assert integrity["scan_from_utc"] == previous.time.isoformat()
+    assert integrity["scan_to_utc"] == next_bar.time.isoformat()
     assert len(integrity["potential_gaps"]) == 1
     assert integrity["potential_gaps"][0]["status"] == "POTENTIAL_GAP_REQUIRES_SESSION_REVIEW"
     assert integrity["automatic_backfill"] is False
