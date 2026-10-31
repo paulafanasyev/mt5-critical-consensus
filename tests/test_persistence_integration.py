@@ -11,6 +11,7 @@ import pytest
 from critical_consensus.market_data import MarketBar
 from critical_consensus.persistence import PostgresRepository
 from critical_consensus.audit import make_audit_event, canonical_hash
+from critical_consensus.calibration_eval import evaluate_repository_forecasts
 from critical_consensus.source_provenance import source_id_for_capture
 
 
@@ -122,6 +123,10 @@ def test_market_forecast_resolves_only_from_first_future_completed_persisted_bar
     assert exported[0]["target_event"] == "NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE"
     assert exported[0]["outcome"] == 1
     assert exported[0]["resolution_evidence_sha256"] == resolved["resolution_evidence_sha256"]
+    report = evaluate_repository_forecasts(repo, model_id=model_id)
+    assert report["dataset"]["row_count"] == 1
+    assert report["provenance_status"] == "DATABASE_LEDGER_SELF_CONSISTENT_NOT_BROKER_AUTHENTICATED"
+    assert report["overall_status"] == "NOT_PROVEN"
 
 
 def test_market_forecast_rejects_reference_close_not_matching_persisted_bar():
