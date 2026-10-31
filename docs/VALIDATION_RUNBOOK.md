@@ -1,6 +1,6 @@
 # MT5 Critical Consensus: full validation runbook
 
-Status as of this change: infrastructure and tests are being added; production readiness is not implied. Do not connect a live account. The intended order is data → persistence → agent evidence → calibration → EA demo → end-to-end verification.
+Status: CI for the current decision/forecast changes is green, but production readiness is NOT PROVEN. Do not connect a live account. The intended order is data → persistence → agent evidence → objective forecast outcomes → calibration → EA demo → end-to-end verification.
 
 ## 1. Read-only market data
 
@@ -96,28 +96,51 @@ For an API that returns a timezone-aware ISO-8601 publication field, the operato
 
 
 
-## 4. Walk-forward calibration
+## 4. Objective market-event forecasts and walk-forward calibration
 
-The agent-analysis runner now captures every validated provider verdict into PostgreSQL `forecast_predictions` before peer review and before any outcome is known. It records the provider/model identity, a unique signal-plus-verdict ID, the provider-issued timestamp, the raw confidence score and the exact signal input SHA-256 in one atomic batch. Identical replays are idempotent; a conflicting replay rejects the full batch. These values are explicitly **raw subjective confidence observations**, not calibrated probabilities, trade win rates or profitability evidence.
+The runner records each validated agent's **objective event probability** before peer review and before the target bar can close. It keeps the agent's qualitative verdict confidence as a separate field; subjective confidence is not used as the calibration probability.
 
-Capture the model forecast before its outcome is available, persist the exact issue timestamp and canonical input hash, then resolve it only after an independently observed outcome is known. Export rows to a CSV with columns:
+The fixed target policy is `next-available-bar-close-above-reference-v1`:
+- The reference is the last completed market bar in the exact signal snapshot, including its symbol, timeframe, UTC bar timestamp and close.
+- The reference close must match an already persisted immutable `market_bars` row before the forecast is accepted.
+- Each agent's issue timestamp is its own UTC `created_at`. The target is the first persisted bar for that symbol/timeframe whose bar-open timestamp is strictly later than that issue timestamp.
+- Outcome is 1 only if that target bar closes strictly above the reference close; flat or lower close is 0.
+- A target bar cannot be resolved until its full timeframe has elapsed plus the configured finalization grace. No later bar may replace the first eligible target bar.
+- Missing reference/target bars remain pending. Manual outcome labels are disabled.
 
-```csv
-model_id,signal_id,issued_at,resolved_at,probability,outcome
-technical-v1,eurusd-h1-001,2026-10-01T10:00:00Z,2026-10-01T11:00:00Z,0.61,1
+On the Windows host with MT5 installed, first import the newest closed bars. The import is read-only with respect to MT5 and does not send orders:
+
+```powershell
+python scripts/import_mt5_history.py --live-terminal --symbol EURUSD --timeframe H1 --from-utc 2026-10-30T00:00:00Z --to-utc 2026-10-31T00:00:00Z
 ```
 
-Then run:
+For an existing CSV export, provide the verified broker/server timezone:
 
-```bash
-python scripts/evaluate_calibration.py predictions.csv --output calibration-report.json
+```powershell
+python scripts/import_mt5_history.py --csv .\\EURUSD_H1.csv --source-timezone Europe/Helsinki --symbol EURUSD --timeframe H1
 ```
 
-The evaluator fits Platt scaling only on earlier forecasts whose outcomes were already resolved before the next test block. It reports Brier score, log loss, reliability bins, ECE, high-confidence false-certainty rate, sample counts and a deterministic paired bootstrap interval. With too few observations or an interval that does not show improvement, the result remains `NOT_PROVEN`. The script cannot independently prove that a supplied historical forecast was genuinely captured before the outcome; only a trusted append-only capture pipeline and audit trail can provide that provenance.
+Then resolve only forecasts whose first target bar is present and complete:
 
-At present, the runner establishes issue-time provenance for raw confidence observations, but it does not automatically adjudicate their correctness or mark them resolved. The existing forecast-resolution repository method is a storage primitive, not an outcome adjudicator. Until an explicit, evidence-backed label protocol and operator-reviewed resolution are in place, these observations remain unresolved and cannot satisfy the Certainty Gate's minimum calibration sample requirements. Never label a model correct simply because the market later moved in the expected direction; apply a pre-defined forecast target and horizon consistently, and preserve NOT_PROVEN when the target cannot be adjudicated.
+```powershell
+python scripts/resolve_forecasts.py --symbol EURUSD --timeframe H1 --limit 500
+```
 
-This is probability calibration, not a strategy/backtest profitability test. A calibrated probability does not prove positive expectancy, execution quality or future profit.
+The resolver is idempotent. It stores an append-only evidence object containing the exact reference bar, target bar, their timestamps/OHLC/source metadata, forecast input hash, target policy and outcome hash. It does not create labels when a bar is missing or incomplete. Repeat after new market bars are imported.
+
+Export only database-resolved objective market-event forecasts; legacy subjective-confidence rows are excluded:
+
+```powershell
+python scripts/export_resolved_forecasts.py --output .\\resolved-forecasts.csv
+python scripts/evaluate_calibration.py .\\resolved-forecasts.csv --output .\\calibration-report.json
+python scripts/store_calibration_report.py .\\calibration-report.json
+```
+
+The evaluator rejects incomplete or tampered evidence metadata, checks the canonical resolution-evidence hash and verifies that the declared outcome matches the reference and target closes. Legacy CSV rows without the new evidence contract can be parsed for diagnostics but force provenance status to `NOT_VERIFIED_BY_SCRIPT` and cannot advance the overall status beyond `NOT_PROVEN`.
+
+The walk-forward evaluator fits Platt scaling only on earlier forecasts whose outcomes were resolved before the next test block. It reports Brier score, log loss, reliability bins, ECE, high-confidence false-certainty rate, sample counts and deterministic paired-bootstrap intervals. Too few observations or an interval that does not show improvement remains `NOT_PROVEN`. The policy's minimum sample requirements still apply independently.
+
+**Evidence limits:** hashes and database constraints demonstrate internal consistency and immutability within this PostgreSQL ledger. They do not independently authenticate broker-feed accuracy/completeness, prove statistical independence between providers, prove a profitable trading strategy or establish future performance. A calibration report is not a backtest, execution test or profitability claim. Do not manually label outcomes or promote legacy subjective-confidence rows into this dataset.
 
 ## 5. Full deterministic Chief Gate
 
