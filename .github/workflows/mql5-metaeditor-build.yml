@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: mql5-metaeditor-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   metaeditor-build:
     name: MetaEditor compile (Windows)
@@ -38,22 +42,31 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $installDir = "C:\MT5"
+          $installDir = Join-Path $env:RUNNER_TEMP "MT5"
+          New-Item -ItemType Directory -Path $installDir -Force | Out-Null
           $installer = Join-Path $env:RUNNER_TEMP "mt5setup.exe"
           $signature = Get-AuthenticodeSignature $installer
           Write-Host "Installer signature: $($signature.Status); signer: $($signature.SignerCertificate.Subject)"
-          $process = Start-Process -FilePath $installer -ArgumentList @("/auto", '/path:"C:\MT5"') -Wait -PassThru
+          $arguments = '/auto /path:"' + $installDir + '"'
+          $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
           Write-Host "Bootstrap installer exit code: $($process.ExitCode)"
           $editor = Join-Path $installDir "metaeditor64.exe"
           $include = Join-Path $installDir "MQL5\Include"
-          $deadline = (Get-Date).AddMinutes(10)
+          $deadline = (Get-Date).AddMinutes(3)
           while ((-not (Test-Path $editor) -or -not (Test-Path $include)) -and (Get-Date) -lt $deadline) {
+            if ((Get-Date).Second % 30 -lt 5) {
+              Write-Host "Waiting for terminal payload. Install directory exists: $(Test-Path $installDir)"
+              if (Test-Path $installDir) {
+                Get-ChildItem $installDir -Force | Select-Object -First 15 | Format-Table Name, Length
+              }
+            }
             Start-Sleep -Seconds 5
           }
           if (-not (Test-Path $editor) -or -not (Test-Path $include)) {
             Write-Host "Install directory diagnostics:"
             if (Test-Path $installDir) {
-              Get-ChildItem $installDir -Force | Select-Object -First 30 | Format-Table Name, Length
+              Get-ChildItem $installDir -Force -Recurse -ErrorAction SilentlyContinue |
+                Select-Object -First 40 FullName, Length | Format-Table
             } else {
               Write-Host "Install directory was not created."
             }
