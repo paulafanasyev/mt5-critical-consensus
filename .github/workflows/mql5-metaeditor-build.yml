@@ -41,17 +41,24 @@ jobs:
           $ErrorActionPreference = "Stop"
           $installDir = "C:\MT5"
           $installer = Join-Path $env:RUNNER_TEMP "mt5setup.exe"
-          $process = Start-Process -FilePath $installer -ArgumentList "/auto /path:$installDir" -Wait -PassThru
-          if ($process.ExitCode -ne 0) {
-            throw "MetaTrader installer exited with code $($process.ExitCode)."
-          }
+          $signature = Get-AuthenticodeSignature $installer
+          Write-Host "Installer signature: $($signature.Status); signer: $($signature.SignerCertificate.Subject)"
+          $process = Start-Process -FilePath $installer -ArgumentList @("/auto", '/path:"C:\MT5"') -Wait -PassThru
+          Write-Host "Bootstrap installer exit code: $($process.ExitCode)"
           $editor = Join-Path $installDir "metaeditor64.exe"
+          $include = Join-Path $installDir "MQL5\Include"
           $deadline = (Get-Date).AddMinutes(10)
-          while (-not (Test-Path $editor) -and (Get-Date) -lt $deadline) {
+          while ((-not (Test-Path $editor) -or -not (Test-Path $include)) -and (Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 5
           }
-          if (-not (Test-Path $editor)) {
-            throw "MetaEditor64.exe was not found under $installDir after installation."
+          if (-not (Test-Path $editor) -or -not (Test-Path $include)) {
+            Write-Host "Install directory diagnostics:"
+            if (Test-Path $installDir) {
+              Get-ChildItem $installDir -Force | Select-Object -First 30 | Format-Table Name, Length
+            } else {
+              Write-Host "Install directory was not created."
+            }
+            throw "MetaEditor or MQL5\Include was not installed. Bootstrap exit code: $($process.ExitCode)."
           }
           $version = (Get-Item $editor).VersionInfo.FileVersion
           "MT5_INSTALL_DIR=$installDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
