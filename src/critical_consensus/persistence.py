@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from .market_data import MarketBar, forecast_bar_duration, validate_bar_series
+from .market_data import MarketBar, forecast_bar_duration, retain_completed_bars, validate_bar_series
 from .audit import verify_audit_chain
 from .source_provenance import validate_source_capture
 
@@ -99,7 +99,9 @@ class PostgresRepository:
                 conn.execute(script, prepare=False)
 
     def append_market_bars(self, bars: Iterable[MarketBar]) -> dict[str, int]:
-        records = validate_bar_series(bars)
+        # The immutable ledger must never store a forming MT5 candle: its OHLC values
+        # can still change, and a later completed version would conflict with the first insert.
+        records = retain_completed_bars(bars, min_bars=1)
         inserted = duplicates = 0
         sql = """
           INSERT INTO market_bars
