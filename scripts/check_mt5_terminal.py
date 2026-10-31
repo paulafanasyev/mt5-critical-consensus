@@ -35,7 +35,12 @@ def probe_terminal(symbol: str, timeframe: str, terminal_path: str | None = None
 
     initialized = mt5.initialize(path=terminal_path) if terminal_path else mt5.initialize()
     if not initialized:
-        raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
+        error = mt5.last_error()
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+        raise RuntimeError(f"MT5 initialize failed: {error}")
 
     try:
         terminal = mt5.terminal_info()
