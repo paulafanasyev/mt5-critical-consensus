@@ -69,7 +69,7 @@ def test_market_forecast_resolves_only_from_first_future_completed_persisted_bar
     model_id = "market-event-model-" + uuid.uuid4().hex
     signal_id = "market-event-signal-" + uuid.uuid4().hex
     issued = now - timedelta(hours=6)
-    reference_at = issued - timedelta(hours=1)
+    reference_at = issued - timedelta(hours=1, seconds=5)
     target_bar_at = issued + timedelta(hours=1)
     symbol = "OUTCOME" + uuid.uuid4().hex[:6].upper()
     reference_close = 1.1000
