@@ -52,14 +52,100 @@ def test_postgres_forecast_cannot_be_rewritten_after_issue_or_resolution():
                                 probability=0.73, input_sha256=digest) is True
     assert repo.record_forecast(model_id=model_id, signal_id=signal_id, issued_at=issued,
                                 probability=0.73, input_sha256=digest) is False
-    resolved = datetime.now(timezone.utc)
-    assert repo.resolve_forecast(model_id=model_id, signal_id=signal_id, resolved_at=resolved, outcome=1) is True
-    assert repo.resolve_forecast(model_id=model_id, signal_id=signal_id, resolved_at=resolved, outcome=1) is False
-    with pytest.raises(ValueError, match="cannot be relabelled"):
-        repo.resolve_forecast(model_id=model_id, signal_id=signal_id, resolved_at=resolved, outcome=0)
+    # Legacy subjective verdict confidence is not a market-event probability and
+    # manual binary labels are no longer accepted.
+    with pytest.raises(ValueError, match="manual forecast labels are disabled"):
+        repo.resolve_forecast(model_id=model_id, signal_id=signal_id,
+                              resolved_at=datetime.now(timezone.utc), outcome=1)
+    assert repo.export_resolved_forecasts(model_id=model_id) == []
+
+
+
+def test_market_forecast_resolves_only_from_first_future_completed_persisted_bar():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    now = datetime.now(timezone.utc)
+    model_id = "market-event-model-" + uuid.uuid4().hex
+    signal_id = "market-event-signal-" + uuid.uuid4().hex
+    issued = now - timedelta(hours=6)
+    reference_at = issued - timedelta(hours=1)
+    target_bar_at = issued + timedelta(hours=1)
+    symbol = "OUTCOME" + uuid.uuid4().hex[:6].upper()
+    reference_close = 1.1000
+
+    reference_bar = MarketBar(
+        symbol, "H1", reference_at, 1.0990, 1.1020, 1.0980, reference_close,
+        tick_volume=500, spread_points=9,
+    )
+    target_bar = MarketBar(
+        symbol, "H1", target_bar_at, 1.1000, 1.1040, 1.0990, 1.1030,
+        tick_volume=620, spread_points=8,
+    )
+    repo.append_market_bars([reference_bar, target_bar])
+
+    forecast = {
+        "model_id": model_id, "signal_id": signal_id, "issued_at": issued,
+        "probability": 0.73, "input_sha256": "sha256:" + "e" * 64,
+        "forecast_kind": "NEXT_BAR_MARKET_EVENT",
+        "target_policy_version": "next-available-bar-close-above-reference-v1",
+        "target_event": "NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE",
+        "symbol": symbol, "timeframe": "H1",
+        "reference_at": reference_at, "reference_close": reference_close,
+    }
+    assert repo.record_forecasts([forecast]) == {
+        "inserted": 1, "identical_replays": 0, "total": 1
+    }
+
+    before_close = repo.resolve_forecast_from_market_data(
+        model_id=model_id, signal_id=signal_id,
+        now=target_bar_at + timedelta(minutes=30),
+    )
+    assert before_close["status"] == "PENDING_BAR_NOT_CLOSED"
+
+    resolved_at = target_bar_at + timedelta(hours=1, seconds=5)
+    resolved = repo.resolve_forecast_from_market_data(
+        model_id=model_id, signal_id=signal_id, now=resolved_at,
+    )
+    assert resolved["status"] == "RESOLVED"
+    assert resolved["outcome"] == 1
+    assert resolved["resolution_evidence_sha256"].startswith("sha256:")
+    assert resolved["evidence"]["reference_bar"]["close"] == reference_close
+    assert resolved["evidence"]["target_bar"]["close"] == pytest.approx(1.1030)
+    repeated = repo.resolve_forecast_from_market_data(
+        model_id=model_id, signal_id=signal_id, now=resolved_at + timedelta(minutes=1),
+    )
+    assert repeated["status"] == "ALREADY_RESOLVED"
+    assert repeated["resolution_evidence_sha256"] == resolved["resolution_evidence_sha256"]
+
     exported = repo.export_resolved_forecasts(model_id=model_id)
     assert len(exported) == 1
-    assert exported[0]["signal_id"] == signal_id
+    assert exported[0]["target_event"] == "NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE"
+    assert exported[0]["outcome"] == 1
+    assert exported[0]["resolution_evidence_sha256"] == resolved["resolution_evidence_sha256"]
+
+
+def test_market_forecast_rejects_reference_close_not_matching_persisted_bar():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    issued = datetime.now(timezone.utc) - timedelta(hours=2)
+    reference_at = issued - timedelta(hours=1)
+    symbol = "BADREF" + uuid.uuid4().hex[:6].upper()
+    repo.append_market_bars([
+        MarketBar(symbol, "H1", reference_at, 1.0, 1.2, 0.9, 1.1),
+    ])
+    with pytest.raises(ValueError, match="does not match an immutable persisted market bar"):
+        repo.record_forecasts([{
+            "model_id": "m-" + uuid.uuid4().hex,
+            "signal_id": "s-" + uuid.uuid4().hex,
+            "issued_at": issued, "probability": 0.6,
+            "input_sha256": "sha256:" + "f" * 64,
+            "forecast_kind": "NEXT_BAR_MARKET_EVENT",
+            "target_policy_version": "next-available-bar-close-above-reference-v1",
+            "target_event": "NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE",
+            "symbol": symbol, "timeframe": "H1",
+            "reference_at": reference_at, "reference_close": 1.1234,
+        }])
+
 
 
 def test_forecast_batch_capture_is_atomic_and_rejects_conflicting_replays():
