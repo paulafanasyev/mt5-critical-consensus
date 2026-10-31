@@ -10,6 +10,16 @@ from critical_consensus.market_data import fetch_mt5_bars, retain_completed_bars
 from critical_consensus.persistence import PostgresRepository
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
 def parse_aware(value: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -28,16 +38,19 @@ def main() -> int:
     parser.add_argument("--bootstrap-from-utc", type=parse_aware,
                         help="required only when this symbol/timeframe has no persisted history")
     parser.add_argument("--terminal-path", help="optional MetaTrader 5 terminal executable path")
-    parser.add_argument("--resolve-limit", type=int, default=500)
+    parser.add_argument("--resolve-limit", type=positive_int, default=500)
     parser.add_argument("--finalization-grace-seconds", type=float, default=2.0)
     args = parser.parse_args()
     if (not isinstance(args.finalization_grace_seconds, (int, float))
             or not 0 <= args.finalization_grace_seconds <= 60):
         parser.error("--finalization-grace-seconds must be finite and in [0,60]")
 
+    symbol = args.symbol.strip().upper()
+    if not symbol:
+        parser.error("--symbol must not be empty")
+
     repo = PostgresRepository()
     repo.migrate()
-    symbol = args.symbol.strip().upper()
     existing = repo.get_recent_market_bars(symbol, args.timeframe, limit=21)
     if existing:
         from_utc = existing[-1].time
