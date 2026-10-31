@@ -21,6 +21,7 @@ def good_request():
 
 def good_snapshot():
     return {"status": "PASS", "observed_at": NOW.isoformat(), "account_mode": "demo",
+            "account_login": 5000001, "account_server": "Demo-Server",
             "symbol": "EURUSD", "symbol_group": "fx-major", "account_equity": 10000.0,
             "account_balance": 10000.0, "daily_pnl": 0.0,
             "day_start_equity": 10000.0, "equity_high_watermark": 10200.0,
@@ -30,6 +31,7 @@ def good_snapshot():
             "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0196,
             "open_stop_risk_fraction": 0.0,
             "open_positions": 1, "correlated_open_positions": 1,
+            "position_symbols": ["EURUSD"],
             "request_binding_sha256": risk_request_binding_hash(good_request()),
             "within_high_impact_news_window": None}
 
@@ -221,6 +223,77 @@ def test_risk_controlled_permission_reaches_human_review_only_when_every_gate_ag
     assert result["allowed"] is False
 
 
+def test_snapshot_equity_and_day_start_must_be_supported_by_the_balance():
+    inflated = good_snapshot()
+    inflated["account_equity"] = 1e9
+    inflated["day_start_equity"] = 1e9
+    inflated["equity_high_watermark"] = 1e9
+    result = risk_controlled_permission(
+        good_request(), {"permission_matrix": {}},
+        kill_switch_state=good_state(active=False), snapshot=inflated, now=NOW,
+    )
+    assert result["status"] == "DENY"
+    assert "DAY_START_EQUITY_ABOVE_DAILY_PNL_IMPLIED_BALANCE" in result["blockers"]
+    assert "RISK_SNAPSHOT_EQUITY_HIGH_WATERMARK_BELOW_EQUITY" not in result["blockers"]
+    assert result["trade_allowed"] is False
+
+
+def test_snapshot_account_identity_is_mandatory_and_can_be_pinned_by_policy():
+    missing_login = good_snapshot()
+    missing_login.pop("account_login")
+    assert "RISK_SNAPSHOT_ACCOUNT_LOGIN_MISSING_OR_INVALID" in risk_snapshot_gate(
+        missing_login, now=NOW)["blockers"]
+    missing_server = good_snapshot()
+    missing_server["account_server"] = "   "
+    assert "RISK_SNAPSHOT_ACCOUNT_SERVER_MISSING_OR_INVALID" in risk_snapshot_gate(
+        missing_server, now=NOW)["blockers"]
+
+    matrix = {"permission_matrix": {"expected_account_login": 42,
+                                    "expected_account_server": "Demo-Server"}}
+    mismatched = risk_controlled_permission(
+        good_request(), matrix, kill_switch_state=good_state(active=False),
+        snapshot=good_snapshot(), now=NOW,
+    )
+    assert mismatched["status"] == "DENY"
+    assert "RISK_SNAPSHOT_ACCOUNT_LOGIN_MISMATCH" in mismatched["blockers"]
+    assert mismatched["trade_allowed"] is False
+
+
+def test_snapshot_position_fields_must_agree_with_each_other():
+    mismatch = good_snapshot()
+    mismatch["position_symbols"] = []
+    assert "RISK_SNAPSHOT_POSITION_COUNT_MISMATCH" in risk_snapshot_gate(
+        mismatch, now=NOW)["blockers"]
+
+    missing = good_snapshot()
+    missing.pop("position_symbols")
+    assert "RISK_SNAPSHOT_POSITION_SYMBOLS_MISSING_OR_INVALID" in risk_snapshot_gate(
+        missing, now=NOW)["blockers"]
+
+    too_many_correlated = good_snapshot()
+    too_many_correlated["correlated_open_positions"] = 2
+    assert "CORRELATED_OPEN_POSITIONS_EXCEED_TOTAL" in risk_snapshot_gate(
+        too_many_correlated, now=NOW)["blockers"]
+
+    exposure_without_positions = good_snapshot()
+    exposure_without_positions["open_stop_risk_fraction"] = 0.01
+    exposure_without_positions["open_positions"] = 0
+    exposure_without_positions["correlated_open_positions"] = 0
+    exposure_without_positions["position_symbols"] = []
+    assert "OPEN_STOP_RISK_WITHOUT_OPEN_POSITIONS" in risk_snapshot_gate(
+        exposure_without_positions, now=NOW)["blockers"]
+
+
+def test_nonfinite_expected_risk_never_reconciles():
+    snapshot = good_snapshot()
+    snapshot["risk_tick_size"] = 5e-324
+    snapshot["risk_value_account_currency"] = 0.0
+    snapshot["risk_fraction"] = 0.0
+    blockers = risk_snapshot_matches_order(good_request(), snapshot)
+    assert "RISK_FRACTION_DOES_NOT_MATCH_ORDER" in blockers
+    assert "RISK_VALUE_DOES_NOT_MATCH_ORDER" in blockers
+
+
 def sell_request():
     return {"instrument": "EURUSD", "direction": "SELL", "size": 0.1, "expected_price": 1.1001,
             "sl_tp": {"sl": 1.1011, "tp": 1.0982}}
@@ -292,6 +365,14 @@ def test_adjusted_rr_below_floor_is_denied_even_when_reviewed_rr_passes():
     assert denied["status"] == "DENY"
     assert "RISK_ADJUSTED_RR_BELOW_MINIMUM" in denied["blockers"]
     assert denied["trade_allowed"] is False
+    # A flat policy mapping must enforce the same floor, not silently skip the check.
+    flat = risk_controlled_permission(
+        request, {"min_expected_rr": 1.5}, kill_switch_state=good_state(active=False),
+        snapshot=snapshot, now=NOW,
+    )
+    assert flat["status"] == "DENY"
+    assert "RISK_ADJUSTED_RR_BELOW_MINIMUM" in flat["blockers"]
+    assert flat["trade_allowed"] is False
     # At the reviewed price the same order still clears the reward floor.
     snapshot["reference_price"] = 1.1001
     value = abs(1.1001 - 1.0995) / 0.0001 * 20.0 * 0.1

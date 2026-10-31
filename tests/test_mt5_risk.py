@@ -24,9 +24,10 @@ class FakeMT5:
     DEAL_TYPE_SELL = 1
     DEAL_TYPE_BALANCE = 2
 
-    def __init__(self, *, trade_mode=0, positions=None, deals=None, fail_positions=False):
-        self.info = SimpleNamespace(trade_mode=trade_mode, equity=10100.0, balance=10000.0,
-                                    server="Demo-Server", currency="USD")
+    def __init__(self, *, trade_mode=0, positions=None, deals=None, fail_positions=False,
+                 specs=None, ticks=None):
+        self.info = SimpleNamespace(trade_mode=trade_mode, login=5000001, equity=10100.0,
+                                    balance=10000.0, server="Demo-Server", currency="USD")
         self.positions = positions or [SimpleNamespace(
             symbol="EURUSD", type=0, volume=0.1, price_open=1.1000, sl=1.0980)]
         self.deals = deals or [SimpleNamespace(
@@ -34,6 +35,8 @@ class FakeMT5:
         self.spec = SimpleNamespace(trade_tick_size=0.00001, trade_tick_value_loss=1.0,
                                     trade_tick_value=1.0, point=0.00001)
         self.tick = SimpleNamespace(bid=1.1000, ask=1.1001, time=int(NOW.timestamp()))
+        self.specs = specs or {}
+        self.ticks = ticks or {}
         self.fail_positions = fail_positions
         self.shutdown_called = False
 
@@ -47,10 +50,14 @@ class FakeMT5:
         return symbol == "EURUSD" and selected is True
 
     def symbol_info(self, symbol):
-        return self.spec if symbol == "EURUSD" else None
+        if symbol == "EURUSD":
+            return self.spec
+        return self.specs.get(symbol)
 
     def symbol_info_tick(self, symbol):
-        return self.tick if symbol == "EURUSD" else None
+        if symbol == "EURUSD":
+            return self.tick
+        return self.ticks.get(symbol)
 
     def positions_get(self):
         if self.fail_positions:
@@ -80,7 +87,7 @@ def test_read_only_demo_risk_snapshot_computes_broker_tick_value_risk(monkeypatc
     assert result["account_mode"] == "demo"
     assert result["daily_pnl"] == 9.0
     assert result["daily_loss_fraction"] == 0.0
-    assert result["risk_fraction"] == pytest.approx(10.0 / 10100.0)
+    assert result["risk_fraction"] == pytest.approx(10.0 / 10000.0)
     assert result["request_binding_sha256"] == risk_request_binding_hash(request)
     assert result["open_positions"] == 1
     assert result["correlated_open_positions"] == 1
@@ -215,7 +222,7 @@ def test_collector_sizes_risk_at_the_worse_reference_price(monkeypatch):
     assert result["status"] == "PASS"
     assert result["risk_entry_price"] == 1.10015
     assert result["risk_value_account_currency"] == pytest.approx(10.5)
-    assert result["risk_fraction"] == pytest.approx(10.5 / 10100.0)
+    assert result["risk_fraction"] == pytest.approx(10.5 / 10000.0)
 
 
 def test_collector_blocks_slippage_beyond_a_tenth_of_the_stop_distance(monkeypatch):
@@ -317,7 +324,7 @@ def test_collector_reports_open_stop_risk_and_blocks_unknown_position_stops(monk
     )
     # |1.1000 - 1.0980| / 0.00001 * 1.0 * 0.1 = 20 account-currency units at risk.
     assert result["open_stop_risk_value_account_currency"] == pytest.approx(20.0)
-    assert result["open_stop_risk_fraction"] == pytest.approx(20.0 / 10100.0)
+    assert result["open_stop_risk_fraction"] == pytest.approx(20.0 / 10000.0)
 
     fake.positions = [SimpleNamespace(symbol="EURUSD", type=0, volume=0.1,
                                       price_open=1.1000, sl=0.0)]
@@ -328,3 +335,73 @@ def test_collector_reports_open_stop_risk_and_blocks_unknown_position_stops(monk
     )
     assert result["status"] == "DENY"
     assert "OPEN_POSITION_STOP_RISK_UNKNOWN" in result["blockers"]
+
+
+def test_stale_quote_on_an_open_position_blocks_the_snapshot(monkeypatch):
+    stale_tick = SimpleNamespace(bid=150.0, ask=150.001,
+                                 time=int(NOW.timestamp()) - 60)
+    fake = FakeMT5(
+        positions=[
+            SimpleNamespace(symbol="EURUSD", type=0, volume=0.1, price_open=1.1000, sl=1.0980),
+            SimpleNamespace(symbol="USDJPY", type=0, volume=0.1, price_open=150.0, sl=149.0),
+        ],
+        specs={"USDJPY": SimpleNamespace(trade_tick_size=0.001, trade_tick_value_loss=6.5,
+                                        trade_tick_value=6.5, point=0.001)},
+        ticks={"USDJPY": stale_tick},
+    )
+    monkeypatch.setitem(__import__("sys").modules, "MetaTrader5", fake)
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
+        proposed_request=proposed_request(),
+        symbol_groups={"EURUSD": "fx-major", "USDJPY": "fx-jpy"}, now=NOW,
+        server_utc_offset_seconds=0,
+    )
+    assert result["status"] == "DENY"
+    assert "OPEN_POSITION_STOP_RISK_UNKNOWN" in result["blockers"]
+
+    # The same position with a fresh quote contributes its stop risk instead.
+    stale_tick.time = int(NOW.timestamp())
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
+        proposed_request=proposed_request(),
+        symbol_groups={"EURUSD": "fx-major", "USDJPY": "fx-jpy"}, now=NOW,
+        server_utc_offset_seconds=0,
+    )
+    assert result["status"] == "PASS"
+    # |150.0 - 149.0| / 0.001 * 6.5 * 0.1 = 650 account-currency units from USDJPY,
+    # plus 20 from the EURUSD position.
+    assert result["open_stop_risk_value_account_currency"] == pytest.approx(670.0)
+
+
+def test_open_stop_risk_is_measured_from_current_price(monkeypatch):
+    fake = FakeMT5(positions=[SimpleNamespace(symbol="EURUSD", type=0, volume=0.1,
+                                              price_open=1.1000, sl=1.0980)])
+    monkeypatch.setitem(__import__("sys").modules, "MetaTrader5", fake)
+    # Break-even stop: entry differs from the stop, but no loss remains from the bid.
+    fake.tick.bid = 1.0980
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
+        proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        server_utc_offset_seconds=0,
+    )
+    assert result["open_stop_risk_value_account_currency"] == pytest.approx(0.0)
+
+    # A stop already on the profitable side cannot create negative exposure.
+    fake.tick.bid = 1.0970
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
+        proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        server_utc_offset_seconds=0,
+    )
+    assert result["open_stop_risk_value_account_currency"] == pytest.approx(0.0)
+
+    # SELL risk is the distance from the ask up to the stop: 19 points * 0.1 lots.
+    fake.positions = [SimpleNamespace(symbol="EURUSD", type=1, volume=0.1,
+                                      price_open=1.1000, sl=1.1020)]
+    fake.tick.ask = 1.1001
+    result = collect_mt5_risk_snapshot(
+        symbol="EURUSD", day_start_equity=10000.0, equity_high_watermark=10200.0,
+        proposed_request=proposed_request(), symbol_groups={"EURUSD": "fx-major"}, now=NOW,
+        server_utc_offset_seconds=0,
+    )
+    assert result["open_stop_risk_value_account_currency"] == pytest.approx(19.0)

@@ -29,7 +29,12 @@ async def main() -> None:
         await asyncio.to_thread(repo.migrate)
         print(json.dumps({"status": "ready", "stream": stream, "group": group, "consumer": consumer}))
         while True:
-            messages = await read_new_messages(redis, stream, group, consumer, count=20, block_ms=5000)
+            # Re-claim entries left pending by a crash or a handler failure before polling new
+            # ones; otherwise a transient PostgreSQL error would never be retried.
+            _, pending = await reclaim_pending_messages(
+                redis, stream, group, consumer, min_idle_ms=30_000, count=20,
+            )
+            messages = pending or await read_new_messages(redis, stream, group, consumer, count=20, block_ms=5000)
             if not messages:
                 continue
 

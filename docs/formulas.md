@@ -44,17 +44,26 @@ Score не заменяет обязательные проверки каждо
 
 ## Сверка persisted risk snapshot с заказом
 
-Персистентный snapshot не считается доказательством сам по себе: перед допуском значения пересчитываются из точных параметров заказа и equity-баз.
+Персистентный snapshot не считается доказательством сам по себе: перед допуском значения пересчитываются из точных параметров заказа и equity-баз. Риск считается по худшей цене входа, а знаменатель — консервативный (меньшее из equity и balance).
 
-`risk_value_expected = |entry_price - stop_loss| / tick_size * tick_value_loss * size`
+```
+worst_entry = max(entry_price, reference_price)  # BUY
+worst_entry = min(entry_price, reference_price)  # SELL
 
-`risk_fraction_expected = risk_value_expected / account_equity`
+risk_value_expected = |worst_entry - stop_loss| / tick_size * tick_value_loss * size
+risk_fraction_expected = risk_value_expected / min(account_equity, account_balance)
 
-`daily_loss_fraction_expected = max(0, day_start_equity - account_equity) / day_start_equity`
+daily_loss_fraction_expected = max(0, day_start_equity - account_equity) / day_start_equity
+drawdown_fraction_expected = max(0, equity_high_watermark - account_equity) / equity_high_watermark
+```
 
-`drawdown_fraction_expected = max(0, equity_high_watermark - account_equity) / equity_high_watermark`
+`open_stop_risk_value = Σ max(0, price_now - stop_loss) / tick_size * tick_value_loss * volume` для BUY (для SELL — `max(0, stop_loss - price_now)` по ask), `open_stop_risk_fraction = open_stop_risk_value / min(account_equity, account_balance)`. Каждая открытая позиция требует собственного свежего тика своего символа: устаревший или отсутствующий тик делает `open_stop_risk_fraction` неизвестным и блокирует снимок (`OPEN_POSITION_STOP_RISK_UNKNOWN`), а не занижает риск нулём.
 
-Snapshot принимается, только если symbol совпадает, `request_binding_sha256` совпадает с заказом, tick size/value положительны, equity high-water mark не ниже текущей equity, а `risk_value`, `risk_fraction`, `daily_loss_fraction` и `drawdown_fraction` отличаются от пересчитанных не более чем на 1% (`RISK_*_DOES_NOT_MATCH_*`). Отсутствующая tick-спецификация, пустая symbol group или нулевая equity-база — DENY, а не допуск. Лимиты применяются проспективно: `daily_loss_fraction + risk_fraction` не должен превышать дневной лимит, а `drawdown_fraction + risk_fraction` — лимит просадки. RR-порог проверяется по пересчитанному из SL/TP значению с допуском 1% к заявленному. Комиссии, спред и гэп-риск в эту оценку не входят; их должен проверять исполнительный слой.
+Незакрытые позиции несут ещё не реализованный риск по стопу. Он считается от текущей цены (позиция, переведённая в безубыток, даёт ноль), а не от цены входа, и обязан присутствовать в snapshot числом `[0, 1]`; отсутствующее, строковое или `null` значение — DENY, а не ноль.
+
+Идентичность счёта обязательна: `account_login` (целое `>= 1`) и `account_server` (непустая строка без крайних пробелов). Политика может закрепить ожидаемые значения (`expected_account_login`, `expected_account_server`) — несовпадение блокирует (`RISK_SNAPSHOT_ACCOUNT_LOGIN_MISMATCH` / `RISK_SNAPSHOT_ACCOUNT_SERVER_MISMATCH`). Согласованность позиций: `position_symbols` — список непустых символов длиной ровно `open_positions`; `correlated_open_positions <= open_positions`; `open_stop_risk_fraction > 0` при `open_positions == 0` запрещён.
+
+Snapshot принимается, только если symbol совпадает, `request_binding_sha256` совпадает с заказом, tick size/value положительны, equity high-water mark не ниже текущей equity, day-start equity согласуется с `balance - daily_pnl` в обе стороны (сверху — `DAY_START_EQUITY_ABOVE_DAILY_PNL_IMPLIED_BALANCE`, снизу — `DAY_START_EQUITY_MISMATCH`), а `risk_value`, `risk_fraction`, `daily_loss_fraction` и `drawdown_fraction` отличаются от пересчитанных не более чем на 1% (`RISK_*_DOES_NOT_MATCH_*`). Нечисловые/`NaN`/`Infinity` значения и отсутствующая tick-спецификация, пустая symbol group, отсутствующая идентичность счёта или нулевая equity/balance-база — DENY, а не допуск. Лимиты применяются проспективно и аддитивно: `daily_loss_fraction + open_stop_risk_fraction + risk_fraction` не должен превышать дневной лимит, а `drawdown_fraction + open_stop_risk_fraction + risk_fraction` — лимит просадки. RR-порог проверяется безусловно (в том числе для flat-снимка) по пересчитанному из SL/TP значению с допуском 1% к заявленному. Комиссии, спред и гэп-риск в эту оценку не входят; их должен проверять исполнительный слой.
 
 ## False certainty rate
 

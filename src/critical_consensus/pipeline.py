@@ -110,9 +110,31 @@ def _validate_verdict_metadata(
 def review_attestation_payload(bundle: Mapping[str, Any]) -> dict[str, Any]:
     """The exact review-service view a review attestation must cover."""
     return {"signal_id": bundle.get("signal_id"),
+            "verdicts": bundle.get("verdicts"),
             "peer_reviews": bundle.get("peer_reviews"),
             "challenge_records": bundle.get("challenge_records"),
             "chief_reasoning": bundle.get("chief_reasoning")}
+
+
+def permission_tombstone_scope(request: Mapping[str, Any]) -> str:
+    """Server-derived identity of the approved order.
+
+    Caller-chosen fields (permission_id, expiry, timestamps) are excluded so that renaming or
+    re-issuing a permission cannot reset the once-per-order authorization tombstone.
+    """
+    sl_tp = request.get("sl_tp")
+    if not isinstance(sl_tp, Mapping):
+        raise EvidenceError("permission request has no SL/TP geometry")
+    return canonical_hash({
+        "signal_id": str(request.get("signal_id", "")).strip(),
+        "instrument": str(request.get("instrument", "")).strip().upper(),
+        "direction": str(request.get("direction", "")).strip().upper(),
+        "size": request.get("size"),
+        "expected_price": request.get("expected_price"),
+        "sl": sl_tp.get("sl"),
+        "tp": sl_tp.get("tp"),
+        "mode": str(request.get("mode", "")).strip().lower(),
+    })
 
 
 def evaluate_signal_bundle(
@@ -778,6 +800,16 @@ def evaluate_signal_bundle(
         if (approved_permission_hash is None
                 or user_decision.get("permission_request_sha256") != approved_permission_hash):
             decision_binding_blockers.append("USER_DECISION_PERMISSION_HASH_MISMATCH")
+        # The human must have approved the terminal snapshot the risk gate actually validated;
+        # a decision signed against a different (or absent) snapshot is not this authorization.
+        try:
+            validated_snapshot_hash = (canonical_hash(dict(terminal_risk_snapshot))
+                                       if isinstance(terminal_risk_snapshot, Mapping) else None)
+        except (TypeError, ValueError):
+            validated_snapshot_hash = None
+        if (validated_snapshot_hash is None
+                or user_decision.get("risk_snapshot_sha256") != validated_snapshot_hash):
+            decision_binding_blockers.append("USER_DECISION_RISK_SNAPSHOT_MISMATCH")
         if decision_binding_blockers:
             emit("USER_AUTHORIZATION", {"signal_id": signal_id, "status": "DENY",
                                         "blockers": decision_binding_blockers})
@@ -817,11 +849,20 @@ def evaluate_signal_bundle(
         return finish("REQUIRE_HUMAN", [], certainty=certainty, chief=chief, permission=permission,
                       human_review_packet=human_review_packet,
                       message="Human review is required; no order command has been created.")
+    try:
+        order_scope = permission_tombstone_scope(req)
+    except (TypeError, ValueError):
+        emit("USER_AUTHORIZATION", {"signal_id": signal_id, "status": "DENY",
+                                    "blockers": ["AUTHORIZATION_ORDER_SCOPE_INVALID"]})
+        return finish("DENY", ["AUTHORIZATION_ORDER_SCOPE_INVALID"], certainty=certainty,
+                      chief=chief, permission=permission)
     authorization = user_authorization_gate(
         permission, user_decision, now=current, nonce_store=authorization_store,
+        order_scope=order_scope,
     )
     emit("USER_AUTHORIZATION", {"signal_id": signal_id, "status": authorization.get("status"),
                                  "permission_id": authorization.get("permission_id"),
+                                 "order_scope": authorization.get("order_scope"),
                                  "blockers": authorization.get("blockers", [])})
     if authorization.get("authorized") is True:
         return finish("AUTHORIZED_ONCE", [], certainty=certainty, chief=chief, permission=permission,

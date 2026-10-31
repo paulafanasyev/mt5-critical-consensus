@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hmac
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -59,6 +60,11 @@ def _bridge_token_reuses_signing_key(token: str) -> str | None:
     return _secret_reuses_signing_key(token)
 
 
+def _header_safe(token: str, min_length: int) -> bool:
+    """A credential placed in an HTTP header must be printable ASCII with no separators."""
+    return re.fullmatch(rf"[A-Za-z0-9._~-]{{{min_length},256}}", token) is not None
+
+
 def _kill_switch_admin_reuses_secret(token: str) -> str | None:
     """The emergency-stop disable secret must be independent of every request credential."""
     bridge = os.getenv("MT5_BRIDGE_TOKEN", "")
@@ -70,7 +76,7 @@ def _kill_switch_admin_reuses_secret(token: str) -> str | None:
 def require_bridge_key(x_bridge_key: str | None = Header(default=None, alias="X-Bridge-Key")) -> None:
     """Shared-secret transport gate for the localhost bridge; not a user-signature verifier."""
     expected = os.getenv("MT5_BRIDGE_TOKEN", "")
-    if len(expected) < 24:
+    if not _header_safe(expected, 24):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Bridge authentication is not configured; protected API disabled",
@@ -87,7 +93,7 @@ def require_bridge_key(x_bridge_key: str | None = Header(default=None, alias="X-
 
 app = FastAPI(
     title="Critical Consensus Policy API",
-    version="0.3.0",
+    version="0.4.0",
     description="Policy checks only; order execution is disabled in this reference scaffold.",
 )
 
@@ -193,7 +199,7 @@ def health() -> dict[str, Any]:
     """Non-sensitive liveness endpoint; reports the execution state, never credentials."""
     bridge_token = os.getenv("MT5_BRIDGE_TOKEN", "")
     bridge_token_distinct = bool(bridge_token) and _bridge_token_reuses_signing_key(bridge_token) is None
-    bridge_ready = len(bridge_token) >= 24 and bridge_token_distinct
+    bridge_ready = _header_safe(bridge_token, 24) and bridge_token_distinct
     evidence_key = os.getenv("MT5_EVIDENCE_HMAC_KEY", "")
     governance_key = os.getenv("MT5_GOVERNANCE_HMAC_KEY", "")
     operator_key = os.getenv("MT5_OPERATOR_HMAC_KEY", "")
@@ -356,7 +362,9 @@ def review_chief(body: SignedPayload) -> dict[str, Any]:
     _assert_separated_domains()
     payload = _verified_payload(body)
     _require_review_attestation(payload)
-    return chief_skeptic_pass(payload)
+    # The attestation covers the whole review view; only the verified reasoning is evaluated,
+    # never the flat bundle itself (which would otherwise carry unattested top-level fields).
+    return chief_skeptic_pass(payload.get("chief_reasoning"))
 
 
 @app.post("/v1/permission/check", dependencies=[Depends(require_bridge_key)])
@@ -386,7 +394,7 @@ def update_kill_switch(
     """Activate the emergency stop with bridge auth; disabling additionally requires a separate admin secret."""
     if not body.active:
         expected = os.getenv("MT5_KILL_SWITCH_ADMIN_TOKEN", "")
-        if len(expected) < 32:
+        if not _header_safe(expected, 32):
             raise HTTPException(status_code=503, detail="Separate kill-switch admin token is not configured; switch cannot be disabled")
         reused = _kill_switch_admin_reuses_secret(expected)
         if reused:

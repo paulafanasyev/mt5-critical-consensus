@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture a read-only MT5 account-risk snapshot for one exact proposed request."""
+"""Capture an order-free MT5 account-risk snapshot for one exact proposed request."""
 from __future__ import annotations
 
 import argparse

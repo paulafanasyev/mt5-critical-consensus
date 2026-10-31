@@ -16,6 +16,10 @@ whose message must survive are pinned as complete ``if (<cond>) { <body> }`` sta
 compared with whitespace removed, so a branch cannot be neutralised while its text stays
 in place, and a parenthesised boolean literal used as a term (``&& (false)``) is rejected
 outright because it disables the surrounding expression without deleting any predicate.
+Because a matching statement could also be an unreachable copy, each pinned guard must
+appear exactly once inside its function and ahead of the send or the last success return;
+values the guards validate (stops, URLs, the expiry clock, the approval flag) are likewise
+pinned where they are consumed, not only where they are checked.
 
 A Python reference model of the EA's flat-object parser is exercised against the shared
 fixtures in ``config/mql5_flat_object_cases.json``. The fixtures are bound to the EA in
@@ -125,8 +129,9 @@ def _scan_to(source: str, start: int, target: str) -> int:
 
 def _required_checks() -> dict[str, str]:
     return {
-        # Fail-closed switches and the demo-only account gate.
-        "demo execution disabled by default": r"input\s+bool\s+EnableDemoExecution\s*=\s*false\s*;",
+        # Fail-closed switches and the demo-only account gate. Demo execution is a compile-time
+        # constant, so no chart input, preset or template can enable it.
+        "demo execution is compile-time disabled": r"const\s+bool\s+ENABLE_DEMO_EXECUTION\s*=\s*false\s*;",
         "live execution switch disabled by default": r"input\s+bool\s+AllowLiveExecution\s*=\s*false\s*;",
         "demo account comparison direction": (
             r"AccountInfoInteger\s*\(\s*ACCOUNT_TRADE_MODE\s*\)\s*!=\s*ACCOUNT_TRADE_MODE_DEMO\s*\)"
@@ -135,7 +140,7 @@ def _required_checks() -> dict[str, str]:
             r"if\s*\(\s*!TerminalInfoInteger\s*\(\s*TERMINAL_TRADE_ALLOWED\s*\)\s*\|\|\s*"
             r"!AccountInfoInteger\s*\(\s*ACCOUNT_TRADE_ALLOWED\s*\)\s*\)"
         ),
-        "demo/live execution gate": r"if\s*\(\s*!EnableDemoExecution\s*\|\|\s*AllowLiveExecution\s*\)",
+        "demo/live execution gate": r"if\s*\(\s*!ENABLE_DEMO_EXECUTION\s*\|\|\s*AllowLiveExecution\s*\)",
         "approval gate includes user approval": (
             r"if\s*\(\s*mode\s*!=\s*\"demo\"\s*\|\|\s*decision\s*!=\s*\"APPROVE\"\s*\|\|\s*!\s*user_approved\s*\)"
         ),
@@ -150,12 +155,33 @@ def _required_checks() -> dict[str, str]:
         "command TTL upper bound comparison": (
             r"if\s*\(\s*expires_raw\s*>\s*now_epoch\s*\+\s*MaxCommandTtlSeconds\s*\)"
         ),
+        # The whole expiry/TTL comparison chain is relative to this one clock read. A shifted
+        # origin (TimeGMT() - 315360000) silently resurrects year-old commands.
+        "expiry clock origin is the terminal GMT time": (
+            r"double\s+now_epoch\s*=\s*\(\s*double\s*\)\s*TimeGMT\s*\(\s*\)\s*;"
+        ),
         "command TTL default": r"input\s+double\s+MaxCommandTtlSeconds\s*=\s*600\s*;",
         "volume cap comparison": r"volume\s*>\s*MaxVolume\s*\|\|",
         "volume cap is positive": r"volume\s*<=\s*0\s*\|\|\s*volume\s*>\s*MaxVolume",
         "volume cap default": r"input\s+double\s+MaxVolume\s*=\s*0\.20\s*;",
         "protective stop-loss and take-profit validation": (
             r"sl\s*<=\s*0\s*\|\|\s*tp\s*<=\s*0\s*\|\|\s*expected_price\s*<=\s*0\s*\)"
+        ),
+        # Validation without binding is useless: the checked locals must reach the order
+        # request itself. Pinned to the exact NormalizeDouble(<local>, digits) form so a
+        # detached or zeroed stop cannot satisfy the invariant.
+        "protective stop-loss is bound to the order request": (
+            r"request\.sl\s*=\s*NormalizeDouble\s*\(\s*sl\s*,\s*digits\s*\)\s*;"
+        ),
+        "protective take-profit is bound to the order request": (
+            r"request\.tp\s*=\s*NormalizeDouble\s*\(\s*tp\s*,\s*digits\s*\)\s*;"
+        ),
+        # Volume and direction are validated as locals too; the request must consume those
+        # exact values, never a second read or a fixed side.
+        "validated volume is bound to the order request": r"request\.volume\s*=\s*volume\s*;",
+        "validated direction selects the order type": (
+            r"request\.type\s*=\s*\(\s*direction\s*==\s*\"BUY\"\s*\)\s*\?\s*"
+            r"ORDER_TYPE_BUY\s*:\s*ORDER_TYPE_SELL\s*;"
         ),
         # Slippage is measured against the symbol point, never a raw price.
         "slippage guard uses point value": (
@@ -231,12 +257,20 @@ def _required_checks() -> dict[str, str]:
         # Bridge transport.
         "localhost bridge default": r"http://127\.0\.0\.1:8000/v1/execution/next",
         "kill-switch endpoint configured": r"KillSwitchUrl",
+        # Only the two URLs OnInit validates may be sent to. An extra input (or local) that
+        # bypasses IsLoopbackHttpUrl would otherwise reach an arbitrary host.
+        "command web request targets BridgeUrl": (
+            r'WebRequest\s*\(\s*"GET"\s*,\s*BridgeUrl\s*,'
+        ),
+        "kill-switch web request targets KillSwitchUrl": (
+            r'WebRequest\s*\(\s*"GET"\s*,\s*KillSwitchUrl\s*,'
+        ),
         "kill-switch HTTP 200 required": r"if\s*\(\s*code\s*!=\s*200\s*\)",
         "kill-switch field must be present": r'KeyInList\s*\(\s*"kill_switch_active"\s*\)',
         "kill-switch response must explicitly be false": r'JsonFalse\s*\(\s*"kill_switch_active"\s*\)',
         "command fetch fail-closed status": r"if\s*\(\s*code\s*!=\s*200\s*\)",
         "command fetch empty-body guard": r"StringLen\s*\(\s*body\s*\)\s*<\s*10",
-        "live-path remains blocked": r"if\s*\(\s*!EnableDemoExecution\s*\|\|\s*AllowLiveExecution\s*\)",
+        "live-path remains blocked": r"if\s*\(\s*!ENABLE_DEMO_EXECUTION\s*\|\|\s*AllowLiveExecution\s*\)",
         # Parser and slots.
         "strict flat-object JSON validation": r"bool\s+ValidateFlatObject\s*\(",
         # The single-brace-pair check up front is what makes the two in-loop
@@ -257,6 +291,16 @@ def _required_checks() -> dict[str, str]:
         # false), so the whole return expression is pinned, not just its left-hand side.
         "JsonBoolExact resolves the exact type slots": (
             r"return\s+g_validated_types\[index\]\s*==\s*\(\s*wanted\s*\?\s*3\s*:\s*4\s*\)\s*;"
+        ),
+        # The wrappers are the only callers that pin the wanted polarity for
+        # user_approved / kill_switch_active, so their complete bodies are pinned here.
+        "JsonTrue wrapper calls JsonBoolExact with true": (
+            r"bool\s+JsonTrue\s*\(\s*const\s+string\s+key\s*\)\s*\{\s*"
+            r"return\s+JsonBoolExact\s*\(\s*key\s*,\s*true\s*\)\s*;\s*\}"
+        ),
+        "JsonFalse wrapper calls JsonBoolExact with false": (
+            r"bool\s+JsonFalse\s*\(\s*const\s+string\s+key\s*\)\s*\{\s*"
+            r"return\s+JsonBoolExact\s*\(\s*key\s*,\s*false\s*\)\s*;\s*\}"
         ),
         # The parser writes the same mapping; swapping it would make JsonFalse accept an active
         # kill switch (a literal true stored as slot type 4).
@@ -339,6 +383,12 @@ def _forbidden_checks() -> dict[str, str]:
         "condition forced with true": r"if\s*\(\s*true\s*\)",
         "identifier alphabet weakened with a negation": r"if\s*\(\s*!\s*allowed\s*&&",
         "approval flag reassigned outside its declaration": r"(?m)^[ \t]*user_approved\s*=",
+        # Same-line reassignment is caught by the token-level structural check too, so the
+        # line-anchored form above is only the first line of defence.
+        "extra URL input variable declared": (
+            r'(?m)^[ \t]*input\s+string\s+(?!BridgeUrl\b|KillSwitchUrl\b)\w+\s*=\s*"http'
+        ),
+        "expiry clock shifted away from the current time": r"TimeGMT\s*\(\s*\)\s*[-+]",
         "return filling fallback restored": r"ORDER_FILLING_RETURN",
         "truncating idempotency key restored": r"SanitizeKeyPart|IdempotencyKey",
         "void OnInit signature restored": r"^void\s+OnInit",
@@ -446,6 +496,35 @@ def _has_if_block(blocks: list[str], expected: str) -> bool:
     return _squeeze(expected) in blocks
 
 
+def _pinned_guard(scope: str, blocks: list[str], expected: str, marker: str | None = None,
+                  anchor: str = "first") -> bool:
+    """A guard must appear exactly once in ``scope``, and before ``marker`` when given.
+
+    ``_has_if_block`` alone only proves that the statement exists *somewhere*: deleting the
+    real guard and appending an unreachable copy after the success return keeps the text but
+    leaves the path unguarded. Counting the exact statement inside the function and requiring
+    it to precede the send (or the last success return) closes that gap.
+    """
+    if not _has_if_block(blocks, expected):
+        return False
+    key = _squeeze(expected)
+    squashed = _squeeze(scope)
+    if not key or squashed.count(key) != 1:
+        return False
+    if marker is None:
+        return True
+    marker_key = _squeeze(marker)
+    position = squashed.rfind(marker_key) if anchor == "last" else squashed.find(marker_key)
+    return position >= 0 and squashed.find(key) < position
+
+
+def _flat_function_body(source: str, name: str, return_type: str = "bool") -> str | None:
+    """Body of a function whose braces are not nested, e.g. the one-line Json wrappers."""
+    match = re.search(rf"\b{re.escape(return_type)}\s+{name}\s*\([^)]*\)\s*\{{([^{{}}]*)\}}",
+                      source)
+    return match.group(1) if match else None
+
+
 def _mask_string_literals(source: str) -> str:
     """Blank out string/char literal contents, preserving offsets, so literals cannot match."""
     out: list[str] = []
@@ -474,17 +553,18 @@ def _mask_string_literals(source: str) -> str:
 
 
 def _parenthesised_literal_terms(source: str) -> list[str]:
-    """Parenthesised boolean literals used as terms, e.g. ``... && (false)``.
+    """Literal terms that neutralise or force a condition, e.g. ``... && (false)`` / ``&& 0``.
 
     A whole control condition such as ``while(true)`` is left to the dedicated dead-branch
     checks; a literal wrapped in parentheses anywhere inside an expression is a bypass, because
     it neutralises (or forces) the surrounding conjunction/disjunction while every required
-    sub-expression stays textually present. String literals are masked first so a message that
+    sub-expression stays textually present. Bare numeric/boolean terms after ``&&``/``||`` are
+    the same bypass without the parentheses. String literals are masked first so a message that
     mentions ``(false)`` cannot trip the check.
     """
     masked = _mask_string_literals(source)
     terms: list[str] = []
-    for match in re.finditer(r"\(\s*(?:true|false)\s*\)", masked):
+    for match in re.finditer(r"\(\s*(?:true|false|0|1)\s*\)", masked):
         before = masked[:match.start()].rstrip()
         after = masked[match.end():].lstrip()
         whole_condition = (
@@ -494,6 +574,8 @@ def _parenthesised_literal_terms(source: str) -> list[str]:
         )
         if not whole_condition:
             terms.append(match.group(0))
+    for match in re.finditer(r"(?:&&|\|\|)\s*(?:true|false|0|1)\b", masked):
+        terms.append(match.group(0))
     return terms
 
 
@@ -528,6 +610,11 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
     checks.append(("exactly one broker OrderCheck call", source.count("OrderCheck(") == 1))
     checks.append(("exactly two GET web requests",
                    source.count('WebRequest("GET"') == 2 and source.count("WebRequest(") == 2))
+    web_targets = re.findall(r'WebRequest\s*\(\s*"GET"\s*,\s*([A-Za-z_]\w*)\s*,', source)
+    checks.append(("web requests pass only the two validated URL inputs",
+                   sorted(web_targets) == ["BridgeUrl", "KillSwitchUrl"]))
+    checks.append(("the expiry clock is assigned exactly once",
+                   len(re.findall(r"\bnow_epoch\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)", source)) == 1))
     checks.append(("FNV multiply constant appears twice", source.count("hash *= 1099511628211;") == 2))
     checks.append(("OrderCheck precedes OrderSend", _after(source, "OrderCheck(request, check)", send)))
     checks.append(("command tombstone precedes OrderSend", _after(source, "GlobalVariableSet(command_key", send)))
@@ -538,7 +625,7 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
     checks.append(("demo account check precedes OrderSend",
                    _after(source, "ACCOUNT_TRADE_MODE_DEMO", send)))
     checks.append(("demo/live gate precedes OrderSend",
-                   _after(source, "if(!EnableDemoExecution || AllowLiveExecution)", send)))
+                   _after(source, "if(!ENABLE_DEMO_EXECUTION || AllowLiveExecution)", send)))
     checks.append(("symbol trading mode precedes OrderSend",
                    _after(source, "SYMBOL_TRADE_MODE_FULL", send)))
     checks.append(("slippage guard precedes OrderSend",
@@ -554,6 +641,7 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
                    ("IsLoopbackHttpUrl", "bool"), ("IsValidBridgeToken", "bool"),
                    ("IsSafeIdentifier", "bool"), ("IsJsonNumberToken", "bool"),
                    ("JsonString", "string"), ("JsonNumber", "double"), ("JsonBoolExact", "bool"),
+                   ("JsonTrue", "bool"), ("JsonFalse", "bool"),
                    ("FindValidatedKey", "int"), ("StoreValidatedValue", "void"),
                    ("CommandTombstoneKey", "string"), ("OrderTombstoneKey", "string"),
                    ("Fnv1aHex", "string"))
@@ -601,6 +689,11 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
                        re.search(r'StoreValidatedValue\s*\(\s*"', source) is None))
         checks.append(("validated slots are stored only by the parser",
                        len(re.findall(r"StoreValidatedValue\s*\(", source)) == 4))
+        # StoreValidatedValue appends the key itself. A hand-written append beside it leaves
+        # g_validated_keys one slot ahead of g_validated_values/types, so every lookup resolves
+        # the empty placeholder and the EA silently misreads every response.
+        checks.append(("validated key slots are appended only by StoreValidatedValue",
+                       "ArrayResize(g_validated_keys, ArraySize(" not in source))
         checks.append(("duplicate key rejection is inside ValidateFlatObject",
                        "DUPLICATE JSON KEY" in parser))
         checks.append(("number values use the strict token parser",
@@ -622,17 +715,23 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
                        "DUPLICATE JSON KEY" in parser
                        and parser.rindex("return true;") > parser.index("DUPLICATE JSON KEY")))
         # Presence of the message is not enforcement: each rejection must still be a whole
-        # `if (<predicate>) { error = "..."; return false; }` statement.
+        # `if (<predicate>) { error = "..."; return false; }` statement that sits on the
+        # reachable path, i.e. before the parser's last success return.
         checks.append(("parser rejects nested values in a complete fail-closed branch",
-                       _has_if_block(blocks, """if(c == '{' || c == '[') { error = "nested value rejected"; return false; }""")))
+                       _pinned_guard(parser, blocks, """if(c == '{' || c == '[') { error = "nested value rejected"; return false; }""",
+                                     "return true;", anchor="last")))
         checks.append(("parser rejects key escapes in a complete fail-closed branch",
-                       _has_if_block(blocks, r"""if(kc == '\\') { error = "escape sequences rejected"; return false; }""")))
+                       _pinned_guard(parser, blocks, r"""if(kc == '\\') { error = "escape sequences rejected"; return false; }""",
+                                     "return true;", anchor="last")))
         checks.append(("parser rejects value escapes in a complete fail-closed branch",
-                       _has_if_block(blocks, r"""if(vc == '\\') { error = "escape sequences rejected"; return false; }""")))
+                       _pinned_guard(parser, blocks, r"""if(vc == '\\') { error = "escape sequences rejected"; return false; }""",
+                                     "return true;", anchor="last")))
         checks.append(("parser rejects key control characters in a complete fail-closed branch",
-                       _has_if_block(blocks, """if(kc < 0x20) { error = "control character rejected"; return false; }""")))
+                       _pinned_guard(parser, blocks, """if(kc < 0x20) { error = "control character rejected"; return false; }""",
+                                     "return true;", anchor="last")))
         checks.append(("parser rejects value control characters in a complete fail-closed branch",
-                       _has_if_block(blocks, """if(vc < 0x20) { error = "control character rejected"; return false; }""")))
+                       _pinned_guard(parser, blocks, """if(vc < 0x20) { error = "control character rejected"; return false; }""",
+                                     "return true;", anchor="last")))
 
     lookups = {
         "JsonString": ("string", "return g_validated_values[index];", 1),
@@ -651,6 +750,14 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
         if slot_type is not None:
             checks.append((f"{name} enforces its value type",
                            f"g_validated_types[index] != {slot_type}" in body))
+
+    # The polarity of user_approved and kill_switch_active lives entirely in these two
+    # wrappers. Their whole body is compared, so flipping the wanted literal is caught.
+    for name, wanted in (("JsonTrue", "true"), ("JsonFalse", "false")):
+        body = _flat_function_body(source, name)
+        checks.append((f"{name} is exactly one JsonBoolExact(key, {wanted}) call",
+                       body is not None
+                       and _squeeze(body) == f"returnJsonBoolExact(key,{wanted});"))
 
     command = _function_body(source, "ExecuteDemoCommand")
     checks.append(("ExecuteDemoCommand function present", command is not None))
@@ -683,17 +790,58 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
         checks.append(("exactly one kill-switch re-read in the command path",
                        command.count("CheckKillSwitch()") == 1))
         checks.append(("the send result is checked", "if(!sent || (result.retcode" in command))
+        # The stops are validated as locals; they must also be the values handed to the
+        # broker, exactly once each, before the send.
+        checks.append(("exactly one protective stop-loss assignment to the request",
+                       len(re.findall(r"request\.sl\s*=(?!=)", source)) == 1))
+        checks.append(("exactly one protective take-profit assignment to the request",
+                       len(re.findall(r"request\.tp\s*=(?!=)", source)) == 1))
+        checks.append(("exactly one volume assignment to the request",
+                       len(re.findall(r"request\.volume\s*=(?!=)", source)) == 1))
+        checks.append(("exactly one order-type assignment to the request",
+                       len(re.findall(r"request\.type\s*=(?!=)", source)) == 1))
+        checks.append(("protective stops are bound before the send",
+                       _after(command, "request.sl = NormalizeDouble(sl, digits);", send)
+                       and _after(command, "request.tp = NormalizeDouble(tp, digits);", send)))
+        checks.append(("validated volume is bound before the send",
+                       _after(command, "request.volume = volume;", send)))
+        checks.append(("validated direction selects the type before the send",
+                       _after(command, 'request.type = (direction=="BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;',
+                              send)))
+        # ...and in the same straight-line run as the other request fields, so they cannot be
+        # moved inside a conditional that the normal path never enters.
+        checks.append(("protective stops sit in the unconditional request block",
+                       _squeeze("request.volume = volume;"
+                                'request.type = (direction=="BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;'
+                                "request.price = NormalizeDouble(live_price, digits);"
+                                "request.sl = NormalizeDouble(sl, digits);"
+                                "request.tp = NormalizeDouble(tp, digits);"
+                                "request.deviation = MaxSlippagePoints;") in _squeeze(command)))
+        # The approval flag is a one-shot derived value: any second assignment token, on any
+        # line and anywhere in the source, would let a caller force approval after validation.
+        checks.append(("approval flag is assigned only in its single declaration",
+                       len(re.findall(r"\buser_approved\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)", source)) == 1
+                       and len(re.findall(r"\bbool\s+user_approved\s*=(?!=)", source)) == 1))
+        # Every guard must be the one on the live path, before the send.
         checks.append(("the pre-send tombstone flush is fail-closed",
-                       _has_if_block(blocks, 'if(!GlobalVariablesFlush()) { Print("BLOCKED: cannot flush idempotency tombstones."); return false; }')))
+                       _pinned_guard(command, blocks, 'if(!GlobalVariablesFlush()) { Print("BLOCKED: cannot flush idempotency tombstones."); return false; }',
+                                     "bool sent = OrderSend(request, result);")))
         # The predicates alone are not enforcement: each gate must still be the complete
-        # statement whose body prints and returns, in one piece.
+        # statement whose body prints and returns, in one piece, ahead of the send.
         checks.append(("user approval gate is a complete fail-closed branch",
-                       _has_if_block(blocks, 'if(mode != "demo" || decision != "APPROVE" || !user_approved) '
-                                             '{ Print("BLOCKED: demo mode and explicit user approval are required."); return false; }')))
+                       _pinned_guard(command, blocks, 'if(mode != "demo" || decision != "APPROVE" || !user_approved) '
+                                                      '{ Print("BLOCKED: demo mode and explicit user approval are required."); return false; }',
+                                     "bool sent = OrderSend(request, result);")))
         checks.append(("identifier validation is a complete fail-closed branch",
-                       _has_if_block(blocks, 'if(!IsSafeIdentifier(command_id) || !IsSafeIdentifier(order_id) '
-                                             '|| !IsSafeIdentifier(symbol)) '
-                                             '{ Print("BLOCKED: command/order/symbol identifier contains unsupported characters."); return false; }')))
+                       _pinned_guard(command, blocks, 'if(!IsSafeIdentifier(command_id) || !IsSafeIdentifier(order_id) '
+                                                      '|| !IsSafeIdentifier(symbol)) '
+                                                      '{ Print("BLOCKED: command/order/symbol identifier contains unsupported characters."); return false; }',
+                                     "bool sent = OrderSend(request, result);")))
+        checks.append(("volume, SL, TP and expected price guard is a complete fail-closed branch",
+                       _pinned_guard(command, blocks, 'if(volume <= 0 || volume > MaxVolume || sl <= 0 '
+                                                      '|| tp <= 0 || expected_price <= 0) '
+                                                      '{ Print("BLOCKED: invalid volume/SL/TP/expected price."); return false; }',
+                                     "bool sent = OrderSend(request, result);")))
         checks.append(("order comment is bounded", "StringSubstr(order_id,0,20)" in command))
         checks.append(("ExecuteDemoCommand has exactly one success return",
                        command.count("return true;") == 1))
@@ -723,8 +871,9 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
         checks.append(("kill-switch response must contain the active flag",
                        'KeyInList("kill_switch_active")' in kill))
         checks.append(("kill-switch value check is a complete fail-closed branch",
-                       _has_if_block(blocks, 'if(!JsonFalse("kill_switch_active")) '
-                                             '{ Print("BLOCKED: kill switch is active or state is invalid."); return false; }')))
+                       _pinned_guard(kill, blocks, 'if(!JsonFalse("kill_switch_active")) '
+                                                   '{ Print("BLOCKED: kill switch is active or state is invalid."); return false; }',
+                                     "return true;")))
         checks.append(("CheckKillSwitch has exactly one success return", kill.count("return true;") == 1))
         checks.append(("CheckKillSwitch success return follows the active-state check",
                        kill.count("return true;") == 1 and 'JsonFalse("kill_switch_active")' in kill
@@ -799,7 +948,7 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
 
     checks += _guard_body_checks(source)
     literal_terms = _parenthesised_literal_terms(source)
-    checks.append(("parenthesised boolean literal term is forbidden", not literal_terms))
+    checks.append(("literal short-circuit term is forbidden", not literal_terms))
     return checks
 
 
@@ -807,7 +956,7 @@ def _structural_problems(source: str) -> list[str]:
     return [name for name, ok in _structural_checks(source) if not ok]
 
 
-MUTATIONS: dict[str, tuple[str, str]] = {
+MUTATIONS: dict[str, tuple[str, str] | tuple[tuple[str, str], ...]] = {
     "kill-switch recheck before send removed": (
         '   if(!CheckKillSwitch())\n   { Print("BLOCKED: kill switch changed before send."); return false; }\n',
         "",
@@ -972,6 +1121,12 @@ MUTATIONS: dict[str, tuple[str, str]] = {
         "StoreValidatedValue(key, number_token, 2);",
         'StoreValidatedValue("user_approved", "true", 3);',
     ),
+    "key slot appended by hand in the parser": (
+        "i++; // closing quote of the key",
+        "ArrayResize(g_validated_keys, ArraySize(g_validated_keys)+1);\n"
+        "      g_validated_keys[ArraySize(g_validated_keys)-1] = key;\n"
+        "      i++; // closing quote of the key",
+    ),
     "JsonBoolExact ternary collapses true and false": (
         "(wanted ? 3 : 4)",
         "(wanted ? 3 : 3)",
@@ -1031,6 +1186,64 @@ MUTATIONS: dict[str, tuple[str, str]] = {
         '   if(StringLen(BridgeToken) > 0 && !IsValidBridgeToken(BridgeToken))\n'
         '   {\n'
         '      Print("BLOCKED: BridgeToken is empty or not 24..256 characters of [A-Za-z0-9._~-]; refusing to initialize.");',
+    ),
+    # Round-7 counter-mutations: a validated value that is never bound, an inverted
+    # one-line wrapper, a shadow endpoint, a shifted clock and unreachable guard copies.
+    "protective stops detached from order request": (
+        "   request.sl = NormalizeDouble(sl, digits);\n"
+        "   request.tp = NormalizeDouble(tp, digits);\n",
+        "",
+    ),
+    "JsonTrue wrapper inverted": (
+        "bool JsonTrue(const string key) { return JsonBoolExact(key, true); }",
+        "bool JsonTrue(const string key) { return JsonBoolExact(key, false); }",
+    ),
+    "JsonFalse wrapper inverted": (
+        "bool JsonFalse(const string key) { return JsonBoolExact(key, false); }",
+        "bool JsonFalse(const string key) { return JsonBoolExact(key, true); }",
+    ),
+    "web request redirected to a shadow URL input": (
+        ('input string BridgeToken = "";',
+         'input string BridgeToken = "";\n'
+         'input string ShadowUrl = "http://10.1.2.3:9999/v1/execution/next";'),
+        ('int code = WebRequest("GET", BridgeUrl, headers, 3000, data, result, result_headers);',
+         'int code = WebRequest("GET", ShadowUrl, headers, 3000, data, result, result_headers);'),
+    ),
+    "expiry clock shifted backwards": (
+        "double now_epoch = (double)TimeGMT();",
+        "double now_epoch = (double)TimeGMT() - 315360000.0;",
+    ),
+    "approval flag reassigned on the same line": (
+        '   bool user_approved = JsonTrue("user_approved");',
+        '   bool user_approved = JsonTrue("user_approved"); user_approved = true;',
+    ),
+    "user approval guard copied to unreachable code": (
+        ('if(mode != "demo" || decision != "APPROVE" || !user_approved)',
+         'if(mode != "demo" || decision != "APPROVE")'),
+        ('         " order_id=",order_id," order=",result.order," deal=",result.deal," retcode=",result.retcode);\n'
+         '   return true;\n}',
+         '         " order_id=",order_id," order=",result.order," deal=",result.deal," retcode=",result.retcode);\n'
+         '   return true;\n'
+         '   if(mode != "demo" || decision != "APPROVE" || !user_approved)\n'
+         '   { Print("BLOCKED: demo mode and explicit user approval are required."); return false; }\n}'),
+    ),
+    # Round-8 counter-mutations: a chart input that can re-enable execution, a neutralised
+    # sizing/stops guard, and validated locals that never reach the request.
+    "demo execution enabled at compile time": (
+        "const bool ENABLE_DEMO_EXECUTION = false;",
+        "const bool ENABLE_DEMO_EXECUTION = true;",
+    ),
+    "volume/SL/TP guard disabled with a short-circuit literal": (
+        "if(volume <= 0 || volume > MaxVolume || sl <= 0 || tp <= 0 || expected_price <= 0)",
+        "if((volume <= 0 || volume > MaxVolume || sl <= 0 || tp <= 0 || expected_price <= 0) && 0)",
+    ),
+    "volume assignment detached from the request": (
+        "   request.volume = volume;\n",
+        "",
+    ),
+    "order type direction inverted": (
+        'request.type = (direction=="BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;',
+        'request.type = (direction=="BUY") ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;',
     ),
 }
 
@@ -1096,12 +1309,13 @@ MUTATION_EXPECTATIONS: dict[str, str] = {
     "number leading-zero guard removed": "number token rejects a leading zero",
     "literal-key slot forged inside the parser": "ValidateFlatObject stores exactly three validated values",
     "parsed key replaced by a literal slot key": "validated slots are never stored under a literal key",
+    "key slot appended by hand in the parser": "validated key slots are appended only by StoreValidatedValue",
     "JsonBoolExact ternary collapses true and false": "JsonBoolExact resolves the exact type slots",
     "parser boolean slot types swapped": "parser stores true as slot type 3 and false as slot type 4",
-    "kill-switch value check disabled with a parenthesised literal": "parenthesised boolean literal term is forbidden",
-    "user approval forced with a parenthesised literal": "parenthesised boolean literal term is forbidden",
+    "kill-switch value check disabled with a parenthesised literal": "literal short-circuit term is forbidden",
+    "user approval forced with a parenthesised literal": "literal short-circuit term is forbidden",
     "approval flag reassigned after validation": "approval flag reassigned outside its declaration",
-    "identifier validation disabled with a parenthesised literal": "parenthesised boolean literal term is forbidden",
+    "identifier validation disabled with a parenthesised literal": "literal short-circuit term is forbidden",
     "nested-value rejection keeps the message but stops returning": "parser rejects nested values in a complete fail-closed branch",
     "escape rejection keeps the message but stops returning": "parser rejects value escapes in a complete fail-closed branch",
     "control-character rejection keeps the message but stops returning": "parser rejects key control characters in a complete fail-closed branch",
@@ -1109,6 +1323,17 @@ MUTATION_EXPECTATIONS: dict[str, str] = {
     "user approval gate keeps the message but stops returning": "user approval gate is a complete fail-closed branch",
     "identifier validation keeps the message but stops returning": "identifier validation is a complete fail-closed branch",
     "empty token accepted at init": "OnInit requires a configured bridge token before starting the timer",
+    "protective stops detached from order request": "protective stop-loss is bound to the order request",
+    "JsonTrue wrapper inverted": "JsonTrue wrapper calls JsonBoolExact with true",
+    "JsonFalse wrapper inverted": "JsonFalse wrapper calls JsonBoolExact with false",
+    "web request redirected to a shadow URL input": "command web request targets BridgeUrl",
+    "expiry clock shifted backwards": "expiry clock origin is the terminal GMT time",
+    "approval flag reassigned on the same line": "approval flag is assigned only in its single declaration",
+    "user approval guard copied to unreachable code": "user approval gate is a complete fail-closed branch",
+    "demo execution enabled at compile time": "demo execution is compile-time disabled",
+    "volume/SL/TP guard disabled with a short-circuit literal": "literal short-circuit term is forbidden",
+    "volume assignment detached from the request": "validated volume is bound to the order request",
+    "order type direction inverted": "validated direction selects the order type",
 }
 
 
@@ -1320,16 +1545,30 @@ def _fixture_parser_parity(cases: dict) -> list[str]:
     return problems
 
 
+def _mutation_edits(spec) -> tuple[tuple[str, str], ...]:
+    """Normalise a catalogue entry to the list of (old, new) edits it performs.
+
+    A single pair is one edit; a tuple of pairs models a counter-mutation that needs two
+    coordinated changes (e.g. declare a shadow input and point the request at it).
+    """
+    if isinstance(spec[0], str):
+        return (spec,)
+    return tuple((old, new) for old, new in spec)
+
+
 def self_test(source: str) -> list[str]:
     """Prove the checker rejects each known bypass for the expected reason."""
     problems: list[str] = []
     if set(MUTATIONS) != set(MUTATION_EXPECTATIONS):
         problems.append("mutation catalogue and expectations differ")
-    for name, (old, new) in MUTATIONS.items():
-        if old not in source:
+    for name, spec in MUTATIONS.items():
+        edits = _mutation_edits(spec)
+        if any(old not in source for old, _ in edits):
             problems.append(f"mutation anchor missing: {name}")
             continue
-        mutated = source.replace(old, new, 1)
+        mutated = source
+        for old, new in edits:
+            mutated = mutated.replace(old, new, 1)
         failures, _ = check_source(mutated)
         expected = MUTATION_EXPECTATIONS.get(name, "")
         if not failures:

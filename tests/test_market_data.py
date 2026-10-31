@@ -40,6 +40,10 @@ def test_bar_rejects_impossible_ohlc_and_nonfinite_values():
         MarketBar("EURUSD", "H1", stamp, 1.2, 1.1, 1.0, 1.15)
     with pytest.raises(ValueError, match="finite"):
         MarketBar("EURUSD", "H1", stamp, 1.0, float("nan"), 0.9, 0.95)
+    with pytest.raises(ValueError, match="positive"):
+        MarketBar("EURUSD", "H1", stamp, 0.0, 1.1, 0.9, 1.0)
+    with pytest.raises(ValueError, match="positive"):
+        MarketBar("EURUSD", "H1", stamp, 1.0, 1.1, -0.5, 1.0)
 
 
 def test_naive_mt5_export_requires_explicit_server_timezone(tmp_path):

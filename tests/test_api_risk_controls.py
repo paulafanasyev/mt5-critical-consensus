@@ -43,6 +43,7 @@ def risk_snapshot_for(bundle, now):
     request = bundle["permission_request"]
     return {
         "status": "PASS", "observed_at": now.isoformat(), "account_mode": "demo",
+        "account_login": 5000001, "account_server": "Demo-Server",
         "symbol": request["instrument"], "symbol_group": "fx-major",
         "account_equity": 10000.0, "account_balance": 10000.0, "daily_pnl": 0.0,
         "day_start_equity": 10000.0, "equity_high_watermark": 10200.0,
@@ -51,6 +52,7 @@ def risk_snapshot_for(bundle, now):
         "reference_price": request["expected_price"],
         "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0196,
         "open_positions": 1, "correlated_open_positions": 0, "open_stop_risk_fraction": 0.0,
+        "position_symbols": [request["instrument"]],
         "request_binding_sha256": risk_request_binding_hash(request),
         "within_high_impact_news_window": False,
     }

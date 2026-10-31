@@ -5,7 +5,9 @@
 input string BridgeUrl = "http://127.0.0.1:8000/v1/execution/next";
 input string KillSwitchUrl = "http://127.0.0.1:8000/v1/risk/kill-switch";
 input string BridgeToken = ""; // For local testing only; use a proper secret manager/short-lived signing in production.
-input bool EnableDemoExecution = false;
+// Compile-time constant, not a chart input: the demo path cannot be enabled by a setting or
+// a preset/template. Enabling it requires a deliberate source change and recompile.
+const bool ENABLE_DEMO_EXECUTION = false;
 input bool AllowLiveExecution = false; // Template intentionally does not permit live execution even if set true.
 input int PollSeconds = 3;
 input int MaxSlippagePoints = 20;
@@ -145,8 +147,9 @@ bool ValidateFlatObject(const string json, string &error)
          error = "DUPLICATE JSON KEY: " + key;
          return false;
       }
-      ArrayResize(g_validated_keys, ArraySize(g_validated_keys)+1);
-      g_validated_keys[ArraySize(g_validated_keys)-1] = key;
+      // StoreValidatedValue is the only place a validated slot is appended: appending the key
+      // here as well would misalign the keys/values/types arrays and every lookup would read
+      // the placeholder slot instead of the parsed value.
       i++; // closing quote of the key
 
       SkipJsonWs(s, i, n);
@@ -452,7 +455,7 @@ bool ExecuteDemoCommand(const string body)
    { Print("BLOCKED: account is not demo. This EA does not execute live trades."); return false; }
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
    { Print("BLOCKED: terminal or account trading is not allowed."); return false; }
-   if(!EnableDemoExecution || AllowLiveExecution)
+   if(!ENABLE_DEMO_EXECUTION || AllowLiveExecution)
    { Print("BLOCKED: demo execution is disabled, or live mode was requested."); return false; }
    if(expires_raw <= 0 || MathFloor(expires_raw) != expires_raw)
    { Print("BLOCKED: expires_at_epoch is not a positive whole number."); return false; }
@@ -576,7 +579,7 @@ int OnInit()
       return(INIT_FAILED);
    }
    EventSetTimer((int)MathMax(1, PollSeconds));
-   Print("CriticalConsensusEA initialized. Demo execution default is disabled. Add bridge URL to MT5 WebRequest allowlist.");
+   Print("CriticalConsensusEA initialized. Demo execution is compile-time disabled. Add bridge URL to MT5 WebRequest allowlist.");
    return(INIT_SUCCEEDED);
 }
 

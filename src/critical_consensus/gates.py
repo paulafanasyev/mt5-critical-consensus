@@ -984,7 +984,8 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
     if not isinstance(risk, Mapping):
         blockers.append("RISK_SNAPSHOT_MISSING")
         risk = {}
-    required_risk_fields = ("risk_fraction", "daily_loss_fraction", "drawdown_fraction", "open_positions", "correlated_open_positions")
+    required_risk_fields = ("risk_fraction", "daily_loss_fraction", "drawdown_fraction",
+                            "open_stop_risk_fraction", "open_positions", "correlated_open_positions")
     missing_risk = [key for key in required_risk_fields if risk.get(key) is None]
     if missing_risk:
         blockers.append("RISK_SNAPSHOT_FIELDS_MISSING:" + ",".join(missing_risk))
@@ -998,14 +999,20 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
         for key, value in risk_values.items():
             if value is None or value < 0 or value > 1 or risk_limits[key] is None or risk_limits[key] < 0 or risk_limits[key] > 1:
                 blockers.append(f"INVALID_RISK_VALUE:{key}")
-        # Open positions carry committed stop risk that is not yet realised. Ignoring it
-        # would let several individually-small orders breach the session caps together.
+        # Open positions carry committed stop risk that is not yet realised. It adds to the
+        # realised loss, so several individually-small open orders cannot jointly breach the
+        # session caps. A present-but-unusable value is a blocker, not an implicit zero.
         open_stop_risk = _finite_float(risk.get("open_stop_risk_fraction"))
-        if open_stop_risk is not None and not 0 <= open_stop_risk <= 1:
+        if risk.get("open_stop_risk_fraction") is not None and open_stop_risk is None:
+            blockers.append("INVALID_RISK_VALUE:open_stop_risk_fraction")
+        elif open_stop_risk is not None and not 0 <= open_stop_risk <= 1:
             blockers.append("INVALID_RISK_VALUE:open_stop_risk_fraction")
             open_stop_risk = None
-        effective_daily_loss = max(risk_values["daily_loss_fraction"], open_stop_risk)             if risk_values["daily_loss_fraction"] is not None and open_stop_risk is not None             else risk_values["daily_loss_fraction"]
-        effective_drawdown = max(risk_values["drawdown_fraction"], open_stop_risk)             if risk_values["drawdown_fraction"] is not None and open_stop_risk is not None             else risk_values["drawdown_fraction"]
+        exposure = open_stop_risk or 0.0
+        effective_daily_loss = (risk_values["daily_loss_fraction"] + exposure
+                                if risk_values["daily_loss_fraction"] is not None else None)
+        effective_drawdown = (risk_values["drawdown_fraction"] + exposure
+                              if risk_values["drawdown_fraction"] is not None else None)
         if risk_values["risk_fraction"] is not None and risk_limits["risk_fraction"] is not None and risk_values["risk_fraction"] > risk_limits["risk_fraction"]:
             blockers.append("RISK_PER_TRADE_LIMIT_EXCEEDED")
         if effective_daily_loss is not None and risk_limits["daily_loss_fraction"] is not None and effective_daily_loss >= risk_limits["daily_loss_fraction"]:
@@ -1098,7 +1105,8 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
 def user_authorization_gate(permission_result: Mapping[str, Any], decision: Mapping[str, Any], *,
                             now: datetime | None = None, max_ttl_seconds: int = 600,
                             max_future_skew_seconds: int = 30,
-                            nonce_store: Any | None = None) -> dict[str, Any]:
+                            nonce_store: Any | None = None,
+                            order_scope: str | None = None) -> dict[str, Any]:
     """Validate one-time authorization metadata; does not sign or dispatch an order.
 
     The nonce is consumed atomically through ``nonce_store``. Without a store the
@@ -1175,9 +1183,20 @@ def user_authorization_gate(permission_result: Mapping[str, Any], decision: Mapp
         # A fresh nonce must not buy a second authorization for an already-used permission.
         return {"status": "DENY", "authorized": False,
                 "blockers": ["AUTHORIZATION_PERMISSION_STORE_REQUIRED"], "trade_allowed": False}
+    # The tombstone key must identify the order, not a caller-chosen permission_id: a client
+    # could otherwise authorize the identical order twice with two different labels. Callers
+    # that can derive an order identity server-side pass it as ``order_scope``.
+    if order_scope is not None:
+        if (not isinstance(order_scope, str) or not order_scope.strip()
+                or order_scope != order_scope.strip()):
+            return {"status": "DENY", "authorized": False,
+                    "blockers": ["AUTHORIZATION_ORDER_SCOPE_INVALID"], "trade_allowed": False}
+        permission_key = order_scope
+    else:
+        permission_key = str(permission_result.get("permission_id")).strip()
     try:
         permission_consumed = permission_store.consume_permission(
-            permission_id=str(permission_result.get("permission_id")).strip(),
+            permission_id=permission_key,
             expires_at=permission_expires if permission_expires is not None else current,
             now=current,
         )
@@ -1190,6 +1209,7 @@ def user_authorization_gate(permission_result: Mapping[str, Any], decision: Mapp
     return {"status": "ALLOW_ONCE", "authorized": True, "blockers": [],
             "user_id": decision.get("user_id"), "timestamp": decision.get("timestamp"),
             "decision_id": decision.get("decision_id"), "nonce_consumed": True,
-            "permission_id": decision.get("permission_id"), "trade_allowed": False,
+            "permission_id": decision.get("permission_id"), "order_scope": permission_key,
+            "trade_allowed": False,
             "note": "One-time authorization metadata only; execution must revalidate signature, expiry, current price, SL/TP and idempotency."}
 

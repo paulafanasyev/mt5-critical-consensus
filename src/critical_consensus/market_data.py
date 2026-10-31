@@ -1,4 +1,4 @@
-"""Read-only MetaTrader 5 market data adapters.
+"""Order-free MetaTrader 5 market data adapters (no order/trading calls).
 
 No order/trading APIs are used in this module. MT5 server timestamps in CSV exports
 are naive by default; callers must explicitly name their server timezone rather than
@@ -38,6 +38,44 @@ def _finite_price(value: Any, field: str) -> float:
     return number
 
 
+def server_offset(value: Any, *, name: str = "server_utc_offset_seconds") -> int:
+    """MT5 reports broker wall-clock time; the offset must be explicit, never guessed.
+
+    One helper for the policy, the agent adapter and the history importer, so a tick, a bar
+    and a schedule window can never be read against two different clocks.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer number of seconds")
+    if value % 60 != 0 or abs(value) > 14 * 3600:
+        raise ValueError(f"{name} must be whole minutes within +/-14 hours")
+    return value
+
+
+def normalize_rate_rows(rows: Any) -> list[dict[str, Any]]:
+    """Turn whatever ``copy_rates_*`` returned into plain dictionaries.
+
+    The package returns a numpy structured ndarray (rows are ``numpy.void`` objects with no
+    ``.get``) or a pandas DataFrame (iterating it yields column *names*, not rows), so a bare
+    ``dict(item)`` either raises or produces the wrong shape on a real terminal.
+    """
+    if rows is None:
+        return []
+    if hasattr(rows, "to_dict") and hasattr(rows, "columns"):
+        return [dict(row) for row in rows.to_dict("records")]
+    names = getattr(getattr(rows, "dtype", None), "names", None)
+    if names is not None:
+        return [{key: row[index] for index, key in enumerate(names)} for row in rows]
+    return [dict(row) for row in rows]
+
+
+def _last_error_code(mt5: Any) -> str:
+    """Only the numeric MT5 error code: the library text is broker-localised and unbounded."""
+    try:
+        return str(int(mt5.last_error()[0]))
+    except Exception:
+        return "unknown"
+
+
 @dataclass(frozen=True)
 class MarketBar:
     symbol: str
@@ -61,6 +99,10 @@ class MarketBar:
         stamp = _as_utc(self.time)
         values = {name: _finite_price(getattr(self, name), name)
                   for name in ("open", "high", "low", "close")}
+        # A zero or negative quote breaks every ratio downstream (returns divide by the prior
+        # close) and is never a real FX bar; refuse it at the boundary rather than propagate.
+        if any(value <= 0 for value in values.values()):
+            raise ValueError("bar prices must be positive")
         if values["high"] < max(values["open"], values["close"], values["low"]):
             raise ValueError("high must be >= open, close and low")
         if values["low"] > min(values["open"], values["close"], values["high"]):
@@ -210,9 +252,18 @@ _MT5_TIMEFRAME_NAMES = {
 
 def fetch_mt5_bars(
     symbol: str, timeframe: str, start_utc: datetime, end_utc: datetime, *,
-    terminal_path: str | None = None,
+    server_utc_offset_seconds: int, terminal_path: str | None = None,
 ) -> list[MarketBar]:
-    """Fetch historical rates from an already-configured MT5 terminal; read-only only."""
+    """Fetch historical rates from an already-configured MT5 terminal; no order API.
+
+    ``symbol_select`` runs only to make the symbol visible to ``copy_rates_range``; it
+    changes Market Watch, never account or order state.
+
+    ``copy_rates_range`` stamps each bar in the broker's server time and gives no zone, so
+    the offset is required: reading a UTC+2 broker as UTC would shift every bar by two hours
+    and silently break every comparison against UTC.
+    """
+    offset = server_offset(server_utc_offset_seconds)
     symbol = symbol.strip().upper()
     timeframe = timeframe.strip().upper()
     if timeframe not in _MT5_TIMEFRAME_NAMES:
@@ -226,22 +277,25 @@ def fetch_mt5_bars(
         raise RuntimeError("MetaTrader5 Python package is required on the MT5 Windows host") from exc
     initialized = mt5.initialize(path=terminal_path) if terminal_path else mt5.initialize()
     if not initialized:
-        raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
+        raise RuntimeError(f"MT5 initialize failed (error {_last_error_code(mt5)})")
     try:
         if not mt5.symbol_select(symbol, True):
-            raise RuntimeError(f"MT5 could not select symbol {symbol}: {mt5.last_error()}")
+            raise RuntimeError(f"MT5 could not select symbol {symbol}"
+                               f" (error {_last_error_code(mt5)})")
         tf_constant = getattr(mt5, _MT5_TIMEFRAME_NAMES[timeframe], None)
         if tf_constant is None:
             raise RuntimeError(f"installed MT5 package does not expose timeframe {timeframe}")
         rates = mt5.copy_rates_range(symbol, tf_constant, start, end)
         if rates is None:
-            raise RuntimeError(f"MT5 copy_rates_range failed: {mt5.last_error()}")
+            raise RuntimeError(f"MT5 copy_rates_range failed (error {_last_error_code(mt5)})")
         output = []
-        for item in rates:
-            row = dict(item)
+        for row in normalize_rate_rows(rates):
+            stamp = row.get("time")
+            if stamp is None:
+                raise RuntimeError("MT5 returned a rate row without a time field")
             output.append(MarketBar(
                 symbol=symbol, timeframe=timeframe,
-                time=datetime.fromtimestamp(int(row["time"]), tz=UTC),
+                time=datetime.fromtimestamp(int(stamp) - offset, tz=UTC),
                 open=row["open"], high=row["high"], low=row["low"], close=row["close"],
                 tick_volume=int(row["tick_volume"]) if "tick_volume" in row else None,
                 spread_points=int(row["spread"]) if "spread" in row else None,

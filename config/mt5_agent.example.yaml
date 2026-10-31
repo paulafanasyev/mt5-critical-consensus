@@ -1,0 +1,66 @@
+# Пример политики MT5-агента (paper-only). Скопируйте в config/mt5_agent.yaml и правьте.
+# Режим live в этом репозитории не реализован: кода отправки ордеров нет намеренно.
+# Вывод работает на русском, английском и вьетнамском; язык задаётся здесь, флагом
+# --language ru|en|vi или переменной MT5_AGENT_LANGUAGE (флаг важнее переменной).
+version: 1
+mode: paper            # observe | paper
+symbol: EURUSD
+timeframe: H1
+history_bars: 200
+# MT5 отдаёт время сервера без таймзоны; без явного смещения загрузка политики — ошибка
+# (молчаливого UTC-дефолта нет).
+server_utc_offset_seconds: 7200
+# confirm — каждая новая позиция требует явного "да" оператора (безопасный дефолт);
+# auto — агент открывает позиции сам. auto запрещён, пока require_demo не true.
+execution_mode: confirm
+ui_language: ru        # ru | en | vi
+
+account:
+  expected_login: null        # закрепите номер демо-счёта, чтобы исключить подмену account
+  expected_server: null       # например "BrokerServer-Demo"
+  require_demo: true
+
+symbol_spec:                  # спецификация для симуляции и расчёта объёма при любом источнике
+  symbol: EURUSD
+  point: 0.00001
+  digits: 5
+  tick_size: 0.00001
+  tick_value: 1.0             # стоимость тика для 1 лота в валюте счёта
+  volume_min: 0.01
+  volume_max: 100.0
+  volume_step: 0.01
+  spread_points: 12
+  stops_level_points: 0
+
+risk:
+  risk_per_trade_fraction: 0.005
+  max_open_positions: 1
+  max_daily_loss_fraction: 0.02
+  max_drawdown_fraction: 0.06
+  min_risk_reward: 1.5
+  max_spread_points: 25
+  max_quote_age_seconds: 15
+
+strategy:
+  min_bars: 60
+  sma_fast: 5
+  sma_slow: 20
+  atr_period: 14
+  stop_atr_multiple: 2.0
+  take_profit_risk_multiple: 2.0
+  min_sma_gap_atr: 0.10
+  min_momentum_abs: 0.0
+  max_confidence: 0.95        # эвристика, а не калиброванная вероятность
+
+schedule:
+  window_start_minute_utc: 0
+  window_end_minute_utc: 1320
+  blocked_weekdays_utc: [6]   # воскресенье: рынок закрыт, ликвидность минимальна
+  blackout_windows_utc: []    # [["2026-11-03T12:00:00+00:00", "2026-11-03T13:30:00+00:00"]]
+
+# Рубильник включён: каждый цикл блокируется, пока вы явно не выключите его для демо-прогона.
+# Если секцию убрать совсем, политика тоже загрузится с active: true (fail-closed), а причина
+# будет POLICY_NOT_PROVIDED; включённый рубильник с пустой reason — ошибка загрузки.
+kill_switch:
+  active: true
+  reason: "example policy: enable deliberately for a demo run"

@@ -305,8 +305,93 @@ def test_production_checker_and_self_test_cover_the_new_predicates():
                  "user approval gate keeps the message but stops returning",
                  "identifier validation keeps the message but stops returning",
                  "empty token accepted at init",
-                 "tombstone flush result ignored"):
+                 "tombstone flush result ignored",
+                 "protective stops detached from order request",
+                 "JsonTrue wrapper inverted",
+                 "JsonFalse wrapper inverted",
+                 "web request redirected to a shadow URL input",
+                 "expiry clock shifted backwards",
+                 "approval flag reassigned on the same line",
+                 "user approval guard copied to unreachable code"):
         assert name in checker.MUTATIONS, name
+
+
+def test_checker_rejects_round7_counter_mutations_and_names_the_cause():
+    """Each reviewed counter-mutation must be rejected for its own invariant."""
+    checker = _checker()
+    source = _ea_source()
+    reviewed = (
+        "protective stops detached from order request",
+        "JsonTrue wrapper inverted",
+        "JsonFalse wrapper inverted",
+        "web request redirected to a shadow URL input",
+        "expiry clock shifted backwards",
+        "approval flag reassigned on the same line",
+        "user approval guard copied to unreachable code",
+    )
+    for name in reviewed:
+        spec = checker.MUTATIONS[name]
+        mutated = source
+        for old, new in checker._mutation_edits(spec):
+            assert old in mutated, (name, old[:80])
+            mutated = mutated.replace(old, new, 1)
+        assert mutated != source, name
+        failures, _ = checker.check_source(mutated)
+        expected = checker.MUTATION_EXPECTATIONS[name]
+        assert any(expected in failure for failure in failures), (name, failures[:5])
+
+
+def test_checker_pins_stops_urls_clock_and_approval_tokens_independently():
+    """Prove the round-7 invariants fail on their own, not only via the catalogue."""
+    checker = _checker()
+    source = _ea_source()
+    weakenings = {
+        # Validated locals that never reach the request.
+        "sl detached": (
+            "request.sl = NormalizeDouble(sl, digits);",
+            "request.sl = 0;",
+            "protective stop-loss is bound to the order request",
+        ),
+        "tp overwritten": (
+            "   request.tp = NormalizeDouble(tp, digits);\n",
+            "   request.tp = NormalizeDouble(tp, digits);\n   request.tp = 0.0;\n",
+            "exactly one protective take-profit assignment to the request",
+        ),
+        # Wrapper polarity.
+        "JsonTrue false": (
+            "bool JsonTrue(const string key) { return JsonBoolExact(key, true); }",
+            "bool JsonTrue(const string key) { return JsonBoolExact(key, (!true)); }",
+            "JsonTrue is exactly one JsonBoolExact(key, true) call",
+        ),
+        "JsonFalse true": (
+            "bool JsonFalse(const string key) { return JsonBoolExact(key, false); }",
+            "bool JsonFalse(const string key) { return JsonBoolExact(key, true); }",
+            "JsonFalse wrapper calls JsonBoolExact with false",
+        ),
+        # WebRequest target.
+        "shadow local url": (
+            'WebRequest("GET", BridgeUrl,',
+            'WebRequest("GET", StringSubstr(KillSwitchUrl, 0, 10),',
+            "command web request targets BridgeUrl",
+        ),
+        # Clock origin.
+        "clock offset": (
+            "double now_epoch = (double)TimeGMT();",
+            "double now_epoch = (double)TimeGMT() + 86400.0;",
+            "expiry clock origin is the terminal GMT time",
+        ),
+        # Any second assignment token, including one appended on the same line.
+        "approval compound assignment": (
+            'bool user_approved = JsonTrue("user_approved");',
+            'bool user_approved = JsonTrue("user_approved"); user_approved |= true;',
+            "approval flag is assigned only in its single declaration",
+        ),
+    }
+    for label, (old, new, invariant) in weakenings.items():
+        weakened = source.replace(old, new, 1)
+        assert weakened != source, label
+        failures, _ = checker.check_source(weakened)
+        assert invariant in failures, (label, failures[:5])
 
 
 def test_checker_rejects_guard_body_and_right_extension_bypasses_outside_the_catalogue():
@@ -403,6 +488,10 @@ def test_checker_rejects_parenthesised_boolean_literal_terms():
             "if((!IsSafeIdentifier(command_id) || !IsSafeIdentifier(order_id) || "
             "!IsSafeIdentifier(symbol)) && ( false ))",
         ),
+        "numeric guard": (
+            "if(volume <= 0 || volume > MaxVolume || sl <= 0 || tp <= 0 || expected_price <= 0)",
+            "if((volume <= 0 || volume > MaxVolume || sl <= 0 || tp <= 0 || expected_price <= 0) && 0)",
+        ),
     }
     for label, (old, new) in bypasses.items():
         weakened = source.replace(old, new, 1)
@@ -410,7 +499,7 @@ def test_checker_rejects_parenthesised_boolean_literal_terms():
         stripped = checker._strip_comments(weakened)
         assert checker._parenthesised_literal_terms(stripped), label
         failures, _ = checker.check_source(weakened)
-        assert "parenthesised boolean literal term is forbidden" in failures, label
+        assert "literal short-circuit term is forbidden" in failures, label
     # The parser's `while(true)` is a whole control condition, not a bypass term.
     assert checker._parenthesised_literal_terms(checker._strip_comments(source)) == []
 

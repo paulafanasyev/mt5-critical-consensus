@@ -17,7 +17,9 @@ _BASELINE_DRIFT_TOLERANCE = 0.01
 
 
 def _finite(value: Any) -> float | None:
-    if isinstance(value, bool):
+    # Numeric strings are rejected: a snapshot or order field that is not a JSON number
+    # must fail closed rather than be coerced (JSON emits numbers, never quoted digits).
+    if isinstance(value, bool) or isinstance(value, str):
         return None
     try:
         number = float(value)
@@ -112,8 +114,15 @@ def global_kill_switch_gate(state: Mapping[str, Any] | None) -> dict[str, Any]:
 def risk_snapshot_gate(
     snapshot: Mapping[str, Any] | None, *, now: datetime | None = None,
     max_age_seconds: int = 15,
+    expected_account_login: int | None = None,
+    expected_account_server: str | None = None,
 ) -> dict[str, Any]:
-    """Validate freshness and coverage of a read-only MT5 account risk snapshot."""
+    """Validate freshness and coverage of a read-only MT5 account risk snapshot.
+
+    A snapshot is only meaningful for the account it was captured on. The collector
+    records the broker login and server, and the policy may pin both; every fraction is
+    denominated in that account's equity, so an unbound row could understate risk.
+    """
     if not isinstance(snapshot, Mapping):
         return {"status": "DENY", "trade_allowed": False, "blockers": ["RISK_SNAPSHOT_MISSING"]}
     current = now or datetime.now(timezone.utc)
@@ -136,6 +145,17 @@ def risk_snapshot_gate(
         blockers.append("MT5_RISK_COLLECTION_NOT_PASS")
     if snapshot.get("account_mode") != "demo":
         blockers.append("MT5_ACCOUNT_NOT_DEMO_OR_UNKNOWN")
+    login = snapshot.get("account_login")
+    if isinstance(login, bool) or not isinstance(login, int) or login <= 0:
+        blockers.append("RISK_SNAPSHOT_ACCOUNT_LOGIN_MISSING_OR_INVALID")
+    elif expected_account_login is not None and login != expected_account_login:
+        blockers.append("RISK_SNAPSHOT_ACCOUNT_LOGIN_MISMATCH")
+    account_server = snapshot.get("account_server")
+    if (not isinstance(account_server, str) or not account_server.strip()
+            or account_server != account_server.strip()):
+        blockers.append("RISK_SNAPSHOT_ACCOUNT_SERVER_MISSING_OR_INVALID")
+    elif expected_account_server is not None and account_server != expected_account_server:
+        blockers.append("RISK_SNAPSHOT_ACCOUNT_SERVER_MISMATCH")
     if not str(snapshot.get("symbol", "")).strip():
         blockers.append("RISK_SNAPSHOT_SYMBOL_MISSING")
     required_positive = ("account_equity", "day_start_equity", "equity_high_watermark")
@@ -161,10 +181,28 @@ def risk_snapshot_gate(
         # Open stops are loss already committed to the market even while unrealized;
         # without them the prospective daily-loss/drawdown caps are understated.
         blockers.append("OPEN_STOP_RISK_FRACTION_MISSING_OR_INVALID")
+    counts: dict[str, float | None] = {}
     for key in ("open_positions", "correlated_open_positions"):
         count = _finite(snapshot.get(key))
         if count is None or count < 0 or not count.is_integer():
             blockers.append(f"{key.upper()}_MISSING_OR_INVALID")
+            counts[key] = None
+        else:
+            counts[key] = count
+    positions = counts["open_positions"]
+    correlated = counts["correlated_open_positions"]
+    if positions is not None and correlated is not None and correlated > positions:
+        # More correlated positions than total positions is internally impossible.
+        blockers.append("CORRELATED_OPEN_POSITIONS_EXCEED_TOTAL")
+    if positions is not None and open_stop_risk is not None and open_stop_risk > 0 and positions == 0:
+        # Exposure with no open position means the snapshot's own fields disagree.
+        blockers.append("OPEN_STOP_RISK_WITHOUT_OPEN_POSITIONS")
+    position_symbols = snapshot.get("position_symbols")
+    if not isinstance(position_symbols, list) or any(
+            not isinstance(value, str) or not value.strip() for value in position_symbols):
+        blockers.append("RISK_SNAPSHOT_POSITION_SYMBOLS_MISSING_OR_INVALID")
+    elif positions is not None and len(position_symbols) != int(positions):
+        blockers.append("RISK_SNAPSHOT_POSITION_COUNT_MISMATCH")
     if not str(snapshot.get("symbol_group") or "").strip():
         blockers.append("SYMBOL_CORRELATION_GROUP_UNKNOWN")
     balance = _finite(snapshot.get("account_balance"))
@@ -186,6 +224,14 @@ def risk_snapshot_gate(
         # understated baseline loosens the daily-loss limit; cashflows must be adjusted
         # explicitly by the operator instead of being silently absorbed here.
         blockers.append("DAY_START_EQUITY_BELOW_DAILY_PNL_IMPLIED_BALANCE")
+    if (balance is not None and balance > 0 and daily_pnl is not None
+            and values["day_start_equity"] is not None
+            and values["day_start_equity"] + daily_pnl
+            > balance * (1 + _BASELINE_DRIFT_TOLERANCE)):
+        # The same reconstruction upper-bounds the baseline: an inflated day-start (or the
+        # equity captured against a different, richer account) would otherwise report every
+        # fraction against a denominator the real balance cannot support.
+        blockers.append("DAY_START_EQUITY_ABOVE_DAILY_PNL_IMPLIED_BALANCE")
     binding = snapshot.get("request_binding_sha256")
     if not isinstance(binding, str) or len(binding) != 71 or not binding.startswith("sha256:") or any(ch not in "0123456789abcdef" for ch in binding[7:]):
         blockers.append("RISK_REQUEST_BINDING_MISSING_OR_INVALID")
@@ -218,6 +264,7 @@ def risk_snapshot_matches_order(
     stop = _finite(sl_tp.get("sl")) if isinstance(sl_tp, Mapping) else None
     take = _finite(sl_tp.get("tp")) if isinstance(sl_tp, Mapping) else None
     equity = _finite(snapshot.get("account_equity"))
+    balance = _finite(snapshot.get("account_balance"))
     tick_size = _finite(snapshot.get("risk_tick_size"))
     tick_value_loss = _finite(snapshot.get("risk_tick_value_loss"))
     reference = _finite(snapshot.get("reference_price"))
@@ -226,6 +273,8 @@ def risk_snapshot_matches_order(
         return sorted(set(blockers + ["RISK_REQUEST_FIELDS_INVALID"]))
     if equity is None or equity <= 0:
         return sorted(set(blockers + ["RISK_SNAPSHOT_ACCOUNT_EQUITY_MISSING_OR_INVALID"]))
+    if balance is None or balance <= 0:
+        return sorted(set(blockers + ["RISK_SNAPSHOT_ACCOUNT_BALANCE_MISSING_OR_INVALID"]))
     if tick_size is None or tick_size <= 0 or tick_value_loss is None or tick_value_loss <= 0:
         return sorted(set(blockers + ["RISK_SNAPSHOT_TICK_SPEC_MISSING_OR_INVALID"]))
     if reference is None or reference <= 0:
@@ -245,11 +294,18 @@ def risk_snapshot_matches_order(
         blockers.append("RISK_CONSERVATIVE_ENTRY_OUTSIDE_GEOMETRY")
 
     expected_value = abs(conservative_entry - stop) / tick_size * tick_value_loss * size
-    expected_fraction = expected_value / equity
+    # Denominating risk in equity alone lets an inflated equity shrink every fraction while
+    # the balance stays small; the conservative base is the lower of the two.
+    risk_base = min(equity, balance)
+    expected_fraction = expected_value / risk_base
     reported_value = _finite(snapshot.get("risk_value_account_currency"))
     reported_fraction = _finite(snapshot.get("risk_fraction"))
 
     def disagrees(reported: float | None, expected: float, name: str) -> None:
+        if not math.isfinite(expected):
+            # An infinite expectation must never compare equal to a reported infinity.
+            blockers.append(name)
+            return
         if reported is None or abs(reported - expected) > max(1e-12, expected * tolerance):
             blockers.append(name)
 
@@ -281,8 +337,27 @@ def risk_controlled_permission(
     risk_fraction_tolerance_fraction: float = 0.01,
 ) -> dict[str, Any]:
     """Require kill-switch and fresh terminal risk gates before the policy permission gate."""
+    policy = matrix.get("permission_matrix", matrix) if isinstance(matrix, Mapping) else {}
+    if not isinstance(policy, Mapping):
+        return {"status": "DENY", "allowed": False, "trade_allowed": False,
+                "blockers": ["RISK_PERMISSION_POLICY_INVALID"]}
+    expected_login = policy.get("expected_account_login")
+    if expected_login is not None and (isinstance(expected_login, bool)
+                                       or not isinstance(expected_login, int)
+                                       or expected_login <= 0):
+        return {"status": "DENY", "allowed": False, "trade_allowed": False,
+                "blockers": ["RISK_EXPECTED_ACCOUNT_LOGIN_POLICY_INVALID"]}
+    expected_server = policy.get("expected_account_server")
+    if expected_server is not None and (not isinstance(expected_server, str)
+                                        or not expected_server.strip()
+                                        or expected_server != expected_server.strip()):
+        return {"status": "DENY", "allowed": False, "trade_allowed": False,
+                "blockers": ["RISK_EXPECTED_ACCOUNT_SERVER_POLICY_INVALID"]}
     switch = global_kill_switch_gate(kill_switch_state)
-    risk = risk_snapshot_gate(snapshot, now=now, max_age_seconds=snapshot_max_age_seconds)
+    risk = risk_snapshot_gate(
+        snapshot, now=now, max_age_seconds=snapshot_max_age_seconds,
+        expected_account_login=expected_login, expected_account_server=expected_server,
+    )
     if switch["status"] != "PASS" or risk["status"] != "PASS" or not isinstance(snapshot, Mapping):
         blockers = list(switch.get("blockers", [])) + list(risk.get("blockers", []))
         return {"status": "DENY", "allowed": False, "trade_allowed": False,
@@ -302,17 +377,20 @@ def risk_controlled_permission(
         return {"status": "DENY", "allowed": False, "trade_allowed": False,
                 "blockers": reconciliation, "kill_switch": switch, "risk_snapshot": risk,
                 "risk_reconciliation": {"status": "FAILED", "blockers": reconciliation}}
-    policy = matrix.get("permission_matrix") if isinstance(matrix, Mapping) else None
-    if isinstance(policy, Mapping):
-        # The policy gate recomputes RR at the reviewed entry; a worse fill can leave that
-        # same order below the reward floor, so the conservative RR must clear it too.
-        min_rr = _finite(policy.get("min_expected_rr", 1.5))
-        adjusted_rr = _adjusted_rr(request, snapshot)
-        if min_rr is not None and min_rr >= 0 and (adjusted_rr is None or adjusted_rr + 1e-9 < min_rr):
-            return {"status": "DENY", "allowed": False, "trade_allowed": False,
-                    "blockers": ["RISK_ADJUSTED_RR_BELOW_MINIMUM"], "kill_switch": switch,
-                    "risk_snapshot": risk, "adjusted_expected_rr": adjusted_rr,
-                    "risk_reconciliation": {"status": "PASS", "blockers": []}}
+    # The policy gate recomputes RR at the reviewed entry; a worse fill can leave that
+    # same order below the reward floor, so the conservative RR must clear it too. The
+    # policy may be supplied wrapped or flat; both shapes must enforce the floor.
+    min_rr = _finite(policy.get("min_expected_rr", 1.5))
+    if min_rr is None or min_rr < 0:
+        return {"status": "DENY", "allowed": False, "trade_allowed": False,
+                "blockers": ["RISK_MIN_EXPECTED_RR_POLICY_INVALID"], "kill_switch": switch,
+                "risk_snapshot": risk}
+    adjusted_rr = _adjusted_rr(request, snapshot)
+    if adjusted_rr is None or adjusted_rr + 1e-9 < min_rr:
+        return {"status": "DENY", "allowed": False, "trade_allowed": False,
+                "blockers": ["RISK_ADJUSTED_RR_BELOW_MINIMUM"], "kill_switch": switch,
+                "risk_snapshot": risk, "adjusted_expected_rr": adjusted_rr,
+                "risk_reconciliation": {"status": "PASS", "blockers": []}}
     merged = dict(request)
     merged["risk_snapshot"] = {
         **dict(merged.get("risk_snapshot", {}) if isinstance(merged.get("risk_snapshot"), Mapping) else {}),

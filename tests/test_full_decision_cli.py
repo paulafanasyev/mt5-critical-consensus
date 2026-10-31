@@ -65,6 +65,31 @@ def test_full_decision_cli_rejects_user_supplied_approval(tmp_path):
          str(bundle_path), "--output", str(output_path)],
         cwd=ROOT, capture_output=True, text=True, check=False,
     )
-    assert result.returncode == 2
+    assert result.returncode == 1
     assert "does not accept or process human approval" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output_path.exists()
+
+
+def test_full_decision_cli_reports_a_missing_database_as_exit_one(tmp_path):
+    signal_input = {"signal_id": "cli-db-001", "instrument": "EURUSD"}
+    bundle = sign_bundle({
+        "signal_id": signal_input["signal_id"],
+        "signal_input": signal_input,
+        "signal_input_hash": canonical_hash(signal_input),
+        "verdicts": [],
+    }, key=EVIDENCE_ENV["MT5_EVIDENCE_HMAC_KEY"], issuer="test-ingress")
+    bundle_path = tmp_path / "bundle.json"
+    output_path = tmp_path / "result.json"
+    bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k != "DATABASE_URL"}
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "evaluate_signal_bundle.py"),
+         str(bundle_path), "--output", str(output_path), "--persist"],
+        cwd=ROOT, capture_output=True, text=True, check=False,
+        env={**env, **EVIDENCE_ENV},
+    )
+    assert result.returncode == 1
+    assert result.stderr.startswith("error: ")
+    assert "Traceback" not in result.stderr
     assert not output_path.exists()

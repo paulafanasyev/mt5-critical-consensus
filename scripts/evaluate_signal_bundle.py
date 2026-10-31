@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -144,8 +145,12 @@ def main() -> int:
     args = parser.parse_args()
     try:
         report = run(args.bundle, args.output, persist=args.persist, policy_dir=args.policy_dir)
-    except (ValueError, RuntimeError) as exc:
-        parser.error(str(exc))
+    except Exception as exc:  # noqa: BLE001 - a CLI failure must not dump a traceback
+        # Missing secrets, unreadable input, an unavailable database and anything else
+        # unexpected all exit 1 so that exit 2 keeps its single meaning: the pipeline ran
+        # and returned something other than REQUIRE_HUMAN.
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     result = report["result"]
     print(json.dumps({
         "signal_id": result.get("signal_id"),

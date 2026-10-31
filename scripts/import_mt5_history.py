@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Import an explicit MT5 CSV export or read-only terminal history into PostgreSQL."""
+"""Import an explicit MT5 CSV export or order-free terminal history into PostgreSQL."""
 from __future__ import annotations
 
 import argparse
@@ -21,12 +21,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--csv", type=Path, help="MT5 OHLC CSV export; the file is not modified")
-    source.add_argument("--live-terminal", action="store_true", help="query the installed MT5 terminal read-only")
+    source.add_argument("--live-terminal", action="store_true", help="query the installed MT5 terminal without order calls (may add the symbol to Market Watch)")
     parser.add_argument("--symbol", required=True)
     parser.add_argument("--timeframe", required=True, choices=["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"])
     parser.add_argument("--source-timezone", help="required for naive CSV dates, e.g. Europe/Helsinki or UTC")
     parser.add_argument("--from-utc", type=parse_aware, help="required for --live-terminal")
     parser.add_argument("--to-utc", type=parse_aware, help="required for --live-terminal")
+    parser.add_argument("--server-utc-offset-seconds", type=int,
+                        help="required for --live-terminal: broker server offset in whole seconds")
     parser.add_argument("--terminal-path", help="optional MetaTrader 5 terminal executable path")
     args = parser.parse_args()
 
@@ -35,7 +37,11 @@ def main() -> int:
             parser.error("--live-terminal requires --from-utc and --to-utc")
         if args.from_utc >= args.to_utc:
             parser.error("--from-utc must be earlier than --to-utc")
+        if args.server_utc_offset_seconds is None:
+            # MT5 stamps bars in broker time; defaulting to UTC would shift every imported bar.
+            parser.error("--live-terminal requires --server-utc-offset-seconds")
         bars = fetch_mt5_bars(args.symbol, args.timeframe, args.from_utc, args.to_utc,
+                              server_utc_offset_seconds=args.server_utc_offset_seconds,
                               terminal_path=args.terminal_path)
         source_name = "MT5 terminal"
     else:

@@ -64,17 +64,20 @@ def _reject_non_string_keys(value: Any, path: str = "payload") -> None:
 
 def canonical_bytes(payload: Any) -> bytes:
     """Strict canonical JSON; no string coercion means hash collisions are not possible."""
-    _reject_non_string_keys(payload)
     try:
+        _reject_non_string_keys(payload)
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
                          allow_nan=False)
-    except (TypeError, ValueError) as exc:
-        raise EvidenceError("payload is not canonically serializable") from exc
-    try:
         return raw.encode("utf-8")
-    except UnicodeError as exc:
-        # Lone surrogates survive json.loads but cannot be encoded; this must be an
-        # EvidenceError so verification fails closed instead of raising a UnicodeError.
+    except EvidenceError:
+        raise
+    except RecursionError as exc:
+        # A deeply nested payload exhausts the C encoder's stack; that must surface as a
+        # fail-closed evidence error (HTTP 4xx), never as an unhandled 500.
+        raise EvidenceError("payload is nested too deeply") from exc
+    except (TypeError, ValueError, UnicodeError) as exc:
+        # Type errors (non-JSON values), NaN/Infinity and lone surrogates all have to reach
+        # callers as EvidenceError so verification fails closed instead of crashing.
         raise EvidenceError("payload is not canonically serializable") from exc
 
 

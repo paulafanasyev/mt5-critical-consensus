@@ -102,6 +102,20 @@ def test_non_string_json_keys_are_rejected_instead_of_colliding():
         payload_sha256([{"items": [{3: "deep"}]}])
 
 
+def test_deeply_nested_payload_fails_closed_instead_of_recursing():
+    payload: dict = {}
+    node = payload
+    for _ in range(5000):
+        node["n"] = {}
+        node = node["n"]
+    with pytest.raises(EvidenceError):
+        payload_sha256(payload)
+    envelope = make_envelope({"a": 1}, key=KEY, issuer=ISSUER, issued_at=NOW)
+    result = verify_envelope(payload, envelope, key=KEY, expected_issuer=ISSUER, now=NOW)
+    assert result["valid"] is False
+    assert "EVIDENCE_PAYLOAD_NOT_CANONICALLY_HASHABLE" in result["blockers"]
+
+
 def test_operator_decision_signature_lives_in_a_separate_domain():
     decision = {"decision": "APPROVE", "permission_id": "perm-1"}
     envelope = sign_decision(decision, key=OTHER_KEY, issuer="operator-console", issued_at=NOW)

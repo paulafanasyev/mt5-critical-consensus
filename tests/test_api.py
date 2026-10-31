@@ -462,6 +462,8 @@ def test_chief_review_endpoint_requires_a_review_attestation(monkeypatch):
     accepted = client.post("/v1/chief/review", headers={"X-Bridge-Key": BRIDGE},
                            json=signed_body({}))
     assert accepted.status_code == 200
+    # Only the attested chief_reasoning is evaluated; an empty payload yields no reasoning.
+    assert accepted.json()["blockers"] == ["INVALID_CHIEF_REASONING"]
     assert accepted.json()["trade_allowed"] is False
 
 

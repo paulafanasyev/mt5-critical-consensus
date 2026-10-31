@@ -136,7 +136,10 @@ def make_bundle(now=NOW):
             "sources": [{"id": "s1", "credibility": 0.95, "age_seconds": 20}, {"id": "s2", "credibility": 0.94, "age_seconds": 40}],
             "expires_at": (now + timedelta(minutes=5)).isoformat(), "within_high_impact_news_window": False,
             "risk_snapshot": {"risk_fraction": 0.003, "daily_loss_fraction": 0.004, "drawdown_fraction": 0.02,
-                              "open_positions": 1, "correlated_open_positions": 0},
+                              "open_stop_risk_fraction": 0.0,
+                              "open_positions": 1, "correlated_open_positions": 0,
+                              "account_login": 5000001, "account_server": "Demo-Server",
+                              "position_symbols": ["EURUSD"]},
         },
     }
     bundle["chief_reasoning"]["reasoning_hash"] = canonical_hash(bundle["chief_reasoning"])
@@ -163,7 +166,8 @@ def make_governance_attestation(now=NOW, *, dissent_rate=0.125, false_certainty_
     return sign_attestation(payload, key=GOVERNANCE_KEY, issuer=GOVERNANCE_ISSUER, issued_at=now)
 
 
-def sign_operator_approval(bundle, *, now=NOW, key=OPERATOR_KEY, issuer=OPERATOR_ISSUER):
+def sign_operator_approval(bundle, *, now=NOW, key=OPERATOR_KEY, issuer=OPERATOR_ISSUER,
+                           risk_snapshot=None):
     """Attach a correctly bound operator signature to a bundle's user_decision."""
     signed = dict(bundle)
     decision = dict(bundle["user_decision"])
@@ -174,6 +178,8 @@ def sign_operator_approval(bundle, *, now=NOW, key=OPERATOR_KEY, issuer=OPERATOR
     decision.setdefault("permission_request_sha256",
                         canonical_hash(dict(permission_request))
                         if isinstance(permission_request, dict) else None)
+    if isinstance(risk_snapshot, dict):
+        decision.setdefault("risk_snapshot_sha256", canonical_hash(dict(risk_snapshot)))
     signed["user_decision"] = decision
     signed["user_decision_envelope"] = sign_decision(
         decision, key=key, issuer=issuer, issued_at=now,
@@ -184,7 +190,8 @@ def sign_operator_approval(bundle, *, now=NOW, key=OPERATOR_KEY, issuer=OPERATOR
 def run_pipeline(bundle, *, now=NOW, sign=True, policy=None, resign_review=None, **kwargs):
     body = dict(bundle)
     if body.get("user_decision") is not None and "user_decision_envelope" not in body:
-        body = sign_operator_approval(body, now=now)
+        body = sign_operator_approval(
+            body, now=now, risk_snapshot=kwargs.get("terminal_risk_snapshot"))
     body.setdefault("governance_attestation", make_governance_attestation(now))
     if resign_review is None:
         # Tests mutate make_bundle() output as if the review service produced that exact
@@ -430,6 +437,7 @@ def _persisted_demo_risk_evidence(bundle, *, kill_switch_active=False, binding_o
     }
     snapshot = {
         "status": "PASS", "observed_at": NOW.isoformat(), "account_mode": "demo",
+        "account_login": 5000001, "account_server": "Demo-Server",
         "symbol": request["instrument"], "symbol_group": "fx-major",
         "account_equity": 10000.0, "account_balance": 10000.0, "daily_pnl": 0.0,
         "day_start_equity": 10000.0,
@@ -440,6 +448,7 @@ def _persisted_demo_risk_evidence(bundle, *, kill_switch_active=False, binding_o
         "daily_loss_fraction": 0.0, "drawdown_fraction": 0.0,
         "open_stop_risk_fraction": 0.0,
         "open_positions": 1, "correlated_open_positions": 0,
+        "position_symbols": [request["instrument"]],
         "request_binding_sha256": binding_override or risk_request_binding_hash(request),
         "within_high_impact_news_window": False,
     }
@@ -617,6 +626,46 @@ def test_replayed_authorization_nonce_is_denied():
     assert first["status"] == "AUTHORIZED_ONCE"
     assert second["status"] == "DENY"
     assert "AUTHORIZATION_NONCE_REPLAYED" in second["blockers"]
+
+
+def test_renaming_the_permission_cannot_reset_the_authorization_tombstone():
+    store = InMemoryNonceStore()
+    bundle = _approval_bundle()
+    state, snapshot = _persisted_demo_risk_evidence(bundle)
+    first = run_pipeline(
+        bundle, require_persisted_risk=True, kill_switch_state=state,
+        terminal_risk_snapshot=snapshot, authorization_store=store,
+    )
+    assert first["status"] == "AUTHORIZED_ONCE"
+
+    renamed = _approval_bundle()
+    renamed["permission_request"]["permission_id"] = "perm-2"
+    renamed["user_decision"]["permission_id"] = "perm-2"
+    renamed["user_decision"]["nonce"] = "m" * 24
+    renamed_state, renamed_snapshot = _persisted_demo_risk_evidence(renamed)
+    second = run_pipeline(
+        renamed, require_persisted_risk=True, kill_switch_state=renamed_state,
+        terminal_risk_snapshot=renamed_snapshot, authorization_store=store,
+    )
+    assert second["status"] == "DENY"
+    assert "AUTHORIZATION_PERMISSION_ALREADY_USED" in second["blockers"]
+
+
+def test_operator_approval_is_bound_to_the_validated_risk_snapshot():
+    bundle = _approval_bundle()
+    state, snapshot = _persisted_demo_risk_evidence(bundle)
+    bundle = sign_operator_approval(bundle, risk_snapshot=snapshot)
+    bundle["user_decision"] = dict(
+        bundle["user_decision"],
+        risk_snapshot_sha256=canonical_hash({**snapshot, "risk_fraction": 0.0001}))
+    bundle["user_decision_envelope"] = sign_decision(
+        bundle["user_decision"], key=OPERATOR_KEY, issuer=OPERATOR_ISSUER, issued_at=NOW)
+    result = run_pipeline(
+        bundle, require_persisted_risk=True, kill_switch_state=state,
+        terminal_risk_snapshot=snapshot, authorization_store=InMemoryNonceStore(),
+    )
+    assert result["status"] == "DENY"
+    assert "USER_DECISION_RISK_SNAPSHOT_MISMATCH" in result["blockers"]
 
 
 def test_authorization_without_persisted_risk_evidence_is_denied():
@@ -869,6 +918,15 @@ def test_review_attestation_is_bound_to_the_signal_id():
         {**review_payload(bundle), "signal_id": "sig-other"},
         key=REVIEW_KEY, issuer=REVIEW_ISSUER, issued_at=NOW,
     )
+    result = run_pipeline(bundle, resign_review=False)
+    assert result["status"] == "GATHER_MORE"
+    assert "REVIEW_PAYLOAD_HASH_MISMATCH" in result["blockers"]
+
+
+def test_review_attestation_is_bound_to_the_verdicts():
+    bundle = make_bundle()
+    bundle["verdicts"][0]["confidence"] = 0.95
+    # Re-sign the evidence envelope, but the review attestation now covers stale verdicts.
     result = run_pipeline(bundle, resign_review=False)
     assert result["status"] == "GATHER_MORE"
     assert "REVIEW_PAYLOAD_HASH_MISMATCH" in result["blockers"]

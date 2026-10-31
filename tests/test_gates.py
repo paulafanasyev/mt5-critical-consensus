@@ -102,8 +102,8 @@ def valid_permission_request(now):
             "sl_tp": {"sl": 1.0820, "tp": 1.0890}, "expires_at": (now + timedelta(minutes=5)).isoformat(),
             "within_high_impact_news_window": False,
             "risk_snapshot": {"risk_fraction": 0.003, "daily_loss_fraction": 0.004,
-                              "drawdown_fraction": 0.02, "open_positions": 1,
-                              "correlated_open_positions": 0}}
+                              "drawdown_fraction": 0.02, "open_stop_risk_fraction": 0.0,
+                              "open_positions": 1, "correlated_open_positions": 0}}
 
 def test_permission_gate_requires_human():
     now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
@@ -255,6 +255,34 @@ def test_authorization_is_once_per_permission_not_just_per_nonce():
                                      now=now, nonce_store=store)
     assert second["status"] == "DENY"
     assert "AUTHORIZATION_PERMISSION_ALREADY_USED" in second["blockers"]
+
+
+def test_authorization_tombstone_is_keyed_on_the_server_order_scope():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    store = InMemoryNonceStore()
+
+    def permission(permission_id):
+        return {"status": "REQUIRE_HUMAN", "permission_id": permission_id, "mode": "demo",
+                "expires_at": (now + timedelta(minutes=5)).isoformat()}
+
+    def approval(permission_id, nonce, decision_id):
+        return {"decision": "APPROVE", "user_id": "operator-1", "reason": "reviewed",
+                "permission_id": permission_id, "decision_id": decision_id,
+                "nonce": nonce, "timestamp": now.isoformat(), "ttl_seconds": 300}
+
+    scope = "sha256:" + "a" * 64
+    first = user_authorization_gate(permission("p1"), approval("p1", "n" * 24, "d-1"),
+                                    now=now, nonce_store=store, order_scope=scope)
+    assert first["authorized"] is True
+    assert first["order_scope"] == scope
+    # A renamed permission for the identical order cannot reset the tombstone.
+    second = user_authorization_gate(permission("p2"), approval("p2", "m" * 24, "d-2"),
+                                     now=now, nonce_store=store, order_scope=scope)
+    assert second["status"] == "DENY"
+    assert "AUTHORIZATION_PERMISSION_ALREADY_USED" in second["blockers"]
+    invalid = user_authorization_gate(permission("p3"), approval("p3", "k" * 24, "d-3"),
+                                      now=now, nonce_store=store, order_scope="  ")
+    assert "AUTHORIZATION_ORDER_SCOPE_INVALID" in invalid["blockers"]
 
 
 def test_authorization_requires_a_store_with_permission_tombstones():
@@ -543,16 +571,52 @@ def test_permission_gate_limits_include_the_proposed_trade():
     now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
     request = valid_permission_request(now)
     request["risk_snapshot"] = {"risk_fraction": 0.004, "daily_loss_fraction": 0.018,
-                                "drawdown_fraction": 0.02, "open_positions": 1,
-                                "correlated_open_positions": 0}
+                                "drawdown_fraction": 0.02, "open_stop_risk_fraction": 0.0,
+                                "open_positions": 1, "correlated_open_positions": 0}
     result = permission_gate(request, _permission_matrix(), now=now)
     assert "PROJECTED_DAILY_LOSS_EXCEEDS_LIMIT" in result["blockers"]
 
     request["risk_snapshot"] = {"risk_fraction": 0.004, "daily_loss_fraction": 0.004,
-                                "drawdown_fraction": 0.098, "open_positions": 1,
-                                "correlated_open_positions": 0}
+                                "drawdown_fraction": 0.098, "open_stop_risk_fraction": 0.0,
+                                "open_positions": 1, "correlated_open_positions": 0}
     result = permission_gate(request, _permission_matrix(), now=now)
     assert "PROJECTED_DRAWDOWN_EXCEEDS_LIMIT" in result["blockers"]
+
+
+def test_open_stop_risk_adds_to_realised_exposure():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    request = valid_permission_request(now)
+    # realised 0.006 + open 0.0125 = 0.0185; adding the proposed 0.003 breaches 0.02.
+    request["risk_snapshot"] = {"risk_fraction": 0.003, "daily_loss_fraction": 0.006,
+                                "drawdown_fraction": 0.05, "open_stop_risk_fraction": 0.0125,
+                                "open_positions": 1, "correlated_open_positions": 0}
+    result = permission_gate(request, _permission_matrix(), now=now)
+    assert "PROJECTED_DAILY_LOSS_EXCEEDS_LIMIT" in result["blockers"]
+
+    # drawdown 0.08 + 0.0175 + proposed 0.003 = 0.1005 breaches the 0.10 cap.
+    request["risk_snapshot"] = {"risk_fraction": 0.003, "daily_loss_fraction": 0.0,
+                                "drawdown_fraction": 0.08, "open_stop_risk_fraction": 0.0175,
+                                "open_positions": 1, "correlated_open_positions": 0}
+    result = permission_gate(request, _permission_matrix(), now=now)
+    assert "PROJECTED_DRAWDOWN_EXCEEDS_LIMIT" in result["blockers"]
+
+
+def test_open_stop_risk_must_be_a_json_number():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    request = valid_permission_request(now)
+    request["risk_snapshot"]["open_stop_risk_fraction"] = "0.019"
+    result = permission_gate(request, _permission_matrix(), now=now)
+    assert result["status"] == "DENY"
+    assert "INVALID_RISK_VALUE:open_stop_risk_fraction" in result["blockers"]
+
+
+def test_open_stop_risk_field_is_mandatory():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    request = valid_permission_request(now)
+    request["risk_snapshot"].pop("open_stop_risk_fraction")
+    result = permission_gate(request, _permission_matrix(), now=now)
+    assert result["status"] == "DENY"
+    assert "RISK_SNAPSHOT_FIELDS_MISSING:open_stop_risk_fraction" in result["blockers"]
 
 
 def test_permission_gate_recalculates_reward_risk_against_the_floor():

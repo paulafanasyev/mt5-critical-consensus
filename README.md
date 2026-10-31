@@ -1,5 +1,7 @@
 # Intelligence → Critical Consensus → Execution (MT5)
 
+**Русский** | [Tiếng Việt](README.vi.md)
+
 **Статус: reference scaffold / demo-first, НЕ production-ready trading system.** Этот репозиторий переводит ТЗ в проверяемый каркас: схема сообщений, fail-closed gates, калибровочные утилиты, FastAPI, конфигурации, pytest, Neo4j DDL и MQL5 EA-заготовка.
 
 ## Безопасные значения по умолчанию
@@ -8,7 +10,7 @@
 - Live-исполнение в MQL5-шаблоне заблокировано без возможности включения одной настройкой; сначала требуются аудит, paper/demo-forward и отдельное изменение политики.
 - API-эндпоинт получения команд в каркасе отвечает `204 No Content`, пока очередь исполнения не реализована и не проверена. Поэтому включение EA само по себе не должно породить ордер.
 - Любой недостающий verdict, открытый challenge, stale source, VETO, риск-флаг, провал калибровки, отсутствие risk snapshot/news state, запрещённое UTC-окно, истёкший TTL, недействительное подтверждение или расхождение risk snapshot с точными параметрами ордера и equity-базой блокирует исполнение.
-- Упоминание `confidence >= 0.98` означает лишь порог допуска по политике. Для CertaintyGate дополнительно нужны калибровочная история и health-метрики: минимум 30 наблюдений для `dissent_rate` и `false_certainty_rate`; отсутствующие метрики блокируют PASS. Это **не** означает 98% вероятность прибыли и не гарантирует исход сделки.
+- Упоминание `confidence >= 0.98` означает лишь порог допуска по политике. Для CertaintyGate дополнительно нужны калибровочная история и health-метрики: минимум 30 наблюдений для `dissent_rate` и `false_certainty_rate`; отсутствующие метрики блокируют PASS. Это **не** означает 98% вероятность прибыли и не гарантирует исход сделки. Уровень успеха 98% этим кодом не измеряется и недостижим для него.
 
 ## Состав
 
@@ -17,15 +19,16 @@
 - `src/critical_consensus/calibration.py` — Brier score, shrinkage penalty, weighted consensus; `calibration_eval.py` — chronological walk-forward Platt calibration and sample-aware reliability report.
 - `src/critical_consensus/api.py` — FastAPI policy endpoints; every policy evaluation requires a fresh HMAC-signed evidence wrapper and, for certainty, a separately signed calibration-service attestation. Authorization and order submission endpoints deliberately remain disabled until durable permission state and a real 2FA/signature verifier exist.
 - `src/critical_consensus/evidence.py` — HMAC-SHA256 envelopes binding exact canonical payloads, issuer, nonce, TTL and payload hash, with distinct `evidence`, `governance`, `operator` and `review` signing domains; `governance.py` — signed historical dissent/false-certainty attestations; `authorization.py` — one-time per-operator nonce stores plus once-per-permission tombstones (in-memory for tests, insert-only PostgreSQL rows for durable use, migration 006).
-- `src/critical_consensus/market_data.py` — read-only MT5 history + CSV adapter and OHLC validation; `providers.py` / `agent_runtime.py` — configurable OpenAI-compatible research agents, exact input-hash binding, TTL checks, unique provider-origin checks and fail-closed collection. `scripts/run_agent_analysis.py` requires all nine mandatory policy-agent IDs, then runs provider-backed anonymized peer review (two reviewers per verdict) and up to three evidence-bound challenge-resolution rounds. `READY_FOR_CHIEF` only means this review ledger is complete; it does not run Certainty Gate or authorize trading.
-- `src/critical_consensus/redis_streams.py` — idempotent event publishing, consumer groups, retry/DLQ and pending-message recovery; `scripts/run_worker.py` durably writes valid events to PostgreSQL before ACK, while poison/invalid events are written to the DLQ (after `max_attempts=3` delivery attempts) and only then ACKed; an event whose handler raises stays pending for retry. This worker archives events; it does not dispatch orders.
+- `src/critical_consensus/market_data.py` — order-free MT5 history + CSV adapter and OHLC validation (the MT5 path calls `symbol_select` to add the symbol to Market Watch); `providers.py` / `agent_runtime.py` — configurable OpenAI-compatible research agents, exact input-hash binding, TTL checks, unique provider-origin checks and fail-closed collection. `scripts/run_agent_analysis.py` requires all nine mandatory policy-agent IDs, then runs provider-backed anonymized peer review (two reviewers per verdict) and up to three evidence-bound challenge-resolution rounds. `READY_FOR_CHIEF` only means this review ledger is complete; it does not run Certainty Gate or authorize trading.
+- `src/critical_consensus/redis_streams.py` — idempotent event publishing, consumer groups, retry/DLQ and pending-message recovery; `scripts/run_worker.py` durably writes valid events to PostgreSQL before ACK. Parse-invalid events are written to the DLQ on first delivery and only then ACKed; an event whose handler raises stays pending and is reclaimed (`XAUTOCLAIM`) on each worker loop, so it is retried up to `max_attempts=3` deliveries before it is dead-lettered and ACKed. This worker archives events; it does not dispatch orders.
+- `src/critical_consensus/mt5_agent/` — слой агента без отправки ордеров поверх терминала (`backend.py`, `LiveMT5Backend` без единой торговой функции; `symbol_spec()` вызывает `symbol_select()`, только когда символа нет в Market Watch, и это добавляет его в список символов терминала), fail-closed `policy.py`, детерминированный сигнал `strategy.py`, объём из спецификации символа `sizing.py`, бумажный брокер без look-ahead `paper.py`, SQLite hash-журнал `journal.py` и цикл `agent.py`; `scripts/run_mt5_agent.py` запускает их на CSV-экспорте или истории терминала. Ни один режим не отправляет ордер.
 - `schemas/` — JSON Schema Draft 2020-12 для 11 контрактов.
 - `config/` — deny-by-default policy thresholds и permissions.
 - `mql5/CriticalConsensusEA.mq5` — демонстрационный EA: demo account only, disabled by default; строгая проверка loopback-URL (точный host `127.0.0.1`/`localhost`, числовой порт, без userinfo/query), непустой header-safe `BridgeToken`, TTL/SL/TP/slippage checks и idempotency-заглушка с проверкой результата `GlobalVariablesFlush()` перед `OrderSend`.
 - `src/critical_consensus/persistence.py` — PostgreSQL repository for immutable market bars, pre-outcome forecasts, one-time labels, kill-switch/risk evidence, Redis inbox events and full pipeline decision/audit persistence. `db/postgres_schema.sql` + `db/migrations/` — base schema plus ordered, forward-only migrations (immutable evidence tables and insert-only nonce tombstones); `neo4j/schema.cypher` — graph schema.
 - `tests/` — adversarial unit tests.
 - `.github/workflows/security-audit.yml`, `tests.yml` and `validation-suite.yml` — dependency/source security scans, unit contracts and PostgreSQL/Redis integration checks.
-- `docs/` — архитектура, формулы, пример trace и недельный roadmap.
+- `docs/` — архитектура, формулы, пример trace, недельный roadmap и `MT5_AGENT.md` в трёх языках (`MT5_AGENT.md`, `MT5_AGENT.en.md`, `MT5_AGENT.vi.md`).
 
 ## Быстрый запуск (Linux, Python 3.11+)
 
@@ -39,10 +42,14 @@ export MT5_EVIDENCE_HMAC_KEY="$(python -c 'import secrets; print(secrets.token_u
 export MT5_GOVERNANCE_HMAC_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 export MT5_OPERATOR_HMAC_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 export MT5_REVIEW_HMAC_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export MT5_EVIDENCE_ISSUER="trusted-ingress"
+export MT5_GOVERNANCE_ISSUER="calibration-service"
+export MT5_OPERATOR_ISSUER="operator-console"
+export MT5_REVIEW_ISSUER="review-service"
 uvicorn critical_consensus.api:app --host 127.0.0.1 --port 8000
 ```
 
-`MT5_EVIDENCE_HMAC_KEY`, `MT5_GOVERNANCE_HMAC_KEY`, `MT5_OPERATOR_HMAC_KEY` и `MT5_REVIEW_HMAC_KEY` должны быть четырьмя разными ключами длиной 32–256 байт; соответствующие issuer (`MT5_EVIDENCE_ISSUER`, `MT5_GOVERNANCE_ISSUER`, `MT5_OPERATOR_ISSUER`, `MT5_REVIEW_ISSUER`) также должны различаться. Первый подписывает evidence-пакеты на доверенном ingress, второй — исторические метрики калибровочного сервиса, третий — решение оператора (approval) в домене `operator`, четвёртый — peer reviews, challenge ledger и ChiefReasoning в домене `review`. Без operator-ключа и issuer бандл с решением человека блокируется, а не принимается без подписи. Реестр ревью принимается только с валидной `review_attestation`, покрывающей `{signal_id, peer_reviews, challenge_records, chief_reasoning}`; ingress-ключ не может её подписать. `MT5_BRIDGE_TOKEN` проверяется при каждом защищённом запросе (а не при старте процесса): он должен содержать не менее 24 символов `[A-Za-z0-9._~-]` и не совпадать ни с одним signing-ключом — иначе endpoint отвечает HTTP 503, а `/health` показывает `bridge_token_distinct_from_signing_keys: false`. Отдельный `MT5_KILL_SWITCH_ADMIN_TOKEN` (≥32 символа) нужен только для выключения kill switch и тоже не должен совпадать с bridge-токеном или signing-ключами. Ключи провайдеров задаются только через переменные вида `MT5_AGENT_KEY_*`, на которые ссылается `api_key_env`; произвольные имена переменных и inline-секреты отклоняются.
+`MT5_EVIDENCE_HMAC_KEY`, `MT5_GOVERNANCE_HMAC_KEY`, `MT5_OPERATOR_HMAC_KEY` и `MT5_REVIEW_HMAC_KEY` должны быть четырьмя разными ключами длиной 32–256 байт; соответствующие issuer (`MT5_EVIDENCE_ISSUER`, `MT5_GOVERNANCE_ISSUER`, `MT5_OPERATOR_ISSUER`, `MT5_REVIEW_ISSUER`) также должны различаться. Первый подписывает evidence-пакеты на доверенном ingress, второй — исторические метрики калибровочного сервиса, третий — решение оператора (approval) в домене `operator`, четвёртый — peer reviews, challenge ledger и ChiefReasoning в домене `review`. Без operator-ключа и issuer бандл с решением человека блокируется, а не принимается без подписи. Реестр ревью принимается только с валидной `review_attestation`, покрывающей `{signal_id, verdicts, peer_reviews, challenge_records, chief_reasoning}`; ingress-ключ не может её подписать. `MT5_BRIDGE_TOKEN` проверяется при каждом защищённом запросе (а не при старте процесса): он должен содержать 24–256 символов `[A-Za-z0-9._~-]` и не совпадать ни с одним signing-ключом — иначе endpoint отвечает HTTP 503, а `/health` показывает `bridge_token_distinct_from_signing_keys: false`. Отдельный `MT5_KILL_SWITCH_ADMIN_TOKEN` (≥32 символа) нужен только для выключения kill switch и тоже не должен совпадать с bridge-токеном или signing-ключами. Ключи провайдеров задаются только через переменные вида `MT5_AGENT_KEY_*`, на которые ссылается `api_key_env`; произвольные имена переменных и inline-секреты отклоняются.
 
 Для Windows VPS с MT5: Python bridge должен слушать только `127.0.0.1`; в MT5 добавьте localhost в список разрешённых адресов для `WebRequest`. Не публикуйте bridge на `0.0.0.0` без отдельного сетевого и криптографического контроля.
 
@@ -62,7 +69,7 @@ docker compose up -d
 
 ## Сквозной demo evaluation flow
 
-`evaluate_signal_bundle(...)` принимает уже сформированные verdicts, peer reviews, challenge ledger, source reports и ChiefReasoning. Он пересчитывает coverage peer-review, использует калибровочные метаданные для consensus, проверяет review-домен, связывает PermissionRequest с хэшем ChiefReasoning, пересчитанным consensus и точными сводками источников, затем применяет certainty gate, ChiefAgent и PermissionGate. Если пользователь не передал решение, возвращается `REQUIRE_HUMAN` вместе с `human_review_packet`: все peer reviews, dissenting opinions, challenge ledger, ChiefReasoning, источники, риск-снимок и tail-risk. Пакет показывает именно persisted terminal snapshot (с его validation/reconciliation), а не клиентскую сводку риска. Решение человека принимается только как отдельно подписанный operator-envelope, привязанный к `signal_id`, хэшу ChiefReasoning и `permission_request_sha256` (точным параметрам ордера), и только при `require_persisted_risk=True`. Валидное решение приводит только к `AUTHORIZED_ONCE`; команда ордера не создаётся.
+`evaluate_signal_bundle(...)` принимает уже сформированные verdicts, peer reviews, challenge ledger, source reports и ChiefReasoning. Он пересчитывает coverage peer-review, использует калибровочные метаданные для consensus, проверяет review-домен, связывает PermissionRequest с хэшем ChiefReasoning, пересчитанным consensus и точными сводками источников, затем применяет certainty gate, ChiefAgent и PermissionGate. Если пользователь не передал решение, возвращается `REQUIRE_HUMAN` вместе с `human_review_packet`: все peer reviews, dissenting opinions, challenge ledger, ChiefReasoning, источники, риск-снимок и tail-risk. Пакет показывает именно persisted terminal snapshot (с его validation/reconciliation), а не клиентскую сводку риска. Решение человека принимается только как отдельно подписанный operator-envelope, привязанный к `signal_id`, хэшу ChiefReasoning, `permission_request_sha256` (точным параметрам ордера) и — на persisted-risk пути — `risk_snapshot_sha256` (снимку, который проверил risk gate), и только при `require_persisted_risk=True`. Валидное решение приводит только к `AUTHORIZED_ONCE`; команда ордера не создаётся.
 
 ```python
 from critical_consensus.evidence import sign_bundle, sign_review
@@ -70,6 +77,7 @@ from critical_consensus.pipeline import evaluate_signal_bundle
 
 bundle["review_attestation"] = sign_review(
     {"signal_id": bundle.get("signal_id"),
+     "verdicts": bundle.get("verdicts"),
      "peer_reviews": bundle.get("peer_reviews"),
      "challenge_records": bundle.get("challenge_records"),
      "chief_reasoning": bundle.get("chief_reasoning")},
@@ -79,15 +87,54 @@ signed = sign_bundle(bundle, key=evidence_key, issuer="trusted-ingress")
 result = evaluate_signal_bundle(
     signed, certainty_policy, permission_matrix,
     evidence_key=evidence_key, governance_key=governance_key,
+    expected_evidence_issuer="trusted-ingress",
+    expected_governance_issuer="calibration-service",
     review_key=review_key, expected_review_issuer="review-service",
 )
 print(result["status"], result["blockers"])
 assert result["trade_allowed"] is False
 ```
 
-Бандл обязан нести свежий `evidence_envelope`; peer reviews, challenge ledger и ChiefReasoning принимаются только из отдельной `review_attestation` review-сервиса (четвёртый ключ и issuer), поэтому ingress-ключ не может «дописать» независимые ревью или Chief CONFIRM. Исторические `dissent_rate`/`false_certainty_rate` принимаются только из подписанной атестации калибровочного сервиса (отдельный ключ, отдельный issuer). `mandatory_agents` и `compliance_agent_id` берутся только из политики. `compliance_status` вычисляется по verdict `ComplianceAgent`, а не по полю бандла. PermissionRequest обязан совпадать с `signal_input` по `instrument` и `direction`. Persisted MT5 risk snapshot должен совпадать с заказом по symbol и request-binding hash, а `risk_value`/`risk_fraction` пересчитываются из `size × |худший вход − SL|` (худший из reviewed и reference price), tick size/tick value и equity и сравниваются с допуском 1%; daily loss и drawdown пересчитываются из equity-баз, day-start equity должна согласовываться с `balance − daily_pnl` (1%), а high-water mark не может быть ниже day-start. Slippage больше 10% дистанции до стопа или reference price за SL/TP блокируют снимок; RR дополнительно проверяется по худшей цене входа против `min_expected_rr`. Разрешение человека требует `decision_id` и одноразовый `nonce`, атомарно потребляемый через `InMemoryNonceStore` (тесты/демо) или `PostgresNonceStore`; nonce одноразовый на оператора, а permission — отдельная insert-only запись в `authorization_permissions` (миграция 006), поэтому ни повтор nonce, ни повторное подтверждение того же permission не проходят. `PostgresNonceStore` хранит insert-only tombstones: приложение не удаляет строки в обработке запроса, ручная очистка допускается только после `expires_at` и согласованного retention-окна. Evidence-envelope не одноразовый: его повтор ограничен `min(max_age_seconds, ttl_seconds)` (по умолчанию 300 с, потолок конверта 3600 с), а идемпотентность обеспечивают nonce/permission stores.
+Бандл обязан нести свежий `evidence_envelope`; verdicts, peer reviews, challenge ledger и ChiefReasoning принимаются только из отдельной `review_attestation` review-сервиса (четвёртый ключ и issuer), поэтому ingress-ключ не может «дописать» независимые ревью или Chief CONFIRM. Исторические `dissent_rate`/`false_certainty_rate` принимаются только из подписанной атестации калибровочного сервиса (отдельный ключ, отдельный issuer). `mandatory_agents` и `compliance_agent_id` берутся только из политики. `compliance_status` вычисляется по verdict `ComplianceAgent`, а не по полю бандла. PermissionRequest обязан совпадать с `signal_input` по `instrument` и `direction`. Persisted MT5 risk snapshot должен совпадать с заказом по symbol и request-binding hash, а `risk_value`/`risk_fraction` пересчитываются из `size × |худший вход − SL|` (худший из reviewed и reference price), tick size/tick value и `min(account_equity, account_balance)` и сравниваются с допуском 1%; daily loss и drawdown пересчитываются из equity-баз, day-start equity должна согласовываться с `balance − daily_pnl` в обе стороны (1%), а high-water mark не может быть ниже day-start. Снимок обязан нести идентичность счёта `account_login` (целое `>= 1`) и `account_server` (непустая строка); политика может закрепить ожидаемые значения, и тогда несовпадение блокирует. Позиции должны быть согласованы: `position_symbols` длиной ровно `open_positions`, `correlated_open_positions <= open_positions`, `open_stop_risk_fraction > 0` запрещён при нуле позиций, а каждая открытая позиция требует свежего тика своего символа — иначе риск по её стопу неизвестен и снимок блокируется. Slippage больше 10% дистанции до стопа или reference price за SL/TP блокируют снимок; RR дополнительно проверяется по худшей цене входа против `min_expected_rr`. Снимок обязан содержать `open_stop_risk_fraction` числом `[0, 1]` (риск незакрытых стопов считается от текущей цены; отсутствующее, строковое или `null` значение — DENY), и проспективные лимиты складывают его с реализованными daily-loss/drawdown и риском новой сделки. Разрешение человека требует `decision_id` и одноразовый `nonce`, атомарно потребляемый через `InMemoryNonceStore` (тесты/демо) или `PostgresNonceStore`; nonce одноразовый на оператора, а отдельная insert-only запись в `authorization_permissions` (миграция 006) привязана к серверному хэшу самого ордера (signal/instrument/direction/size/entry/SL/TP/mode), а не к клиентскому `permission_id`, поэтому ни повтор nonce, ни переименование разрешения не позволяют подтвердить тот же ордер дважды. `PostgresNonceStore` хранит insert-only tombstones: приложение не удаляет строки в обработке запроса, ручная очистка допускается только после `expires_at` и согласованного retention-окна. Evidence-envelope не одноразовый: его повтор ограничен `min(max_age_seconds, ttl_seconds)` (по умолчанию 300 с, потолок конверта 3600 с), а идемпотентность обеспечивают nonce/permission stores.
 
 Защищённые policy API endpoints требуют `X-Bridge-Key` и тело `{"payload": ..., "envelope": ...}` с валидной HMAC-подписью. Если `MT5_BRIDGE_TOKEN`, evidence-ключ/issuer, governance-ключ/issuer или review-ключ/issuer не настроены либо signing-домены пересекаются, endpoint отвечает HTTP 503; отсутствующий или неверный `X-Bridge-Key` — HTTP 401; неверная или изменённая evidence-подпись, а также отсутствующая/чужая `review_attestation` (`review_attestation_invalid`) — HTTP 403; неверная схема тела — HTTP 422. API пересчитывает `reviewer_count`, consensus и `open_challenges` из raw-записей и игнорирует заявленные клиентом агрегаты; verdict-метаданные (signal_id, `input_hash` против канонического `signal_input`, `created_at`/TTL) перепроверяются так же, как в pipeline. `/v1/permission/check` намеренно отвечает HTTP 423 и требует persisted-risk эндпоинт `/v1/risk/permission/check`. `/health` не содержит секретов и честно показывает, какие проверки сконфигурированы (`evidence`/`governance`/`operator`/`review` verification, отдельность bridge-токена, kill-switch admin и signing-ключей/issuer), но всегда сообщает execution disabled. Ключ bridge — защита localhost-транспорта, а не 2FA/цифровая подпись пользователя. `/v1/authorization/check` намеренно отвечает HTTP 423: он не принимает переданный клиентом объект PermissionResult как доказательство выданного разрешения, поскольку долговременного server-side permission store и настоящего 2FA/signature verifier пока нет.
+
+## MT5-агент: observe/paper поверх терминала
+
+Отдельный пакет `src/critical_consensus/mt5_agent/` (не часть конвейера разрешений) читает
+состояние терминала без торговых вызовов, применяет fail-closed гейты и пишет каждое решение в
+SQLite hash-журнал. `symbol_spec()` вызывает `symbol_select()`, только когда символа нет в
+Market Watch, и это добавляет его в список символов терминала.
+**Ордерного API в пакете нет**: `mode: live` отвергается политикой, каждая запись журнала содержит
+`broker_order_sent: false`, а тест `test_agent_never_reports_a_broker_order`, скан исходников
+`mt5_agent` с allowlist вызовов терминала без отправки ордеров и проверка `dir(MT5Agent)`
+закрепляют это.
+
+```bash
+cp config/mt5_agent.example.yaml config/mt5_agent.yaml
+python scripts/run_mt5_agent.py --db agent_data/mt5_agent.db run \
+  --policy config/mt5_agent.yaml --source csv --csv export_eurusd_h1.csv \
+  --source-timezone Europe/London --balance 10000 --language ru --execution confirm
+python scripts/run_mt5_agent.py --db agent_data/mt5_agent.db report
+```
+
+Гейты одного цикла: часы UTC → kill switch → демо-счёт и закреплённые login/server → базы equity
+и дневные лимиты → торговое окно и blackout → лимит позиций → свежесть котировки → риск по стопам
+уже открытых позиций и убыток, зафиксированный за день → сигнал SMA/ATR (включая лимит спреда) →
+риск/награда и объём из стоп-расстояния и `volume_step` → суммарный риск по стопам с дневным
+убытком → режим исполнения → реквота после
+подтверждения (дрейф не более 10 % стоп-расстояния, пересчёт RR и объёма, не выше одобренного
+лота). `paper` исполняет сделку локально на исторических барах без
+подглядывания вперёд (стоп проверяется раньше тейка внутри одного бара); `observe` только
+фиксирует предложение. `--execution confirm` (по умолчанию) спрашивает `y/n/a/q` перед каждой
+позицией, `--execution auto` разрешён только на демо-счёте; `--language ru|en|vi` переключает весь
+интерфейс (русский, английский, вьетнамский), а журнал хранит только машинные коды.
+
+Чтение реального терминала на этом хосте **NOT PROVEN**: пакет `MetaTrader5` и `terminal64.exe`
+здесь отсутствуют, поэтому `--source live` проверяется против stub-модуля, а живые цифры — на
+синтетических барах и не являются оценкой доходности. Шаги для проверки на своём Windows VPS и
+полное описание: [docs/MT5_AGENT.md](docs/MT5_AGENT.md) /
+[docs/MT5_AGENT.en.md](docs/MT5_AGENT.en.md) / [docs/MT5_AGENT.vi.md](docs/MT5_AGENT.vi.md).
 
 ## Где ещё нет production-функций
 
@@ -106,11 +153,11 @@ assert result["trade_allowed"] is False
 9. Неподписанный, просроченный или изменённый evidence bundle не доходит ни до одного gate.
 10. Исторические health-метрики без подписанной атестации калибровочного сервиса блокируют certainty PASS.
 11. Peer reviews, challenge ledger и ChiefReasoning без подписи review-домена блокируют evaluation; ingress-ключ не может их подписать.
-12. Одно и то же человеческое подтверждение не может быть использовано дважды — ни по nonce, ни по permission_id.
+12. Одно и то же человеческое подтверждение не может быть использовано дважды — ни по nonce, ни по ордеру: tombstone привязан к серверному хэшу параметров ордера, а не к `permission_id`.
 
 ## Проверка текущего каркаса
 
-- Локальная проверка ветки `harden/10of10` на Python 3.12 (Windows): `pytest -q` — **309 passed, 10 skipped**; `python scripts/check_mql5_safety.py` — **383 static invariants verified, 73 mutations rejected** (компиляция EA и demo-исполнение по-прежнему NOT PROVEN). Все пропуски требуют `TEST_DATABASE_URL` и/или `TEST_REDIS_URL` и здесь не запускались. Результаты GitHub Actions относятся к предыдущим коммитам и для этой ветки должны быть подтверждены отдельным run после push; они не наследуются автоматически.
+- Локальная проверка ветки `harden/10of10` на Python 3.12 (Windows): `pytest -q` — **479 passed, 10 skipped**; `python scripts/check_mql5_safety.py` — **423 checks (including 85 mutation rejections)** (компиляция EA и demo-исполнение по-прежнему NOT PROVEN). Все пропуски требуют `TEST_DATABASE_URL` и/или `TEST_REDIS_URL` и здесь не запускались. Результаты GitHub Actions относятся к предыдущим коммитам и для этой ветки должны быть подтверждены отдельным run после push; они не наследуются автоматически.
 - Проверяются fail-closed gates, HMAC evidence/governance envelopes, одноразовые authorization nonce, integrity binding между ChiefReasoning/consensus/source summary и PermissionRequest, выдача полного human review packet, hash chain, API key gate, строгая каноническая сериализация и Redis Streams helpers.
 - Проверка зелёных тестов доказывает поведение локальных функций на синтетических входах, но не проверяет брокер, MQL5-компиляцию, реальную очередь, рыночные данные или доходность.
 - ChiefReasoning hash вычисляется по каноническому JSON без поля `reasoning_hash`; изменение любого шага делает hash невалидным.

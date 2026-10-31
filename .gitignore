@@ -11,3 +11,4 @@ htmlcov/
 .env
 .env.*.local
 *.log
+agent_data/
