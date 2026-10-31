@@ -153,7 +153,7 @@ def test_market_forecast_rejects_reference_close_not_matching_persisted_bar():
     repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
     repo.migrate()
     issued = datetime.now(timezone.utc) - timedelta(hours=2)
-    reference_at = issued - timedelta(hours=1)
+    reference_at = issued - timedelta(hours=1, seconds=5)
     symbol = "BADREF" + uuid.uuid4().hex[:6].upper()
     repo.append_market_bars([
         MarketBar(symbol, "H1", reference_at, 1.0, 1.2, 0.9, 1.1),
