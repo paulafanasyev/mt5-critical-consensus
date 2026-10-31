@@ -69,7 +69,10 @@ def main() -> int:
     else:
         parser.error("no persisted history; provide --bootstrap-from-utc for the initial chronological import")
 
-    to_utc = datetime.now(timezone.utc)
+    application_clock_utc = datetime.now(timezone.utc)
+    database_clock = repo.get_database_clock()
+    to_utc = database_clock["now_utc"]
+    clock_skew_seconds = abs((application_clock_utc - to_utc).total_seconds())
     if from_utc >= to_utc:
         parser.error("last persisted bar timestamp is not earlier than current UTC time")
 
@@ -115,6 +118,13 @@ def main() -> int:
         "timeframe": args.timeframe,
         "from_utc": from_utc.isoformat(),
         "to_utc": to_utc.isoformat(),
+        "clock": {
+            "database_time_utc": to_utc.isoformat(),
+            "database_session_timezone": database_clock["session_timezone"],
+            "application_time_utc": application_clock_utc.isoformat(),
+            "application_database_skew_seconds": round(clock_skew_seconds, 3),
+            "finalization_clock_source": "postgresql_server_clock",
+        },
         "received_bars": received,
         "finalized_bars": len(finalized),
         "dropped_forming_bars": dropped_forming,
