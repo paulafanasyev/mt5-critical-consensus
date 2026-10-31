@@ -38,50 +38,75 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $installer = Join-Path $env:RUNNER_TEMP "mt5setup.exe"
-          $process = Start-Process -FilePath $installer -ArgumentList "/auto" -PassThru -Wait
-          Write-Host "Installer exit code: $($process.ExitCode)"
+          $installRoot = Join-Path $env:RUNNER_TEMP "MetaTrader5"
+          $report = Join-Path $env:RUNNER_TEMP "mt5-install-diagnostics.txt"
+          New-Item -ItemType Directory -Force -Path $installRoot | Out-Null
 
-          $editor = $null
-          $roots = @(
-            (Join-Path $env:ProgramFiles "MetaTrader 5"),
-            (Join-Path $env:ProgramFiles "MetaTrader 5 Terminal"),
-            (Join-Path $env:LOCALAPPDATA "Programs")
-          )
-          foreach ($root in $roots) {
-            if (Test-Path $root) {
-              $candidate = Get-ChildItem -Path $root -Filter "metaeditor64.exe" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($candidate) { $editor = $candidate.FullName; break }
+          try {
+            # Install into writable runner temp, not Program Files. /path is supported by MetaQuotes.
+            $process = Start-Process -FilePath $installer -ArgumentList @("/auto", "/path:$installRoot") -WorkingDirectory $env:RUNNER_TEMP -PassThru -Wait
+            "InstallerExitCode=$($process.ExitCode)" | Set-Content -Path $report
+            "RequestedInstallPath=$installRoot" | Add-Content -Path $report
+            Write-Host "Installer exit code: $($process.ExitCode)"
+
+            $editor = Join-Path $installRoot "metaeditor64.exe"
+            if (-not (Test-Path $editor)) {
+              $candidate = Get-ChildItem -Path $installRoot -Filter "metaeditor64.exe" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($candidate) { $editor = $candidate.FullName }
             }
-          }
-          if (-not $editor) {
-            throw "MetaEditor was not installed or could not be located. Installer exit code: $($process.ExitCode)"
-          }
 
-          $terminalRoot = Split-Path $editor -Parent
-          $experts = Join-Path $terminalRoot "MQL5\Experts"
-          New-Item -ItemType Directory -Force -Path $experts | Out-Null
-          $source = Join-Path $PWD "mql5\CriticalConsensusEA.mq5"
-          $target = Join-Path $experts "CriticalConsensusEA.mq5"
-          Copy-Item $source $target -Force
+            if (-not (Test-Path $editor)) {
+              $roots = @(
+                (Join-Path $env:ProgramFiles "MetaTrader 5"),
+                (Join-Path $env:ProgramFiles "MetaTrader 5 Terminal"),
+                (Join-Path $env:LOCALAPPDATA "Programs"),
+                (Join-Path $env:APPDATA "MetaQuotes")
+              ) | Where-Object { $_ -and (Test-Path $_) }
+              foreach ($root in $roots) {
+                $candidate = Get-ChildItem -Path $root -Filter "metaeditor64.exe" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($candidate) { $editor = $candidate.FullName; break }
+              }
+            }
+            if (-not (Test-Path $editor)) {
+              "MetaEditorFound=False" | Add-Content -Path $report
+              "InstallRootContents:" | Add-Content -Path $report
+              Get-ChildItem -Path $installRoot -Force -ErrorAction SilentlyContinue | Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize | Out-String | Add-Content -Path $report
+              throw "MetaEditor was not installed or could not be located; inspect mt5-install-diagnostics.txt."
+            }
 
-          $compile = Start-Process -FilePath $editor -ArgumentList @("/compile:`"$target`"", "/log") -PassThru -Wait
-          $log = "$target.log"
-          if (-not (Test-Path $log)) {
-            throw "MetaEditor did not create a compiler log. Process exit code: $($compile.ExitCode)"
+            "MetaEditorPath=$editor" | Add-Content -Path $report
+            $terminalRoot = Split-Path $editor -Parent
+            $experts = Join-Path $terminalRoot "MQL5\Experts"
+            New-Item -ItemType Directory -Force -Path $experts | Out-Null
+            $source = Join-Path $PWD "mql5\CriticalConsensusEA.mq5"
+            $target = Join-Path $experts "CriticalConsensusEA.mq5"
+            Copy-Item $source $target -Force
+
+            $compileArguments = @('/compile:"' + $target + '"', "/log")
+            $compile = Start-Process -FilePath $editor -ArgumentList $compileArguments -PassThru -Wait
+            "MetaEditorExitCode=$($compile.ExitCode)" | Add-Content -Path $report
+            $log = "$target.log"
+            if (-not (Test-Path $log)) {
+              throw "MetaEditor did not create a compiler log. Process exit code: $($compile.ExitCode)"
+            }
+            Get-Content $log
+            $logText = Get-Content $log -Raw
+            if ($logText -match "(?im)\b[1-9]\d* errors?\b" -or $logText -notmatch "(?im)\b0 errors?\b") {
+              throw "MQL5 compilation did not report zero errors."
+            }
+            if ($logText -match "(?im)\b[1-9]\d* warnings?\b") {
+              Write-Warning "MetaEditor reported compiler warnings; review the uploaded log."
+            }
+            $ex5 = [System.IO.Path]::ChangeExtension($target, ".ex5")
+            if (-not (Test-Path $ex5)) {
+              throw "Compiler log reports no errors but the expected EX5 artifact is missing."
+            }
+            Write-Host "PASS: MetaEditor produced CriticalConsensusEA.ex5 with zero compiler errors."
           }
-          Get-Content $log
-          $logText = Get-Content $log -Raw
-          if ($logText -match "(?im)\b[1-9]\d* errors?\b" -or $logText -notmatch "(?im)\b0 errors?\b") {
-            throw "MQL5 compilation did not report zero errors."
+          catch {
+            "Failure=$($_.Exception.Message)" | Add-Content -Path $report
+            throw
           }
-          if ($logText -match "(?im)\b[1-9]\d* warnings?\b") {
-            Write-Warning "MetaEditor reported compiler warnings; review the uploaded log."
-          }
-          $ex5 = [System.IO.Path]::ChangeExtension($target, ".ex5")
-          if (-not (Test-Path $ex5)) {
-            throw "Compiler log reports no errors but the expected EX5 artifact is missing."
-          }
-          Write-Host "PASS: MetaEditor produced CriticalConsensusEA.ex5 with zero compiler errors."
 
       - name: Upload MetaEditor compiler evidence
         if: always()
