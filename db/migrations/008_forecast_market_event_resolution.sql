@@ -44,18 +44,35 @@ ALTER TABLE forecast_predictions
 ALTER TABLE forecast_predictions
   ADD CONSTRAINT forecast_predictions_market_resolution_check
   CHECK (
-    (outcome IS NULL AND resolved_at IS NULL
+    (
+      forecast_kind = 'LEGACY_VERDICT_CONFIDENCE'
+      AND target_policy_version IS NULL AND target_event IS NULL
+      AND symbol IS NULL AND timeframe IS NULL
+      AND reference_at IS NULL AND reference_close IS NULL
       AND resolved_bar_time IS NULL AND resolved_bar_close IS NULL
-      AND resolution_source IS NULL AND resolution_evidence_sha256 IS NULL)
+      AND resolution_source IS NULL AND resolution_evidence_sha256 IS NULL
+      AND (
+        (outcome IS NULL AND resolved_at IS NULL)
+        OR (outcome IS NOT NULL AND resolved_at IS NOT NULL)
+      )
+    )
     OR
-    (outcome IS NOT NULL AND resolved_at IS NOT NULL
-      AND forecast_kind = 'NEXT_BAR_MARKET_EVENT'
-      AND resolved_bar_time IS NOT NULL AND resolved_bar_time > issued_at
-      AND resolved_bar_close IS NOT NULL AND resolved_bar_close > 0
-      AND resolution_source IS NOT NULL AND length(trim(resolution_source)) > 0
-      AND resolution_evidence_sha256 IS NOT NULL
-      AND resolution_evidence_sha256 ~ '^sha256:[0-9a-f]{64}$'
-      AND outcome = CASE WHEN resolved_bar_close > reference_close THEN 1 ELSE 0 END)
+    (
+      forecast_kind = 'NEXT_BAR_MARKET_EVENT'
+      AND (
+        (outcome IS NULL AND resolved_at IS NULL
+          AND resolved_bar_time IS NULL AND resolved_bar_close IS NULL
+          AND resolution_source IS NULL AND resolution_evidence_sha256 IS NULL)
+        OR
+        (outcome IS NOT NULL AND resolved_at IS NOT NULL
+          AND resolved_bar_time IS NOT NULL AND resolved_bar_time > issued_at
+          AND resolved_bar_close IS NOT NULL AND resolved_bar_close > 0
+          AND resolution_source IS NOT NULL AND length(trim(resolution_source)) > 0
+          AND resolution_evidence_sha256 IS NOT NULL
+          AND resolution_evidence_sha256 ~ '^sha256:[0-9a-f]{64}$'
+          AND outcome = CASE WHEN resolved_bar_close > reference_close THEN 1 ELSE 0 END)
+      )
+    )
   );
 
 CREATE INDEX IF NOT EXISTS idx_forecast_predictions_pending_market_events
