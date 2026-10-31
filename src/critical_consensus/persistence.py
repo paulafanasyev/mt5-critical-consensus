@@ -359,6 +359,21 @@ class PostgresRepository:
 
         inserted_count = replay_count = 0
         with self._connect() as conn:
+            # The reference price must already exist as an immutable stored market bar;
+            # callers cannot manufacture a reference close in an API payload.
+            for record in prepared:
+                (model_id, signal_id, issued, probability, input_sha256, kind,
+                 version, target_event, symbol, timeframe, reference_at, reference_close) = record
+                if kind == "NEXT_BAR_MARKET_EVENT":
+                    reference_bar = conn.execute(
+                        """SELECT close FROM market_bars
+                           WHERE symbol=%s AND timeframe=%s AND bar_time=%s""",
+                        (symbol, timeframe, reference_at),
+                    ).fetchone()
+                    if (reference_bar is None
+                            or not math.isclose(float(reference_bar[0]), reference_close,
+                                                rel_tol=0.0, abs_tol=1e-12)):
+                        raise ValueError("forecast reference close does not match an immutable persisted market bar")
             for record in prepared:
                 (model_id, signal_id, issued, probability, input_sha256, kind,
                  version, target_event, symbol, timeframe, reference_at, reference_close) = record
@@ -468,6 +483,15 @@ class PostgresRepository:
                 }
 
             duration = forecast_bar_duration(str(timeframe))
+            reference_bar = conn.execute(
+                """SELECT bar_time, open, high, low, close, tick_volume, spread_points, source
+                   FROM market_bars
+                   WHERE symbol=%s AND timeframe=%s AND bar_time=%s""",
+                (symbol, timeframe, reference_at),
+            ).fetchone()
+            if reference_bar is None or not math.isclose(
+                    float(reference_bar[4]), float(reference_close), rel_tol=0.0, abs_tol=1e-12):
+                raise RuntimeError("persisted reference market bar is missing or does not match forecast contract")
             target = conn.execute(
                 """SELECT bar_time, open, high, low, close, tick_volume,
                           spread_points, source
@@ -500,10 +524,13 @@ class PostgresRepository:
                 "signal_id": signal_id,
                 "issued_at": issued_at.isoformat(),
                 "input_sha256": str(input_sha256),
-                "reference": {
+                "reference_bar": {
                     "symbol": str(symbol), "timeframe": str(timeframe),
-                    "bar_time": reference_at.isoformat(),
-                    "close": float(reference_close),
+                    "bar_time": reference_bar[0].isoformat(),
+                    "open": float(reference_bar[1]), "high": float(reference_bar[2]),
+                    "low": float(reference_bar[3]), "close": float(reference_bar[4]),
+                    "tick_volume": reference_bar[5], "spread_points": reference_bar[6],
+                    "source": str(reference_bar[7]),
                 },
                 "target_bar": {
                     "bar_time": bar_time.isoformat(),
