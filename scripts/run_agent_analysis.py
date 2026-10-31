@@ -114,6 +114,52 @@ async def run(args) -> int:
                       "blockers": ["AGENT_CONFIGURATION_OR_COLLECTION_FAILED"],
                       "trade_allowed": False}
 
+    # Store each validated raw confidence observation before peer review and before
+    # any outcome can be known. A failed/ambiguous persistence blocks this signal.
+    forecast_capture = {"inserted": 0, "identical_replays": 0, "total": 0}
+    forecast_records = []
+    valid_verdicts = result.get("verdicts", [])
+    if isinstance(valid_verdicts, list):
+        for verdict in valid_verdicts:
+            if not isinstance(verdict, dict):
+                continue
+            model_id = str(verdict.get("provider_identity", "")).strip()
+            verdict_id = str(verdict.get("verdict_id", "")).strip()
+            verdict_signal_id = str(verdict.get("signal_id", "")).strip()
+            if not model_id or not verdict_id or verdict_signal_id != signal_id:
+                result["status"] = "GATHER_MORE"
+                result["blockers"] = sorted(set(result.get("blockers", []) + [
+                    "PRE_OUTCOME_FORECAST_PROVENANCE_MISSING"
+                ]))
+                result["trade_allowed"] = False
+                forecast_records = []
+                break
+            forecast_records.append({
+                "model_id": model_id,
+                "signal_id": signal_id + "::" + verdict_id,
+                "issued_at": verdict.get("created_at"),
+                "probability": verdict.get("confidence"),
+                "input_sha256": verdict.get("input_hash"),
+            })
+    if forecast_records:
+        try:
+            forecast_capture = await asyncio.to_thread(repo.record_forecasts, forecast_records)
+            for verdict, observation in zip(valid_verdicts, forecast_records):
+                verdict["forecast_observation"] = {
+                    "model_id": observation["model_id"],
+                    "signal_id": observation["signal_id"],
+                    "issued_at": observation["issued_at"],
+                    "input_sha256": observation["input_sha256"],
+                    "meaning": "raw subjective confidence in this agent verdict; not calibrated",
+                    "persistence": "PERSISTED",
+                }
+        except Exception as exc:
+            result["status"] = "GATHER_MORE"
+            result["blockers"] = sorted(set(result.get("blockers", []) + [
+                "PRE_OUTCOME_FORECAST_CAPTURE_FAILED:" + type(exc).__name__
+            ]))
+            result["trade_allowed"] = False
+
     if result.get("status") == "READY_FOR_REVIEW":
         try:
             reviewer_registry = [
@@ -227,6 +273,7 @@ async def run(args) -> int:
                                          "independence_groups": source_context.get("independence_groups", []),
                                          "blockers": source_context.get("blockers", [])},
                       "collection": result,
+                      "pre_outcome_forecast_capture": forecast_capture,
                       "pipeline_stage": "AGENT_REVIEW_AND_DETERMINISTIC_GATES",
                       "deterministic_pipeline": {
                           "status": decision_evaluation.get("status"),
