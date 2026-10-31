@@ -61,6 +61,61 @@ def test_postgres_forecast_cannot_be_rewritten_after_issue_or_resolution():
     assert len(exported) == 1
     assert exported[0]["signal_id"] == signal_id
 
+
+def test_forecast_batch_capture_is_atomic_and_rejects_conflicting_replays():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    model_id = "batch-model-" + uuid.uuid4().hex
+    issued = datetime.now(timezone.utc)
+    first_id = "batch-signal-" + uuid.uuid4().hex
+    second_id = "batch-signal-" + uuid.uuid4().hex
+    records = [
+        {"model_id": model_id, "signal_id": first_id, "issued_at": issued,
+         "probability": 0.63, "input_sha256": "sha256:" + "a" * 64},
+        {"model_id": model_id, "signal_id": second_id, "issued_at": issued,
+         "probability": 0.71, "input_sha256": "sha256:" + "b" * 64},
+    ]
+    assert repo.record_forecasts(records) == {
+        "inserted": 2, "identical_replays": 0, "total": 2
+    }
+    assert repo.record_forecasts(records) == {
+        "inserted": 0, "identical_replays": 2, "total": 2
+    }
+
+    uncommitted_id = "batch-signal-" + uuid.uuid4().hex
+    conflicting_batch = [
+        {"model_id": model_id, "signal_id": uncommitted_id, "issued_at": issued,
+         "probability": 0.55, "input_sha256": "sha256:" + "c" * 64},
+        dict(records[1], probability=0.72),
+    ]
+    with pytest.raises(ValueError, match="conflicting replay"):
+        repo.record_forecasts(conflicting_batch)
+
+    with repo._connect() as connection:
+        inserted = connection.execute(
+            "SELECT 1 FROM forecast_predictions WHERE model_id=%s AND signal_id=%s",
+            (model_id, uncommitted_id),
+        ).fetchone()
+    assert inserted is None
+
+
+def test_forecast_batch_rejects_duplicate_keys_and_unverified_probability_inputs_before_db():
+    def unexpected_connect(_dsn):
+        raise AssertionError("invalid batch must be rejected before database access")
+
+    repo = PostgresRepository("postgresql://unused/unused", connect_fn=unexpected_connect)
+    record = {
+        "model_id": "model-a", "signal_id": "signal-a",
+        "issued_at": datetime.now(timezone.utc), "probability": 0.7,
+        "input_sha256": "sha256:" + "d" * 64,
+    }
+    with pytest.raises(ValueError, match="duplicate"):
+        repo.record_forecasts([record, dict(record)])
+    for bad_probability in (True, float("nan"), float("inf"), -0.1, 1.1):
+        with pytest.raises(ValueError, match="probability"):
+            repo.record_forecasts([dict(record, probability=bad_probability)])
+
+
 def test_persisted_kill_switch_defaults_active_and_appends_audit_events():
     repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
     repo.migrate()
