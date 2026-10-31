@@ -35,7 +35,17 @@ ALTER TABLE forecast_predictions
       AND target_event = 'NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE'
       AND symbol IS NOT NULL AND length(trim(symbol)) > 0
       AND timeframe IS NOT NULL AND timeframe IN ('M1','M5','M15','M30','H1','H4','D1','W1')
-      AND reference_at IS NOT NULL AND reference_at < issued_at
+      AND reference_at IS NOT NULL
+      AND (
+        (timeframe = 'M1' AND issued_at >= reference_at + INTERVAL '1 minute 2 seconds')
+        OR (timeframe = 'M5' AND issued_at >= reference_at + INTERVAL '5 minutes 2 seconds')
+        OR (timeframe = 'M15' AND issued_at >= reference_at + INTERVAL '15 minutes 2 seconds')
+        OR (timeframe = 'M30' AND issued_at >= reference_at + INTERVAL '30 minutes 2 seconds')
+        OR (timeframe = 'H1' AND issued_at >= reference_at + INTERVAL '1 hour 2 seconds')
+        OR (timeframe = 'H4' AND issued_at >= reference_at + INTERVAL '4 hours 2 seconds')
+        OR (timeframe = 'D1' AND issued_at >= reference_at + INTERVAL '1 day 2 seconds')
+        OR (timeframe = 'W1' AND issued_at >= reference_at + INTERVAL '7 days 2 seconds')
+      )
       AND reference_close IS NOT NULL AND reference_close > 0)
   );
 
