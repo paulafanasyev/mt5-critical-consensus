@@ -6,7 +6,11 @@ import argparse
 import json
 from datetime import datetime, timezone
 
-from critical_consensus.market_data import fetch_mt5_bars, retain_completed_bars
+from critical_consensus.market_data import (
+    detect_potential_bar_gaps,
+    fetch_mt5_bars,
+    retain_completed_bars,
+)
 from critical_consensus.persistence import PostgresRepository
 
 
@@ -51,7 +55,9 @@ def main() -> int:
 
     repo = PostgresRepository()
     repo.migrate()
-    existing = repo.get_recent_market_bars(symbol, args.timeframe, limit=21)
+    # Scan the recent immutable history window for suspicious gaps while resuming
+    # from its newest bar. Gaps are advisory because broker sessions/holidays vary.
+    existing = repo.get_recent_market_bars(symbol, args.timeframe, limit=5000)
     if existing:
         from_utc = existing[-1].time
     elif args.bootstrap_from_utc is not None:
@@ -79,6 +85,13 @@ def main() -> int:
             if "insufficient completed bars" not in str(exc):
                 raise
     dropped_forming = received - len(finalized)
+    latest_persisted = existing[-1].time if existing else None
+    new_finalized = [
+        bar for bar in finalized
+        if latest_persisted is None or bar.time > latest_persisted
+    ]
+    gap_scan_bars = (existing + new_finalized)[-5000:]
+    potential_gaps = detect_potential_bar_gaps(gap_scan_bars) if len(gap_scan_bars) >= 2 else []
     ingest = repo.append_market_bars(finalized) if finalized else {
         "inserted": 0, "identical_duplicates": 0, "total": 0,
     }
@@ -98,6 +111,19 @@ def main() -> int:
         "dropped_forming_bars": dropped_forming,
         "ingestion": ingest,
         "forecast_resolution": resolution,
+        "market_history_integrity": {
+            "bars_scanned": len(gap_scan_bars),
+            "scan_scope": (
+                "last_5000_persisted_bars_plus_new_closed_bars"
+                if existing else "initial_bootstrap_batch_only"
+            ),
+            "potential_gaps": potential_gaps,
+            "interpretation": (
+                "Advisory only. Weekend-spanning intervals are ignored; other gaps may "
+                "reflect broker sessions or holidays and require operator review."
+            ),
+            "automatic_backfill": False,
+        },
         "trade_allowed": False,
         "execution": "NOT_REQUESTED",
     }, indent=2, sort_keys=True, default=str, allow_nan=False))
