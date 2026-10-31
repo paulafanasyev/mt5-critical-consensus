@@ -98,7 +98,9 @@ For an API that returns a timezone-aware ISO-8601 publication field, the operato
 
 ## 4. Walk-forward calibration
 
-Capture the model forecast before its outcome is available, persist the exact issue timestamp and canonical input hash, then resolve it once the outcome is known. Export rows to a CSV with columns:
+The agent-analysis runner now captures every validated provider verdict into PostgreSQL `forecast_predictions` before peer review and before any outcome is known. It records the provider/model identity, a unique signal-plus-verdict ID, the provider-issued timestamp, the raw confidence score and the exact signal input SHA-256 in one atomic batch. Identical replays are idempotent; a conflicting replay rejects the full batch. These values are explicitly **raw subjective confidence observations**, not calibrated probabilities, trade win rates or profitability evidence.
+
+Capture the model forecast before its outcome is available, persist the exact issue timestamp and canonical input hash, then resolve it only after an independently observed outcome is known. Export rows to a CSV with columns:
 
 ```csv
 model_id,signal_id,issued_at,resolved_at,probability,outcome
@@ -112,6 +114,8 @@ python scripts/evaluate_calibration.py predictions.csv --output calibration-repo
 ```
 
 The evaluator fits Platt scaling only on earlier forecasts whose outcomes were already resolved before the next test block. It reports Brier score, log loss, reliability bins, ECE, high-confidence false-certainty rate, sample counts and a deterministic paired bootstrap interval. With too few observations or an interval that does not show improvement, the result remains `NOT_PROVEN`. The script cannot independently prove that a supplied historical forecast was genuinely captured before the outcome; only a trusted append-only capture pipeline and audit trail can provide that provenance.
+
+At present, the runner establishes issue-time provenance for raw confidence observations, but it does not automatically adjudicate their correctness or mark them resolved. The existing forecast-resolution repository method is a storage primitive, not an outcome adjudicator. Until an explicit, evidence-backed label protocol and operator-reviewed resolution are in place, these observations remain unresolved and cannot satisfy the Certainty Gate's minimum calibration sample requirements. Never label a model correct simply because the market later moved in the expected direction; apply a pre-defined forecast target and horizon consistently, and preserve NOT_PROVEN when the target cannot be adjudicated.
 
 This is probability calibration, not a strategy/backtest profitability test. A calibrated probability does not prove positive expectancy, execution quality or future profit.
 
