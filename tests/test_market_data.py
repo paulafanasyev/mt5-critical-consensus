@@ -2,7 +2,8 @@ from datetime import datetime, timezone, timedelta
 
 import pytest
 
-from critical_consensus.market_data import (MarketBar, build_market_snapshot, build_next_bar_forecast_contract,\n                                            read_mt5_csv, retain_completed_bars, validate_bar_series)
+from critical_consensus.market_data import (MarketBar, build_market_snapshot, build_next_bar_forecast_contract,
+    read_mt5_csv, retain_completed_bars, validate_bar_series)
 
 
 def bars(n=25):
