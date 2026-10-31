@@ -1,0 +1,91 @@
+name: mql5-metaeditor-build
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  metaeditor-build:
+    name: MetaEditor compile (Windows)
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Download official MetaTrader 5 installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Join-Path $env:RUNNER_TEMP "mt5setup.exe"
+          Invoke-WebRequest -Uri "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile $installer
+          if (-not (Test-Path $installer) -or (Get-Item $installer).Length -lt 100000) {
+            throw "The official MetaTrader 5 installer download is missing or unexpectedly small."
+          }
+
+      - name: Install MetaTrader 5 in isolated runner
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installDir = "C:\\MT5"
+          $installer = Join-Path $env:RUNNER_TEMP "mt5setup.exe"
+          $process = Start-Process -FilePath $installer -ArgumentList "/auto /path:$installDir" -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "MetaTrader installer exited with code $($process.ExitCode)."
+          }
+          $editor = Join-Path $installDir "metaeditor64.exe"
+          $deadline = (Get-Date).AddMinutes(10)
+          while (-not (Test-Path $editor) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 5
+          }
+          if (-not (Test-Path $editor)) {
+            throw "MetaEditor64.exe was not found under $installDir after installation."
+          }
+          $version = (Get-Item $editor).VersionInfo.FileVersion
+          "MT5_INSTALL_DIR=$installDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "METAEDITOR_PATH=$editor" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "MetaEditor file version: $version"
+          "MetaEditor file version: $version" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Generate and compile demo EA with MetaEditor
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python scripts/build_demo_ea.py --compile --metaeditor "$env:METAEDITOR_PATH" --include-dir "$env:MT5_INSTALL_DIR\MQL5" --out "artifacts\demo_ea"
+          if ($LASTEXITCODE -ne 0) {
+            throw "The demo EA generation or MetaEditor compilation failed."
+          }
+          $binary = "artifacts\demo_ea\CriticalConsensusEA_Demo.ex5"
+          $source = "artifacts\demo_ea\CriticalConsensusEA_Demo.mq5"
+          $log = "artifacts\demo_ea\CriticalConsensusEA_Demo.log"
+          foreach ($file in @($binary, $source, $log)) {
+            if (-not (Test-Path $file) -or (Get-Item $file).Length -eq 0) {
+              throw "Expected build output is missing or empty: $file"
+            }
+          }
+          $hash = (Get-FileHash $binary -Algorithm SHA256).Hash
+          "Demo EA EX5 SHA-256: $hash" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          Get-Content $log -Tail 20
+
+      - name: Upload compiled demo EA and compiler evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: mt5-demo-ea-windows
+          path: |
+            artifacts/demo_ea/CriticalConsensusEA_Demo.mq5
+            artifacts/demo_ea/CriticalConsensusEA_Demo.ex5
+            artifacts/demo_ea/CriticalConsensusEA_Demo.log
+          if-no-files-found: error
+          retention-days: 14
