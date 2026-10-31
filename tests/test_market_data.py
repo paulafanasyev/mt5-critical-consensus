@@ -4,6 +4,7 @@ import pytest
 
 from critical_consensus.market_data import (MarketBar, build_market_snapshot, build_next_bar_forecast_contract,
     read_mt5_csv, retain_completed_bars, validate_bar_series)
+from critical_consensus.persistence import PostgresRepository
 
 
 def bars(n=25):
@@ -93,3 +94,26 @@ def test_objective_forecast_contract_rejects_unsupported_monthly_timeframe():
     snapshot["timeframe"] = "MN1"
     with pytest.raises(ValueError, match="does not support this timeframe"):
         build_next_bar_forecast_contract(snapshot)
+
+
+
+def test_forecast_rejects_reference_bar_not_finalized_before_issue_without_database():
+    def unexpected_connect(_dsn):
+        raise AssertionError("reference timing must be validated before database access")
+
+    repo = PostgresRepository("postgresql://unused/unused", connect_fn=unexpected_connect)
+    issued = datetime(2026, 10, 2, 10, 0, tzinfo=timezone.utc)
+    with pytest.raises(ValueError, match="reference market bar must be fully finalized"):
+        repo.record_forecasts([{
+            "model_id": "model-a", "signal_id": "signal-a",
+            "issued_at": issued, "probability": 0.61,
+            "input_sha256": "sha256:" + "a" * 64,
+            "forecast_kind": "NEXT_BAR_MARKET_EVENT",
+            "target_policy_version": "next-available-bar-close-above-reference-v1",
+            "target_event": "NEXT_AVAILABLE_BAR_CLOSE_ABOVE_REFERENCE",
+            "symbol": "EURUSD", "timeframe": "H1",
+            "reference_at": issued - timedelta(hours=1),
+            "reference_close": 1.1,
+        }])
+
+
