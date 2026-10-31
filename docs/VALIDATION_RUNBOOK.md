@@ -35,7 +35,11 @@ The wrapper writes a timestamped log under `logs/`, refuses to start synchroniza
 
 For Windows Task Scheduler, create a task under the same Windows account that owns the configured MT5 terminal session. Set **Program/script** to `powershell.exe`, **Add arguments** to `-NoProfile -ExecutionPolicy Bypass -File "C:\\path\\to\\mt5-critical-consensus\\scripts\\run_mt5_sync.ps1" -Symbol EURUSD -Timeframe H1 -TerminalPath "C:\\Program Files\\MetaTrader 5\\terminal64.exe"`, and **Start in** to the repository root. Run it at an interval appropriate to the timeframe (for example, every five minutes for H1 monitoring). This is read-only data synchronization and forecast resolution; it does not submit orders.
 
-The connector only calls `initialize`, `symbol_select`, `copy_rates_range`, and `shutdown`. It contains no order submission calls. For CSV export, specify the broker/server timezone explicitly:
+Each synchronization scans up to the latest 5,000 persisted bars plus newly received closed bars and includes `market_history_integrity` in its JSON result. Week-spanning intervals are ignored as normal weekend closures; other timestamp gaps are reported as `POTENTIAL_GAP_REQUIRES_SESSION_REVIEW`. This is an advisory detector, not a broker-calendar oracle: holidays, daily maintenance and instrument-specific sessions can produce legitimate gaps. Review alerts against the broker's actual trading schedule before classifying them as missing data. The sync does not backfill older bars automatically, because the append-only forward ledger intentionally rejects late inserts that could alter forecast outcomes. Historical correction/backfill remains a separately audited operation.
+
+The MT5 data adapter re-checks terminal connectivity immediately before reading rates and shuts down after both successful and failed initialization paths. A successful preflight is only a point-in-time connection check; the data adapter checks again because the terminal can disconnect between preflight and ingestion.
+
+The connector only calls `initialize`, `terminal_info`, `symbol_select`, `copy_rates_range`, and `shutdown`. It contains no order submission calls. For CSV export, specify the broker/server timezone explicitly:
 
 ```powershell
 python scripts/import_mt5_history.py --csv .\EURUSD_H1.csv --source-timezone Europe/Helsinki --symbol EURUSD --timeframe H1
