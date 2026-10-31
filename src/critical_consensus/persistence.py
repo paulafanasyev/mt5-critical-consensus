@@ -98,6 +98,19 @@ class PostgresRepository:
             for script in scripts:
                 conn.execute(script, prepare=False)
 
+    def get_database_clock(self) -> dict[str, Any]:
+        """Return PostgreSQL's current time normalized to UTC and its session timezone."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT now(), current_setting('TimeZone')"
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("PostgreSQL did not return its server clock")
+        return {
+            "now_utc": _timestamp(row[0], "database clock"),
+            "session_timezone": str(row[1]),
+        }
+
     def append_market_bars(self, bars: Iterable[MarketBar]) -> dict[str, int]:
         # The immutable ledger must never store a forming MT5 candle: its OHLC values
         # can still change, and a later completed version would conflict with the first insert.
