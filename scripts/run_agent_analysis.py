@@ -16,7 +16,8 @@ import yaml
 from critical_consensus.agent_runtime import collect_agent_verdicts
 from critical_consensus.decision_bundle import build_decision_bundle, write_decision_bundle
 from critical_consensus.pipeline import evaluate_signal_bundle
-from critical_consensus.market_data import (build_market_snapshot, build_next_bar_forecast_contract,\n                                            retain_completed_bars)
+from critical_consensus.market_data import (build_market_snapshot, build_next_bar_forecast_contract,
+                                            retain_completed_bars)
 from redis.asyncio import Redis
 
 from critical_consensus.persistence import PostgresRepository
@@ -118,8 +119,8 @@ async def run(args) -> int:
                       "blockers": ["AGENT_CONFIGURATION_OR_COLLECTION_FAILED"],
                       "trade_allowed": False}
 
-    # Store each validated raw confidence observation before peer review and before
-    # any outcome can be known. A failed/ambiguous persistence blocks this signal.
+    # Store each validated objective next-bar event probability before peer review and
+    # before the target bar can close. Subjective verdict confidence stays separate.
     forecast_capture = {"inserted": 0, "identical_replays": 0, "total": 0}
     forecast_records = []
     valid_verdicts = result.get("verdicts", [])
