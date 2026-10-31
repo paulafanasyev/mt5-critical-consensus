@@ -136,16 +136,17 @@ def test_database_rejects_new_legacy_confidence_outcome_labels():
     issued = datetime.now(timezone.utc) - timedelta(hours=2)
     with repo._connect() as conn:
         with pytest.raises(Exception, match="new legacy verdict-confidence rows cannot receive manual outcome labels"):
-            conn.execute(
-                """INSERT INTO forecast_predictions
-                   (model_id, signal_id, issued_at, probability, input_sha256,
-                    forecast_kind, outcome, resolved_at)
-                   VALUES (%s,%s,%s,%s,%s,'LEGACY_VERDICT_CONFIDENCE',1,%s)""",
-                ("legacy-label-" + uuid.uuid4().hex,
-                 "legacy-signal-" + uuid.uuid4().hex,
-                 issued, 0.7, "sha256:" + "a" * 64,
-                 issued + timedelta(hours=1)),
-            )
+            with conn.transaction():
+                conn.execute(
+                    """INSERT INTO forecast_predictions
+                       (model_id, signal_id, issued_at, probability, input_sha256,
+                        forecast_kind, outcome, resolved_at)
+                       VALUES (%s,%s,%s,%s,%s,'LEGACY_VERDICT_CONFIDENCE',1,%s)""",
+                    ("legacy-label-" + uuid.uuid4().hex,
+                     "legacy-signal-" + uuid.uuid4().hex,
+                     issued, 0.7, "sha256:" + "a" * 64,
+                     issued + timedelta(hours=1)),
+                )
 
 
 
