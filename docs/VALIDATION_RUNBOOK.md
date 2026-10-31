@@ -23,7 +23,17 @@ python scripts/sync_mt5_market_data.py --symbol EURUSD --timeframe H1 --bootstra
 python scripts/sync_mt5_market_data.py --symbol EURUSD --timeframe H1
 ```
 
-Schedule the second command on the Windows MT5 host at a suitable interval (for example, every five minutes for H1 monitoring). This is a read-only data synchronization and forecast-resolution job; it does not submit orders.
+For a single logged command that performs the preflight first and then synchronizes, use the PowerShell wrapper:
+
+```powershell
+.\scripts\run_mt5_sync.ps1 -Symbol EURUSD -Timeframe H1 -TerminalPath "C:\Program Files\MetaTrader 5\terminal64.exe" -BootstrapFromUtc "2026-10-01T00:00:00Z"
+# Subsequent runs omit -BootstrapFromUtc:
+.\scripts\run_mt5_sync.ps1 -Symbol EURUSD -Timeframe H1 -TerminalPath "C:\Program Files\MetaTrader 5\terminal64.exe"
+```
+
+The wrapper writes a timestamped log under `logs/`, refuses to start synchronization if the live terminal preflight fails, and never prints the `DATABASE_URL` value. Configure `DATABASE_URL` in the Windows task's user/service environment or secret manager; do not put credentials in Task Scheduler arguments.
+
+For Windows Task Scheduler, create a task under the same Windows account that owns the configured MT5 terminal session. Set **Program/script** to `powershell.exe`, **Add arguments** to `-NoProfile -ExecutionPolicy Bypass -File "C:\\path\\to\\mt5-critical-consensus\\scripts\\run_mt5_sync.ps1" -Symbol EURUSD -Timeframe H1 -TerminalPath "C:\\Program Files\\MetaTrader 5\\terminal64.exe"`, and **Start in** to the repository root. Run it at an interval appropriate to the timeframe (for example, every five minutes for H1 monitoring). This is read-only data synchronization and forecast resolution; it does not submit orders.
 
 The connector only calls `initialize`, `symbol_select`, `copy_rates_range`, and `shutdown`. It contains no order submission calls. For CSV export, specify the broker/server timezone explicitly:
 
