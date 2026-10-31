@@ -269,3 +269,22 @@ def test_potential_gap_detector_ignores_weekend_market_closure():
 def test_potential_gap_detector_rejects_invalid_tolerance():
     with pytest.raises(ValueError, match="gap_tolerance_seconds"):
         detect_potential_bar_gaps(bars(2), gap_tolerance_seconds=float("nan"))
+
+
+
+def test_weekend_suppression_does_not_hide_extended_or_missing_weekly_history():
+    extended = [
+        MarketBar("EURUSD", "H1", datetime(2026, 10, 23, 20, tzinfo=timezone.utc),
+                  1.0, 1.1, 0.9, 1.05),
+        MarketBar("EURUSD", "H1", datetime(2026, 11, 2, 0, tzinfo=timezone.utc),
+                  1.05, 1.15, 0.95, 1.1),
+    ]
+    assert len(detect_potential_bar_gaps(extended, ignore_weekend_closures=True)) == 1
+
+    missing_week = [
+        MarketBar("EURUSD", "W1", datetime(2026, 10, 5, tzinfo=timezone.utc),
+                  1.0, 1.1, 0.9, 1.05),
+        MarketBar("EURUSD", "W1", datetime(2026, 10, 19, tzinfo=timezone.utc),
+                  1.05, 1.15, 0.95, 1.1),
+    ]
+    assert len(detect_potential_bar_gaps(missing_week, ignore_weekend_closures=True)) == 1
