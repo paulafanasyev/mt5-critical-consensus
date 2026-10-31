@@ -11,7 +11,8 @@ param(
     [string]$TerminalPath,
     [string]$BootstrapFromUtc,
     [string]$PythonExe = "python",
-    [string]$LogDirectory = ".\logs"
+    [string]$LogDirectory = ".\logs",
+    [switch]$IgnoreWeekendClosures
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,6 +52,9 @@ try {
     $syncArgs = @("scripts/sync_mt5_market_data.py", "--symbol", $Symbol, "--timeframe", $Timeframe) + $terminalArgs
     if (-not [string]::IsNullOrWhiteSpace($BootstrapFromUtc)) {
         $syncArgs += @("--bootstrap-from-utc", $BootstrapFromUtc)
+    }
+    if ($IgnoreWeekendClosures) {
+        $syncArgs += "--ignore-weekend-closures"
     }
 
     Write-Host "Preflight passed. Starting read-only market-data sync and due-forecast resolution."
