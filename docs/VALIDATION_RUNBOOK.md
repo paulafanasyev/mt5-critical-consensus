@@ -18,7 +18,7 @@ The connector only calls `initialize`, `symbol_select`, `copy_rates_range`, and 
 python scripts/import_mt5_history.py --csv .\EURUSD_H1.csv --source-timezone Europe/Helsinki --symbol EURUSD --timeframe H1
 ```
 
-Do not assume the broker's export timezone; verify it in MT5 first. Naive timestamps without an explicit timezone are rejected. The source CSV is read-only. OHLC rows are validated for finite prices, valid ranges, ordered unique UTC timestamps, symbol and timeframe consistency.
+Do not assume the broker's export timezone; verify it in MT5 first. Naive timestamps without an explicit timezone are rejected. The source CSV is read-only. OHLC rows are validated for finite prices, valid ranges, ordered unique UTC timestamps, symbol and timeframe consistency. After the initial chronological history load, the PostgreSQL market-bar ledger accepts only forward inserts for each symbol/timeframe; identical replays remain idempotent, while late backfills are rejected because they could retroactively change which bar resolves an already-issued forecast. Historical corrections require a separately audited revision path.
 
 ## 2. PostgreSQL and Redis
 
