@@ -22,6 +22,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 import time
 import uuid
@@ -97,6 +98,22 @@ def permission_id_for(run_id: str, policy_version: int) -> str:
 
 def decision_id_for(command_id: str, decision: str) -> str:
     return "dec-" + _digest("decision", command_id, decision)[:24]
+
+
+_MAX_REASON_CHARS = 180
+# A skip reason is operator-facing text. Quoting, connection or filesystem details must not
+# ride along from an unexpected adapter exception, so anything that looks like one is dropped
+# and the whole line falls back to the exception class name.
+_REASON_NOISE = re.compile(r"""(?:[A-Za-z]:[\\/]|\\\\|://|\btoken\b|\bpassword\b|\blogin\s*[:=]
+                                |\bport\s*[:=])""", re.IGNORECASE | re.VERBOSE)
+
+
+def skip_reason(exc: BaseException) -> str:
+    """Why a symbol was dropped: the class name plus a bounded, scrubbed detail if safe."""
+    detail = " ".join(str(exc).split())
+    if not detail or len(detail) > _MAX_REASON_CHARS or _REASON_NOISE.search(detail):
+        return type(exc).__name__
+    return f"{type(exc).__name__}: {detail}"
 
 
 def parse_symbols(value: str | None, *, language: str = "ru") -> list[str] | None:
@@ -727,12 +744,14 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
                 specs[symbol] = terminal.symbol_spec(symbol)
             except Exception as exc:
                 # A symbol the broker does not offer cannot be traded, but it must be named
-                # in the journal instead of silently disappearing from the run.
-                unavailable[symbol] = type(exc).__name__
+                # in the journal instead of silently disappearing from the run. The reason is
+                # operator-facing: "pays profit in JPY" is actionable, "RuntimeError" is not.
+                reason = skip_reason(exc)
+                unavailable[symbol] = reason
                 journal.record(SYMBOL_SKIPPED_EVENT, {
-                    "symbol": symbol, "reason": type(exc).__name__, "broker_order_sent": False})
+                    "symbol": symbol, "reason": reason, "broker_order_sent": False})
                 print(text("runner.symbol_unavailable", language, symbol=symbol,
-                           reason=type(exc).__name__), file=sys.stderr)
+                           reason=reason), file=sys.stderr)
         active = [symbol for symbol in symbols if symbol in specs]
         if not active:
             print(text("runner.no_symbols", language), file=sys.stderr)

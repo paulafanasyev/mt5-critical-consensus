@@ -732,7 +732,8 @@ def test_the_run_covers_every_requested_instrument(tmp_path, monkeypatch, capsys
     summary = json.loads(capsys.readouterr().out)
     assert summary["symbols_requested"] == ["EURUSD", "XAUUSD", "BTCUSD"]
     assert summary["symbols_active"] == ["EURUSD", "XAUUSD"]
-    assert summary["symbols_unavailable"] == {"BTCUSD": "RuntimeError"}
+    assert summary["symbols_unavailable"] == {
+        "BTCUSD": "RuntimeError: symbol BTCUSD is not available in the terminal"}
     assert set(summary["per_symbol"]) == {"EURUSD", "XAUUSD"}
     assert summary["passes"] == 1 and summary["cycles"] == 2
     assert summary["broker_order_sent"] is False
@@ -846,3 +847,28 @@ def test_an_empty_history_result_set_is_an_error_not_an_empty_book():
     terminal._mt5 = Module()
     with pytest.raises(RuntimeError):
         terminal.entry_deals(datetime.now(UTC) - timedelta(hours=1))
+
+
+def test_a_skip_reason_keeps_the_actionable_detail():
+    # Verified against the real terminal: four universe symbols are refused because profit is
+    # paid in a currency other than the account currency. "RuntimeError" alone hid that.
+    reason = runner.skip_reason(RuntimeError(
+        "MT5 symbol USDJPY pays profit in JPY, not in the account currency USD;"
+        " sizing in account currency would be wrong"))
+    assert reason.startswith("RuntimeError: ")
+    assert "pays profit in JPY" in reason
+
+
+def test_a_skip_reason_never_carries_paths_urls_or_credentials():
+    for message in (r'cannot open C:\Users\op\Documents\journal.db',
+                    'connect to socks5://127.0.0.1:1080 failed',
+                    'refused: token=abc123 for login=10013404855',
+                    r'\\server\share\terminal64.exe is missing',
+                    'port = 8000 already in use'):
+        assert runner.skip_reason(RuntimeError(message)) == "RuntimeError"
+
+
+def test_an_empty_or_endlessly_long_reason_degrades_to_the_class_name():
+    assert runner.skip_reason(RuntimeError("   \n  ")) == "RuntimeError"
+    assert runner.skip_reason(RuntimeError("x" * (runner._MAX_REASON_CHARS + 1))) == "RuntimeError"
+    assert runner.skip_reason(KeyError("boom")) == "KeyError: 'boom'"
