@@ -97,6 +97,21 @@ def test_objective_forecast_contract_rejects_unsupported_monthly_timeframe():
 
 
 
+
+def test_persistence_rejects_a_still_forming_market_bar_before_database_access():
+    def unexpected_connect(_dsn):
+        raise AssertionError("forming bars must be rejected before database access")
+
+    repo = PostgresRepository("postgresql://unused/unused", connect_fn=unexpected_connect)
+    forming = MarketBar(
+        "EURUSD", "H1", datetime.now(timezone.utc) - timedelta(minutes=30),
+        1.0, 1.2, 0.9, 1.1,
+    )
+    with pytest.raises(ValueError, match="insufficient completed bars"):
+        repo.append_market_bars([forming])
+
+
+
 def test_forecast_rejects_reference_bar_not_finalized_before_issue_without_database():
     def unexpected_connect(_dsn):
         raise AssertionError("reference timing must be validated before database access")
