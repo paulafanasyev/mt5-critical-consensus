@@ -390,13 +390,9 @@ def evaluate_walk_forward(
     report: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "provenance_status": (
-            "SELF_CONSISTENT_PERSISTED_MARKET_BAR_EVIDENCE_NOT_BROKER_AUTHENTICATED"
-            if all(row.target_policy_version == "next-available-bar-close-above-reference-v1"
-                   and isinstance(row.resolution_evidence, Mapping)
-                   for row in rows)
-            else "NOT_VERIFIED_BY_SCRIPT"
-        ),
+        # An in-memory Forecast list or CSV cannot prove it came from the append-only
+        # PostgreSQL ledger. Only evaluate_repository_forecasts() may upgrade this label.
+        "provenance_status": "NOT_VERIFIED_BY_SCRIPT",
         "important_limit": (
             "The report can verify self-consistency of the exported local market-bar evidence, but it does not "
             "independently authenticate broker-feed accuracy/completeness, establish statistical independence, "
@@ -464,7 +460,7 @@ def evaluate_walk_forward(
     )
     has_self_consistent_evidence = (
         report["provenance_status"]
-        == "SELF_CONSISTENT_PERSISTED_MARKET_BAR_EVIDENCE_NOT_BROKER_AUTHENTICATED"
+        == "DATABASE_LEDGER_SELF_CONSISTENT_NOT_BROKER_AUTHENTICATED"
     )
     report["overall_status"] = (
         "PRELIMINARY_REVIEW_ONLY"
@@ -482,3 +478,44 @@ def evaluate_csv(path: str | Path, *, min_train_samples: int = 30,
                                    min_class_samples=min_class_samples, refit_interval=refit_interval)
     result["dataset"] = {"filename": source.name, "sha256": "sha256:" + digest}
     return result
+
+
+
+def evaluate_repository_forecasts(
+    repository: Any, *, model_id: str | None = None,
+    min_train_samples: int = 30, min_class_samples: int = 5, refit_interval: int = 25,
+) -> dict[str, Any]:
+    """Evaluate rows read directly from the append-only PostgreSQL forecast ledger."""
+    if not callable(getattr(repository, "export_resolved_forecasts", None)):
+        raise ValueError("repository must expose export_resolved_forecasts")
+    exported = repository.export_resolved_forecasts(model_id=model_id)
+    if not exported:
+        raise ValueError("no evidence-backed resolved market forecasts exist in PostgreSQL")
+    if not isinstance(exported, Sequence) or isinstance(exported, (str, bytes, bytearray)):
+        raise ValueError("repository forecast export must be a sequence")
+    forecasts = [parse_forecast_row(row, index + 1) for index, row in enumerate(exported)]
+    if any(row.target_policy_version != "next-available-bar-close-above-reference-v1"
+           or not isinstance(row.resolution_evidence, Mapping) for row in forecasts):
+        raise ValueError("database export contains a legacy or incomplete forecast row")
+    report = evaluate_walk_forward(
+        forecasts, min_train_samples=min_train_samples,
+        min_class_samples=min_class_samples, refit_interval=refit_interval,
+    )
+    canonical_dataset = json.dumps(
+        exported, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False, default=str,
+    )
+    report["provenance_status"] = "DATABASE_LEDGER_SELF_CONSISTENT_NOT_BROKER_AUTHENTICATED"
+    report["dataset"] = {
+        "source": "PostgreSQL forecast_predictions + forecast_resolution_events",
+        "model_id": model_id,
+        "row_count": len(forecasts),
+        "sha256": "sha256:" + hashlib.sha256(canonical_dataset.encode("utf-8")).hexdigest(),
+    }
+    enough_out_of_sample = any(
+        model["walk_forward"]["calibrated_oos_count"] >= 50 for model in report["models"].values()
+    )
+    report["overall_status"] = (
+        "PRELIMINARY_REVIEW_ONLY" if enough_out_of_sample else "NOT_PROVEN"
+    )
+    return report
