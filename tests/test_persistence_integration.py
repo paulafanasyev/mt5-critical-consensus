@@ -129,6 +129,26 @@ def test_market_forecast_resolves_only_from_first_future_completed_persisted_bar
     assert report["overall_status"] == "NOT_PROVEN"
 
 
+
+def test_database_rejects_new_legacy_confidence_outcome_labels():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    issued = datetime.now(timezone.utc) - timedelta(hours=2)
+    with repo._connect() as conn:
+        with pytest.raises(Exception, match="new legacy verdict-confidence rows cannot receive manual outcome labels"):
+            conn.execute(
+                """INSERT INTO forecast_predictions
+                   (model_id, signal_id, issued_at, probability, input_sha256,
+                    forecast_kind, outcome, resolved_at)
+                   VALUES (%s,%s,%s,%s,%s,'LEGACY_VERDICT_CONFIDENCE',1,%s)""",
+                ("legacy-label-" + uuid.uuid4().hex,
+                 "legacy-signal-" + uuid.uuid4().hex,
+                 issued, 0.7, "sha256:" + "a" * 64,
+                 issued + timedelta(hours=1)),
+            )
+
+
+
 def test_market_forecast_rejects_reference_close_not_matching_persisted_bar():
     repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
     repo.migrate()
