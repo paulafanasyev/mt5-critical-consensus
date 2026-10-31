@@ -121,7 +121,7 @@ def test_compile_source_uses_documented_metaeditor_include_switch(tmp_path, monk
     def fake_run(args, **kwargs):
         captured["args"] = args
         source.with_suffix(".log").write_text(
-            "Result: 0 errors, 0 warnings, 1 ms elapsed\\n", encoding="utf-16"
+            "Result: 0 errors, 0 warnings, 1 ms elapsed\n", encoding="utf-16"
         )
         source.with_suffix(".ex5").write_bytes(b"compiled-ex5")
         return SimpleNamespace(returncode=0)
