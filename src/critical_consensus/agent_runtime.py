@@ -75,6 +75,16 @@ def _validate_result(
         confidence = None
     if confidence is None or not math.isfinite(confidence) or not 0 <= confidence <= 1:
         blockers.append("CONFIDENCE_INVALID")
+    raw_event_probability = result.get("next_bar_up_probability")
+    if isinstance(raw_event_probability, bool) or not isinstance(raw_event_probability, (int, float)):
+        event_probability = None
+    else:
+        event_probability = float(raw_event_probability)
+    if (event_probability is None or not math.isfinite(event_probability)
+            or not 0 <= event_probability <= 1):
+        blockers.append("OBJECTIVE_FORECAST_PROBABILITY_INVALID")
+    if result.get("forecast_contract") != signal.get("forecast_contract"):
+        blockers.append("OBJECTIVE_FORECAST_CONTRACT_MISMATCH")
     if str(result.get("verdict", "")).upper() not in {"APPROVE", "ABSTAIN", "REJECT", "VETO", "HOLD"}:
         blockers.append("VERDICT_INVALID")
     created = _valid_stamp(result.get("created_at"))
