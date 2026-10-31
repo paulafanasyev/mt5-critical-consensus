@@ -9,6 +9,9 @@ On the Windows host that already has MetaTrader 5 installed and logged in:
 ```powershell
 python -m pip install -e ".[data]" MetaTrader5
 $env:DATABASE_URL = "postgresql://USER:PASSWORD@127.0.0.1:5432/mt5cc"
+# First verify terminal connectivity and access to two closed bars; no order APIs are called.
+python scripts/check_mt5_terminal.py --symbol EURUSD --timeframe H1
+# Only after the preflight reports PASS, import historical data:
 python scripts/import_mt5_history.py --live-terminal --symbol EURUSD --timeframe H1 --from-utc 2026-10-01T00:00:00Z --to-utc 2026-10-30T00:00:00Z
 ```
 
