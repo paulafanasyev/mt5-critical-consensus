@@ -111,6 +111,10 @@ class FakeTerminal:
         self.specs, self.unavailable = dict(specs or {}), set(unavailable or ())
         self.trade_mode, self.server, self.read_error = trade_mode, server, read_error
 
+    def attach_journal(self, journal: DecisionJournal) -> None:
+        # Mirrors DemoTerminal's runner contract; this adapter uses the runner's fake broker.
+        self.journal = journal
+
     def account(self) -> AccountInfo:
         if self.read_error is not None:
             raise self.read_error
