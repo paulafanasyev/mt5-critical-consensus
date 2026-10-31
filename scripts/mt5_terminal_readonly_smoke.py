@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 UTC = timezone.utc
-SYMBOL_PATTERN = re.compile(r"[A-Z0-9._-]{1,32}\\Z")
+SYMBOL_PATTERN = re.compile(r"[A-Z0-9._-]{1,32}\Z")
 
 
 class ProbeError(RuntimeError):
@@ -85,7 +85,7 @@ def run_probe(
 
     try:
         initialized = bool(mt5.initialize(**kwargs))
-    except Exception as exc:
+    except Exception:
         raise ProbeError("MetaTrader5.initialize raised an exception; credentials were not logged") from None
     if not initialized:
         code = -1
