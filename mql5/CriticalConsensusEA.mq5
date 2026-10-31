@@ -1,5 +1,5 @@
 #property strict
-#property version   "0.12"
+#property version   "1.000"
 #property description "Demo-only reference bridge. Disabled by default; live execution is blocked."
 
 input string BridgeUrl = "http://127.0.0.1:8000/v1/execution/next";
@@ -213,6 +213,10 @@ bool ValidateFlatObject(const string json, string &error)
       error = "unexpected character after value";
       return false;
    }
+   // Unreachable: the loop above only leaves through a return. The MQL5 compiler does not
+   // treat `while(true)` as non-returning, so an explicit terminal return keeps the build
+   // clean instead of failing with "not all control paths return a value".
+   return false;
 }
 
 // Callers must run ValidateFlatObject() first. Lookups return values from the validated slots
@@ -531,18 +535,20 @@ bool ExecuteDemoCommand(const string body)
    if(!CheckKillSwitch())
    { Print("BLOCKED: kill switch changed before send."); return false; }
 
-   // At-most-once: both tombstones are written and flushed before the send. Terminal global
-   // variables are not crash-atomic, so the bridge's exact-ID record and broker reconciliation
-   // remain authoritative, and an uncertain result requires manual reconciliation, never a retry.
+   // At-most-once: both tombstones are written before the send. Terminal global variables are
+   // not crash-atomic, so the bridge's exact-ID record and broker reconciliation remain
+   // authoritative, and an uncertain result requires manual reconciliation, never a retry.
    // The tombstones are intentionally kept after a failed send because the order may still have
    // reached the broker.
    if(GlobalVariableSet(command_key, (double)TimeGMT()) == 0
       || GlobalVariableSet(order_key, (double)TimeGMT()) == 0)
    { Print("BLOCKED: cannot persist idempotency tombstones."); return false; }
-   // The flush must be confirmed: a best-effort flush could leave the process before the
-   // terminal persisted the tombstones, so a resend after a restart would not be blocked.
-   if(!GlobalVariablesFlush())
-   { Print("BLOCKED: cannot flush idempotency tombstones."); return false; }
+   // Both writes must be observable before the send. GlobalVariablesFlush() returns void in
+   // build 6295, so its result cannot gate the send; the bridge's durable exact-ID record is
+   // what survives a crash between these lines and the broker.
+   if(!GlobalVariableCheck(command_key) || !GlobalVariableCheck(order_key))
+   { Print("BLOCKED: idempotency tombstones missing after persist."); return false; }
+   GlobalVariablesFlush();
 
    ResetLastError();
    bool sent = OrderSend(request, result);
@@ -579,7 +585,9 @@ int OnInit()
       return(INIT_FAILED);
    }
    EventSetTimer((int)MathMax(1, PollSeconds));
-   Print("CriticalConsensusEA initialized. Demo execution is compile-time disabled. Add bridge URL to MT5 WebRequest allowlist.");
+   Print("CriticalConsensusEA initialized. Demo execution is ",
+         ENABLE_DEMO_EXECUTION ? "ENABLED" : "disabled",
+         ". Add bridge URL to MT5 WebRequest allowlist.");
    return(INIT_SUCCEEDED);
 }
 

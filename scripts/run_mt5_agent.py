@@ -23,33 +23,10 @@ from critical_consensus.market_data import MarketBar, read_mt5_csv
 from critical_consensus.mt5_agent import (AgentPolicy, DecisionJournal, MT5Agent, PaperBroker,
                                           codes, i18n, load_policy, trade_event_payload)
 from critical_consensus.mt5_agent.i18n import describe, describe_many, normalize_language, text
+from operator_answers import ANSWER_VERDICTS, ApprovalState, verdict as _verdict
 
 LANGUAGE_ENV_VAR = "MT5_AGENT_LANGUAGE"
 EXECUTION_CHOICES = ("auto", "confirm")
-# Whole answers only. Deriving tokens from a prose list once let a lone Russian "в" or
-# Vietnamese "tất" silently approve every later position, so accept-all and quit require
-# the full phrase and the Latin letters always work everywhere.
-ANSWER_VERDICTS = {
-    "y": "y", "yes": "y", "да": "y", "vâng": "y", "có": "y",
-    "n": "n", "no": "n", "нет": "n", "không": "n", "khong": "n",
-    "a": "a", "all": "a", "все": "a", "tất cả": "a", "tat ca": "a",
-    "q": "q", "quit": "q", "stop": "q", "стоп": "q", "dừng": "q", "dung": "q",
-}
-
-
-def _verdict(line: str) -> str | None:
-    answer = " ".join(line.split()).lower()
-    verdict = ANSWER_VERDICTS.get(answer)
-    if verdict is not None:
-        return verdict
-    # A cp1251 console sends bytes that are not valid UTF-8; stdin was decoded with
-    # ``surrogateescape``, so re-encode to the original bytes and try the legacy code page
-    # instead of silently treating a real "да" as an unanswered prompt.
-    try:
-        recovered = answer.encode("utf-8", "surrogateescape").decode("cp1251")
-    except (UnicodeError, LookupError):
-        return None
-    return ANSWER_VERDICTS.get(" ".join(recovered.split()).lower())
 
 
 # --------------------------------------------------------------------- language
@@ -195,15 +172,6 @@ def _run_id(language: str) -> Callable[[str], str]:
 
 
 # ------------------------------------------------------------------- confirmation
-@dataclasses.dataclass
-class ApprovalState:
-    """What the operator decided for the rest of the run, kept outside the agent."""
-
-    accept_all: bool = False
-    decline_all: bool = False
-    stop_requested: bool = False
-
-
 def _print_proposal(proposal: Mapping[str, Any], sizing: Mapping[str, Any], *, language: str,
                     digits: int, stream: IO[str]) -> None:
     def price(value: Any) -> str:
@@ -569,14 +537,8 @@ def main(argv: list[str] | None = None) -> int:
     # Operator answers are not ASCII only ("да", "tất cả"). stdin keeps undecodable bytes as
     # surrogates so a cp1251 console can be recovered; output never carries them and must not
     # crash the run, so it replaces instead.
-    for stream, errors in ((sys.stdin, "surrogateescape"), (sys.stdout, "replace"),
-                           (sys.stderr, "replace")):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is not None:
-            try:
-                reconfigure(encoding="utf-8", errors=errors)
-            except (OSError, ValueError):
-                pass
+    i18n.configure_console_output(sys.stdin, errors="surrogateescape")
+    i18n.configure_console_output(sys.stdout, sys.stderr)
     argv = list(sys.argv[1:]) if argv is None else list(argv)
     fallback_language = _language_from_argv(argv)
     args = None

@@ -132,6 +132,10 @@ CODE_LABELS: dict[str, tuple[str, str, str]] = {
         "Цена ушла от согласованного входа дальше допустимого",
         "The price moved too far from the approved entry",
         "Giá đã đi quá xa so với mức vào đã xác nhận"),
+    "PROPOSAL_SYMBOL_MISMATCH": (
+        "Предложение относится к другому инструменту и не может быть отправлено",
+        "The proposal belongs to another instrument and cannot be sent",
+        "Đề xuất thuộc về một mã khác và không thể được gửi"),
     "RISK_REWARD_BELOW_MINIMUM": ("Соотношение прибыль/риск ниже минимума",
                                   "Reward-to-risk is below the policy minimum",
                                   "Tỷ lệ lợi nhuận/rủi ro dưới mức tối thiểu"),
@@ -259,6 +263,14 @@ TEXT: dict[str, tuple[str, str, str]] = {
     "cli.currency": ("валюта счёта", "account currency", "tiền tệ tài khoản"),
     "cli.limit_cycles": ("максимум циклов за прогон", "maximum cycles per run",
                          "số vòng tối đa mỗi lần chạy"),
+    "cli.runner_cycles": (
+        "максимум проходов по списку инструментов; 0 — без ограничения",
+        "maximum passes over the instrument list; 0 means unlimited",
+        "số lượt tối đa qua danh sách mã; 0 là không giới hạn"),
+    "cli.symbols": (
+        "инструменты через запятую или all (EURUSD,XAUUSD,...)",
+        "comma-separated instruments or all (EURUSD,XAUUSD,...)",
+        "các mã cách nhau bằng dấu phẩy hoặc all (EURUSD,XAUUSD,...)"),
     "cli.run_id": ("идентификатор прогона для журнала", "journal run identifier",
                    "mã định danh lượt chạy cho nhật ký"),
     "cli.fresh": ("очистить весь общий журнал перед прогоном, включая прогоны других run-id"
@@ -285,6 +297,33 @@ TEXT: dict[str, tuple[str, str, str]] = {
                           "mã anchor từ lượt trước để kiểm tra chuỗi"),
     "cli.balance_report": ("баланс для расчёта доходности", "balance used for the return",
                            "số dư dùng để tính tỷ suất sinh lời"),
+    "cli.bridge_port": ("порт локального моста (только 127.0.0.1)",
+                        "localhost bridge port (127.0.0.1 only)",
+                        "cổng cầu nối nội bộ (chỉ 127.0.0.1)"),
+    "cli.bridge_token": ("токен моста; по умолчанию MT5_BRIDGE_TOKEN",
+                         "bridge token; defaults to MT5_BRIDGE_TOKEN",
+                         "mã cầu nối; mặc định MT5_BRIDGE_TOKEN"),
+    "cli.tombstones": ("файл защищённых идентификаторов команд",
+                       "durable command-id tombstone file",
+                       "tệp mã lệnh đã ghi nhận"),
+    "cli.interval_seconds": ("пауза между циклами, секунды", "pause between cycles, seconds",
+                             "khoảng nghỉ giữa các vòng, giây"),
+    "cli.fill_timeout": ("сколько ждать подтверждения сделки, секунды",
+                         "seconds to wait for a fill before declaring the result unknown",
+                         "số giây chờ khớp lệnh trước khi coi kết quả là chưa rõ"),
+    "cli.ttl_seconds": ("время жизни команды, секунды (не больше 600)",
+                        "command TTL in seconds (at most 600)",
+                        "thời hạn lệnh, giây (tối đa 600)"),
+    "cli.acknowledge_uncertain": (
+        "продолжить, приняв неопределённые команды к ручной сверке",
+        "continue while accepting uncertain earlier commands for manual reconciliation",
+        "tiếp tục, chấp nhận các lệnh chưa rõ để đối soát thủ công"),
+    "cli.reconcile_window": ("сколько часов назад проверять отданные команды",
+                             "how many hours back to reconcile served commands",
+                             "đối soát lệnh đã giao trong bao nhiêu giờ gần đây"),
+    "cli.max_volume": ("жёсткий предел объёма, лотов (не больше 0.20)",
+                       "hard volume cap in lots (at most 0.20)",
+                       "giới hạn khối lượng cứng, lot (tối đa 0.20)"),
 
     "out.disclaimer": (
         "Внимание: агент работает только с демо-счётом или в локальной симуляции. Ни один"
@@ -353,6 +392,12 @@ TEXT: dict[str, tuple[str, str, str]] = {
                     "{value} phải là số nguyên"),
     "err.at_least_one": ("{value} должно быть не меньше 1", "{value} must be at least 1",
                          "{value} phải ít nhất là 1"),
+    "err.non_negative": ("{value} не может быть отрицательным", "{value} cannot be negative",
+                         "{value} không được âm"),
+    "err.symbols": (
+        "инструмент «{value}» недопустим: укажите тикеры через запятую или all",
+        "instrument \"{value}\" is not usable: give tickers separated by commas, or all",
+        "mã \"{value}\" không hợp lệ: hãy nhập các mã cách nhau bằng dấu phẩy, hoặc all"),
     "err.empty_run_id": ("--run-id не может быть пустым", "--run-id cannot be empty",
                          "--run-id không được để trống"),
     "err.run_id_invalid": (
@@ -413,6 +458,220 @@ TEXT: dict[str, tuple[str, str, str]] = {
                               "Người vận hành chọn chế độ tự động cho phần còn lại."),
     "confirm.stopped": ("Оператор остановил прогон.", "The operator stopped the run.",
                         "Người vận hành đã dừng lượt chạy."),
+
+    # Demo execution runner (scripts/run_mt5_demo_trading.py). These strings describe a
+    # demo-only EA path that is separate from the order-free package; the journal still
+    # stores codes, not translations.
+    "runner.description": (
+        "Демо-исполнение: агент ищет сигнал, локальный мост отдаёт команду EA, EA отправляет"
+        " только демо-ордер. Реальные деньги не используются.",
+        "Demo execution: the agent finds a signal, a localhost bridge hands the command to the"
+        " EA, and the EA sends a demo order only. No real money is used.",
+        "Thực thi demo: agent tìm tín hiệu, cầu nối nội bộ chuyển lệnh cho EA, EA chỉ gửi lệnh"
+        " demo. Không dùng tiền thật."),
+    "runner.policy_gate": (
+        "Демо-исполнение требует account.require_demo: true и режим observe или paper.",
+        "Demo execution requires account.require_demo: true and mode observe or paper.",
+        "Thực thi demo yêu cầu account.require_demo: true và chế độ observe hoặc paper."),
+    "runner.not_demo": (
+        "Терминал подключён не к демо-счёту; демо-исполнение отклонено.",
+        "The terminal is not signed into a demo account; demo execution refused.",
+        "Terminal không đăng nhập tài khoản demo; từ chối thực thi demo."),
+    "runner.identity_mismatch": (
+        "Счёт {login} на сервере {server} не совпадает с политикой; демо-исполнение отклонено.",
+        "Account {login} on {server} does not match the policy; demo execution refused.",
+        "Tài khoản {login} trên {server} không khớp chính sách; từ chối thực thi demo."),
+    "runner.ready": (
+        "Демо-счёт {login} ({server}), баланс {balance}, плечо {leverage}. Мост {url}.",
+        "Demo account {login} ({server}), balance {balance}, leverage {leverage}. Bridge {url}.",
+        "Tài khoản demo {login} ({server}), số dư {balance}, đòn bẩy {leverage}. Cầu nối {url}."),
+    "runner.ea_hint": (
+        "Проверьте, что демо-EA прикреплён к графику, а URL моста добавлен в белый список"
+        " WebRequest.",
+        "Make sure the demo EA is attached to a chart and the bridge URL is in the WebRequest"
+        " allowlist.",
+        "Hãy chắc rằng EA demo đã gắn vào biểu đồ và URL cầu nối nằm trong danh sách cho phép"
+        " WebRequest."),
+    "runner.symbols_line": (
+        "Инструменты: {active}. Недоступны у брокера: {unavailable}.",
+        "Instruments: {active}. Not offered by the broker: {unavailable}.",
+        "Các mã: {active}. Broker không cung cấp: {unavailable}."),
+    "runner.symbol_unavailable": (
+        "Инструмент {symbol} недоступен в терминале ({reason}); пропущен.",
+        "Instrument {symbol} is unavailable in the terminal ({reason}); skipped.",
+        "Mã {symbol} không có trong terminal ({reason}); bỏ qua."),
+    "runner.no_symbols": (
+        "Ни один запрошенный инструмент недоступен в терминале; запуск остановлен.",
+        "None of the requested instruments is available in the terminal; the run is stopped.",
+        "Không mã nào trong danh sách có trong terminal; lượt chạy bị dừng."),
+    "runner.bridge_token_missing": (
+        "Нужен MT5_BRIDGE_TOKEN: 24..256 символов [A-Za-z0-9._~-].",
+        "MT5_BRIDGE_TOKEN is required: 24..256 characters of [A-Za-z0-9._~-].",
+        "Cần MT5_BRIDGE_TOKEN: 24..256 ký tự thuộc [A-Za-z0-9._~-]."),
+    "runner.queued": (
+        "Команда {command_id} поставлена в очередь: {direction} {symbol}, объём {volume}.",
+        "Command {command_id} queued: {direction} {symbol}, volume {volume}.",
+        "Lệnh {command_id} đã vào hàng đợi: {direction} {symbol}, khối lượng {volume}."),
+    "runner.filled": (
+        "Демо-сделка подтверждена: тикет {ticket}, цена {price}, объём {volume}.",
+        "Demo fill confirmed: ticket {ticket}, price {price}, volume {volume}.",
+        "Đã xác nhận khớp lệnh demo: ticket {ticket}, giá {price}, khối lượng {volume}."),
+    "runner.expired": (
+        "EA не забрал команду за отведённое время; ничего не отправлено.",
+        "The EA did not pick up the command within its TTL; nothing was sent.",
+        "EA không nhận lệnh trong thời hạn; chưa gửi gì."),
+    "runner.unconfirmed": (
+        "EA забрал команду, но сделка не наблюдалась за {seconds} с. Результат неизвестен:"
+        " нужна ручная сверка, повтор запрещён.",
+        "The EA picked up the command but no fill was observed within {seconds}s. The result is"
+        " unknown: reconcile manually, do not retry.",
+        "EA đã nhận lệnh nhưng không thấy khớp lệnh trong {seconds} giây. Kết quả chưa rõ: hãy"
+        " đối soát thủ công, không thử lại."),
+    "runner.unconfirmed_unreadable": (
+        "EA забрал команду, но историю сделок не удалось прочитать ({error}) за {seconds} с."
+        " Результат неизвестен: нужна ручная сверка, повтор запрещён.",
+        "The EA picked up the command but the deal history stayed unreadable ({error}) for"
+        " {seconds}s. The result is unknown: reconcile manually, do not retry.",
+        "EA đã nhận lệnh nhưng không đọc được lịch sử giao dịch ({error}) trong {seconds} giây."
+        " Kết quả chưa rõ: hãy đối soát thủ công, không thử lại."),
+    "runner.refused": (
+        "Предложение отклонено до отправки: {reason}.",
+        "The proposal was refused before sending: {reason}.",
+        "Đề xuất bị từ chối trước khi gửi: {reason}."),
+    "runner.duplicate": (
+        "Этот идентификатор ордера уже отдавался EA; команда не повторяется.",
+        "This order identifier was already handed to the EA; the command is not repeated.",
+        "Mã lệnh này đã được giao cho EA; không lặp lại lệnh."),
+    "runner.stopped_uncertain": (
+        "Остановка: у предыдущей команды неизвестный результат; нужна ручная сверка.",
+        "Stopping: the previous command has an unknown result; manual reconciliation is"
+        " required.",
+        "Dừng: lệnh trước có kết quả chưa rõ; cần đối soát thủ công."),
+    "runner.stopped": (
+        "Оператор остановил демо-исполнение.",
+        "The operator stopped demo execution.",
+        "Người vận hành đã dừng thực thi demo."),
+    "runner.confirm_note": (
+        "Внимание: подтверждённый ордер уйдёт на ДЕМО-счёт через EA.",
+        "Note: an approved order will be sent to the DEMO account through the EA.",
+        "Lưu ý: lệnh được duyệt sẽ gửi tới tài khoản DEMO qua EA."),
+    "runner.summary": (
+        "Итог демо-исполнения {run_id}: сигналов {signals}, команд {commands}, исполнено"
+        " {filled}, истекло {expired}, неизвестно {unconfirmed}, отклонено {refused}; цепочка"
+        " журнала корректна: {chain}.",
+        "Demo execution summary {run_id}: signals {signals}, commands {commands}, filled"
+        " {filled}, expired {expired}, unconfirmed {unconfirmed}, refused {refused}; journal"
+        " chain valid: {chain}.",
+        "Tóm tắt thực thi demo {run_id}: tín hiệu {signals}, lệnh {commands}, khớp {filled},"
+        " hết hạn {expired}, chưa rõ {unconfirmed}, bị từ chối {refused}; chuỗi nhật ký hợp lệ:"
+        " {chain}."),
+    "runner.uncertain_startup": (
+        "В журнале моста есть отданные команды без подтверждённой сделки: {ids}. Проверьте"
+        " вручную или добавьте --acknowledge-uncertain.",
+        "The bridge journal lists served commands without a confirmed deal: {ids}. Reconcile"
+        " manually or add --acknowledge-uncertain.",
+        "Nhật ký cầu nối có lệnh đã giao mà chưa xác nhận khớp: {ids}. Hãy đối soát thủ công"
+        " hoặc thêm --acknowledge-uncertain."),
+    "runner.acknowledged": (
+        "Оператор принял неопределённые команды к ручной сверке: {ids}.",
+        "The operator accepted the uncertain commands for manual reconciliation: {ids}.",
+        "Người vận hành đã nhận các lệnh chưa rõ để đối soát thủ công: {ids}."),
+    "runner.disclaimer": (
+        "Демо-исполнение через EA: ордера уходят только на демо-счёт. Реальные деньги не"
+        " используются; прошлые результаты не гарантируют прибыль.",
+        "Demo execution through the EA: orders go to a demo account only. No real money is"
+        " used; past results do not guarantee profit.",
+        "Thực thi demo qua EA: lệnh chỉ gửi tới tài khoản demo. Không dùng tiền thật; kết quả"
+        " quá khứ không bảo đảm lợi nhuận."),
+    # Host setup: terminal configuration for the loopback demo bridge.
+    "setup.not_windows": (
+        "Этот скрипт настраивает терминал MetaTrader 5 на Windows.",
+        "This script configures a MetaTrader 5 terminal on Windows.",
+        "Tập lệnh này cấu hình terminal MetaTrader 5 trên Windows."),
+    "setup.terminal_running": (
+        "Терминал MetaTrader 5 запущен ({processes}). Закройте его и повторите.",
+        "MetaTrader 5 is running ({processes}). Close it and retry.",
+        "MetaTrader 5 đang chạy ({processes}). Hãy đóng nó rồi thử lại."),
+    "setup.ini_missing": (
+        "Файл конфигурации терминала не найден: {path}.",
+        "Terminal configuration file not found: {path}.",
+        "Không tìm thấy tệp cấu hình terminal: {path}."),
+    "setup.ini_encoding": (
+        "Файл {path} не в UTF-16 с BOM; скрипт не перезаписывает его вслепую.",
+        "{path} is not UTF-16 with a BOM; the script will not rewrite it blindly.",
+        "{path} không phải UTF-16 có BOM; tập lệnh sẽ không ghi đè một cách mù quáng."),
+    "setup.ini_section": (
+        "В common.ini должна быть ровно одна секция [Experts], найдено: {count}.",
+        "common.ini must contain exactly one [Experts] section; found {count}.",
+        "common.ini phải có đúng một mục [Experts]; tìm thấy {count}."),
+    "setup.ini_key_missing": (
+        "В секции [Experts] нет ключа {name}.",
+        "The [Experts] section has no {name} key.",
+        "Mục [Experts] không có khóa {name}."),
+    "setup.ini_duplicate_key": (
+        "Ключ {name} встречается в [Experts] более одного раза.",
+        "The {name} key appears more than once in [Experts].",
+        "Khóa {name} xuất hiện nhiều lần trong [Experts]."),
+    "setup.url_not_loopback": (
+        "Адрес моста должен быть http://127.0.0.1:<порт> или http://localhost:<порт>;"
+        " получено {url}.",
+        "The bridge URL must be http://127.0.0.1:<port> or http://localhost:<port>; got {url}.",
+        "URL bridge phải là http://127.0.0.1:<cổng> hoặc http://localhost:<cổng>; nhận được {url}."),
+    "setup.ea_missing": (
+        "Нет собранного демо-EA: {path}. Запустите скрипт без --skip-build.",
+        "No demo EA binary at {path}. Run the script without --skip-build.",
+        "Không có EA demo tại {path}. Chạy lại không dùng --skip-build."),
+    "setup.ea_built": (
+        "EA собран: {errors} ошибок, {warnings} предупреждений; установлен в {experts}.",
+        "EA compiled: {errors} errors, {warnings} warnings; installed into {experts}.",
+        "EA đã biên dịch: {errors} lỗi, {warnings} cảnh báo; đã cài vào {experts}."),
+    "setup.ea_present": (
+        "Собранный EA уже на месте: {path}.",
+        "The compiled EA is already in place: {path}.",
+        "EA đã biên dịch đã có sẵn: {path}."),
+    "setup.ini_unchanged": (
+        "common.ini уже разрешает автоторговлю и WebRequest для {url}; файл не изменён.",
+        "common.ini already allows automated trading and WebRequest for {url}; nothing"
+        " changed.",
+        "common.ini đã cho phép giao dịch tự động và WebRequest cho {url}; không thay đổi."),
+    "setup.ini_changed": (
+        "common.ini обновлён; резервная копия: {backup}.",
+        "common.ini updated; backup: {backup}.",
+        "Đã cập nhật common.ini; bản sao lưu: {backup}."),
+    "setup.verify_failed": (
+        "Запись common.ini не прошла проверку: {path}.",
+        "common.ini did not verify after writing: {path}.",
+        "common.ini không khớp sau khi ghi: {path}."),
+    "setup.dry_run": (
+        "Пробный запуск: файлы не изменены. Добавьте --apply.",
+        "Dry run: no files changed. Add --apply.",
+        "Chạy thử: chưa thay đổi tệp nào. Thêm --apply."),
+    "setup.ready": (
+        "Терминал готов: демо-счёт {login}, EA {ea}, мост {url}.",
+        "Terminal ready: demo account {login}, EA {ea}, bridge {url}.",
+        "Terminal đã sẵn sàng: tài khoản demo {login}, EA {ea}, bridge {url}."),
+    "setup.next": (
+        "Дальше: запустите демо-раннер (он поднимет мост), включите AutoTrading в терминале и"
+        " прикрепите EA к графику; BridgeToken берите из MT5_BRIDGE_TOKEN.",
+        "Next: start the demo runner (it raises the bridge), enable AutoTrading in the"
+        " terminal and attach the EA to a chart; use MT5_BRIDGE_TOKEN as BridgeToken.",
+        "Tiếp theo: chạy demo runner (nó mở bridge), bật AutoTrading trong terminal và gắn EA"
+        " vào biểu đồ; dùng MT5_BRIDGE_TOKEN làm BridgeToken."),
+    "setup.data_dir_missing": (
+        "Не найден каталог данных терминала: {path}. Укажите --data-dir.",
+        "Terminal data directory not found: {path}. Pass --data-dir.",
+        "Không tìm thấy thư mục dữ liệu terminal: {path}. Hãy truyền --data-dir."),
+    "setup.data_dir_ambiguous": (
+        "Найдено несколько каталогов данных терминала ({count}); укажите --data-dir.",
+        "Several terminal data directories found ({count}); pass --data-dir.",
+        "Tìm thấy nhiều thư mục dữ liệu terminal ({count}); hãy truyền --data-dir."),
+    "setup.process_check_failed": (
+        "Не удалось проверить запущенные процессы ({error}); состояние неизвестно, скрипт"
+        " остановлен.",
+        "Could not check running processes ({error}); the state is unknown, so the script"
+        " stopped.",
+        "Không kiểm tra được tiến trình đang chạy ({error}); trạng thái không rõ nên tập lệnh"
+        " dừng."),
 }
 
 _INDEX = {language: position for position, language in enumerate(LANGUAGES)}
@@ -450,6 +709,25 @@ def placeholders(rendered: str) -> frozenset[str]:
     return frozenset(field for _, field, _, _ in string.Formatter().parse(rendered) if field)
 
 
+def configure_console_output(*streams: Any, errors: str = "replace") -> None:
+    """Make localized output survivable on a legacy Windows code page.
+
+    A piped cp1252 stream raises ``UnicodeEncodeError`` on the first Cyrillic or
+    Vietnamese character, which would kill ``--help`` and every report. UTF-8 keeps the
+    text readable in a file or a ``chcp 65001`` console; ``replace`` keeps an exotic
+    stream from aborting a run that is already trading. ``errors="surrogateescape"`` on
+    stdin is what lets an operator type "да" on a cp1251 console without a decode crash.
+    """
+    for stream in streams:
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors=errors)
+        except (OSError, ValueError):
+            continue
+
+
 __all__ = ["CODE_LABELS", "DEFAULT_LANGUAGE", "LANGUAGES", "LANGUAGE_NAMES", "TEXT",
-           "UnsupportedLanguage", "describe", "describe_many", "normalize_language",
-           "placeholders", "text"]
+           "UnsupportedLanguage", "configure_console_output", "describe", "describe_many",
+           "normalize_language", "placeholders", "text"]

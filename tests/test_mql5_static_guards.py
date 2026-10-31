@@ -88,7 +88,7 @@ def test_ea_requires_header_safe_token_and_durable_idempotency_tombstone():
     assert source.index("GlobalVariablesFlush()") < source.index("OrderSend(request, result)")
 
 
-def test_ea_refuses_an_empty_token_and_requires_a_successful_tombstone_flush():
+def test_ea_refuses_an_empty_token_and_verifies_tombstones_before_sending():
     source = _ea_source()
     oninit = re.search(r"int\s+OnInit\s*\(\s*\)\s*\{(?P<body>.*?)\n\}", source, re.S).group("body")
     # An empty token must refuse initialization instead of polling and logging BLOCKED forever.
@@ -98,10 +98,14 @@ def test_ea_refuses_an_empty_token_and_requires_a_successful_tombstone_flush():
     command = re.search(r"bool\s+ExecuteDemoCommand\s*\([^)]*\)\s*\{(?P<body>.*?)\n\}", source, re.S)
     assert command is not None
     body = command.group("body")
-    # The flush result must gate the send, so the tombstone cannot be best-effort.
-    assert "if(!GlobalVariablesFlush())" in body
-    assert re.search(r"(?m)^\s*GlobalVariablesFlush\(\);\s*$", body) is None
-    assert body.index("if(!GlobalVariablesFlush())") < body.index("OrderSend(request, result)")
+    # GlobalVariablesFlush() is void in build 6295, so the persisted keys themselves must be
+    # re-read after both writes and before the send.
+    verify = "if(!GlobalVariableCheck(command_key) || !GlobalVariableCheck(order_key))"
+    assert verify in body
+    assert re.search(r"(?m)^\s*GlobalVariablesFlush\(\);\s*$", body) is not None
+    assert body.index(verify) < body.rindex("GlobalVariablesFlush()")
+    assert body.index(verify) < body.index("OrderSend(request, result)")
+    assert "!GlobalVariablesFlush" not in source
     # The unused expiry cast was removed; expiry is compared in double precision instead.
     assert "long expires_at =" not in source
 
@@ -305,7 +309,8 @@ def test_production_checker_and_self_test_cover_the_new_predicates():
                  "user approval gate keeps the message but stops returning",
                  "identifier validation keeps the message but stops returning",
                  "empty token accepted at init",
-                 "tombstone flush result ignored",
+                 "tombstone verification removed",
+                 "tombstone verification short-circuited",
                  "protective stops detached from order request",
                  "JsonTrue wrapper inverted",
                  "JsonFalse wrapper inverted",

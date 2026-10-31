@@ -240,8 +240,12 @@ def _required_checks() -> dict[str, str]:
         # Idempotency tombstones.
         "idempotency persist failure is fail-closed": r"GlobalVariableSet\s*\(\s*command_key\s*,\s*\(double\)TimeGMT\s*\(\s*\)\s*\)\s*==\s*0",
         "order tombstone persist failure is fail-closed": r"GlobalVariableSet\s*\(\s*order_key\s*,\s*\(double\)TimeGMT\s*\(\s*\)\s*\)\s*==\s*0",
-        "idempotency flush result is fail-closed": (
-            r'if\s*\(\s*!\s*GlobalVariablesFlush\s*\(\s*\)\s*\)\s*\{\s*'
+        # MQL5 build 6295 declares GlobalVariablesFlush() as void, so the flush cannot gate the
+        # send. Both writes must instead be observable before the send; durable idempotency is
+        # the bridge's exact-ID record, not this in-memory tombstone.
+        "tombstones are re-checked after persist": (
+            r"if\s*\(\s*!\s*GlobalVariableCheck\s*\(\s*command_key\s*\)\s*\|\|\s*"
+            r"!\s*GlobalVariableCheck\s*\(\s*order_key\s*\)\s*\)\s*\{\s*"
             r'Print\(\s*"BLOCKED:[^"]*"\s*\)\s*;\s*return\s+false\s*;\s*\}'
         ),
         "command tombstone hashes command_id": r'return\s+"CC_TRIED_C_"\s*\+\s*Fnv1aHex\s*\(\s*command_id\s*\)',
@@ -397,7 +401,9 @@ def _forbidden_checks() -> dict[str, str]:
         "loopback host checked by prefix": r"StringFind\s*\(\s*(?:BridgeUrl|KillSwitchUrl)\s*,\s*\"http://127\.0\.0\.1:\"\s*\)\s*!=\s*0",
         "kill switch treated as active": r"if\s*\(\s*JsonTrue\s*\(\s*\"kill_switch_active\"\s*\)\s*\)",
         "broker preflight result ignored": r"(?m)^[ \t]*OrderCheck\s*\(",
-        "idempotency flush result ignored": r"(?m)^[ \t]*GlobalVariablesFlush\s*\(\s*\)\s*;[ \t]*$",
+        # GlobalVariablesFlush() is void in the installed compiler; using it as a value is a
+        # compile error, so a source that gates the send on it cannot build at all.
+        "void flush used as a value": r"!\s*GlobalVariablesFlush|GlobalVariablesFlush\s*\(\s*\)\s*(?:==|!=)",
         "idempotency flush made conditional": r"if\s*\([^\n]*\)\s*GlobalVariablesFlush\s*\(\s*\)\s*;",
         "write request introduced": r"WebRequest\s*\(\s*\"(?:POST|PUT|PATCH|DELETE)\"",
         "asynchronous or direct order API": (
@@ -782,6 +788,18 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
                        _after(command, "OrderCheck(request, check)", "GlobalVariableSet(command_key")))
         checks.append(("tombstones are written before the flush",
                        _after(command, "GlobalVariableSet(order_key", "GlobalVariablesFlush()")))
+        # The duplicate guard earlier in the function is not this check: the persisted keys
+        # must be re-read after both writes, before the send.
+        write_at = command.find("GlobalVariableSet(order_key")
+        verify_at = command.find("GlobalVariableCheck(command_key)", write_at) \
+            if write_at >= 0 else -1
+        checks.append(("tombstones are re-checked after they are written",
+                       write_at >= 0 and verify_at > write_at))
+        # GlobalVariablesFlush() returns void in build 6295; gating on it cannot compile.
+        checks.append(("the void flush is not used as a value",
+                       "!GlobalVariablesFlush" not in source
+                       and "GlobalVariablesFlush() ==" not in source
+                       and "GlobalVariablesFlush() !=" not in source))
         checks.append(("the flush precedes OrderSend",
                        _after(command, "GlobalVariablesFlush()", "OrderSend(request, result)")))
         checks.append(("the last order gate is the kill-switch re-read",
@@ -823,8 +841,9 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
                        len(re.findall(r"\buser_approved\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)", source)) == 1
                        and len(re.findall(r"\bbool\s+user_approved\s*=(?!=)", source)) == 1))
         # Every guard must be the one on the live path, before the send.
-        checks.append(("the pre-send tombstone flush is fail-closed",
-                       _pinned_guard(command, blocks, 'if(!GlobalVariablesFlush()) { Print("BLOCKED: cannot flush idempotency tombstones."); return false; }',
+        checks.append(("the persisted tombstones are verified before the send",
+                       _pinned_guard(command, blocks, 'if(!GlobalVariableCheck(command_key) || !GlobalVariableCheck(order_key)) '
+                                                      '{ Print("BLOCKED: idempotency tombstones missing after persist."); return false; }',
                                      "bool sent = OrderSend(request, result);")))
         # The predicates alone are not enforcement: each gate must still be the complete
         # statement whose body prints and returns, in one piece, ahead of the send.
@@ -976,12 +995,17 @@ MUTATIONS: dict[str, tuple[str, str] | tuple[tuple[str, str], ...]] = {
     ),
     "symbol trade mode disabled": ("trade_mode != SYMBOL_TRADE_MODE_FULL", "trade_mode != SYMBOL_TRADE_MODE_DISABLED"),
     "tombstone flush removed": (
-        '   if(!GlobalVariablesFlush())\n   { Print("BLOCKED: cannot flush idempotency tombstones."); return false; }\n',
+        "   GlobalVariablesFlush();\n",
         "",
     ),
-    "tombstone flush result ignored": (
-        '   if(!GlobalVariablesFlush())\n   { Print("BLOCKED: cannot flush idempotency tombstones."); return false; }\n',
-        "   GlobalVariablesFlush();\n",
+    "tombstone verification removed": (
+        '   if(!GlobalVariableCheck(command_key) || !GlobalVariableCheck(order_key))\n'
+        '   { Print("BLOCKED: idempotency tombstones missing after persist."); return false; }\n',
+        "",
+    ),
+    "tombstone verification short-circuited": (
+        "if(!GlobalVariableCheck(command_key) || !GlobalVariableCheck(order_key))",
+        "if(false)",
     ),
     "kill-switch URL parser removed": ("if(!IsLoopbackHttpUrl(KillSwitchUrl, url_error))", "if(false)"),
     "terminal trading check short-circuited": (
@@ -1255,8 +1279,9 @@ MUTATION_EXPECTATIONS: dict[str, str] = {
     "JsonString type guard removed": "JsonString enforces its value type",
     "JsonString re-parses the raw body": "JsonString does not re-parse the raw body",
     "symbol trade mode disabled": "symbol requires full trading mode",
-    "tombstone flush removed": "idempotency flush result is fail-closed",
-    "tombstone flush result ignored": "idempotency flush result is fail-closed",
+    "tombstone flush removed": "tombstone flush precedes OrderSend",
+    "tombstone verification removed": "tombstones are re-checked after persist",
+    "tombstone verification short-circuited": "tombstones are re-checked after persist",
     "kill-switch URL parser removed": "OnInit validates both loopback URLs",
     "terminal trading check short-circuited": "terminal and account trading allowed check",
     "demo account comparison inverted": "demo account comparison direction",

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import os
 import sqlite3
@@ -15,6 +16,9 @@ from critical_consensus.mt5_agent import codes, i18n
 from test_mt5_agent import make_bars
 
 ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
 
 POLICY_TEMPLATE = """\
 version: 1
@@ -516,3 +520,72 @@ def test_the_journal_stores_codes_and_never_translations(tmp_path):
         for blocker in json.loads(payload)["blockers"]:
             assert blocker in known or blocker.startswith("BLACKOUT_WINDOW_"), blocker
         assert "отверг" not in payload and "từ chối" not in payload
+
+
+# --------------------------------------------------------------------------- console encoding
+# A cp1252 console or pipe is the normal state on this host's Windows shell. Cyrillic and
+# Vietnamese must never be able to raise UnicodeEncodeError on the way out of a CLI.
+def test_configure_console_output_makes_a_legacy_stream_writable():
+    buffer = io.BytesIO()
+    stream = io.TextIOWrapper(buffer, encoding="cp1252", errors="strict", line_buffering=True)
+    with pytest.raises(UnicodeEncodeError):
+        stream.write("подтвердить")
+
+    i18n.configure_console_output(stream)
+
+    stream.write("подтвердить — xác nhận")
+    stream.flush()
+    assert buffer.getvalue().decode("utf-8") == "подтвердить — xác nhận"
+
+
+def test_configure_console_output_skips_streams_it_cannot_reconfigure():
+    class NoReconfigure:
+        def __init__(self) -> None:
+            self.written: list[str] = []
+
+        def write(self, value: str) -> None:
+            self.written.append(value)
+
+    class FailingReconfigure:
+        def reconfigure(self, **_kwargs):
+            raise OSError("closed")
+
+    quiet = NoReconfigure()
+    i18n.configure_console_output(quiet, FailingReconfigure(), None)
+    assert quiet.written == []
+
+
+@pytest.mark.parametrize("script,arguments", [
+    ("run_mt5_agent.py", ["--help"]),
+    ("run_mt5_demo_trading.py", ["--policy", "x.yaml", "--db", "x.db", "--help"]),
+])
+def test_help_survives_a_cp1252_pipe(tmp_path, script, arguments):
+    process_env = {key: value for key, value in os.environ.items()
+                   if key != "MT5_AGENT_LANGUAGE"}
+    process_env.update(MT5_AGENT_LANGUAGE="ru", PYTHONIOENCODING="cp1252")
+    result = subprocess.run([sys.executable, str(SCRIPTS / script), *arguments],
+                            cwd=tmp_path, capture_output=True, check=False, env=process_env)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    combined = result.stdout.decode("utf-8") + result.stderr.decode("utf-8")
+    assert "Traceback" not in combined
+    # The Russian help is only reachable if the write itself did not raise.
+    assert "язык" in combined
+
+
+def test_a_setup_refusal_reaches_a_legacy_stderr_as_localized_text(monkeypatch):
+    import setup_demo_terminal
+
+    monkeypatch.setattr(setup_demo_terminal, "running_terminals",
+                        lambda *args, **kwargs: ["terminal64.exe"])
+    captured = io.BytesIO()
+    monkeypatch.setattr(sys, "stderr", io.TextIOWrapper(captured, encoding="cp1252",
+                                                        errors="strict", line_buffering=True))
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(io.BytesIO(), encoding="cp1252",
+                                                        errors="strict", line_buffering=True))
+
+    # Without the console guard, main() raises UnicodeEncodeError while reporting the refusal.
+    assert setup_demo_terminal.main(["--language", "ru"]) == 3
+    sys.stderr.flush()
+    message = captured.getvalue().decode("utf-8")
+    assert "terminal64.exe" in message
+    assert "запущен" in message
