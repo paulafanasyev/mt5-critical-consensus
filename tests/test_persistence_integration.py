@@ -130,6 +130,23 @@ def test_market_forecast_resolves_only_from_first_future_completed_persisted_bar
 
 
 
+
+def test_market_bars_reject_late_historical_inserts_but_allow_identical_replays():
+    repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
+    repo.migrate()
+    symbol = "FORWARD" + uuid.uuid4().hex[:6].upper()
+    start = datetime.now(timezone.utc) - timedelta(days=2)
+    first = MarketBar(symbol, "H1", start, 1.0, 1.2, 0.9, 1.1, tick_volume=10)
+    latest = MarketBar(symbol, "H1", start + timedelta(hours=2), 1.1, 1.3, 1.0, 1.2, tick_volume=12)
+    assert repo.append_market_bars([first, latest])["inserted"] == 2
+    replay = repo.append_market_bars([first])
+    assert replay["identical_duplicates"] == 1
+    late = MarketBar(symbol, "H1", start + timedelta(hours=1), 1.05, 1.25, 1.0, 1.15, tick_volume=11)
+    with pytest.raises(Exception, match="late historical market-bar insert is blocked"):
+        repo.append_market_bars([late])
+
+
+
 def test_database_rejects_new_legacy_confidence_outcome_labels():
     repo = PostgresRepository(os.environ["TEST_DATABASE_URL"])
     repo.migrate()
