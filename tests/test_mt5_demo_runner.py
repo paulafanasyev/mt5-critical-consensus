@@ -1253,6 +1253,61 @@ def test_the_run_covers_every_requested_instrument(tmp_path, monkeypatch, capsys
         journal.close()
 
 
+def test_a_broker_that_only_lists_suffixed_names_trades_those_names(tmp_path, monkeypatch,
+                                                                    capsys):
+    """Exness-style naming must not turn a second broker into "no instruments available"."""
+    class SuffixTerminal(FakeTerminal):
+        def __init__(self, listed, **kwargs):
+            super().__init__(**kwargs)
+            self._listed = list(listed)
+            self.spec_calls: list[str] = []
+            self.listed_names: dict[str, str] = {}
+
+        def symbols(self):
+            return list(self._listed)
+
+        def symbol_spec(self, symbol):
+            self.spec_calls.append(symbol)
+            return super().symbol_spec(symbol)
+
+        def use_broker_names(self, mapping):
+            self.listed_names = dict(mapping)
+
+    built: list = []
+
+    class RecordingAgent(StubAgent):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            built.append(self.policy)
+
+    monkeypatch.setattr(runner, "MT5Agent", RecordingAgent)
+    terminal = SuffixTerminal(["XAUUSDm", "EURUSD"], specs={"XAUUSDm": GOLD},
+                              unavailable={"BTCUSD"}, ask=2400.05, bid=2399.95)
+    code = runner._run(run_args(tmp_path), make_policy(execution_mode="auto"), "en", TOKEN,
+                       "run-1", terminal, ["XAUUSD", "BTCUSD"])
+    assert code == 0
+    captured = capsys.readouterr()
+    summary = json.loads(captured.out)
+    assert summary["symbols_requested"] == ["XAUUSD", "BTCUSD"]
+    assert summary["symbols_active"] == ["XAUUSDm"]
+    assert set(summary["per_symbol"]) == {"XAUUSDm"}
+    assert "lists XAUUSD as XAUUSDm" in captured.err
+    # The declared symbol_spec describes gold on the server it was written for. An aliased
+    # instrument is another broker's contract, so the numbers have to come from the terminal.
+    # The policy keeps its own upper-case key; what has to be exact is the name that reaches
+    # the terminal, because MT5 has no idea that XAUUSDM and XAUUSDm are the same symbol.
+    assert [(policy.symbol, policy.symbol_spec) for policy in built] == [("XAUUSDM", None)]
+    assert terminal.spec_calls == ["XAUUSDm", "BTCUSD"]
+    assert terminal.listed_names == {"XAUUSD": "XAUUSDm"}
+    journal = DecisionJournal(tmp_path / "journal.db", run_id="run-1")
+    try:
+        aliased = payloads(journal, runner.SYMBOL_ALIAS_EVENT)
+        assert aliased == [{"requested": "XAUUSD", "resolved": "XAUUSDm",
+                            "broker_order_sent": False}]
+    finally:
+        journal.close()
+
+
 def test_a_run_with_no_available_instrument_is_refused(tmp_path, capsys):
     terminal = FakeTerminal(unavailable={"EURUSD", "XAUUSD"})
     code = runner._run(run_args(tmp_path),

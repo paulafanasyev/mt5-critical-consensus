@@ -340,6 +340,44 @@ def assert_backend_contract(backend: Any) -> None:
                         f"{', '.join(missing)}")
 
 
+def resolve_broker_symbol(requested: str, available: Sequence[str]) -> str:
+    """Map a logical instrument name onto the one this broker actually lists.
+
+    Retail MT5 servers rarely publish ``XAUUSD``: Exness, RoboForex, ITAM and AMarkets
+    append an account-type suffix, so the same instrument is ``XAUUSDm``, ``XAUUSDc`` or
+    ``XAUUSD.i``. Without a mapping a run refuses every symbol on a second broker and
+    looks like a broken strategy rather than a naming difference.
+
+    The mapping is deliberately narrow, because a wrong resolution trades a different
+    contract:
+
+    * only six-character instrument codes are candidates, so ``BTC`` cannot resolve to
+      the US stock ticker ``BTCO`` that MetaQuotes-Demo also lists;
+    * the suffix is at most three characters, which covers the observed account types;
+    * an exact match always wins, and several suffix matches refuse instead of guessing
+      which one this account is allowed to trade.
+
+    Comparison ignores case, but the name handed back is the server's own spelling:
+    ``symbol_select("XAUUSDM")`` fails on a broker that lists ``XAUUSDm``.
+    """
+    name = requested.strip().upper()
+    listed = [str(symbol).strip() for symbol in available]
+    exact = [row for row in listed if row.upper() == name]
+    if exact:
+        return exact[0]
+    if len(name) != 6:
+        raise RuntimeError(f"MT5 has no symbol {name} and {name} is too short to alias safely")
+    matches = sorted({row for row in listed
+                      if row.upper().startswith(name)
+                      and 0 < len(row) - len(name) <= 3})
+    if not matches:
+        raise RuntimeError(f"MT5 has no symbol {name} and no suffixed variant of it")
+    if len(matches) > 1:
+        raise RuntimeError(f"MT5 offers several variants of {name}: {', '.join(matches)}; "
+                           "refusing to guess which one this account trades")
+    return matches[0]
+
+
 class LiveMT5Backend:
     """Order-free adapter for an installed MetaTrader 5 terminal on Windows.
 
@@ -414,8 +452,29 @@ class LiveMT5Backend:
             raise RuntimeError("MT5 account_info() returned no account")
         return AccountInfo.from_terminal(info)
 
+    # Internal keys are upper case, but MT5 symbol names are not: Exness lists gold as
+    # XAUUSDm and ``symbol_info("XAUUSDM")`` returns nothing. A run that resolved a broker's
+    # own spelling registers it here so every terminal call below can go out under it.
+    _names: dict[str, str] | None = None
+
+    def use_broker_names(self, mapping: Mapping[str, str]) -> None:
+        """Remember how this server spells the instruments the run asked for."""
+        names = dict(self._names or {})
+        for requested, exact in dict(mapping).items():
+            key = str(requested).strip().upper()
+            exact = str(exact).strip()
+            held = names.get(key)
+            if held is not None and held != exact:
+                raise RuntimeError(f"{key} cannot name both {held} and {exact} on one terminal")
+            names[key] = exact
+        self._names = names
+
+    def _name(self, symbol: str) -> str:
+        return (self._names or {}).get(str(symbol).strip().upper(),
+                                       str(symbol).strip().upper())
+
     def symbol_spec(self, symbol: str) -> SymbolSpec:
-        name = symbol.strip().upper()
+        name = self._name(symbol)
         info = self._mt5.symbol_info(name)
         if info is None:
             # A symbol absent from Market Watch has no data. symbol_select is the documented
@@ -428,7 +487,7 @@ class LiveMT5Backend:
         return SymbolSpec.from_terminal(info, self.account().currency)
 
     def tick(self, symbol: str) -> Tick:
-        name = symbol.strip().upper()
+        name = self._name(symbol)
         tick = self._mt5.symbol_info_tick(name)
         if tick is None:
             raise RuntimeError(f"MT5 returned no tick for {name}")
@@ -441,7 +500,7 @@ class LiveMT5Backend:
                     server_utc_offset_seconds=self._offset)
 
     def bars(self, symbol: str, timeframe: str, count: int) -> list[MarketBar]:
-        name = symbol.strip().upper()
+        name = self._name(symbol)
         tf = timeframe.strip().upper()
         if tf not in _TIMEFRAME_CONSTANTS:
             raise ValueError(f"unsupported timeframe: {tf}")

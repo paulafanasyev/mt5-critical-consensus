@@ -63,7 +63,8 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from critical_consensus.mt5_agent import (AgentPolicy, DecisionJournal, MT5Agent, codes, i18n,
                                           load_policy)
-from critical_consensus.mt5_agent.backend import LiveMT5Backend
+from critical_consensus.mt5_agent.backend import (LiveMT5Backend,
+                            resolve_broker_symbol)
 from critical_consensus.mt5_agent.i18n import (DEFAULT_LANGUAGE, describe, normalize_language,
                                                text)
 from mt5_demo_bridge import (ADMIN_TOKEN_ENV, BRIDGE_TOKEN_ENV, IDENTIFIER_PATTERN,
@@ -98,6 +99,7 @@ OUTCOME_EVENT = "demo_order_outcome"
 ACK_EVENT = "demo_reconciliation_ack"
 RISK_BASELINE_EVENT = "demo_risk_baseline"
 SYMBOL_SKIPPED_EVENT = "demo_symbol_unavailable"
+SYMBOL_ALIAS_EVENT = "demo_symbol_alias"
 STATE_FILLED = "FILLED"
 STATE_EXPIRED = "EXPIRED"
 STATE_UNCONFIRMED = "UNCONFIRMED"
@@ -384,6 +386,19 @@ class DemoTerminal(LiveMT5Backend):
         # library caller keeps a silent adapter.
         self._out = out
         self._language = normalize_language(language)
+
+    def symbols(self) -> list[str]:
+        """Every symbol name this server publishes, for instrument aliasing.
+
+        The runner's adapter, not the package: ``mt5_agent`` promises exactly nine
+        order-free terminal calls, and a broker-portability convenience has no business
+        widening that surface. Read whole rather than searched per symbol, because a
+        suffix guess made from a partial list trades the wrong contract.
+        """
+        rows = self._mt5.symbols_get()
+        if rows is None:
+            raise RuntimeError("MT5 symbols_get() returned nothing")
+        return [str(row.name) for row in rows]
 
     def _say(self, key: str, **placeholders: Any) -> None:
         if self._out is not None:
@@ -679,7 +694,7 @@ class DemoExecutor:
             # Before anything else, and before any market read: the operator's stop outranks
             # every gate below because it is a decision, not a measurement.
             return self._stop_refusal()
-        if str(proposal.get("symbol", "")).upper() != self._symbol:
+        if str(proposal.get("symbol", "")).strip().upper() != self._symbol.strip().upper():
             # A proposal for another instrument must never be routed through this executor:
             # its spec, tick and reconciliation window all belong to ``self._symbol``.
             return self._outcome(STATE_REFUSED, reason=codes.PROPOSAL_SYMBOL_MISMATCH,
@@ -1115,9 +1130,38 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
                 print(text("runner.acknowledged", language, ids=listing), file=sys.stderr)
 
         symbols = list(symbols or [policy.symbol])
+        # Retail MT5 servers rarely list XAUUSD under that name — Exness, RoboForex and ITAM
+        # append an account-type suffix — so the requested names are resolved against the
+        # server's own list once, up front, and the resolved name is what every later call,
+        # proposal and order carries. A failed resolution falls back to the requested name
+        # rather than dropping the instrument: symbol_spec still refuses it with its own,
+        # better reason.
+        listed: list[str] | None = None
+        read_list = getattr(terminal, "symbols", None)
+        if callable(read_list):
+            try:
+                listed = list(read_list())
+            except Exception as exc:
+                print(text("runner.symbol_unavailable", language, symbol="*",
+                           reason=skip_reason(exc)), file=sys.stderr)
         specs: dict[str, Any] = {}
         unavailable: dict[str, str] = {}
+        aliases: dict[str, str] = {}
+        resolved_symbols: list[str] = []
         for symbol in symbols:
+            requested = symbol
+            if listed is not None:
+                try:
+                    symbol = resolve_broker_symbol(requested, listed)
+                except Exception:
+                    symbol = requested
+            if symbol != requested:
+                aliases[requested] = symbol
+                journal.record(SYMBOL_ALIAS_EVENT, {
+                    "requested": requested, "resolved": symbol, "broker_order_sent": False})
+                print(text("runner.symbol_aliased", language, requested=requested,
+                           resolved=symbol), file=sys.stderr)
+            resolved_symbols.append(symbol)
             try:
                 specs[symbol] = terminal.symbol_spec(symbol)
             except Exception as exc:
@@ -1130,7 +1174,12 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
                     "symbol": symbol, "reason": reason, "broker_order_sent": False})
                 print(text("runner.symbol_unavailable", language, symbol=symbol,
                            reason=reason), file=sys.stderr)
-        active = [symbol for symbol in symbols if symbol in specs]
+        if aliases and callable(getattr(terminal, "use_broker_names", None)):
+            # Every later read goes through the adapter under the internal upper-case key, so
+            # it has to know the server's own spelling to ask for the instrument at all.
+            terminal.use_broker_names({requested.upper(): exact
+                                       for requested, exact in aliases.items()})
+        active = [symbol for symbol in resolved_symbols if symbol in specs]
         if not active:
             print(text("runner.no_symbols", language), file=sys.stderr)
             return 3
@@ -1141,7 +1190,10 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
             # The declared spec belongs to the policy's own symbol; for any other instrument
             # the live terminal is the only source of contract data, so it is dropped rather
             # than re-declared (a wrong declaration would silently mis-size gold).
-            per_policy = (policy if symbol == policy.symbol
+            # The declared spec belongs to the policy's own symbol *under that name*: an
+            # aliased instrument is a different broker contract, so its numbers come from
+            # the terminal even when the base name matches the policy.
+            per_policy = (policy if (symbol == policy.symbol and symbol not in aliases.values())
                           else replace(policy, symbol=symbol, symbol_spec=None))
             approver = None
             if per_policy.execution_mode == "confirm":

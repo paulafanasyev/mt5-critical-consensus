@@ -525,6 +525,13 @@ TEXT: dict[str, tuple[str, str, str]] = {
         "Инструмент {symbol} недоступен в терминале ({reason}); пропущен.",
         "Instrument {symbol} is unavailable in the terminal ({reason}); skipped.",
         "Mã {symbol} không có trong terminal ({reason}); bỏ qua."),
+    "runner.symbol_aliased": (
+        "Инструмент {requested} у этого брокера торгуется как {resolved}; используется"
+        " {resolved}, спецификация берётся из терминала.",
+        "This broker lists {requested} as {resolved}; trading {resolved} and reading its"
+        " specification from the terminal.",
+        "Broker này niêm yết {requested} dưới dạng {resolved}; dùng {resolved} và lấy đặc"
+        " tả từ terminal."),
     "runner.no_symbols": (
         "Ни один запрошенный инструмент недоступен в терминале; запуск остановлен.",
         "None of the requested instruments is available in the terminal; the run is stopped.",
