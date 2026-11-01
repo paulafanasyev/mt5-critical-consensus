@@ -138,30 +138,33 @@ jobs:
           # Nothing in this step can place an order: it only opens the terminal.
           $process = Start-Process -FilePath $env:MT5_TERMINAL_EXE `
             -ArgumentList "/portable", "/config:$ini" -PassThru
+          # A first start also compiles every bundled MQL5 example, which can take minutes
+          # before the terminal ever talks to the broker, so the wait is generous and ends
+          # early as soon as the authorization line appears.
           $logDir = Join-Path $installDir "logs"
-          $deadline = (Get-Date).AddSeconds(150)
           $terminalLog = $null
-          while (-not $terminalLog -and (Get-Date) -lt $deadline) {
-            Start-Sleep -Seconds 5
-            if (Test-Path $logDir) {
+          $connected = $false
+          $deadline = (Get-Date).AddSeconds(600)
+          while (-not $connected -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 10
+            if ($process.HasExited) {
+              throw "The MetaTrader terminal exited before reaching the broker (exit code $($process.ExitCode))."
+            }
+            if (-not $terminalLog -and (Test-Path $logDir)) {
               $terminalLog = Get-ChildItem $logDir -Filter "*.log" -ErrorAction SilentlyContinue |
                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
             }
-          }
-          if (-not $terminalLog) { throw "The MetaTrader terminal opened no log within 150 s." }
-          $connected = $false
-          $waitUntil = (Get-Date).AddSeconds(120)
-          while (-not $connected -and (Get-Date) -lt $waitUntil) {
-            Start-Sleep -Seconds 5
-            $text = Get-Content $terminalLog.FullName -Encoding unicode -ErrorAction SilentlyContinue
-            if ($text -match "authorized on|trading has been enabled|terminal synchronized") {
-              $connected = $true
+            if ($terminalLog) {
+              $text = Get-Content $terminalLog.FullName -Encoding unicode -ErrorAction SilentlyContinue
+              if ($text -match "authorized on|trading has been enabled|terminal synchronized") {
+                $connected = $true
+              }
             }
           }
           if (-not $connected) {
             Write-Host "Terminal log tail:"
-            Get-Content $terminalLog.FullName -Encoding unicode -Tail 30
-            throw "The MetaTrader terminal did not reach the broker within 120 s."
+            if ($terminalLog) { Get-Content $terminalLog.FullName -Encoding unicode -Tail 40 }
+            throw "The MetaTrader terminal did not reach the broker within 600 s."
           }
           "The demo terminal is running in portable mode and reached the broker." |
             Add-Content $env:GITHUB_STEP_SUMMARY
