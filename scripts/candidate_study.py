@@ -10,15 +10,18 @@ Definitions the code pins (the prose version is in the pre-registration):
 
 * Decisions use closed bars only. A signal evaluated on bar ``i``'s close is filled at bar
   ``i+1``'s open, never at the signal bar's close.
-* One position per instrument. No pyramiding, no reversal while a position is open.
-* Inside a bar the protective exit is checked from the entry bar itself and **the stop is
-  checked before the target**. A bar whose open is already through the stop fills at the
-  open (worse than the stop); one already through the target fills at the open (better).
-* R = (gross P&L - cost) / (2 x ATR(14) at the signal bar). R is net of the round-trip
-  cost; the cost sweep re-scales only that subtraction, never the exits.
-* The interval is a **cluster** bootstrap: a cluster is one decision date (C1, C2) or one
-  calendar month (C3), so trades that share a cause are resampled together instead of
-  being treated as independent draws.
+* One position per instrument. No pyramiding, no reversal, and no new signal is evaluated on
+  the bar on which a position is closed.
+* Protective exits are checked from the entry bar itself. A gap through a level fills at the
+  open on either side; only when the open is inside both levels does the intrabar rule apply,
+  and then the stop is checked before the target.
+* ``max_hold`` counts the entry bar as the first held bar: protections are live on bars
+  ``E .. E+max_hold-1``, and the time exit is the open of ``E+max_hold``.
+* R = (gross P&L - transaction cost - financing) / (2 x ATR(14) at the signal bar). R is
+  therefore net of every charge.
+* The interval is a **moving-block** bootstrap over entry months: three consecutive months
+  are drawn together, so positions that share a month (three correlated FX pairs) and
+  positions in adjacent months (one dislocation, one regime) are resampled as a block.
 """
 from __future__ import annotations
 
@@ -32,23 +35,29 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE = ROOT / "agent_data" / "daily"
-LOCKS = ROOT / "agent_data" / "holdout_locks.json"
+LOCKS = ROOT / "docs" / "evidence" / "holdout_locks.json"
+DEV_EVIDENCE = ROOT / "docs" / "evidence" / "candidates_dev_2026_11.json"
 
 BOOTSTRAP = 10_000
 SEED = 20261101
-# Three candidates, one-sided 5% family-wise: 0.05 / 3 = 0.0167 -> a 98.33% interval.
+# Three candidates. A two-sided 98.33% interval leaves 0.83% in each tail, so each candidate
+# is a one-sided 0.83% test and the family-wise error is at most 2.5% -- stricter than the
+# 5% the protocol allows, and kept as registered.
 DEV_CONFIDENCE = 1.0 - 0.05 / 3
 HOLDOUT_CONFIDENCE = 0.90
 MIN_DEV_TRADES = 100
 MIN_HOLDOUT_TRADES = 30
+MIN_CLUSTERS = 30
+BLOCK_LENGTH = 3
 
 WINDOWS = {
     "dev": (date(2004, 6, 11), date(2019, 12, 31)),
     "holdout": (date(2024, 1, 1), date(2026, 11, 1)),
 }
-# 2020-01-01 .. 2023-12-31 is deliberately excluded from both windows: it is the period
-# earlier studies in this repository examined, so it can serve as neither clean development
-# nor an unexamined holdout. It is left unused rather than folded into development.
+# 2020-01-01 .. 2023-12-31 is excluded from both windows: earlier studies in this repository
+# examined it, so it is neither clean development nor an unexamined holdout. It may still be
+# read *backwards* by an indicator lookback that starts at a window edge (e.g. the 252-day
+# return on the first holdout month); it can never contribute a trade of its own.
 
 COSTS = {
     # point = price of one MT5 point; spread_floor_points covers the D1 "spread" field being
@@ -60,11 +69,12 @@ COSTS = {
     "NZDUSD": {"point": 0.00001, "spread_floor_points": 2, "slippage_bps": 0.0, "slippage_price": 0.00005},
 }
 
-CANDIDATES = ("c1_inside_breakout", "c2_silver_lead", "c3_fx_tsmom")
+CANDIDATES = ("c1_inside_breakout", "c2_ratio_reversion", "c3_fx_tsmom")
 
 # Bars of indicator history required before a rule may fire, and the flat annual financing
 # charge the protocol adds to every held night (see the pre-registration, section "Costs").
 WARMUP_C1 = 30
+WARMUP_C3 = 252
 FINANCING_PER_YEAR = {"XAUUSD": 0.03, "XAGUSD": 0.03,
                       "EURUSD": 0.02, "AUDUSD": 0.02, "NZDUSD": 0.02}
 
@@ -81,6 +91,10 @@ def load(symbol: str) -> list[dict]:
 
 def manifest_hash() -> str:
     return hashlib.sha256((CACHE / "manifest.json").read_bytes()).hexdigest()
+
+
+def engine_hash() -> str:
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 # --------------------------------------------------------------------------- maths
@@ -127,46 +141,56 @@ def cost_price(symbol: str, bar: dict, price: float) -> float:
 
 def protective_exit(bars: list[dict], entry_index: int, last_index: int, *, direction: int,
                     stop: float, target: float) -> tuple[int, float, str] | None:
-    """First protective exit between the entry bar and `last_index`, stop before target."""
+    """First protective exit between the entry bar and `last_index`.
+
+    A gap through either level fills at that bar's open, so both opens are checked before
+    any intrabar level; only inside the bar does the stop win over the target.
+    """
     for index in range(entry_index, last_index + 1):
         bar = bars[index]
         if direction > 0:
             if bar["o"] <= stop:
                 return index, bar["o"], "stop_gap"
-            if bar["l"] <= stop:
-                return index, stop, "stop"
             if bar["o"] >= target:
                 return index, bar["o"], "target_gap"
+            if bar["l"] <= stop:
+                return index, stop, "stop"
             if bar["h"] >= target:
                 return index, target, "target"
         else:
             if bar["o"] >= stop:
                 return index, bar["o"], "stop_gap"
-            if bar["h"] >= stop:
-                return index, stop, "stop"
             if bar["o"] <= target:
                 return index, bar["o"], "target_gap"
+            if bar["h"] >= stop:
+                return index, stop, "stop"
             if bar["l"] <= target:
                 return index, target, "target"
     return None
 
 
+def month_key(day: date) -> str:
+    return f"{day.year}-{day.month:02d}"
+
+
 def make_trade(symbol: str, direction: int, entry_index: int, entry: float, risk: float,
                exit_index: int, exit_price: float, reason: str, bars: list[dict],
-               cluster: str, cost_multiple: float = 1.0,
-               financing_multiple: float = 1.0) -> dict:
+               cost_multiple: float = 1.0, financing_multiple: float = 1.0) -> dict:
     gross = (exit_price - entry) * direction
-    held = exit_index - entry_index
-    financing = entry * FINANCING_PER_YEAR[symbol] * held / 252.0 * financing_multiple
-    cost = cost_price(symbol, bars[entry_index], entry) * cost_multiple + financing
+    nights = exit_index - entry_index
+    financing = entry * FINANCING_PER_YEAR[symbol] * nights / 252.0 * financing_multiple
+    transaction = cost_price(symbol, bars[entry_index], entry) * cost_multiple
+    cost = transaction + financing
     return {
         "symbol": symbol, "dir": direction,
         "entry_date": bars[entry_index]["date"].isoformat(),
         "exit_date": bars[exit_index]["date"].isoformat(),
         "entry": entry, "exit": exit_price, "risk": risk,
-        "gross_pnl": gross, "cost": cost, "financing": financing,
-        "gross_r": gross / risk, "cost_r": cost / risk, "r": (gross - cost) / risk,
-        "reason": reason, "cluster": cluster, "bars_held": exit_index - entry_index + 1,
+        "gross_pnl": gross, "transaction": transaction, "financing": financing,
+        "cost": cost, "gross_r": gross / risk, "cost_r": cost / risk,
+        "r": (gross - cost) / risk, "reason": reason,
+        "cluster": month_key(bars[entry_index]["date"]),
+        "bars_held": exit_index - entry_index + 1, "financing_nights": nights,
     }
 
 
@@ -190,10 +214,10 @@ def rule_c1(bars: list[dict]) -> dict:
 
 
 def rule_c2(bars: list[dict], silver: list[dict]) -> dict:
-    """Gold lags silver on a 5-day horizon; trade the standardised gap back toward zero.
+    """Gold/silver ratio reversion: trade the standardised 5-day relative return back to zero.
 
-    Both returns span the same pair of joint (both-venues-traded) dates, so the spread is
-    a like-for-like comparison rather than two different calendars.
+    Both returns span the same pair of joint (both-venues-traded) dates, so the spread is a
+    like-for-like comparison rather than two different calendars.
     """
     count = len(bars)
     intent = [0] * count
@@ -233,9 +257,9 @@ def rule_c3(bars: list[dict]) -> dict:
         if bars[index]["date"].month == bars[index - 1]["date"].month:
             continue
         signal = index - 1
-        if signal < 252:
+        if signal < WARMUP_C3:
             continue
-        change = bars[signal]["c"] / bars[signal - 252]["c"] - 1.0
+        change = bars[signal]["c"] / bars[signal - WARMUP_C3]["c"] - 1.0
         if change > 0:
             intent[signal] = 1
         elif change < 0:
@@ -246,21 +270,18 @@ def rule_c3(bars: list[dict]) -> dict:
 # --------------------------------------------------------------------------- engine
 
 
-def window_bounds(bars: list[dict], window: tuple[date, date]) -> tuple[int, int] | None:
+def window_bounds(bars: list[dict], window: tuple[date, date]) -> tuple[int, int]:
     start_date, end_date = window
     indices = [index for index, bar in enumerate(bars) if start_date <= bar["date"] <= end_date]
     if len(indices) < 30:
-        return None
+        raise ValueError(f"window {window} contains only {len(indices)} bars; refusing to score it")
     return indices[0], indices[-1]
 
 
 def simulate(symbol: str, bars: list[dict], rule: dict, window: tuple[date, date],
              *, cost_multiple: float = 1.0, financing_multiple: float = 1.0) -> list[dict]:
     """C1/C2: next-open entry, protective exits, fixed maximum holding time."""
-    bounds = window_bounds(bars, window)
-    if bounds is None:
-        return []
-    start, end = bounds
+    start, end = window_bounds(bars, window)
     ranges = atr(bars, 14)
     intent = rule["intent"]
     max_hold = rule["max_hold"]
@@ -290,9 +311,10 @@ def simulate(symbol: str, bars: list[dict], rule: dict, window: tuple[date, date
             exit_index, exit_price, reason = end, bars[end]["c"], "end"
         trades.append(make_trade(symbol, direction, entry_index, entry, risk, exit_index,
                                  exit_price, reason, bars,
-                                 cluster=bars[entry_index]["date"].isoformat(),
                                  cost_multiple=cost_multiple,
                                  financing_multiple=financing_multiple))
+        # The exit bar's own close is not evaluated: the next candidate signal is the bar
+        # after the exit, filled at the open of the bar after that.
         index = exit_index + 1
     return trades
 
@@ -300,10 +322,7 @@ def simulate(symbol: str, bars: list[dict], rule: dict, window: tuple[date, date
 def simulate_monthly(symbol: str, bars: list[dict], rule: dict, window: tuple[date, date],
                      *, cost_multiple: float = 1.0, financing_multiple: float = 1.0) -> list[dict]:
     """C3: enter on the first bar of a month, exit at the next month's first open."""
-    bounds = window_bounds(bars, window)
-    if bounds is None:
-        return []
-    _, end = bounds
+    _, end = window_bounds(bars, window)
     ranges = atr(bars, 14)
     intent = rule["intent"]
     month_starts = [index for index in range(1, len(bars))
@@ -337,8 +356,6 @@ def simulate_monthly(symbol: str, bars: list[dict], rule: dict, window: tuple[da
             exit_index, exit_price, reason = last_index, bars[last_index]["c"], "end"
         trades.append(make_trade(symbol, direction, entry_index, entry, risk, exit_index,
                                  exit_price, reason, bars,
-                                 cluster=f"{bars[entry_index]['date'].year}-"
-                                         f"{bars[entry_index]['date'].month:02d}",
                                  cost_multiple=cost_multiple,
                                  financing_multiple=financing_multiple))
     return trades
@@ -348,8 +365,14 @@ def simulate_monthly(symbol: str, bars: list[dict], rule: dict, window: tuple[da
 
 
 def cluster_bootstrap(trades: list[dict], confidence: float, *, rounds: int = BOOTSTRAP,
-                      seed: int = SEED) -> tuple[float, float, float, float]:
-    """Resample clusters, not trades. Returns (mean R, low, high, one-sided p)."""
+                      seed: int = SEED, block: int = BLOCK_LENGTH) -> tuple[float, float, float]:
+    """Moving-block bootstrap over entry months. Returns (mean R, low, high).
+
+    Months are ordered chronologically and ``block`` consecutive months are drawn per step
+    with wrap-around, so a block carries both contemporaneous trades (three FX pairs in one
+    month) and the serial dependence between adjacent months. With ``block == len(months)``
+    every draw is the whole sample, which the test suite uses to prove the block mechanism.
+    """
     clusters: dict[str, list[float]] = {}
     for trade in trades:
         clusters.setdefault(trade["cluster"], []).append(trade["r"])
@@ -358,53 +381,56 @@ def cluster_bootstrap(trades: list[dict], confidence: float, *, rounds: int = BO
     counts = [len(clusters[key]) for key in keys]
     total = sum(counts)
     if total == 0:
-        return 0.0, 0.0, 0.0, 1.0
+        return 0.0, 0.0, 0.0
     observed = sum(sums) / total
+    width = max(1, min(block, len(keys)))
     generator = random.Random(seed)
     draws: list[float] = []
     for _ in range(rounds):
         picked_sum = 0.0
         picked_count = 0
-        for _ in range(len(keys)):
-            choice = generator.randrange(len(keys))
-            picked_sum += sums[choice]
-            picked_count += counts[choice]
+        while picked_count < total:
+            start = generator.randrange(len(keys))
+            for offset in range(width):
+                choice = (start + offset) % len(keys)
+                picked_sum += sums[choice]
+                picked_count += counts[choice]
         draws.append(picked_sum / picked_count)
     draws.sort()
     tail = (1.0 - confidence) / 2.0
-    low = draws[int(tail * (rounds - 1))]
-    high = draws[int((1.0 - tail) * (rounds - 1))]
-    p_value = sum(1 for value in draws if value <= 0.0) / rounds
-    return observed, low, high, p_value
+    return observed, draws[int(tail * (rounds - 1))], draws[int((1.0 - tail) * (rounds - 1))]
 
 
 def summarise(name: str, trades: list[dict], confidence: float) -> dict:
     values = [trade["r"] for trade in trades]
     count = len(values)
+    clusters = len({trade["cluster"] for trade in trades})
     if count == 0:
-        return {"name": name, "n": 0, "mean": 0.0, "low": 0.0, "high": 0.0, "p": 1.0,
-                "win": 0.0, "t": 0.0, "profit_factor": 0.0, "max_dd_r": 0.0,
-                "gross_mean": 0.0, "cost_r": 0.0, "reasons": {}, "by_symbol": {}}
-    observed, low, high, p_value = cluster_bootstrap(trades, confidence)
+        return {"name": name, "n": 0, "clusters": 0, "mean": 0.0, "low": 0.0, "high": 0.0,
+                "win": 0.0, "profit_factor": 0.0, "max_dd_r": 0.0, "gross_mean": 0.0,
+                "cost_r": 0.0, "sd": 0.0, "reasons": {}, "by_symbol": {}, "by_direction": {}}
+    observed, low, high = cluster_bootstrap(trades, confidence)
     wins = [value for value in values if value > 0]
     losses = [value for value in values if value <= 0]
+    loss_total = -sum(losses)
+    deviation = stdev(values)
     equity = peak = drawdown = 0.0
-    for trade in trades:
+    for trade in sorted(trades, key=lambda item: item["exit_date"]):
         equity += trade["r"]
         peak = max(peak, equity)
         drawdown = max(drawdown, peak - equity)
-    deviation = stdev(values)
     return {
-        "name": name, "n": count,
-        "mean": observed, "low": low, "high": high, "p": p_value,
+        "name": name, "n": count, "clusters": clusters,
+        "mean": observed, "low": low, "high": high,
         "win": len(wins) / count,
-        "t": observed / (deviation / math.sqrt(count)) if deviation > 0 else 0.0,
-        "profit_factor": (sum(wins) / -sum(losses)) if losses and sum(losses) < 0 else float("inf"),
+        "profit_factor": (sum(wins) / loss_total) if loss_total > 0 else None,
         "max_dd_r": drawdown,
         "gross_mean": mean([trade["gross_r"] for trade in trades]),
         "cost_r": mean([trade["cost_r"] for trade in trades]),
+        "sd": deviation,
         "reasons": reason_histogram(trades),
         "by_symbol": per_symbol(trades),
+        "by_direction": per_direction(trades),
     }
 
 
@@ -423,6 +449,14 @@ def per_symbol(trades: list[dict]) -> dict:
             for symbol, values in sorted(symbols.items())}
 
 
+def per_direction(trades: list[dict]) -> dict:
+    out = {}
+    for label, wanted in (("long", 1), ("short", -1)):
+        values = [trade["r"] for trade in trades if trade["dir"] == wanted]
+        out[label] = {"n": len(values), "mean": mean(values)}
+    return out
+
+
 # --------------------------------------------------------------------------- study
 
 
@@ -430,7 +464,7 @@ def pieces(candidate: str):
     if candidate == "c1_inside_breakout":
         bars = load("XAUUSD")
         return [("XAUUSD", bars, rule_c1(bars), simulate)]
-    if candidate == "c2_silver_lead":
+    if candidate == "c2_ratio_reversion":
         gold, silver = load("XAUUSD"), load("XAGUSD")
         return [("XAUUSD", gold, rule_c2(gold, silver), simulate)]
     if candidate == "c3_fx_tsmom":
@@ -442,8 +476,64 @@ def pieces(candidate: str):
     raise SystemExit(f"unknown candidate {candidate}")
 
 
+def _recorded_development(candidate: str) -> dict:
+    """The development decision recorded on disk, and the numbers it claims."""
+    if not DEV_EVIDENCE.exists():
+        raise SystemExit(f"{DEV_EVIDENCE} is missing; run development first")
+    report = json.loads(DEV_EVIDENCE.read_text(encoding="utf-8"))
+    entry = report.get("candidates", {}).get(candidate, {})
+    if report.get("window") != "dev" or not entry.get("decision", {}).get("passed"):
+        raise SystemExit(f"{candidate} has no passed development run recorded; the holdout stays closed")
+    return {"report": report, "entry": entry,
+            "sha256": hashlib.sha256(DEV_EVIDENCE.read_bytes()).hexdigest()}
+
+
+def require_holdout_open(candidate: str) -> dict:
+    """A holdout is only scored if the lock exists, matches this engine and this evidence."""
+    if not LOCKS.exists():
+        raise SystemExit("no holdout lock; a holdout must be opened once, after development passes")
+    entry = json.loads(LOCKS.read_text(encoding="utf-8")).get(candidate)
+    if not entry:
+        raise SystemExit(f"no holdout lock for {candidate}; development must pass first")
+    recorded = _recorded_development(candidate)
+    if entry.get("development_evidence_sha256") != recorded["sha256"]:
+        raise SystemExit("the development evidence changed after the lock was written; refusing")
+    if entry.get("engine_sha256") != engine_hash():
+        raise SystemExit("the engine changed after the lock was written; the holdout would not be "
+                         "the same rule, so it is refused")
+    if entry.get("cache_manifest_sha256") != manifest_hash():
+        raise SystemExit("the data cache changed after the lock was written; refusing")
+    return entry
+
+
+def open_holdout(candidate: str) -> str:
+    """Open the holdout exactly once, after checking the recorded development result."""
+    recorded = _recorded_development(candidate)
+    decision = recorded["entry"]["decision"]
+    # Recompute the development result and require the file to describe it. Fabricating a
+    # passing document now also requires a passing run, because the numbers must agree.
+    fresh = summarise(candidate, build(candidate, "dev"), DEV_CONFIDENCE)
+    for field in ("n", "clusters", "mean", "low"):
+        if abs(float(fresh[field]) - float(decision.get(field, 0.0))) > 1e-6:
+            raise SystemExit(f"the recorded development {field} does not match a fresh run; refusing")
+    digest = recorded["sha256"]
+    locks = json.loads(LOCKS.read_text(encoding="utf-8")) if LOCKS.exists() else {}
+    if candidate in locks:
+        raise SystemExit(f"holdout already opened for {candidate} at {locks[candidate]['opened_at']}")
+    locks[candidate] = {"opened_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "development_evidence_sha256": digest,
+                        "engine_sha256": engine_hash(),
+                        "cache_manifest_sha256": manifest_hash(),
+                        "development_n": decision.get("n"), "development_low": decision.get("low")}
+    LOCKS.parent.mkdir(parents=True, exist_ok=True)
+    LOCKS.write_text(json.dumps(locks, indent=2), encoding="utf-8")
+    return digest
+
+
 def build(candidate: str, window: str, *, cost_multiple: float = 1.0,
           financing_multiple: float = 1.0) -> list[dict]:
+    if window == "holdout":
+        require_holdout_open(candidate)
     start, end = WINDOWS[window]
     trades: list[dict] = []
     for symbol, bars, rule, runner in pieces(candidate):
@@ -453,7 +543,7 @@ def build(candidate: str, window: str, *, cost_multiple: float = 1.0,
 
 
 def cost_sweep(candidate: str, window: str) -> dict:
-    """Re-price the same trades at 0x and 2x cost (exits never depend on the cost)."""
+    """Re-price the same trades at 0x, transaction-only, base and double cost."""
     out = {}
     rows = (("zero", 0.0, 0.0), ("transaction_only", 1.0, 0.0),
             ("base", 1.0, 1.0), ("double", 2.0, 2.0))
@@ -464,32 +554,37 @@ def cost_sweep(candidate: str, window: str) -> dict:
     return out
 
 
-def verdict(summary: dict, window: str) -> dict:
+def verdict(summary: dict, window: str, *, double_cost_mean: float) -> dict:
     floor = MIN_DEV_TRADES if window == "dev" else MIN_HOLDOUT_TRADES
     confidence = DEV_CONFIDENCE if window == "dev" else HOLDOUT_CONFIDENCE
     if summary["n"] < floor:
-        reason = f"n={summary['n']} is below the pre-registered floor of {floor}; no decision"
-    elif summary["low"] > 0:
+        return {"status": "no_decision", "passed": False, "threshold_n": floor,
+                "threshold_clusters": MIN_CLUSTERS, "confidence": confidence,
+                "reason": f"n={summary['n']} is below the pre-registered floor of {floor}; no decision"}
+    if summary["clusters"] < MIN_CLUSTERS:
+        return {"status": "no_decision", "passed": False, "threshold_n": floor,
+                "threshold_clusters": MIN_CLUSTERS, "confidence": confidence,
+                "reason": f"only {summary['clusters']} clusters; the interval is not usable"}
+    if summary["low"] > 0 and double_cost_mean > 0:
+        status = "pass"
         reason = (f"mean net R {summary['mean']:+.4f}, {confidence:.2%} interval "
                   f"[{summary['low']:+.4f}, {summary['high']:+.4f}] entirely above zero")
+        reason += f", and still {double_cost_mean:+.4f} R at double cost"
     elif summary["high"] < 0:
+        status = "fail"
         reason = (f"mean net R {summary['mean']:+.4f}, {confidence:.2%} interval "
                   f"[{summary['low']:+.4f}, {summary['high']:+.4f}] entirely below zero")
     else:
+        status = "fail"
         reason = (f"mean net R {summary['mean']:+.4f}, {confidence:.2%} interval "
                   f"[{summary['low']:+.4f}, {summary['high']:+.4f}] straddles zero")
-    return {"passed": summary["n"] >= floor and summary["low"] > 0,
-            "threshold_n": floor, "confidence": confidence, "reason": reason}
-
-
-def holdout_lock(candidate: str) -> None:
-    locks = json.loads(LOCKS.read_text(encoding="utf-8")) if LOCKS.exists() else {}
-    if candidate in locks:
-        raise SystemExit(f"holdout already opened for {candidate} at {locks[candidate]}; "
-                         "a holdout is opened exactly once")
-    locks[candidate] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    LOCKS.parent.mkdir(parents=True, exist_ok=True)
-    LOCKS.write_text(json.dumps(locks, indent=2), encoding="utf-8")
+        if double_cost_mean <= 0:
+            reason += f"; the edge is also negative at double cost ({double_cost_mean:+.4f} R)"
+    z_value = 2.394 if window == "dev" else 1.645
+    detectable = z_value * summary.get("sd", 0.0) / math.sqrt(max(summary["clusters"], 1))
+    return {"status": status, "passed": status == "pass", "threshold_n": floor,
+            "threshold_clusters": MIN_CLUSTERS, "confidence": confidence,
+            "detectable_r": detectable, "double_cost_mean": double_cost_mean, "reason": reason}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -504,7 +599,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.window == "holdout":
         if len(wanted) != 1:
             raise SystemExit("the holdout is opened one candidate at a time, after it passed development")
-        holdout_lock(wanted[0])
+        open_holdout(wanted[0])
 
     confidence = DEV_CONFIDENCE if args.window == "dev" else HOLDOUT_CONFIDENCE
     report = {"window": args.window, "confidence": confidence, "seed": SEED,
@@ -513,22 +608,27 @@ def main(argv: list[str] | None = None) -> int:
                           for name, (low, high) in WINDOWS.items()},
               "candidates": {}}
     print(f"window {args.window} ({WINDOWS[args.window][0]} .. {WINDOWS[args.window][1]}), "
-          f"confidence {confidence:.4f}, cache {manifest_hash()[:12]}")
-    print(f"{'candidate':22}{'n':>6}{'win%':>7}{'meanR':>9}{'lowR':>9}{'highR':>9}{'p':>8}{'costR':>8}")
+          f"confidence {confidence:.4f}, {len(wanted)} candidate(s), "
+          f"cache {manifest_hash()[:12]}")
+    print(f"{'candidate':22}{'n':>6}{'clust':>6}{'win%':>7}{'meanR':>9}{'lowR':>9}{'highR':>9}{'costR':>8}")
     for candidate in wanted:
-        summary = summarise(candidate, build(candidate, args.window), confidence)
-        decision = verdict(summary, args.window)
+        trades = build(candidate, args.window)
+        summary = summarise(candidate, trades, confidence)
+        sweep = cost_sweep(candidate, args.window)
+        double_cost = sweep["double"]["mean"]
+        decision = verdict(summary, args.window, double_cost_mean=double_cost)
         summary["decision"] = decision
-        if args.cost_sweep:
-            summary["cost_sweep"] = cost_sweep(candidate, args.window)
+        summary["cost_sweep"] = sweep
         report["candidates"][candidate] = summary
-        print(f"{candidate:22}{summary['n']:6}{summary['win'] * 100:6.1f}%"
+        print(f"{candidate:22}{summary['n']:6}{summary['clusters']:6}{summary['win'] * 100:6.1f}%"
               f"{summary['mean']:+9.4f}{summary['low']:+9.4f}{summary['high']:+9.4f}"
-              f"{summary['p']:8.4f}{summary['cost_r']:+8.4f}")
-        print(f"    {decision['reason']}")
-        print(f"    exits {summary['reasons']}  by symbol {summary['by_symbol']}")
-        if args.cost_sweep:
-            print(f"    cost sweep {summary['cost_sweep']}")
+              f"{summary['cost_r']:+8.4f}")
+        print(f"    {decision['status'].upper()}: {decision['reason']}")
+        print(f"    detectable edge at this confidence/cluster count: {decision['detectable_r']:.3f} R")
+        print(f"    exits {summary['reasons']}  by symbol {summary['by_symbol']}  "
+              f"by direction {summary['by_direction']}")
+        if sweep:
+            print(f"    cost sweep {sweep}")
     if args.json:
         Path(args.json).parent.mkdir(parents=True, exist_ok=True)
         Path(args.json).write_text(json.dumps(report, indent=2), encoding="utf-8")
