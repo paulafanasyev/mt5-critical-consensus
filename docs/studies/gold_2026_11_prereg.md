@@ -1,5 +1,16 @@
 # Pre-registration — gold study, stamped 2026-11-01
 
+> **Status: REJECTED by review on 2026-11-01, after the first development run.**
+> The claim below that this was "written before any hypothesis" is false. The holdout
+> period had already been examined: `docs/evidence/gold_ema50200_folds.json` (13:29,
+> 27 minutes before this stamp) covers 2025–2026, and `standalone/reports/gold_research_report.txt`
+> (2026-10-31 20:18) already ran PAXG 2020–2026 folds whose out-of-sample included 2024–2026.
+> A holdout that has been seen is not a holdout, so this document cannot support any test
+> on that period. The review also found the six rule clauses ambiguous enough to change
+> trade counts by an order of magnitude, and the design powered only for edges of ~0.25R
+> or more, which the cost model makes implausible. It is kept as a record of a rejected
+> design, not as a protocol to run.
+
 Written before any hypothesis in this study was run. The point of the stamp is that the
 rules, the split, the costs and the decision rule cannot move after the results are seen.
 If the data says no, the study reports no.
