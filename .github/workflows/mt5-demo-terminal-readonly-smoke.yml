@@ -129,6 +129,8 @@ jobs:
           MT5_DEMO_PASSWORD: ${{ secrets.MT5_DEMO_PASSWORD }}
           MT5_DEMO_SERVER: ${{ secrets.MT5_DEMO_SERVER }}
           MT5_SMOKE_SYMBOLS: ${{ inputs.symbols }}
+          MT5_INITIALIZE_TIMEOUT_MS: "300000"
+          MT5_PORTABLE: "1"
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Path "artifacts" -Force | Out-Null
