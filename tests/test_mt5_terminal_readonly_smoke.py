@@ -22,8 +22,10 @@ class FakeMT5:
     def __init__(self, *, trade_mode=None, login=123456, server="Broker-Demo",
                  connected=True, initialize=True, bid=1.10001, ask=1.10003):
         self.trade_mode = self.ACCOUNT_TRADE_MODE_DEMO if trade_mode is None else trade_mode
-        self.login = login
+        self.account_login = login
         self.server = server
+        self.login_kwargs = None
+        self.login_result = True
         self.connected = connected
         self.initialize_result = initialize
         self.bid = bid
@@ -39,12 +41,16 @@ class FakeMT5:
     def last_error(self):
         return (-10004, "credentials intentionally not reproduced")
 
+    def login(self, **kwargs):
+        self.login_kwargs = kwargs
+        return self.login_result
+
     def terminal_info(self):
         return SimpleNamespace(connected=self.connected, trade_allowed=True)
 
     def account_info(self):
         return SimpleNamespace(
-            login=self.login, server=self.server, trade_mode=self.trade_mode,
+            login=self.account_login, server=self.server, trade_mode=self.trade_mode,
             trade_allowed=True,
         )
 
@@ -77,9 +83,9 @@ def test_readonly_smoke_accepts_exact_demo_account_and_reads_quotes():
     assert report["positions_modified"] == 0
     assert [row["symbol"] for row in report["quotes"]] == ["EURUSD", "GBPUSD"]
     assert report["quotes"][0]["ask"] >= report["quotes"][0]["bid"]
-    assert mt5.initialize_kwargs == {
-        "login": 123456, "password": "sensitive-password",
-        "server": "Broker-Demo", "timeout": 60_000,
+    assert mt5.initialize_kwargs == {"timeout": 60_000}
+    assert mt5.login_kwargs == {
+        "login": 123456, "password": "sensitive-password", "server": "Broker-Demo",
     }
     assert mt5.shutdown_called is True
     assert "sensitive-password" not in json.dumps(report)
