@@ -70,6 +70,11 @@ class StrategyConfig:
     atr_period: int = 14
     stop_atr_multiple: float = 2.0
     take_profit_risk_multiple: float = 2.0
+    # A stop closer than a few spreads is not a stop: it is a guaranteed loss on the
+    # entry spread. Silver in a quiet hour produced an ATR of two points against a
+    # twenty-two point spread, so the rule was stopped out by the spread itself and the
+    # tiny stop distance then sized the position up to twenty-five lots.
+    min_stop_spread_multiple: float = 3.0
     min_sma_gap_atr: float = 0.10
     min_momentum_abs: float = 0.0
     max_confidence: float = 0.95
@@ -97,6 +102,8 @@ class StrategyConfig:
         _fraction(self.stop_atr_multiple, name="stop_atr_multiple", low=0.5, high=20.0)
         _fraction(self.take_profit_risk_multiple, name="take_profit_risk_multiple",
                   low=0.1, high=20.0)
+        _fraction(self.min_stop_spread_multiple, name="min_stop_spread_multiple",
+                  low=0.0, high=50.0)
         _fraction(self.min_sma_gap_atr, name="min_sma_gap_atr", low=0.0, high=10.0)
         _fraction(self.min_momentum_abs, name="min_momentum_abs", low=0.0, high=1.0)
         _fraction(self.max_confidence, name="max_confidence", low=0.0, high=0.99)
@@ -299,8 +306,8 @@ class AgentPolicy:
         strategy = _section(raw, "strategy", {
             "family", "min_bars", "sma_fast", "sma_slow", "ema_fast", "ema_slow",
             "bollinger_period", "bollinger_dev", "donchian_period", "atr_period",
-            "stop_atr_multiple", "take_profit_risk_multiple", "min_sma_gap_atr",
-            "min_momentum_abs", "max_confidence"})
+            "stop_atr_multiple", "take_profit_risk_multiple", "min_stop_spread_multiple",
+            "min_sma_gap_atr", "min_momentum_abs", "max_confidence"})
         schedule = _section(raw, "schedule", {
             "window_start_minute_utc", "window_end_minute_utc", "blocked_weekdays_utc",
             "blackout_windows_utc"})

@@ -118,3 +118,15 @@ def test_donchian_family_stays_inside_the_channel():
     evaluation = evaluate(closes, family="donchian", donchian_period=20)
     assert evaluation.proposal is None
     assert "NO_TREND_SIGNAL" in evaluation.blockers
+
+
+def test_a_stop_is_never_inside_the_spread():
+    """A quiet hour can leave an ATR smaller than the spread; the stop is floored at it."""
+    closes = [1.10 + 0.00005 * index for index in range(120)]
+    rows = bars_from(closes)
+    wide = Tick(symbol="EURUSD", bid=rows[-1].close, ask=rows[-1].close + 0.0005,
+                server_time=rows[-1].time + timedelta(seconds=1), server_utc_offset_seconds=0)
+    evaluation = evaluate_signal(rows, SPEC, wide, StrategyConfig(family="ema"),
+                                 max_spread_points=1_000, expected_timeframe="H1")
+    assert evaluation.proposal is not None, evaluation.blockers
+    assert evaluation.proposal.risk_distance >= 3 * 0.0005 - 1e-12

@@ -225,9 +225,13 @@ def evaluate_signal(bars: Sequence[MarketBar], spec: SymbolSpec, tick: Tick,
         return _blocked((codes.BAR_TIME_IN_FUTURE,), features)
 
     entry = tick.ask if direction == "BUY" else tick.bid
-    stop = entry - atr * config.stop_atr_multiple if direction == "BUY" \
-        else entry + atr * config.stop_atr_multiple
-    risk_distance = abs(entry - stop)
+    spread_price = tick.ask - tick.bid
+    # A stop inside the spread is a guaranteed loss: the entry itself pays more than the
+    # stop allows. The ATR distance is therefore floored at a few spreads, which also
+    # keeps the size sane - a tiny stop distance divides into a huge volume below.
+    risk_distance = max(atr * config.stop_atr_multiple,
+                        spread_price * config.min_stop_spread_multiple)
+    stop = entry - risk_distance if direction == "BUY" else entry + risk_distance
     take = entry + risk_distance * config.take_profit_risk_multiple if direction == "BUY" \
         else entry - risk_distance * config.take_profit_risk_multiple
     # A stop below zero is not a level any broker accepts; ATR on a low-priced instrument can
