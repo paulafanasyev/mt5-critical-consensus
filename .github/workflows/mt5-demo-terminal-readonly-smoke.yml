@@ -19,7 +19,8 @@ concurrency:
 
 jobs:
   read-only-demo-terminal:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false }}
+    # Draft smoke is permitted only for the repository owner; fork PRs never receive demo secrets.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false || github.event.pull_request.user.login == 'paulafanasyev' }}
     name: Read-only MT5 demo account and quotes (Windows)
     runs-on: windows-2022
     timeout-minutes: 35
