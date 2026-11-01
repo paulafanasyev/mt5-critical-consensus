@@ -83,7 +83,16 @@ FINANCING_PER_YEAR = {"XAUUSD": 0.03, "XAGUSD": 0.03,
 
 
 def load(symbol: str) -> list[dict]:
-    rows = json.loads((CACHE / f"{symbol}.json").read_bytes())
+    path = CACHE / f"{symbol}.json"
+    try:
+        payload = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Missing frozen MT5 research data for {symbol}: {path}. "
+            "The candidate study requires the original broker cache; on the MT5 host run "
+            "'python scripts/fetch_daily_basket.py'. Never substitute synthetic test data."
+        ) from exc
+    rows = json.loads(payload)
     for row in rows:
         row["date"] = date.fromisoformat(row["d"])
     return rows
