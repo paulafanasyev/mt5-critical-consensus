@@ -1,0 +1,59 @@
+﻿# Gold trend variant: EMA 50/200, the one family the research reported as positive OOS.
+version: 1
+mode: paper
+symbol: XAUUSD
+timeframe: H1
+history_bars: 10000
+server_utc_offset_seconds: 7200
+execution_mode: auto
+ui_language: ru
+
+account:
+  expected_login: 114929502
+  expected_server: MetaQuotes-Demo
+  require_demo: true
+
+# Read from the terminal (MetaQuotes-Demo, 2026-11-01): point 0.01, tick_value 0.10 per lot.
+symbol_spec:
+  symbol: XAUUSD
+  point: 0.01
+  digits: 2
+  tick_size: 0.01
+  tick_value: 0.1
+  volume_min: 0.01
+  volume_max: 100.0
+  volume_step: 0.01
+  spread_points: 20
+  stops_level_points: 0
+
+risk:
+  risk_per_trade_fraction: 0.005
+  max_open_positions: 1
+  max_daily_loss_fraction: 0.25
+  max_drawdown_fraction: 0.5
+  min_risk_reward: 1.5
+  max_spread_points: 200
+  max_quote_age_seconds: 300
+
+strategy:
+  family: ema
+  min_bars: 250
+  ema_fast: 50
+  ema_slow: 200
+  atr_period: 14
+  stop_atr_multiple: 2.0
+  take_profit_risk_multiple: 2.0
+  min_sma_gap_atr: 0.10
+  min_momentum_abs: 0.0
+  max_confidence: 0.95
+
+schedule:
+  window_start_minute_utc: 0
+  window_end_minute_utc: 1440
+  blocked_weekdays_utc: []
+  blackout_windows_utc: []
+
+kill_switch:
+  active: false
+  reason: "forward comparison run"
+

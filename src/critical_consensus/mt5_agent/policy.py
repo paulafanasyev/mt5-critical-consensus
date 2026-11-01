@@ -15,6 +15,7 @@ MODES = ("observe", "paper")
 # "confirm" is the default: an agent that opens positions on its own is a decision the
 # operator has to make explicitly, not something a missing key quietly grants.
 EXECUTION_MODES = ("confirm", "auto")
+STRATEGY_FAMILIES = ("sma", "ema", "bollinger", "donchian")
 _MINUTE_SPAN = 24 * 60
 
 
@@ -54,9 +55,18 @@ def _boolean(value: Any, *, name: str) -> bool:
 
 @dataclass(frozen=True)
 class StrategyConfig:
+    # The family decides which rule produces the direction; the ATR stop, the target
+    # multiple and every geometry check are shared, so the variants differ only in how
+    # they read the same closed bars.
+    family: str = "sma"
     min_bars: int = 60
     sma_fast: int = 5
     sma_slow: int = 20
+    ema_fast: int = 20
+    ema_slow: int = 50
+    bollinger_period: int = 20
+    bollinger_dev: float = 2.0
+    donchian_period: int = 20
     atr_period: int = 14
     stop_atr_multiple: float = 2.0
     take_profit_risk_multiple: float = 2.0
@@ -65,13 +75,24 @@ class StrategyConfig:
     max_confidence: float = 0.95
 
     def __post_init__(self) -> None:
+        if self.family not in STRATEGY_FAMILIES:
+            raise ValueError(f"strategy.family must be one of {sorted(STRATEGY_FAMILIES)}")
         _integer(self.min_bars, name="min_bars", low=30, high=100_000)
         _integer(self.sma_fast, name="sma_fast", low=2, high=500)
         _integer(self.sma_slow, name="sma_slow", low=5, high=5_000)
         if self.sma_fast >= self.sma_slow:
             raise ValueError("sma_fast must be smaller than sma_slow")
-        if self.min_bars <= self.sma_slow:
-            raise ValueError("min_bars must exceed sma_slow")
+        _integer(self.ema_fast, name="ema_fast", low=2, high=500)
+        _integer(self.ema_slow, name="ema_slow", low=5, high=5_000)
+        if self.ema_fast >= self.ema_slow:
+            raise ValueError("ema_fast must be smaller than ema_slow")
+        _integer(self.bollinger_period, name="bollinger_period", low=5, high=5_000)
+        _fraction(self.bollinger_dev, name="bollinger_dev", low=0.5, high=6.0)
+        _integer(self.donchian_period, name="donchian_period", low=5, high=5_000)
+        # The warm-up has to cover the family's own longest window, not just the SMA one,
+        # or a variant would be judged on a history it cannot compute.
+        if self.min_bars <= self.lookback:
+            raise ValueError(f"min_bars must exceed the {self.family} lookback {self.lookback}")
         _integer(self.atr_period, name="atr_period", low=2, high=500)
         _fraction(self.stop_atr_multiple, name="stop_atr_multiple", low=0.5, high=20.0)
         _fraction(self.take_profit_risk_multiple, name="take_profit_risk_multiple",
@@ -79,6 +100,15 @@ class StrategyConfig:
         _fraction(self.min_sma_gap_atr, name="min_sma_gap_atr", low=0.0, high=10.0)
         _fraction(self.min_momentum_abs, name="min_momentum_abs", low=0.0, high=1.0)
         _fraction(self.max_confidence, name="max_confidence", low=0.0, high=0.99)
+
+    @property
+    def lookback(self) -> int:
+        return {
+            "sma": self.sma_slow,
+            "ema": self.ema_slow,
+            "bollinger": self.bollinger_period,
+            "donchian": self.donchian_period,
+        }[self.family]
 
 
 @dataclass(frozen=True)
@@ -267,9 +297,10 @@ class AgentPolicy:
             "max_drawdown_fraction", "min_risk_reward", "max_spread_points",
             "max_quote_age_seconds"})
         strategy = _section(raw, "strategy", {
-            "min_bars", "sma_fast", "sma_slow", "atr_period", "stop_atr_multiple",
-            "take_profit_risk_multiple", "min_sma_gap_atr", "min_momentum_abs",
-            "max_confidence"})
+            "family", "min_bars", "sma_fast", "sma_slow", "ema_fast", "ema_slow",
+            "bollinger_period", "bollinger_dev", "donchian_period", "atr_period",
+            "stop_atr_multiple", "take_profit_risk_multiple", "min_sma_gap_atr",
+            "min_momentum_abs", "max_confidence"})
         schedule = _section(raw, "schedule", {
             "window_start_minute_utc", "window_end_minute_utc", "blocked_weekdays_utc",
             "blackout_windows_utc"})

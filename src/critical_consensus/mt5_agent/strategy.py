@@ -66,6 +66,94 @@ def _sma(values: Sequence[float], period: int) -> float:
     return sum(window) / len(window)
 
 
+def _ema(values: Sequence[float], period: int) -> float:
+    weight = 2.0 / (period + 1.0)
+    result = values[0]
+    for value in values[1:]:
+        result = value * weight + result * (1.0 - weight)
+    return result
+
+
+def _stdev(values: Sequence[float], period: int) -> float:
+    window = values[-period:]
+    mean = sum(window) / len(window)
+    return math.sqrt(sum((item - mean) ** 2 for item in window) / len(window))
+
+
+def _family_direction(bars: Sequence[MarketBar], closes: Sequence[float], atr: float,
+                      config: StrategyConfig) -> tuple[str, tuple[str, ...], dict[str, Any]]:
+    """Return the family's direction, its blockers and the features it read.
+
+    Every family answers from the same closed bars and shares the ATR stop and target
+    below; only the rule that names a direction differs. A family that finds nothing
+    returns no direction and the ``NO_TREND_SIGNAL`` blocker, which is what keeps the
+    journal comparable across variants.
+    """
+    if config.family == "sma":
+        fast = _sma(closes, config.sma_fast)
+        slow = _sma(closes, config.sma_slow)
+        gap = (fast - slow) / atr
+        momentum_bars = min(config.sma_fast, len(closes) - 1)
+        previous_close = closes[-1 - momentum_bars]
+        if previous_close <= 0:
+            return "", (codes.PRIOR_CLOSE_NON_POSITIVE,), {}
+        momentum = closes[-1] / previous_close - 1.0
+        strength = min(abs(gap), 3.0) / 3.0 * 0.6 + min(abs(momentum) * 100.0, 1.0) * 0.4
+        features = {"family_features": {"sma_fast": fast, "sma_slow": slow,
+                                        "sma_gap_atr": gap, "momentum": momentum},
+                    "strength": strength}
+        if gap >= config.min_sma_gap_atr and momentum > config.min_momentum_abs:
+            return "BUY", (), features
+        if gap <= -config.min_sma_gap_atr and momentum < -config.min_momentum_abs:
+            return "SELL", (), features
+        return "", (codes.NO_TREND_SIGNAL,), features
+
+    if config.family == "ema":
+        fast = _ema(closes, config.ema_fast)
+        slow = _ema(closes, config.ema_slow)
+        gap = (fast - slow) / atr
+        features = {"family_features": {"ema_fast": fast, "ema_slow": slow,
+                                        "ema_gap_atr": gap},
+                    "strength": min(abs(gap), 3.0) / 3.0}
+        if gap >= config.min_sma_gap_atr:
+            return "BUY", (), features
+        if gap <= -config.min_sma_gap_atr:
+            return "SELL", (), features
+        return "", (codes.NO_TREND_SIGNAL,), features
+
+    if config.family == "bollinger":
+        mid = _sma(closes, config.bollinger_period)
+        deviation = _stdev(closes, config.bollinger_period)
+        if not math.isfinite(deviation) or deviation <= 0:
+            return "", (codes.ATR_NOT_MEANINGFUL,), {}
+        band = config.bollinger_dev * deviation
+        distance = (closes[-1] - mid) / band
+        features = {"family_features": {"bollinger_mid": mid, "bollinger_band": band,
+                                        "band_distance": distance},
+                    "strength": min(abs(distance), 2.0) / 2.0}
+        # Mean reversion buys the lower band and sells the upper one; the ATR stop below
+        # still sits outside the entry, so a band that keeps stretching is cut, not averaged.
+        if closes[-1] <= mid - band:
+            return "BUY", (), features
+        if closes[-1] >= mid + band:
+            return "SELL", (), features
+        return "", (codes.NO_TREND_SIGNAL,), features
+
+    # donchian
+    window = bars[-config.donchian_period - 1:-1]
+    if not window:
+        return "", (codes.INSUFFICIENT_BARS,), {}
+    highest = max(bar.high for bar in window)
+    lowest = min(bar.low for bar in window)
+    features = {"family_features": {"donchian_high": highest, "donchian_low": lowest},
+                "strength": 0.5}
+    if closes[-1] > highest:
+        return "BUY", (), features
+    if closes[-1] < lowest:
+        return "SELL", (), features
+    return "", (codes.NO_TREND_SIGNAL,), features
+
+
 def _true_ranges(bars: Sequence[MarketBar]) -> list[float]:
     ranges = []
     for index in range(1, len(bars)):
@@ -116,31 +204,18 @@ def evaluate_signal(bars: Sequence[MarketBar], spec: SymbolSpec, tick: Tick,
     if not math.isfinite(atr) or atr <= 0:
         return _blocked((codes.ATR_NOT_MEANINGFUL,), {"bar_count": len(rows)})
 
-    fast = _sma(closes, config.sma_fast)
-    slow = _sma(closes, config.sma_slow)
-    gap = (fast - slow) / atr
-    momentum_bars = min(config.sma_fast, len(closes) - 1)
-    previous_close = closes[-1 - momentum_bars]
-    if previous_close <= 0:
-        return _blocked((codes.PRIOR_CLOSE_NON_POSITIVE,), {})
-    momentum = closes[-1] / previous_close - 1.0
+    direction, family_blockers, family_features = _family_direction(
+        rows, closes, atr, config)
 
     spread_points = (tick.ask - tick.bid) / spec.point
-    blockers: list[str] = []
+    blockers: list[str] = list(family_blockers)
     if spread_points > max_spread_points:
         blockers.append(codes.SPREAD_ABOVE_LIMIT)
 
-    if gap >= config.min_sma_gap_atr and momentum > config.min_momentum_abs:
-        direction = "BUY"
-    elif gap <= -config.min_sma_gap_atr and momentum < -config.min_momentum_abs:
-        direction = "SELL"
-    else:
-        direction = ""
-        blockers.append(codes.NO_TREND_SIGNAL)
-
-    features = {"bar_count": len(rows), "last_close": closes[-1], "sma_fast": fast,
-                "sma_slow": slow, "sma_gap_atr": gap, "momentum": momentum, "atr": atr,
-                "spread_points": spread_points, "direction": direction}
+    features = {"bar_count": len(rows), "last_close": closes[-1], "atr": atr,
+                "spread_points": spread_points, "direction": direction,
+                "family": config.family}
+    features.update(family_features)
     if blockers or not direction:
         return _blocked(tuple(sorted(set(blockers))), features)
 
@@ -175,15 +250,15 @@ def evaluate_signal(bars: Sequence[MarketBar], spec: SymbolSpec, tick: Tick,
         if abs(take - entry) / spec.point < spec.stops_level_points:
             return _blocked((codes.TARGET_INSIDE_BROKER_STOPS_LEVEL,), features)
 
-    strength = min(abs(gap), 3.0) / 3.0 * 0.6 + min(abs(momentum) * 100.0, 1.0) * 0.4
+    strength = min(max(float(features.get("strength", 0.0)), 0.0), 1.0)
     confidence = round(min(0.5 + 0.5 * strength, config.max_confidence), 4)
-    reasons = (
-        f"sma_{config.sma_fast}_minus_sma_{config.sma_slow}={gap:+.3f}*ATR",
-        f"momentum_{momentum_bars}={momentum:+.5f}",
-        f"atr_{config.atr_period}={atr:.8f}",
-        f"spread_points={spread_points:.1f}",
-        "heuristic_score_not_calibrated_probability",
-    )
+    detail = features.get("family_features") or {}
+    reasons = tuple(
+        [f"{config.family}.{key}={value:+.6f}" if isinstance(value, float)
+         else f"{config.family}.{key}={value}" for key, value in detail.items()]
+        + [f"atr_{config.atr_period}={atr:.8f}",
+           f"spread_points={spread_points:.1f}",
+           "heuristic_score_not_calibrated_probability"])
     proposal = Proposal(symbol=spec.symbol, timeframe=rows[-1].timeframe, direction=direction,
                         evaluated_at=rows[-1].time, entry_price=entry, stop_loss=stop,
                         take_profit=take, risk_distance=risk_distance,
