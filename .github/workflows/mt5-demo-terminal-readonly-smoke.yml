@@ -130,14 +130,22 @@ jobs:
             "[Common]",
             "Login=$env:MT5_DEMO_LOGIN",
             "Password=$env:MT5_DEMO_PASSWORD",
-            "Server=$env:MT5_DEMO_SERVER"
+            "Server=$env:MT5_DEMO_SERVER",
+            "ProxyEnable=0",
+            "CertInstall=0",
+            "NewsEnable=0"
           ) -join "`r`n"
           $body | Out-File -FilePath $ini -Encoding unicode
-          # A fresh install cannot answer the IPC handshake until the terminal has opened
-          # its data folder once, so the terminal is started here and given time to log in.
-          # Nothing in this step can place an order: it only opens the terminal.
+          # A first start compiles the bundled MQL5 examples and otherwise opens the
+          # "open an account" wizard, which never logs in. The documented startup
+          # parameters below make the terminal sign in to the demo account directly.
+          # They are visible to this throwaway runner only; nothing prints them, and
+          # this step can place no order - it only opens the terminal.
           $process = Start-Process -FilePath $env:MT5_TERMINAL_EXE `
-            -ArgumentList "/portable", "/config:$ini" -PassThru
+            -ArgumentList "/portable", "/config:$ini",
+              "/login:$env:MT5_DEMO_LOGIN",
+              "/password:$env:MT5_DEMO_PASSWORD",
+              "/server:$env:MT5_DEMO_SERVER" -PassThru
           # A first start also compiles every bundled MQL5 example, which can take minutes
           # before the terminal ever talks to the broker, so the wait is generous and ends
           # early as soon as the authorization line appears.
