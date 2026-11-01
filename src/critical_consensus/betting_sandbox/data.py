@@ -40,7 +40,7 @@ _SEASON = re.compile(r"^\d{4}$")
 _DIVISION = re.compile(r"^[A-Z0-9]{2,4}$")
 
 _SOURCE_HOST = "www.football-data.co.uk"
-_SOURCE_PATH = re.compile(r"^/mmz4281/\\d{4}/[A-Z0-9]{2,4}\\.csv$")
+_SOURCE_PATH = re.compile(r"^/mmz4281/[0-9]{4}/[A-Z0-9]{2,4}[.]csv$")
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
