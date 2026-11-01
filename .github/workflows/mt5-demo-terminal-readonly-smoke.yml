@@ -114,7 +114,14 @@ jobs:
           }
           $version = (Get-Item $terminal).VersionInfo.FileVersion
           "MT5_TERMINAL_EXE=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "MT5_INSTALLER_EXIT_CODE=$($process.ExitCode)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "MetaTrader terminal file version: $version" | Add-Content $env:GITHUB_STEP_SUMMARY
+          "Installer bootstrap exit code: $($process.ExitCode)" | Add-Content $env:GITHUB_STEP_SUMMARY
+          $terminalSignature = Get-AuthenticodeSignature $terminal
+          "Terminal executable signature status: $($terminalSignature.Status)" | Add-Content $env:GITHUB_STEP_SUMMARY
+          if ($terminalSignature.Status -ne "Valid" -or $terminalSignature.SignerCertificate.Subject -notlike "*MetaQuotes*") {
+            throw "Installed terminal executable does not have a valid MetaQuotes signature."
+          }
 
       # The MetaTrader5 Python API is given the exact executable path and demo credentials.
       # initialize() starts or attaches to the terminal in this same runner session; this
@@ -130,7 +137,6 @@ jobs:
           MT5_DEMO_SERVER: ${{ secrets.MT5_DEMO_SERVER }}
           MT5_SMOKE_SYMBOLS: ${{ inputs.symbols || 'EURUSD' }}
           MT5_INITIALIZE_TIMEOUT_MS: "300000"
-          MT5_PORTABLE: "1"
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Path "artifacts" -Force | Out-Null
