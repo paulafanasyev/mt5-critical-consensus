@@ -75,14 +75,23 @@ def run_probe(
     if terminal_path and not Path(terminal_path).is_file():
         raise ProbeError("The requested MT5 terminal executable was not found")
 
+    timeout_text = os.environ.get("MT5_INITIALIZE_TIMEOUT_MS", "60000").strip()
+    if not timeout_text.isdigit():
+        raise ProbeError("MT5_INITIALIZE_TIMEOUT_MS must be an integer in milliseconds")
+    timeout_ms = int(timeout_text)
+    if not 10_000 <= timeout_ms <= 600_000:
+        raise ProbeError("MT5_INITIALIZE_TIMEOUT_MS must be between 10000 and 600000")
+
     kwargs: dict[str, Any] = {
         "login": login,
         "password": password,
         "server": server.strip(),
-        "timeout": 300_000,
+        "timeout": timeout_ms,
     }
     if terminal_path:
         kwargs["path"] = terminal_path
+    if os.environ.get("MT5_PORTABLE", "").strip() == "1":
+        kwargs["portable"] = True
 
     try:
         initialized = bool(mt5.initialize(**kwargs))
