@@ -45,6 +45,10 @@ KILL_SWITCH_STATE_FILENAME = "kill_switch.json"
 # Served when no switch record exists yet. It is a blocker, not a label: the reason text
 # is what an operator sees first when the state file was deleted or never seeded.
 UNSEEDED_REASON = "NOT_SEEDED"
+# Written into the first record a fresh path receives. A run may create the file, but only in
+# the armed state: seeding it from a policy that merely forgot the stop would hand consent to
+# whoever deleted a record, since no new process can tell the two cases apart.
+SEEDED_REASON = "SEEDED_ARMED"
 MAX_REQUEST_BYTES = 4096
 MAX_NOTE_CHARS = 180
 # The most a refused request is drained out of. Refusals are answered only after the body is

@@ -522,6 +522,16 @@ TEXT: dict[str, tuple[str, str, str]] = {
         "The emergency stop is armed ({reason}); no new order will be sent until it is"
         " released.",
         "Khẩn dừng đang bật ({reason}); không lệnh mới nào được gửi cho tới khi tắt lại."),
+    "runner.kill_switch_seeded": (
+        "В {file} не было ни одной записи, поэтому прогон создал её с активной аварийной"
+        " остановкой ({reason}): отсутствие записи не является разрешением торговать. Снимите"
+        " её через --release-kill-switch с MT5_KILL_SWITCH_ADMIN_TOKEN.",
+        "{file} held no record at all, so this run created one with the emergency stop armed"
+        " ({reason}): an absent record is not permission to trade. Lift it with"
+        " --release-kill-switch and MT5_KILL_SWITCH_ADMIN_TOKEN.",
+        "Trong {file} không có bản ghi nào, nên phiên chạy này tạo một bản ghi với khẩn dừng"
+        " đang bật ({reason}): không có bản ghi không phải là giấy phép giao dịch. Tắt nó bằng"
+        " --release-kill-switch cùng MT5_KILL_SWITCH_ADMIN_TOKEN."),
     "runner.kill_switch_state_lost": (
         "Состояние аварийной остановки не записано ({error}); она остаётся активной в этом"
         " процессе, но переживёт ли она перезапуск — неизвестно.",

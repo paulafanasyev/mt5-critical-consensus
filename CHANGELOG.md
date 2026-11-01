@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — round 12 review fixes (blocker: an absent kill-switch record is not consent)
+
+- `scripts/run_mt5_demo_trading.py` (`_run`): a fresh kill-switch state path is now seeded **armed**, never from the policy's own flag. Previously a policy that omitted the stop wrote `kill_switch_active: false` into the first record, so deleting `kill_switch.json` between two processes disarmed the emergency stop with no admin token, no operator record and nothing in the journal — "absence is not consent" was asserted in the docs but not implemented. A new process cannot distinguish a path that was never used from one whose stop an operator deleted, so it now creates the record armed with `SEEDED_REASON` and halts before any order is built. Lifting a seeded stop takes `MT5_KILL_SWITCH_ADMIN_TOKEN` through `--release-kill-switch` like any other release; the run says so on stderr through the new trilingual `runner.kill_switch_seeded` key.
+- `scripts/mt5_demo_bridge.py`: new `SEEDED_REASON = "SEEDED_ARMED"` constant, distinct from `UNSEEDED_REASON` (the read-side blocker) so an operator can tell a stop this run armed because nothing existed from one a broken record is being refused.
+- Tests: 747 passed, 10 skipped (DB/Redis), up from 744 — 3 new cases in `tests/test_mt5_demo_runner.py` (a fresh path is armed rather than consented to and the run queues nothing; deleting a record from outside a process reseeds it armed; a released record is never reseeded by the next run) plus the `release_stop()` helper that models the operator act every end-to-end run now has to begin from.
+
 ## Unreleased — real-data demo run, and the evidence that came out of it
 
 - `scripts/render_demo_evidence.py` (new): turns a decision journal and a year of the broker's own

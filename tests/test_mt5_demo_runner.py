@@ -1043,6 +1043,48 @@ def test_a_policy_that_arrives_stopped_seeds_the_durable_stop(tmp_path, monkeypa
     assert "operator halt" in (tmp_path / "kill_switch.json").read_text(encoding="utf-8")
 
 
+def test_a_fresh_state_path_is_seeded_armed_not_from_the_policy(tmp_path, monkeypatch, capsys):
+    """`active: false` in a policy is the absence of a halt, not consent to trade."""
+    monkeypatch.setattr(runner, "MT5Agent", StubAgent)
+    policy = make_policy(execution_mode="auto", kill_switch__active=False)
+    assert runner._run(run_args(tmp_path), policy, "en", TOKEN, "run-1", FakeTerminal(),
+                       ["EURUSD"]) == 0
+    captured = capsys.readouterr()
+    assert "held no record at all" in captured.err
+    summary = json.loads(captured.out)
+    assert summary["kill_switch_armed"] is True
+    assert summary["commands_queued"] == 0
+    seeded = json.loads((tmp_path / "kill_switch.json").read_text(encoding="utf-8"))
+    assert seeded["kill_switch_active"] is True
+    assert seeded["kill_switch_reason"] == runner.SEEDED_REASON
+
+
+def test_deleting_the_record_from_outside_a_process_reseeds_it_armed(tmp_path, monkeypatch,
+                                                                    capsys):
+    """A new process cannot tell a never-used path from a deleted stop, so it must halt."""
+    monkeypatch.setattr(runner, "MT5Agent", StubAgent)
+    path = tmp_path / "kill_switch.json"
+    runner.KillSwitchStore(path).record(active=True, actor_id="operator", reason="halt",
+                                        now=NOW)
+    path.unlink()
+    policy = make_policy(execution_mode="auto", kill_switch__active=False)
+    assert runner._run(run_args(tmp_path), policy, "en", TOKEN, "run-1", FakeTerminal(),
+                       ["EURUSD"]) == 0
+    assert json.loads(path.read_text(encoding="utf-8"))["kill_switch_active"] is True
+    assert json.loads(capsys.readouterr().out)["kill_switch_armed"] is True
+
+
+def test_a_released_record_is_never_reseeded_by_the_next_run(tmp_path, monkeypatch, capsys):
+    """The release is a durable operator act: a later run must not overwrite it with an arm."""
+    monkeypatch.setattr(runner, "MT5Agent", StubAgent)
+    release_stop(tmp_path)
+    assert runner._run(run_args(tmp_path), make_policy(execution_mode="auto"), "en", TOKEN,
+                       "run-1", FakeTerminal(), ["EURUSD"]) == 0
+    captured = capsys.readouterr()
+    assert "held no record at all" not in captured.err
+    assert json.loads(captured.out)["kill_switch_armed"] is False
+
+
 def test_a_stop_left_by_an_earlier_run_blocks_the_next_one(tmp_path, monkeypatch, capsys):
     """A policy that no longer mentions the stop cannot lift the one an operator pulled."""
     monkeypatch.setattr(runner, "MT5Agent", StubAgent)
@@ -1059,8 +1101,21 @@ def test_a_stop_left_by_an_earlier_run_blocks_the_next_one(tmp_path, monkeypatch
     assert json.loads(captured.out)["kill_switch_armed"] is True
 
 
-def _run_with_real_bridge(tmp_path, monkeypatch, capsys, *, policy, terminal):
+def release_stop(tmp_path: Path) -> None:
+    """Model the operator act a run is no longer allowed to perform for itself.
+
+    A fresh state path is seeded armed, so an end-to-end run has to begin from a released
+    record exactly as a real one does: through the release guarded by the admin secret, not
+    through a `kill_switch: {active: false}` line in a policy nobody read.
+    """
+    runner.KillSwitchStore(tmp_path / "kill_switch.json").record(
+        active=False, actor_id="operator", reason="released for the test run", now=NOW)
+
+
+def _run_with_real_bridge(tmp_path, monkeypatch, capsys, *, policy, terminal, release=True):
     """Drive ``_run`` end to end: the real bridge on a real socket, the agent that offers."""
+    if release:
+        release_stop(tmp_path)
     monkeypatch.setattr(runner, "MT5Agent", OfferingAgent)
     built: list[runner.DemoBridge] = []
 
@@ -1122,7 +1177,8 @@ def test_a_run_with_the_stop_armed_never_puts_a_command_in_the_queue(
                          kill_switch__reason="operator halt")
     capsys.readouterr()
     code, summary, err, bridge = _run_with_real_bridge(tmp_path, monkeypatch, capsys,
-                                                       policy=policy, terminal=terminal)
+                                                       policy=policy, terminal=terminal,
+                                                       release=False)
     assert code == 0
     assert summary["commands_queued"] == 0 and summary["refused"] == 1
     assert summary["filled"] == 0 and summary["broker_order_sent"] is False

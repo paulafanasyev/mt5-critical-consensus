@@ -51,7 +51,7 @@ from critical_consensus.mt5_agent import (AgentPolicy, DecisionJournal, MT5Agent
 from critical_consensus.mt5_agent.backend import LiveMT5Backend
 from critical_consensus.mt5_agent.i18n import describe, normalize_language, text
 from mt5_demo_bridge import (ADMIN_TOKEN_ENV, BRIDGE_TOKEN_ENV, IDENTIFIER_PATTERN,
-                             BridgeError, DemoBridge, KillSwitchStore,
+                             BridgeError, DemoBridge, KillSwitchStore, SEEDED_REASON,
                              kill_switch_state_path, release_refusal, validate_token)
 from operator_answers import ApprovalState
 from run_mt5_agent import EXECUTION_CHOICES, _make_approver
@@ -890,12 +890,17 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
         return 2
     if switch.read() is None:
         # No durable record exists for this path yet, so this run leaves one: the state file
-        # is what makes a later deletion a corruption rather than a fresh start. A record an
-        # operator POSTed or an earlier halted run wrote is never overwritten here, because a
-        # stop somebody pulled outranks a policy that forgot it.
-        _set_stop(switch, language=language, actor="policy",
-                  active=bool(policy.kill_switch_active),
-                  reason=str(policy.kill_switch_reason or "POLICY"))
+        # is what makes a later deletion a corruption rather than a fresh start. It is seeded
+        # ARMED and never from the policy's own flag, because a new process cannot tell a path
+        # that was never used from one whose stop an operator deleted, and `active: false` in a
+        # policy is an absence of intent to halt, not a grant of permission to trade. Lifting
+        # the seeded stop takes the separate admin secret, like any other release.
+        _set_stop(switch, language=language, actor="policy", active=True,
+                  reason=str(policy.kill_switch_reason if policy.kill_switch_active
+                             else SEEDED_REASON))
+        if not policy.kill_switch_active:
+            print(text("runner.kill_switch_seeded", language, file=str(switch_path),
+                       reason=SEEDED_REASON), file=sys.stderr)
     try:
         account = terminal.account()
         if not account.is_demo:
