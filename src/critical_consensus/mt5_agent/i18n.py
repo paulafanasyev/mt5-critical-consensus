@@ -593,6 +593,13 @@ TEXT: dict[str, tuple[str, str, str]] = {
         "Оператор остановил демо-исполнение.",
         "The operator stopped demo execution.",
         "Người vận hành đã dừng thực thi demo."),
+    "runner.interrupted_send": (
+        "Прервано с командой {command_id} для {symbol}, уже переданной в мост: EA мог её"
+        " взять, а сделка не прочитана; результат неизвестен.",
+        "Interrupted while command {command_id} for {symbol} was already in the bridge: the EA"
+        " may have taken it, and no deal was read, so the result is unknown.",
+        "Bị gián đoạn khi lệnh {command_id} cho {symbol} đã nằm trong cầu nối: EA có thể đã"
+        " nhận lệnh, và không có giao dịch nào được đọc, nên kết quả không rõ."),
     "runner.confirm_note": (
         "Внимание: подтверждённый ордер уйдёт на ДЕМО-счёт через EA.",
         "Note: an approved order will be sent to the DEMO account through the EA.",

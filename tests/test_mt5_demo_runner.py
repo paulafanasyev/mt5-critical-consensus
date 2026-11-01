@@ -428,6 +428,50 @@ def test_a_fill_is_journaled_as_sent_only_after_the_broker_deal_is_seen(journal)
     assert len(queue.commands) == 1
 
 
+def test_a_known_outcome_leaves_no_pending_send_for_an_interrupt_to_inherit(journal):
+    """Once the broker has answered, a Ctrl-C says nothing about the order.
+
+    ``pending_send`` is what the run loop reads when it is interrupted, so a fill that was
+    read and a command the bridge will never hand out both have to clear it: leaving either
+    set would arm a stop over a send whose outcome is already known.
+    """
+    order_id = runner.client_order_id_for("run-1", proposal(), 0.05)
+    executor, _, _, _ = make_executor(
+        journal=journal, terminal=FakeTerminal(deals=[entry_deal(order_id=order_id)]))
+    assert executor.pending_send is None
+    assert executor.offer(proposal(), sizing()).state == runner.STATE_FILLED
+    assert executor.pending_send is None
+    assert executor.journal_interrupted_send() is None
+
+    expired, _, _, _ = make_executor(journal=journal, queue=FakeQueue(behaviour="expire"))
+    assert expired.offer(proposal(), sizing()).state == runner.STATE_EXPIRED
+    assert expired.pending_send is None
+    assert expired.journal_interrupted_send() is None
+
+
+def test_a_send_the_interrupt_arrived_over_is_journalled_as_unconfirmed(journal):
+    """The command left this process; only the broker's deals can say what happened to it."""
+    executor, queue, _, _ = make_executor(journal=journal,
+                                          terminal=FakeTerminal(deals=[],
+                                                                 deals_error=KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        executor.offer(proposal(), sizing())
+    assert len(queue.commands) == 1
+    assert executor.pending_send is not None
+
+    outcome = executor.journal_interrupted_send()
+    assert outcome.state == runner.STATE_UNCONFIRMED and outcome.stop_run
+    assert outcome.requires_reconciliation and outcome.queued
+    payload = payloads(journal, runner.OUTCOME_EVENT)[-1]
+    assert payload["reason"] == "INTERRUPTED_BEFORE_FILL_WAS_KNOWN"
+    assert payload["state"] == runner.STATE_UNCONFIRMED
+    assert payload["broker_order_sent"] is None
+    assert payload["client_order_id"] == queue.commands[0]["client_order_id"]
+    # Booked once: the same command must not be journalled twice by a second pass.
+    assert executor.pending_send is None
+    assert executor.journal_interrupted_send() is None
+
+
 def test_the_command_carries_the_live_price_the_approved_sizing_and_the_ttl(journal):
     executor, queue, _, _ = make_executor(journal=journal, terminal=FakeTerminal(deals=[]),
                                           ttl=45)
@@ -1214,6 +1258,61 @@ def test_a_served_command_that_shows_no_deal_arms_the_stop_for_the_next_process(
     assert armed["kill_switch_reason"] == f"EURUSD:{runner.STATE_UNCONFIRMED}"
     # A brand-new process reads the same blocker without being told about it.
     assert runner.stop_is_armed(runner.KillSwitchStore(tmp_path / "kill_switch.json").payload)
+
+
+def test_interrupting_the_run_over_a_served_command_arms_the_stop_and_exits_non_zero(
+        tmp_path, monkeypatch, capsys):
+    """Ctrl-C is not a clean finish once the command reached the bridge.
+
+    The interrupt lands in the fill read, so nothing this process knows can say whether the
+    EA sent the order. Before this, the run printed "operator stopped", reported an empty
+    send count and exited 0, leaving the next process - or the operator - to guess.
+    """
+    terminal = FakeTerminal(deals=[], deals_error=KeyboardInterrupt())
+    capsys.readouterr()
+    code, summary, err, bridge = _run_with_real_bridge(
+        tmp_path, monkeypatch, capsys, policy=make_policy(execution_mode="auto"),
+        terminal=terminal)
+    assert code == 4
+    assert summary["interrupted_with_send_in_flight"] is True
+    assert summary["commands_queued"] == 1 and summary["unconfirmed"] == 1
+    assert summary["requires_manual_reconciliation"] is True
+    assert summary["halted"] is True and summary["halted_by"] == "EURUSD"
+    assert summary["kill_switch_armed"] is True
+    assert len(bridge.commands_served) == 1
+    armed = json.loads((tmp_path / "kill_switch.json").read_text(encoding="utf-8"))
+    assert armed["kill_switch_active"] is True
+    assert armed["kill_switch_reason"] == f"EURUSD:{runner.STATE_UNCONFIRMED}"
+    assert "was already in the bridge" in err
+    journal = DecisionJournal(tmp_path / "journal.db", run_id="run-1")
+    try:
+        outcome = payloads(journal, runner.OUTCOME_EVENT)[-1]
+        assert outcome["state"] == runner.STATE_UNCONFIRMED
+        assert outcome["reason"] == "INTERRUPTED_BEFORE_FILL_WAS_KNOWN"
+        assert outcome["broker_order_sent"] is None
+    finally:
+        journal.close()
+
+
+def test_an_interrupt_before_any_command_exists_exits_zero_and_leaves_the_stop_alone(
+        tmp_path, monkeypatch, capsys):
+    """The extra gate is for unknown sends, not for every Ctrl-C: a refused cycle is clean."""
+    class InterruptingAgent(StubAgent):
+        def run_cycle(self, **_kwargs):
+            raise KeyboardInterrupt
+
+    release_stop(tmp_path)
+    monkeypatch.setattr(runner, "MT5Agent", InterruptingAgent)
+    code = runner._run(run_args(tmp_path), make_policy(execution_mode="auto"), "en", TOKEN,
+                       "run-1", FakeTerminal(), ["EURUSD"])
+    captured = capsys.readouterr()
+    assert code == 0
+    summary = json.loads(captured.out)
+    assert summary["interrupted_with_send_in_flight"] is False
+    assert summary["halted"] is False and summary["commands_queued"] == 0
+    assert summary["kill_switch_armed"] is False
+    armed = json.loads((tmp_path / "kill_switch.json").read_text(encoding="utf-8"))
+    assert armed["kill_switch_active"] is False
 
 
 def test_a_stop_file_that_cannot_be_read_stops_the_run_before_it_starts(tmp_path, monkeypatch,

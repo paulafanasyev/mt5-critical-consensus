@@ -19,12 +19,17 @@ independently re-checks every one of those plus the kill switch, the TTL and its
 compile-time demo gate.
 
 The emergency stop is a file, not a variable: ``kill_switch.json`` next to the tombstones
-is armed by an authenticated POST to the bridge or by this runner's own halt, seeded from
-the policy on a first run that finds no record, and released only with the separate admin
-token. Both this process and the EA read that same record on every cycle, so a stop an
-operator pulled survives a restart, a stop released elsewhere is obeyed here, and anything
+is armed by an authenticated POST to the bridge or by this runner's own halt, seeded ARMED
+by a first run that finds no record -- a policy that omits the stop is not a grant of
+permission to trade -- and released only with the separate admin token. Both this process
+and the EA read that same record on every cycle, so a stop an operator pulled survives a
+restart, a stop released elsewhere is obeyed here, and anything
 other than a provably inactive record -- unreadable, deleted, or never written -- counts as
 armed.
+
+An interrupt is not a clean finish either: a Ctrl-C that lands after a command reached the
+bridge queues that command as unconfirmed, arms the durable stop and exits 4, because only
+the broker's deals can say whether the EA sent the order.
 """
 from __future__ import annotations
 
@@ -518,6 +523,11 @@ class DemoExecutor:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._sleep = sleep or time.sleep
         self._out = out
+        # The command this executor handed to the bridge and has not seen an outcome for.
+        # From the moment a command is in the queue the EA can take it, and a process that
+        # dies before the fill is known cannot tell an order the broker took from one it did
+        # not -- only the deals say, and they say later. The runner reads this on the way out.
+        self.pending_send: Mapping[str, Any] | None = None
 
     # ------------------------------------------------------------------ helpers
     def _now(self) -> datetime:
@@ -649,6 +659,8 @@ class DemoExecutor:
             return self._outcome(STATE_REFUSED, reason=exc.code, command_id=command_id,
                                  client_order_id=order_id, broker_order_sent=False)
         command_id = str(queued["command_id"])
+        self.pending_send = {"command_id": command_id, "client_order_id": order_id,
+                             "symbol": self._symbol}
         self._journal.record(COMMAND_EVENT, {
             **{key: queued[key] for key in ("command_id", "client_order_id", "permission_id",
                                             "signal_id", "instrument", "direction", "size",
@@ -670,6 +682,9 @@ class DemoExecutor:
                        volume=f"{final_volume:.2f}"))
 
         if not self._wait_for_serve(command):
+            # The bridge drops a command once its expiry passes and never hands it out again,
+            # so an expired command cannot become an order: this is a known non-send.
+            self.pending_send = None
             self._say(text("runner.expired", self._language))
             return self._outcome(STATE_EXPIRED, reason="COMMAND_EXPIRED",
                                  command_id=command_id, client_order_id=order_id,
@@ -677,8 +692,31 @@ class DemoExecutor:
         self._journal.record(SERVED_EVENT, {
             "symbol": self._symbol, "command_id": command_id, "client_order_id": order_id,
             "broker_order_sent": None, "state": "SERVED"})
-        return self._await_fill(command_id=command_id, order_id=order_id,
-                                since=now - timedelta(minutes=10))
+        outcome = self._await_fill(command_id=command_id, order_id=order_id,
+                                   since=now - timedelta(minutes=10))
+        # Only a fill we actually read, or a timeout that reported itself, ends the uncertainty.
+        self.pending_send = None
+        return outcome
+
+    def journal_interrupted_send(self) -> Outcome | None:
+        """Book a send this process handed to the bridge and never saw the outcome of.
+
+        Ctrl-C between the enqueue and the fill leaves the same question a timeout leaves: the
+        EA may already have sent the order, and the process that would have read the deals is
+        gone. The command is journalled as unconfirmed so the audit trail ends on the truth
+        rather than on a `SERVED` with nothing after it.
+        """
+        send = self.pending_send
+        if send is None:
+            return None
+        self.pending_send = None
+        self._say(text("runner.interrupted_send", self._language,
+                       command_id=str(send["command_id"]), symbol=str(send["symbol"])))
+        return self._outcome(STATE_UNCONFIRMED, reason="INTERRUPTED_BEFORE_FILL_WAS_KNOWN",
+                             command_id=str(send["command_id"]),
+                             client_order_id=str(send["client_order_id"]),
+                             stop_run=True, requires_reconciliation=True, queued=True,
+                             broker_order_sent=None)
 
     def _confirmation(self, proposal: Mapping[str, Any], sizing: Mapping[str, Any]) -> str:
         if self._policy.execution_mode != "confirm":
@@ -985,7 +1023,7 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
                                     symbol=symbol, ttl_seconds=args.ttl_seconds,
                                     fill_timeout_seconds=args.fill_timeout,
                                     max_volume=args.max_volume, approver=approver,
-                                    operator_state=operator_state)
+                                    operator_state=operator_state, out=sys.stderr)
             agents[symbol] = (agent, executor)
         try:
             bridge.start()
@@ -1013,6 +1051,7 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
         passes = 0
         halted = False
         halted_by = ""
+        interrupted = False
         try:
             while args.cycles <= 0 or passes < args.cycles:
                 for symbol in active:
@@ -1052,6 +1091,21 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
                 time.sleep(args.interval_seconds)
         except KeyboardInterrupt:
             print(text("runner.stopped", language), file=sys.stderr)
+            for symbol, (_agent, executor) in agents.items():
+                outcome = executor.journal_interrupted_send()
+                if outcome is None:
+                    continue
+                # A command the EA could still take is an unknown send, and an unknown send
+                # outlives this process: the stop has to be durable and the exit code has to
+                # say that the operator's job is not finished.
+                tally = tallies[symbol]
+                tally["commands"] += 1
+                tally[STATE_UNCONFIRMED] += 1
+                _set_stop(switch, language=language, reason=f"{symbol}:{STATE_UNCONFIRMED}")
+                halted = True
+                halted_by = symbol
+                interrupted = True
+                print(text("runner.stopped_uncertain", language), file=sys.stderr)
 
         def total(key: str) -> int:
             return sum(tally[key] for tally in tallies.values())
@@ -1086,6 +1140,7 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
             "unconfirmed": total(STATE_UNCONFIRMED),
             "refused": total(STATE_REFUSED), "duplicate": total(STATE_DUPLICATE),
             "halted": halted, "halted_by": halted_by,
+            "interrupted_with_send_in_flight": interrupted,
             "kill_switch_armed": stop_is_armed(switch.payload),
             "kill_switch_reason": str(switch.payload().get("kill_switch_reason") or ""),
             "broker_order_sent": filled > 0,
@@ -1102,7 +1157,9 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
                    refused=total(STATE_REFUSED),
                    chain=str(report["verified_chain"]["valid"]).lower()), file=sys.stderr)
         print(text("runner.disclaimer", language), file=sys.stderr)
-        return 0
+        # A Ctrl-C that leaves a live command behind is not a clean finish: the caller has to
+        # reconcile with the broker before trusting this journal again.
+        return 4 if interrupted else 0
     finally:
         if bridge is not None:
             bridge.stop()
