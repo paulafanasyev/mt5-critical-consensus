@@ -115,6 +115,57 @@ jobs:
           "MT5_TERMINAL_EXE=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "MetaTrader terminal file version: $version" | Add-Content $env:GITHUB_STEP_SUMMARY
 
+      - name: Start the demo terminal in portable mode
+        if: steps.demo_credentials.outputs.ready == 'true'
+        shell: pwsh
+        env:
+          MT5_DEMO_LOGIN: ${{ secrets.MT5_DEMO_LOGIN }}
+          MT5_DEMO_PASSWORD: ${{ secrets.MT5_DEMO_PASSWORD }}
+          MT5_DEMO_SERVER: ${{ secrets.MT5_DEMO_SERVER }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installDir = Split-Path $env:MT5_TERMINAL_EXE
+          $ini = Join-Path $installDir "start-demo.ini"
+          $body = @(
+            "[Common]",
+            "Login=$env:MT5_DEMO_LOGIN",
+            "Password=$env:MT5_DEMO_PASSWORD",
+            "Server=$env:MT5_DEMO_SERVER"
+          ) -join "`r`n"
+          $body | Out-File -FilePath $ini -Encoding unicode
+          # A fresh install cannot answer the IPC handshake until the terminal has opened
+          # its data folder once, so the terminal is started here and given time to log in.
+          # Nothing in this step can place an order: it only opens the terminal.
+          $process = Start-Process -FilePath $env:MT5_TERMINAL_EXE `
+            -ArgumentList "/portable", "/config:$ini" -PassThru
+          $logDir = Join-Path $installDir "logs"
+          $deadline = (Get-Date).AddSeconds(150)
+          $terminalLog = $null
+          while (-not $terminalLog -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 5
+            if (Test-Path $logDir) {
+              $terminalLog = Get-ChildItem $logDir -Filter "*.log" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            }
+          }
+          if (-not $terminalLog) { throw "The MetaTrader terminal opened no log within 150 s." }
+          $connected = $false
+          $waitUntil = (Get-Date).AddSeconds(120)
+          while (-not $connected -and (Get-Date) -lt $waitUntil) {
+            Start-Sleep -Seconds 5
+            $text = Get-Content $terminalLog.FullName -Encoding unicode -ErrorAction SilentlyContinue
+            if ($text -match "authorized on|trading has been enabled|terminal synchronized") {
+              $connected = $true
+            }
+          }
+          if (-not $connected) {
+            Write-Host "Terminal log tail:"
+            Get-Content $terminalLog.FullName -Encoding unicode -Tail 30
+            throw "The MetaTrader terminal did not reach the broker within 120 s."
+          }
+          "The demo terminal is running in portable mode and reached the broker." |
+            Add-Content $env:GITHUB_STEP_SUMMARY
+
       - name: Run read-only demo-account and quote probe
         id: mt5_probe
         if: steps.demo_credentials.outputs.ready == 'true'
