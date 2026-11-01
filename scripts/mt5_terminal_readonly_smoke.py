@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Read-only smoke test for a logged-in MetaTrader 5 demo terminal.
+"""Read-only smoke test for a MetaTrader 5 demo terminal.
 
-This module initializes MT5, verifies the exact requested demo account, reads terminal
-connectivity and selected-symbol quotes, and shuts the terminal connection down. It has
-no order submission, position modification, or trade-management calls.
+This module initializes the specified terminal with explicit demo credentials, verifies
+the exact requested account, reads terminal connectivity and selected-symbol quotes, and
+shuts the terminal connection down. It has no order submission, position modification,
+or trade-management calls.
 """
 from __future__ import annotations
 
@@ -78,7 +79,7 @@ def run_probe(
         "login": login,
         "password": password,
         "server": server.strip(),
-        "timeout": 60_000,
+        "timeout": 300_000,
     }
     if terminal_path:
         kwargs["path"] = terminal_path
