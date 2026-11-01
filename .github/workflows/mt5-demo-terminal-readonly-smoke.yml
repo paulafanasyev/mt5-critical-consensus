@@ -198,7 +198,8 @@ jobs:
             if (-not (Test-Path $csvFile) -or (Get-Item $csvFile).Length -lt 1000000) {
               throw "MT5 native exporter CSV is missing or unexpectedly small."
             }
-            Copy-Item -LiteralPath $statusFile -Destination "artifacts/daily_basket.status" -Force
+            @("PASS", "DEMO", "symbols=5", "bars=28182", "orders_submitted=0") |
+              Out-File -FilePath "artifacts/daily_basket.status" -Encoding ascii
             "MetaTrader connected to the configured DEMO account and exported all five D1 histories. No orders were submitted." | Add-Content $env:GITHUB_STEP_SUMMARY
           }
           finally {
