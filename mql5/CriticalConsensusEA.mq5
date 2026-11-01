@@ -15,6 +15,15 @@ input long MagicNumber = 8172026;
 input double MaxVolume = 0.20;
 input double MaxCommandTtlSeconds = 600; // Upper bound on expires_at_epoch - now.
 
+// What the chart inputs above may be set to. These are the same ceilings the runner enforces
+// (MAX_DEMO_VOLUME, MAX_SLIPPAGE_POINTS, MAX_TTL_SECONDS in scripts/run_mt5_demo_trading.py):
+// an input box is not an approval, so raising one is a source change reviewed next to the
+// Python side, not something a preset or a double-click on a chart can do.
+const double EA_VOLUME_CEILING = 0.20;
+const int EA_SLIPPAGE_CEILING = 20;
+const int EA_POLL_CEILING = 60;
+const double EA_TTL_CEILING = 600.0;
+
 // Key/value slots collected by the most recent ValidateFlatObject() call. Lookups read only
 // these slots, never the raw body, so a string value that happens to contain a field name can
 // never be mistaken for that field. Callers stop on failure, so a partial list is never used.
@@ -488,15 +497,25 @@ bool ExecuteDemoCommand(const string body)
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    if(point <= 0) { Print("BLOCKED: invalid symbol point."); return false; }
    double live_price = (direction=="BUY") ? tick.ask : tick.bid;
-   if(MathAbs(live_price - expected_price) > MaxSlippagePoints * point)
+   // The broker receives the rounded values, so the guards below must measure the rounded
+   // values too. Checking the unrounded locals and rounding only at the end approves a stop that
+   // sits a fraction of a point from the price and then rounds onto it, or a distance that
+   // clears the stops level before rounding and falls inside it after. A guard on a number that
+   // is never sent is not a guard on the order.
+   double order_price = NormalizeDouble(live_price, digits);
+   double order_sl = NormalizeDouble(sl, digits);
+   double order_tp = NormalizeDouble(tp, digits);
+   if(order_price <= 0 || order_sl <= 0 || order_tp <= 0)
+   { Print("BLOCKED: rounding price/SL/TP to symbol digits produced a non-positive level."); return false; }
+   if(MathAbs(order_price - expected_price) > MaxSlippagePoints * point)
    { Print("BLOCKED: slippage guard triggered."); return false; }
-   if(direction=="BUY" && !(sl < live_price && live_price < tp))
+   if(direction=="BUY" && !(order_sl < order_price && order_price < order_tp))
    { Print("BLOCKED: invalid BUY SL/TP geometry."); return false; }
-   if(direction=="SELL" && !(tp < live_price && live_price < sl))
+   if(direction=="SELL" && !(order_tp < order_price && order_price < order_sl))
    { Print("BLOCKED: invalid SELL SL/TP geometry."); return false; }
 
    long stops = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   if(MathAbs(live_price - sl) < stops * point || MathAbs(tp - live_price) < stops * point)
+   if(MathAbs(order_price - order_sl) < stops * point || MathAbs(order_tp - order_price) < stops * point)
    { Print("BLOCKED: SL/TP inside broker stops level (", stops, " points)."); return false; }
 
    double step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
@@ -513,9 +532,9 @@ bool ExecuteDemoCommand(const string body)
    request.symbol = symbol;
    request.volume = volume;
    request.type = (direction=="BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-   request.price = NormalizeDouble(live_price, digits);
-   request.sl = NormalizeDouble(sl, digits);
-   request.tp = NormalizeDouble(tp, digits);
+   request.price = order_price;
+   request.sl = order_sl;
+   request.tp = order_tp;
    request.deviation = MaxSlippagePoints;
    request.type_time = ORDER_TIME_GTC;
 
@@ -584,7 +603,35 @@ int OnInit()
       Print("BLOCKED: BridgeToken is empty or not 24..256 characters of [A-Za-z0-9._~-]; refusing to initialize.");
       return(INIT_FAILED);
    }
-   EventSetTimer((int)MathMax(1, PollSeconds));
+   // Every limit an order is measured against arrives from the chart, so each one is capped
+   // here before the timer that would poll a command starts. An EA that accepted
+   // MaxVolume = 100 would honour a size nothing on either side of the bridge approved.
+   if(MagicNumber <= 0)
+   {
+      Print("BLOCKED: MagicNumber must be a positive integer; refusing to initialize.");
+      return(INIT_FAILED);
+   }
+   if(PollSeconds < 1 || PollSeconds > EA_POLL_CEILING)
+   {
+      Print("BLOCKED: PollSeconds must be between 1 and ", EA_POLL_CEILING, "; refusing to initialize.");
+      return(INIT_FAILED);
+   }
+   if(MaxVolume <= 0 || MaxVolume > EA_VOLUME_CEILING)
+   {
+      Print("BLOCKED: MaxVolume must be above 0 and at or below ", EA_VOLUME_CEILING, "; refusing to initialize.");
+      return(INIT_FAILED);
+   }
+   if(MaxSlippagePoints < 1 || MaxSlippagePoints > EA_SLIPPAGE_CEILING)
+   {
+      Print("BLOCKED: MaxSlippagePoints must be between 1 and ", EA_SLIPPAGE_CEILING, "; refusing to initialize.");
+      return(INIT_FAILED);
+   }
+   if(MaxCommandTtlSeconds < 1 || MaxCommandTtlSeconds > EA_TTL_CEILING)
+   {
+      Print("BLOCKED: MaxCommandTtlSeconds must be between 1 and ", EA_TTL_CEILING, "; refusing to initialize.");
+      return(INIT_FAILED);
+   }
+   EventSetTimer(PollSeconds);
    Print("CriticalConsensusEA initialized. Demo execution is ",
          ENABLE_DEMO_EXECUTION ? "ENABLED" : "disabled",
          ". Add bridge URL to MT5 WebRequest allowlist.");

@@ -164,18 +164,52 @@ def _required_checks() -> dict[str, str]:
         "volume cap comparison": r"volume\s*>\s*MaxVolume\s*\|\|",
         "volume cap is positive": r"volume\s*<=\s*0\s*\|\|\s*volume\s*>\s*MaxVolume",
         "volume cap default": r"input\s+double\s+MaxVolume\s*=\s*0\.20\s*;",
+        # The limits an order is measured against are chart inputs, so the inputs themselves are
+        # capped by compile-time constants that OnInit enforces. A preset, a template or a
+        # double-click must not be able to raise a ceiling the Python side never approved.
+        "EA volume ceiling constant": r"const\s+double\s+EA_VOLUME_CEILING\s*=\s*0\.20\s*;",
+        "EA slippage ceiling constant": r"const\s+int\s+EA_SLIPPAGE_CEILING\s*=\s*20\s*;",
+        "EA poll ceiling constant": r"const\s+int\s+EA_POLL_CEILING\s*=\s*60\s*;",
+        "EA TTL ceiling constant": r"const\s+double\s+EA_TTL_CEILING\s*=\s*600\.0\s*;",
+        "OnInit caps the magic number": r"if\s*\(\s*MagicNumber\s*<=\s*0\s*\)",
+        "OnInit caps the poll interval": (
+            r"if\s*\(\s*PollSeconds\s*<\s*1\s*\|\|\s*PollSeconds\s*>\s*EA_POLL_CEILING\s*\)"
+        ),
+        "OnInit caps the volume ceiling": (
+            r"if\s*\(\s*MaxVolume\s*<=\s*0\s*\|\|\s*MaxVolume\s*>\s*EA_VOLUME_CEILING\s*\)"
+        ),
+        "OnInit caps the slippage ceiling": (
+            r"if\s*\(\s*MaxSlippagePoints\s*<\s*1\s*\|\|\s*MaxSlippagePoints\s*>\s*EA_SLIPPAGE_CEILING\s*\)"
+        ),
+        "OnInit caps the TTL ceiling": (
+            r"if\s*\(\s*MaxCommandTtlSeconds\s*<\s*1\s*\|\|\s*MaxCommandTtlSeconds\s*>\s*EA_TTL_CEILING\s*\)"
+        ),
+        # Clamping a poll interval to 1s was a silent override: an input of 0 becomes a 1-second
+        # poll only if the operator asked for the floor, so the interval is used as given.
+        "timer uses the capped poll interval": r"EventSetTimer\s*\(\s*PollSeconds\s*\)\s*;",
         "protective stop-loss and take-profit validation": (
             r"sl\s*<=\s*0\s*\|\|\s*tp\s*<=\s*0\s*\|\|\s*expected_price\s*<=\s*0\s*\)"
         ),
-        # Validation without binding is useless: the checked locals must reach the order
-        # request itself. Pinned to the exact NormalizeDouble(<local>, digits) form so a
-        # detached or zeroed stop cannot satisfy the invariant.
-        "protective stop-loss is bound to the order request": (
-            r"request\.sl\s*=\s*NormalizeDouble\s*\(\s*sl\s*,\s*digits\s*\)\s*;"
+        # Validation without binding is useless: the checked values must reach the order
+        # request itself. The broker receives the digits-rounded numbers, so rounding happens
+        # once, into named locals, and both the guards and the request read those locals —
+        # pinned to the exact NormalizeDouble(<local>, digits) form so a detached or zeroed
+        # stop cannot satisfy the invariant.
+        "sent price is the rounded live price": (
+            r"double\s+order_price\s*=\s*NormalizeDouble\s*\(\s*live_price\s*,\s*digits\s*\)\s*;"
         ),
-        "protective take-profit is bound to the order request": (
-            r"request\.tp\s*=\s*NormalizeDouble\s*\(\s*tp\s*,\s*digits\s*\)\s*;"
+        "sent stop-loss is the rounded stop": (
+            r"double\s+order_sl\s*=\s*NormalizeDouble\s*\(\s*sl\s*,\s*digits\s*\)\s*;"
         ),
+        "sent take-profit is the rounded target": (
+            r"double\s+order_tp\s*=\s*NormalizeDouble\s*\(\s*tp\s*,\s*digits\s*\)\s*;"
+        ),
+        "rounded levels are validated as positive": (
+            r"if\s*\(\s*order_price\s*<=\s*0\s*\|\|\s*order_sl\s*<=\s*0\s*\|\|\s*order_tp\s*<=\s*0\s*\)"
+        ),
+        "rounded price is bound to the order request": r"request\.price\s*=\s*order_price\s*;",
+        "protective stop-loss is bound to the order request": r"request\.sl\s*=\s*order_sl\s*;",
+        "protective take-profit is bound to the order request": r"request\.tp\s*=\s*order_tp\s*;",
         # Volume and direction are validated as locals too; the request must consume those
         # exact values, never a second read or a fixed side.
         "validated volume is bound to the order request": r"request\.volume\s*=\s*volume\s*;",
@@ -183,9 +217,10 @@ def _required_checks() -> dict[str, str]:
             r"request\.type\s*=\s*\(\s*direction\s*==\s*\"BUY\"\s*\)\s*\?\s*"
             r"ORDER_TYPE_BUY\s*:\s*ORDER_TYPE_SELL\s*;"
         ),
-        # Slippage is measured against the symbol point, never a raw price.
+        # Slippage is measured against the symbol point, never a raw price, and on the value
+        # that will actually be sent.
         "slippage guard uses point value": (
-            r"MathAbs\s*\(\s*live_price\s*-\s*expected_price\s*\)\s*>\s*MaxSlippagePoints\s*\*\s*point\s*\)"
+            r"MathAbs\s*\(\s*order_price\s*-\s*expected_price\s*\)\s*>\s*MaxSlippagePoints\s*\*\s*point\s*\)"
         ),
         "slippage default": r"input\s+int\s+MaxSlippagePoints\s*=\s*20\s*;",
         "broker request deviation": r"request\.deviation\s*=\s*MaxSlippagePoints\s*;",
@@ -194,14 +229,16 @@ def _required_checks() -> dict[str, str]:
         # Symbol and broker preflight.
         "symbol requires full trading mode": r"trade_mode\s*!=\s*SYMBOL_TRADE_MODE_FULL",
         "BUY geometry check": (
-            r"if\s*\(\s*direction\s*==\s*\"BUY\"\s*&&\s*!\s*\(\s*sl\s*<\s*live_price\s*&&\s*live_price\s*<\s*tp\s*\)\s*\)"
+            r"if\s*\(\s*direction\s*==\s*\"BUY\"\s*&&\s*!\s*\(\s*order_sl\s*<\s*order_price\s*&&\s*"
+            r"order_price\s*<\s*order_tp\s*\)\s*\)"
         ),
         "SELL geometry check": (
-            r"if\s*\(\s*direction\s*==\s*\"SELL\"\s*&&\s*!\s*\(\s*tp\s*<\s*live_price\s*&&\s*live_price\s*<\s*sl\s*\)\s*\)"
+            r"if\s*\(\s*direction\s*==\s*\"SELL\"\s*&&\s*!\s*\(\s*order_tp\s*<\s*order_price\s*&&\s*"
+            r"order_price\s*<\s*order_sl\s*\)\s*\)"
         ),
         "broker stops level check": (
-            r"MathAbs\s*\(\s*live_price\s*-\s*sl\s*\)\s*<\s*stops\s*\*\s*point\s*\|\|\s*"
-            r"MathAbs\s*\(\s*tp\s*-\s*live_price\s*\)\s*<\s*stops\s*\*\s*point\s*\)"
+            r"MathAbs\s*\(\s*order_price\s*-\s*order_sl\s*\)\s*<\s*stops\s*\*\s*point\s*\|\|\s*"
+            r"MathAbs\s*\(\s*order_tp\s*-\s*order_price\s*\)\s*<\s*stops\s*\*\s*point\s*\)"
         ),
         "broker stops level source": r"SYMBOL_TRADE_STOPS_LEVEL",
         "volume step constraint": (
@@ -819,21 +856,48 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
         checks.append(("exactly one order-type assignment to the request",
                        len(re.findall(r"request\.type\s*=(?!=)", source)) == 1))
         checks.append(("protective stops are bound before the send",
-                       _after(command, "request.sl = NormalizeDouble(sl, digits);", send)
-                       and _after(command, "request.tp = NormalizeDouble(tp, digits);", send)))
+                       _after(command, "request.sl = order_sl;", send)
+                       and _after(command, "request.tp = order_tp;", send)))
         checks.append(("validated volume is bound before the send",
                        _after(command, "request.volume = volume;", send)))
         checks.append(("validated direction selects the type before the send",
                        _after(command, 'request.type = (direction=="BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;',
                               send)))
+        # The numbers the guards approve must be the numbers that are sent, so rounding is
+        # computed once, ahead of every guard, and no guard may be re-anchored to the
+        # unrounded locals it replaced.
+        checks.append(("each rounded level is computed exactly once",
+                       len(re.findall(r"\border_price\s*=(?!=)", source)) == 1
+                       and len(re.findall(r"\border_sl\s*=(?!=)", source)) == 1
+                       and len(re.findall(r"\border_tp\s*=(?!=)", source)) == 1))
+        checks.append(("rounding precedes the guards that use it",
+                       _after(command, "double order_tp = NormalizeDouble(tp, digits);",
+                              "if(MathAbs(order_price - expected_price)")
+                       and _after(command, "double order_tp = NormalizeDouble(tp, digits);",
+                                  'if(direction=="BUY" && !(order_sl < order_price')))
+        checks.append(("the guards precede the request bindings",
+                       _after(command, "if(MathAbs(order_price - order_sl) < stops * point",
+                              "request.sl = order_sl;")))
+        checks.append(("no guard measures the unrounded price",
+                       "MathAbs(live_price -" not in command
+                       and "MathAbs(tp - live_price)" not in command
+                       and "sl < live_price" not in command
+                       and "tp < live_price" not in command
+                       and "live_price < tp" not in command
+                       and "live_price < sl" not in command))
+        checks.append(("the request never carries an unrounded level",
+                       "request.price = live_price" not in command
+                       and "request.price = NormalizeDouble" not in command
+                       and "request.sl = NormalizeDouble" not in command
+                       and "request.tp = NormalizeDouble" not in command))
         # ...and in the same straight-line run as the other request fields, so they cannot be
         # moved inside a conditional that the normal path never enters.
         checks.append(("protective stops sit in the unconditional request block",
                        _squeeze("request.volume = volume;"
                                 'request.type = (direction=="BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;'
-                                "request.price = NormalizeDouble(live_price, digits);"
-                                "request.sl = NormalizeDouble(sl, digits);"
-                                "request.tp = NormalizeDouble(tp, digits);"
+                                "request.price = order_price;"
+                                "request.sl = order_sl;"
+                                "request.tp = order_tp;"
                                 "request.deviation = MaxSlippagePoints;") in _squeeze(command)))
         # The approval flag is a one-shot derived value: any second assignment token, on any
         # line and anywhere in the source, would let a caller force approval after validation.
@@ -924,6 +988,18 @@ def _structural_checks(source: str) -> list[tuple[str, bool]]:
         checks.append(("OnInit requires a configured bridge token before starting the timer",
                        _after(oninit, "if(!IsValidBridgeToken(BridgeToken))", "EventSetTimer")))
         checks.append(("OnInit succeeds only at the end", oninit.rindex("return(INIT_SUCCEEDED)") > oninit.rindex("EventSetTimer")))
+        # A cap checked after the timer starts is a cap on the second poll: the command that
+        # arrives first would already have been measured against an out-of-range input.
+        checks.append(("OnInit caps every input before the timer starts",
+                       all(_after(oninit, guard, "EventSetTimer") for guard in (
+                           "if(MagicNumber <= 0)",
+                           "if(PollSeconds < 1 || PollSeconds > EA_POLL_CEILING)",
+                           "if(MaxVolume <= 0 || MaxVolume > EA_VOLUME_CEILING)",
+                           "if(MaxSlippagePoints < 1 || MaxSlippagePoints > EA_SLIPPAGE_CEILING)",
+                           "if(MaxCommandTtlSeconds < 1 || MaxCommandTtlSeconds > EA_TTL_CEILING)"))
+                       and "EventSetTimer(PollSeconds);" in oninit))
+        checks.append(("OnInit does not clamp an out-of-range poll interval",
+                       "MathMax(1, PollSeconds)" not in source))
 
     url = _function_body(source, "IsLoopbackHttpUrl")
     if url is not None:
@@ -1035,11 +1111,11 @@ MUTATIONS: dict[str, tuple[str, str] | tuple[tuple[str, str], ...]] = {
     "TTL bound widened": ("now_epoch + MaxCommandTtlSeconds", "now_epoch + MaxCommandTtlSeconds * 1000"),
     "volume cap removed": ("volume <= 0 || volume > MaxVolume || sl <= 0", "volume <= 0 || sl <= 0"),
     "slippage threshold widened": (
-        "MathAbs(live_price - expected_price) > MaxSlippagePoints * point",
-        "MathAbs(live_price - expected_price) > MaxSlippagePoints * 50 * point",
+        "MathAbs(order_price - expected_price) > MaxSlippagePoints * point",
+        "MathAbs(order_price - expected_price) > MaxSlippagePoints * 50 * point",
     ),
     "stops level check disabled": (
-        "MathAbs(live_price - sl) < stops * point || MathAbs(tp - live_price) < stops * point",
+        "MathAbs(order_price - order_sl) < stops * point || MathAbs(order_tp - order_price) < stops * point",
         "false",
     ),
     "volume step rounding removed": (
@@ -1214,8 +1290,8 @@ MUTATIONS: dict[str, tuple[str, str] | tuple[tuple[str, str], ...]] = {
     # Round-7 counter-mutations: a validated value that is never bound, an inverted
     # one-line wrapper, a shadow endpoint, a shifted clock and unreachable guard copies.
     "protective stops detached from order request": (
-        "   request.sl = NormalizeDouble(sl, digits);\n"
-        "   request.tp = NormalizeDouble(tp, digits);\n",
+        "   request.sl = order_sl;\n"
+        "   request.tp = order_tp;\n",
         "",
     ),
     "JsonTrue wrapper inverted": (
@@ -1268,6 +1344,85 @@ MUTATIONS: dict[str, tuple[str, str] | tuple[tuple[str, str], ...]] = {
     "order type direction inverted": (
         'request.type = (direction=="BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;',
         'request.type = (direction=="BUY") ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;',
+    ),
+    # Round-12 counter-mutations: guards moved back onto the unrounded locals, the rounded
+    # value replaced by the raw one, and a chart input ceiling raised or left unenforced.
+    "slippage guard moved back to the unrounded price": (
+        "MathAbs(order_price - expected_price)",
+        "MathAbs(live_price - expected_price)",
+    ),
+    "BUY geometry guard moved back to the unrounded locals": (
+        'if(direction=="BUY" && !(order_sl < order_price && order_price < order_tp))',
+        'if(direction=="BUY" && !(sl < live_price && live_price < tp))',
+    ),
+    "SELL geometry guard moved back to the unrounded locals": (
+        'if(direction=="SELL" && !(order_tp < order_price && order_price < order_sl))',
+        'if(direction=="SELL" && !(tp < live_price && live_price < sl))',
+    ),
+    "stops level guard moved back to the unrounded locals": (
+        "MathAbs(order_price - order_sl) < stops * point || MathAbs(order_tp - order_price) < stops * point",
+        "MathAbs(live_price - sl) < stops * point || MathAbs(tp - live_price) < stops * point",
+    ),
+    "rounding replaced by the unrounded stop": (
+        "double order_sl = NormalizeDouble(sl, digits);",
+        "double order_sl = sl;",
+    ),
+    "stop bound to the unrounded local": (
+        "   request.sl = order_sl;\n",
+        "   request.sl = sl;\n",
+    ),
+    "price bound to the unrounded local": (
+        "   request.price = order_price;\n",
+        "   request.price = live_price;\n",
+    ),
+    "rounded levels accepted without a positivity guard": (
+        "if(order_price <= 0 || order_sl <= 0 || order_tp <= 0)",
+        "if(false)",
+    ),
+    "EA volume ceiling raised": (
+        "const double EA_VOLUME_CEILING = 0.20;",
+        "const double EA_VOLUME_CEILING = 100.0;",
+    ),
+    "EA slippage ceiling raised": (
+        "const int EA_SLIPPAGE_CEILING = 20;",
+        "const int EA_SLIPPAGE_CEILING = 5000;",
+    ),
+    "EA poll ceiling raised": (
+        "const int EA_POLL_CEILING = 60;",
+        "const int EA_POLL_CEILING = 3600;",
+    ),
+    "EA TTL ceiling raised": (
+        "const double EA_TTL_CEILING = 600.0;",
+        "const double EA_TTL_CEILING = 86400.0;",
+    ),
+    "OnInit volume cap short-circuited": (
+        "if(MaxVolume <= 0 || MaxVolume > EA_VOLUME_CEILING)",
+        "if(false)",
+    ),
+    "OnInit slippage cap short-circuited": (
+        "if(MaxSlippagePoints < 1 || MaxSlippagePoints > EA_SLIPPAGE_CEILING)",
+        "if(false)",
+    ),
+    "OnInit TTL cap short-circuited": (
+        "if(MaxCommandTtlSeconds < 1 || MaxCommandTtlSeconds > EA_TTL_CEILING)",
+        "if(false)",
+    ),
+    "OnInit poll cap short-circuited": (
+        "if(PollSeconds < 1 || PollSeconds > EA_POLL_CEILING)",
+        "if(false)",
+    ),
+    "OnInit magic number cap short-circuited": (
+        "if(MagicNumber <= 0)",
+        "if(false)",
+    ),
+    "timer started before the input caps are enforced": (
+        ('   EventSetTimer(PollSeconds);\n', ''),
+        ('   if(PollSeconds < 1 || PollSeconds > EA_POLL_CEILING)',
+         '   EventSetTimer(PollSeconds);\n   if(PollSeconds < 1 || PollSeconds > EA_POLL_CEILING)'),
+    ),
+    "poll interval clamped instead of refused": (
+        "   EventSetTimer(PollSeconds);",
+        "   EventSetTimer((int)MathMax(1, PollSeconds));",
     ),
 }
 
@@ -1359,6 +1514,25 @@ MUTATION_EXPECTATIONS: dict[str, str] = {
     "volume/SL/TP guard disabled with a short-circuit literal": "literal short-circuit term is forbidden",
     "volume assignment detached from the request": "validated volume is bound to the order request",
     "order type direction inverted": "validated direction selects the order type",
+    "slippage guard moved back to the unrounded price": "slippage guard uses point value",
+    "BUY geometry guard moved back to the unrounded locals": "BUY geometry check",
+    "SELL geometry guard moved back to the unrounded locals": "SELL geometry check",
+    "stops level guard moved back to the unrounded locals": "broker stops level check",
+    "rounding replaced by the unrounded stop": "sent stop-loss is the rounded stop",
+    "stop bound to the unrounded local": "protective stop-loss is bound to the order request",
+    "price bound to the unrounded local": "rounded price is bound to the order request",
+    "rounded levels accepted without a positivity guard": "rounded levels are validated as positive",
+    "EA volume ceiling raised": "EA volume ceiling constant",
+    "EA slippage ceiling raised": "EA slippage ceiling constant",
+    "EA poll ceiling raised": "EA poll ceiling constant",
+    "EA TTL ceiling raised": "EA TTL ceiling constant",
+    "OnInit volume cap short-circuited": "OnInit caps the volume ceiling",
+    "OnInit slippage cap short-circuited": "OnInit caps the slippage ceiling",
+    "OnInit TTL cap short-circuited": "OnInit caps the TTL ceiling",
+    "OnInit poll cap short-circuited": "OnInit caps the poll interval",
+    "OnInit magic number cap short-circuited": "OnInit caps the magic number",
+    "timer started before the input caps are enforced": "OnInit caps every input before the timer starts",
+    "poll interval clamped instead of refused": "OnInit does not clamp an out-of-range poll interval",
 }
 
 

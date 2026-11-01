@@ -5,16 +5,21 @@ that default. Turning execution on for a controlled demo test is a deliberate bu
 step, not a chart input, so this script flips exactly that line in a generated copy and
 refuses if the source no longer matches the reviewed shape. Compilation is optional and
 uses the installed MetaEditor; the log's error count decides success because
-MetaEditor's process exit code is not reliable.
+MetaEditor's process exit code is not reliable — and only a log this run wrote counts,
+because an older log from a previous build would otherwise report an unchanged source as
+clean. Every result carries the SHA-256 of the reviewed source, of the generated source
+and of the binary, so an .ex5 found on a chart can be traced back to a reviewed line.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +35,14 @@ LIVE_FLAG = "input bool AllowLiveExecution = false;"
 
 class BuildError(RuntimeError):
     pass
+
+
+def _sha256(body: str) -> str:
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def demo_source(base: str) -> tuple[str, int]:
@@ -96,6 +109,12 @@ def _find_metaeditor(explicit: Path | None) -> Path:
 def compile_source(source: Path, *, metaeditor: Path, include_dir: Path,
                    timeout: int = 300) -> dict:
     log_path = source.with_suffix(".log")
+    # A log left by an earlier build of this same file would report an unchanged source as
+    # clean, so this run's log is removed first and then only accepted if MetaEditor wrote
+    # it after the process started.
+    if log_path.exists():
+        log_path.unlink()
+    started_before = time.time_ns()
     completed = subprocess.run(
         [str(metaeditor), f"/compile:{source}", f"/log:{log_path}", f"/include:{include_dir}"],
         capture_output=True, text=True, timeout=timeout, check=False)
@@ -103,15 +122,14 @@ def compile_source(source: Path, *, metaeditor: Path, include_dir: Path,
     errors = warnings = None
     text = ""
     for _ in range(50):
-        if log_path.is_file() and log_path.stat().st_size > 0:
+        if log_path.is_file() and log_path.stat().st_size > 0 \
+                and log_path.stat().st_mtime_ns >= started_before:
             try:
                 errors, warnings, text = parse_compile_log(log_path.read_bytes())
             except BuildError:
                 errors = None
             if errors is not None:
                 break
-        import time
-
         time.sleep(0.1)
     if errors is None:
         raise BuildError(f"no usable MetaEditor result log (exit {completed.returncode})")
@@ -120,7 +138,7 @@ def compile_source(source: Path, *, metaeditor: Path, include_dir: Path,
         tail = "\n".join(line for line in text.splitlines()[-12:])
         raise BuildError(f"MetaEditor reported {errors} error(s); log tail:\n{tail}")
     return {"errors": errors, "warnings": warnings, "ex5": str(binary),
-            "log": str(log_path)}
+            "log": str(log_path), "ex5_sha256": _sha256_file(binary)}
 
 
 def build(*, out_dir: Path, do_compile: bool = False, metaeditor: Path | None = None,
@@ -131,7 +149,9 @@ def build(*, out_dir: Path, do_compile: bool = False, metaeditor: Path | None = 
     target = out_dir / f"{DEMO_NAME}.mq5"
     target.write_text(generated, encoding="utf-8", newline="")
     result: dict = {"source": str(target), "gate_line": gate_line,
-                    "gate_enabled": True, "compiled": False}
+                    "gate_enabled": True, "compiled": False,
+                    "reviewed_source": str(SOURCE), "reviewed_sha256": _sha256(base),
+                    "generated_sha256": _sha256(generated)}
     if do_compile:
         compiled = compile_source(target, metaeditor=_find_metaeditor(metaeditor),
                                   include_dir=include_dir)

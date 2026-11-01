@@ -175,16 +175,48 @@ def test_ea_blocks_live_and_unsafe_broker_states_before_send():
     assert "if(expires_raw <= 0 || MathFloor(expires_raw) != expires_raw)" in source
 
 
+def test_ea_caps_chart_inputs_before_the_poll_starts():
+    """A chart input is not an approval: OnInit refuses out-of-range limits before arming itself."""
+    checker = _checker()
+    source = _ea_source()
+    oninit = checker._function_body(source, "OnInit", "int")
+    assert oninit is not None
+    for cap in ("EA_VOLUME_CEILING = 0.20", "EA_SLIPPAGE_CEILING = 20",
+                "EA_POLL_CEILING = 60", "EA_TTL_CEILING = 600.0"):
+        assert cap in source, cap
+    for guard in ("if(MagicNumber <= 0)",
+                  "if(PollSeconds < 1 || PollSeconds > EA_POLL_CEILING)",
+                  "if(MaxVolume <= 0 || MaxVolume > EA_VOLUME_CEILING)",
+                  "if(MaxSlippagePoints < 1 || MaxSlippagePoints > EA_SLIPPAGE_CEILING)",
+                  "if(MaxCommandTtlSeconds < 1 || MaxCommandTtlSeconds > EA_TTL_CEILING)"):
+        assert oninit.index(guard) < oninit.index("EventSetTimer(PollSeconds);"), guard
+    # Clamping would silently accept a request for a 0-second poll instead of refusing it.
+    assert "MathMax(1, PollSeconds)" not in source
+
+
+def test_ea_guards_measure_the_rounded_levels_the_broker_receives():
+    checker = _checker()
+    command = checker._function_body(_ea_source(), "ExecuteDemoCommand")
+    assert command is not None
+    rounding = "double order_tp = NormalizeDouble(tp, digits);"
+    assert command.index(rounding) < command.index('if(direction=="BUY"')
+    assert command.index(rounding) < command.index("MathAbs(order_price - expected_price)")
+    assert command.index("MathAbs(order_price - order_sl)") < command.index("request.sl = order_sl;")
+    assert "request.price = NormalizeDouble" not in command
+    assert "MathAbs(live_price -" not in command
+
+
 def test_ea_pins_exact_limits_for_size_slippage_ttl_and_filling():
     source = _ea_source()
     assert "AccountInfoInteger(ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO" in source
     assert "volume <= 0 || volume > MaxVolume" in source
-    assert "MathAbs(live_price - expected_price) > MaxSlippagePoints * point" in source
+    assert "MathAbs(order_price - expected_price) > MaxSlippagePoints * point" in source
     assert "expires_raw > now_epoch + MaxCommandTtlSeconds" in source
     assert "if(expires_raw <= now_epoch)" in source
     assert "if((filling & (long)SYMBOL_FILLING_FOK) != 0)       request.type_filling = ORDER_FILLING_FOK;" in source
     assert "else if((filling & (long)SYMBOL_FILLING_IOC) != 0)  request.type_filling = ORDER_FILLING_IOC;" in source
-    assert "MathAbs(live_price - sl) < stops * point || MathAbs(tp - live_price) < stops * point" in source
+    assert ("MathAbs(order_price - order_sl) < stops * point || "
+            "MathAbs(order_tp - order_price) < stops * point") in source
     assert "if(KeyInList(key))" in source
     assert 'if(host != "127.0.0.1" && host != "localhost")' in source
 
@@ -214,7 +246,7 @@ def test_checker_rejects_each_pinned_predicate_inversion_independently():
         "slippage": ("MaxSlippagePoints * point", "MaxSlippagePoints * 50 * point"),
         "ttl": ("now_epoch + MaxCommandTtlSeconds", "now_epoch + MaxCommandTtlSeconds * 1000"),
         "expiry": ("if(expires_raw <= now_epoch)", "if(expires_raw <= now_epoch - 86400)"),
-        "stops": ("MathAbs(live_price - sl) < stops * point", "false"),
+        "stops": ("MathAbs(order_price - order_sl) < stops * point", "false"),
     }
     for label, (old, new) in inversions.items():
         weakened = source.replace(old, new, 1)
@@ -353,13 +385,13 @@ def test_checker_pins_stops_urls_clock_and_approval_tokens_independently():
     weakenings = {
         # Validated locals that never reach the request.
         "sl detached": (
-            "request.sl = NormalizeDouble(sl, digits);",
+            "request.sl = order_sl;",
             "request.sl = 0;",
             "protective stop-loss is bound to the order request",
         ),
         "tp overwritten": (
-            "   request.tp = NormalizeDouble(tp, digits);\n",
-            "   request.tp = NormalizeDouble(tp, digits);\n   request.tp = 0.0;\n",
+            "   request.tp = order_tp;\n",
+            "   request.tp = order_tp;\n   request.tp = 0.0;\n",
             "exactly one protective take-profit assignment to the request",
         ),
         # Wrapper polarity.
@@ -416,8 +448,8 @@ def test_checker_rejects_guard_body_and_right_extension_bypasses_outside_the_cat
         "volume extension": ("volume > MaxVolume ||", "volume > MaxVolume * 1000 ||"),
         "ttl extension": ("now_epoch + MaxCommandTtlSeconds)", "now_epoch + MaxCommandTtlSeconds * 1000)"),
         "stops extension": (
-            "< stops * point || MathAbs(tp - live_price) < stops * point)",
-            "< stops * point * 10 || MathAbs(tp - live_price) < stops * point)",
+            "< stops * point || MathAbs(order_tp - order_price) < stops * point)",
+            "< stops * point * 10 || MathAbs(order_tp - order_price) < stops * point)",
         ),
         # Prepend a success return so the whole function becomes a no-op.
         "prepended success": (
