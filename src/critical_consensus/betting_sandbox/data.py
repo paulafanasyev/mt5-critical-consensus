@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from urllib.parse import urlsplit
 
 BASE_URL = "https://www.football-data.co.uk/mmz4281"
 USER_AGENT = "critical-consensus-betting-sandbox/0.4 (personal research; contact: local)"
@@ -37,6 +38,26 @@ CLOSING_ODDS_SETS = (
 )
 _SEASON = re.compile(r"^\d{4}$")
 _DIVISION = re.compile(r"^[A-Z0-9]{2,4}$")
+
+_SOURCE_HOST = "www.football-data.co.uk"
+_SOURCE_PATH = re.compile(r"^/mmz4281/\\d{4}/[A-Z0-9]{2,4}\\.csv$")
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Fail closed: never follow a server redirect to a different origin or scheme."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _validate_source_url(url: str) -> str:
+    """Accept only the fixed HTTPS host and the documented season/division CSV path."""
+    parsed = urlsplit(url)
+    if (parsed.scheme != "https" or parsed.hostname != _SOURCE_HOST
+            or parsed.port not in (None, 443) or parsed.username or parsed.password
+            or parsed.query or parsed.fragment or not _SOURCE_PATH.fullmatch(parsed.path)):
+        raise DatasetError("refusing a non-canonical football-data.co.uk HTTPS URL")
+    return url
 
 
 @dataclass(frozen=True)
@@ -111,11 +132,12 @@ def download_dataset(cache_dir: Path, season: str, division: str, *,
     if path.is_file() and not refresh:
         return load_cached_dataset(cache_dir, season, division)  # type: ignore[return-value]
 
-    url = f"{BASE_URL}/{season}/{division}.csv"
+    url = _validate_source_url(f"{BASE_URL}/{season}/{division}.csv")
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
                                                    "Accept": "text/csv,*/*;q=0.5"})
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        opener = urllib.request.build_opener(_NoRedirectHandler())
+        with opener.open(request, timeout=timeout) as response:
             if getattr(response, "status", 200) != 200:
                 raise DatasetError(f"download failed with HTTP {response.status}: {url}")
             raw = response.read(MAX_BYTES + 1)
