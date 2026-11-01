@@ -41,6 +41,7 @@ def _get_json(url: str, params: dict) -> list:
 def fetch_bars(symbol: str, bars: int) -> list:
     from critical_consensus.market_data import MarketBar
 
+    tick = TICK.get(symbol, 0.01)
     rows: list = []
     end_time = None
     while len(rows) < bars:
@@ -54,7 +55,11 @@ def fetch_bars(symbol: str, bars: int) -> list:
             MarketBar(symbol=symbol, timeframe="H1",
                       time=datetime.fromtimestamp(item[0] / 1000, tz=UTC),
                       open=float(item[1]), high=float(item[2]), low=float(item[3]),
-                      close=float(item[4]), tick_volume=int(float(item[5])), spread_points=2)
+                      close=float(item[4]), tick_volume=int(float(item[5])),
+                      # The paper broker prefers the bar's spread over the spec's, so the
+                      # round-trip taker fee has to be carried here or it is not charged
+                      # at all. 0.2% of price, capped by the policy's spread gate.
+                      spread_points=max(1, min(round(float(item[4]) * 0.002 / tick), 9_999)))
             for item in batch
         ] + rows
         end_time = batch[0][0] - 1

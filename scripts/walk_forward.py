@@ -105,10 +105,9 @@ kill_switch:
         return load_policy(str(path))
 
 
-def run_fold(bars: list, spec: dict, policy, *, balance: float) -> dict:
+def run_fold(bars: list, spec: dict, policy, *, balance: float, warmup: int) -> dict:
     from critical_consensus.mt5_agent import MT5Agent, PaperBroker
 
-    warmup = policy.strategy.min_bars
     series = bars
     broker = PaperBroker(bars={policy.symbol: series}, spec=_spec(spec),
                          login=policy.expected_login or 1_000_000_000,
@@ -138,6 +137,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--symbol", required=True)
     parser.add_argument("--families", default="sma,ema,bollinger,donchian")
+    parser.add_argument("--policy", default="",
+                        help="use this policy file verbatim instead of a generated one")
     parser.add_argument("--folds", type=int, default=6)
     parser.add_argument("--bars", type=int, default=10000)
     parser.add_argument("--balance", type=float, default=10_000.0)
@@ -151,27 +152,34 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     bars = load_bars(symbol, args.bars)
     families = [item.strip().lower() for item in args.families.split(",") if item.strip()]
-    warmup = 250
-    usable = bars[warmup:]
-    fold_size = len(usable) // args.folds
-    if fold_size < 50:
-        print("not enough history for that many folds", file=sys.stderr)
-        return 2
+    fixed_policy = None
+    if args.policy:
+        from critical_consensus.mt5_agent import load_policy
 
+        fixed_policy = load_policy(args.policy)
+        families = [fixed_policy.strategy.family]
     report: dict[str, list] = {}
-    print(f"{symbol}: {len(bars)} bars, {args.folds} folds of ~{fold_size} hours")
     for family in families:
-        policy = build_policy(symbol, spec, family, balance=args.balance)
+        policy = fixed_policy or build_policy(symbol, spec, family, balance=args.balance)
+        # The warm-up has to leave the seed of an EMA far behind: at 250 bars an EMA(200)
+        # still carries ~8% of its first value, so each fold would be judging a different
+        # rule. Three lookbacks, never less than 300 bars.
+        warmup = max(300, 3 * policy.strategy.lookback)
+        usable = bars[warmup:]
+        fold_size = len(usable) // args.folds
+        if fold_size < 50:
+            print("not enough history for that many folds", file=sys.stderr)
+            return 2
         rows = []
         for index in range(args.folds):
             start = index * fold_size
             end = start + fold_size if index < args.folds - 1 else len(usable)
             chunk = usable[max(0, start - warmup):end]
-            rows.append(run_fold(chunk, spec, policy, balance=args.balance))
+            rows.append(run_fold(chunk, spec, policy, balance=args.balance, warmup=warmup))
         report[family] = rows
         cells = " ".join(f"{row['return'] * 100:+6.1f}%" for row in rows)
         positive = sum(1 for row in rows if row["return"] > 0)
-        print(f"{family:10} folds: {cells}   positive {positive}/{len(rows)}")
+        print(f"{family:10} warmup={warmup:4} folds: {cells}   positive {positive}/{len(rows)}")
 
     if args.report:
         Path(args.report).write_text(json.dumps(report, indent=2), encoding="utf-8")

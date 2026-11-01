@@ -127,10 +127,17 @@ class RiskLimits:
     min_risk_reward: float = 1.5
     max_spread_points: int = 25
     max_quote_age_seconds: int = 15
+    # A notional ceiling in equity multiples. Without it a quiet market shrinks the stop,
+    # the risk budget divides into a huge lot, and the broker's volume_max is the only
+    # bound left - which is how twenty-five lots of silver were opened on a ten-thousand
+    # dollar account.
+    max_notional_fraction: float = 3.0
 
     def __post_init__(self) -> None:
         _fraction(self.risk_per_trade_fraction, name="risk_per_trade_fraction",
                   low=0.0001, high=0.05)
+        _fraction(self.max_notional_fraction, name="max_notional_fraction",
+                  low=0.1, high=1_000.0)
         _integer(self.max_open_positions, name="max_open_positions", low=0, high=50)
         _fraction(self.max_daily_loss_fraction, name="max_daily_loss_fraction",
                   low=0.0001, high=0.25)
@@ -302,7 +309,7 @@ class AgentPolicy:
         risk = _section(raw, "risk", {
             "risk_per_trade_fraction", "max_open_positions", "max_daily_loss_fraction",
             "max_drawdown_fraction", "min_risk_reward", "max_spread_points",
-            "max_quote_age_seconds"})
+            "max_quote_age_seconds", "max_notional_fraction"})
         strategy = _section(raw, "strategy", {
             "family", "min_bars", "sma_fast", "sma_slow", "ema_fast", "ema_slow",
             "bollinger_period", "bollinger_dev", "donchian_period", "atr_period",

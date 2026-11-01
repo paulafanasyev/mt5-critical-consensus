@@ -318,7 +318,9 @@ class MT5Agent:
                                risk_fraction_limit=policy.risk.risk_per_trade_fraction,
                                stop_distance=proposal.risk_distance, leverage=account.leverage,
                                margin_available=account.margin_free,
-                               price=tick.reference[proposal.direction])
+                               price=tick.reference[proposal.direction],
+                               max_notional=min(equity, account.balance)
+                               * policy.risk.max_notional_fraction)
         if not sizing.accepted:
             return self._finish(codes.STATUS_BLOCKED, (sizing.denial,), proposal.as_dict(), None,
                                 None, moment, equity=equity, open_positions=len(positions))
@@ -697,7 +699,8 @@ class MT5Agent:
         resized = size_position(spec=spec, equity=risk_equity,
                                 risk_fraction_limit=policy.risk.risk_per_trade_fraction,
                                 stop_distance=stop_distance, leverage=leverage,
-                                margin_available=margin_available, price=fill)
+                                margin_available=margin_available, price=fill,
+                                max_notional=risk_equity * policy.risk.max_notional_fraction)
         if not resized.accepted:
             return (resized.denial,), None, info
         candidate = resized.order

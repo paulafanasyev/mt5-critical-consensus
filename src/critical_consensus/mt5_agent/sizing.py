@@ -40,15 +40,17 @@ class SizingResult:
 
 def size_position(*, spec: SymbolSpec, equity: float, risk_fraction_limit: float,
                   stop_distance: float, leverage: int, margin_available: float,
-                  price: float) -> SizingResult:
+                  price: float, max_notional: float | None = None) -> SizingResult:
     """Largest stepped volume whose stop-out loss and margin both stay inside the account.
 
     A stop distance is only half the story: the same risk on a very tight stop implies a lot
     the broker will refuse (or that consumes the whole account as margin), so the volume is
-    also capped by the free margin the terminal reports. ``price`` is the entry being sized
-    for: the broker's reserved margin scales with the instrument's notional, so sizing a
-    EURUSD trade and a gold trade at the same constant would be wrong for both. A refusal is
-    a denial, never a silent oversize.
+    also capped by the free margin the terminal reports and by the broker's own maximum.
+    ``price`` is the entry being sized for: the broker's reserved margin scales with the
+    instrument's notional, so sizing a EURUSD trade and a gold trade at the same constant
+    would be wrong for both. ``max_notional`` caps the position's notional value directly,
+    because a small stop on a cheap asset can pass every risk check and still be ten times
+    the account. A refusal is a denial, never a silent oversize.
     """
     if not math.isfinite(equity) or equity <= 0:
         raise ValueError("equity must be positive and finite")
@@ -60,6 +62,8 @@ def size_position(*, spec: SymbolSpec, equity: float, risk_fraction_limit: float
         raise ValueError("margin_available must be finite")
     if not math.isfinite(price) or price <= 0:
         raise ValueError("price must be positive and finite")
+    if max_notional is not None and (not math.isfinite(max_notional) or max_notional <= 0):
+        raise ValueError("max_notional must be positive and finite when given")
 
     risk_per_lot = stop_distance / spec.tick_size * spec.tick_value
     if not math.isfinite(risk_per_lot) or risk_per_lot <= 0:
@@ -72,6 +76,16 @@ def size_position(*, spec: SymbolSpec, equity: float, risk_fraction_limit: float
         return SizingResult(None, MINIMUM_LOT_EXCEEDS_RISK_BUDGET)
 
     steps = math.floor(budget / (risk_per_lot * spec.volume_step) + 1e-12)
+    # The broker's own ceiling and the account's notional ceiling both bind before the
+    # risk budget does whenever the stop is small relative to the price.
+    steps = min(steps, math.floor(spec.volume_max / spec.volume_step + 1e-12))
+    if max_notional is not None:
+        # One lot's notional is value_per_price_unit(1) * price, not the raw price: a silver
+        # lot is five hundred ounces, so price alone understates it by that factor.
+        lot_notional = spec.value_per_price_unit(1.0) * price
+        if lot_notional > 0:
+            steps = min(steps, math.floor((max_notional / lot_notional)
+                                          / spec.volume_step + 1e-12))
     volume = spec.price_to_volume(steps * spec.volume_step)
     if volume <= 0:
         return SizingResult(None, MINIMUM_LOT_EXCEEDS_RISK_BUDGET)
