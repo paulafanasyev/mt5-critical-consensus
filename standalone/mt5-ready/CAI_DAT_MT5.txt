@@ -1,0 +1,43 @@
+CRITICAL CONSENSUS CHO META TRADER 5 — cài đặt trong 2 phút
+================================================================
+
+ĐÂY LÀ GÌ
+Expert cho MT5: 5 agent bỏ phiếu theo giá thật, certainty gate hoạt động
+(tất cả "ĐỒNG Ý" hoặc không có lệnh), hai chế độ — confirmation
+(xác nhận trên điện thoại qua Telegram) và autonomous (không hỏi).
+CHỈ TÀI KHOẢN DEMO: với tài khoản thật expert từ chối giao dịch.
+
+CÁC TỆP
+- CriticalConsensusStandalone.ex5 — expert đã biên dịch sẵn
+  (biên dịch bằng trình biên dịch MQL5 thật: 0 lỗi, 0 cảnh báo)
+- CriticalConsensusStandalone.mq5 — mã nguồn (nếu muốn xem/sửa)
+
+CÀI ĐẶT — 4 BƯỚC
+1) Trong MT5: File → Open Data Folder → mở thư mục MQL5\Experts\
+   và copy CriticalConsensusStandalone.ex5 vào đó
+2) Trong MT5: Tools → Options → tab "Expert Advisors" →
+   tick "Allow WebRequest for URL" và thêm dòng:
+        https://api.telegram.org
+   → OK, khởi động lại MT5
+3) Trong Navigator (Ctrl+N) mở "Expert Advisors", kéo
+   CriticalConsensusStandalone vào biểu đồ EURUSD (M15)
+4) Trong cửa sổ cài đặt:
+   - TelegramToken: token từ @BotFather
+   - WorkMode: confirmation (thẻ xác nhận trên điện thoại) hoặc autonomous (tự động)
+   - ChatID: để TRỐNG — gửi /start cho bot, chat_id tự nhận diện
+   → OK
+
+XONG. Expert tự động: 5 agent bỏ phiếu theo giá thật, tất cả "ĐỒNG Ý"
+→ vào lệnh bằng tiền demo (confirmation: thẻ trên Telegram với nút
+Approve/Reject, 5 phút trả lời).
+
+AN TOÀN
+- Chỉ tài khoản demo (tài khoản thật — từ chối giao dịch)
+- Tối đa 3 lệnh/ngày, một vị thế cùng lúc, lọc spread
+- Autonomous: trần 0.05 lot; confirmation: quá hạn = hủy
+- Mỗi tín hiệu được ghi log trong tab "Experts"
+
+NẾU CÓ VẤN ĐỀ
+- "TELEGRAM BLOCKED: add ..." — chưa làm bước 2 (URL vào allowlist)
+- "token rejected" — kiểm tra token với @BotFather
+- Không có gì xảy ra — mở tab "Experts", đó là log của từng quyết định

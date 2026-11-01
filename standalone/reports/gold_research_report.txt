@@ -1,0 +1,41 @@
+=== HOURLY PROFILE (avg return %, avg range %, t-stat, UTC hours) ===
+  00 Asia      avg +0.0080%  range 0.330%  t=+1.79
+  01 Asia      avg +0.0104%  range 0.343%  t=+1.98
+  02 Asia      avg -0.0016%  range 0.302%  t=-0.36
+  03 Asia      avg +0.0012%  range 0.270%  t=+0.31
+  04 Asia      avg -0.0013%  range 0.262%  t=-0.38
+  05 Asia      avg -0.0004%  range 0.293%  t=-0.09
+  06 Asia      avg +0.0026%  range 0.302%  t=+0.57
+  07 London    avg +0.0002%  range 0.317%  t=+0.04
+  08 London    avg +0.0013%  range 0.332%  t=+0.28
+  09 London    avg +0.0044%  range 0.319%  t=+1.09
+  10 London    avg +0.0027%  range 0.314%  t=+0.68
+  11 London    avg +0.0073%  range 0.319%  t=+1.60
+  12 London    avg -0.0005%  range 0.399%  t=-0.09
+  13 NY        avg -0.0083%  range 0.429%  t=-1.36
+  14 NY        avg -0.0021%  range 0.438%  t=-0.34
+  15 NY        avg -0.0051%  range 0.410%  t=-0.86
+  16 NY        avg +0.0030%  range 0.364%  t=+0.66
+  17 NY        avg -0.0041%  range 0.338%  t=-0.98
+  18 NY        avg +0.0054%  range 0.333%  t=+1.23
+  19 NY        avg -0.0053%  range 0.326%  t=-1.22
+  20 NY-late   avg +0.0129%  range 0.326%  t=+1.32
+  21 NY-late   avg -0.0014%  range 0.310%  t=-0.20
+  22 rollover  avg +0.0055%  range 0.325%  t=+1.18
+  23 rollover  avg +0.0027%  range 0.308%  t=+0.55
+
+=== WEEKDAY ===
+  Mon   avg -0.0002%  t=-0.08  n=7723
+  Tue   avg +0.0004%  t=+0.14  n=7726
+  Wed   avg +0.0045%  t=+1.73  n=7726
+  Thu   avg +0.0017%  t=+0.62  n=7727
+  Fri   avg +0.0015%  t=+0.57  n=7733
+
+=== TREND PERSISTENCE (24h return -> next 24h) ===
+  corr = -0.015  (>0 trends continue, <0 mean reversion)
+
+=== WALK-FORWARD: 8 folds (IS 3/4 of history span -> OOS 1/4), chained OOS ===
+  EMA trend (20/100)     chained OOS: +43.2% over 707 trades (WR 25.7%)  folds: ['-17.0%', '-10.7%', '-16.4%', '-9.0%', '+12.4%', '+20.2%', '+31.9%', '+31.7%']
+  EMA trend (50/200)     chained OOS: +84.5% over 286 trades (WR 32.5%)  folds: ['-17.9%', '+6.9%', '+6.7%', '+6.9%', '+13.2%', '+15.9%', '+21.4%', '+31.4%']
+  Bollinger (20, 2.5)    chained OOS: -44.1% over 1806 trades (WR 62.8%)  folds: ['+29.8%', '-0.6%', '-7.0%', '+8.7%', '-4.6%', '-25.3%', '-19.4%', '-25.6%']
+  Momentum (24, 200)     chained OOS: -284.5% over 4478 trades (WR 13.8%)  folds: ['-115.1%', '-54.0%', '-40.0%', '-41.7%', '-19.8%', '-19.8%', '+7.4%', '-1.5%']

@@ -1,0 +1,22 @@
+{
+ "EMA trend (20/100)": {
+  "chained_oos_pct": 43.2,
+  "oos_trades": 707,
+  "winrate": 25.7
+ },
+ "EMA trend (50/200)": {
+  "chained_oos_pct": 84.5,
+  "oos_trades": 286,
+  "winrate": 32.5
+ },
+ "Bollinger (20, 2.5)": {
+  "chained_oos_pct": -44.1,
+  "oos_trades": 1806,
+  "winrate": 62.8
+ },
+ "Momentum (24, 200)": {
+  "chained_oos_pct": -284.5,
+  "oos_trades": 4478,
+  "winrate": 13.8
+ }
+}
