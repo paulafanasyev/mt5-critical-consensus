@@ -531,7 +531,11 @@ class DemoBridge:
             def _host_allowed(self) -> bool:
                 host = (self.headers.get("Host") or "").strip().lower()
                 if not host:
-                    return False
+                    # MQL5's WebRequest sends only the headers it is given, so the EA
+                    # arrives without a Host header. A browser cannot omit Host, so the
+                    # DNS-rebinding rule below still covers every request that can come
+                    # from a page; the socket itself is bound to loopback.
+                    return self.client_address[0] in {"127.0.0.1", "::1"}
                 # Refuse DNS-rebinding style requests: the only hosts this bridge answers
                 # for are the loopback names it is bound to.
                 return host in {f"127.0.0.1:{bridge.port}", f"localhost:{bridge.port}"}

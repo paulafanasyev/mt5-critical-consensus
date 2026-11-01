@@ -416,6 +416,32 @@ def test_a_foreign_host_header_is_refused(make_bridge):
     assert status == 200
 
 
+def test_a_request_without_a_host_header_is_served(make_bridge):
+    """MQL5 WebRequest sends no Host header; the loopback socket is the trust boundary.
+
+    A browser cannot omit Host, so the DNS-rebinding refusal is untouched by this
+    allowance - only a client that speaks HTTP itself, on the loopback socket, can
+    arrive without one.
+    """
+    module = _bridge()
+    bridge = make_bridge().start()
+    request = f"GET {module.KILL_SWITCH_PATH} HTTP/1.1\r\nX-Bridge-Key: {TOKEN}\r\n\r\n"
+    with socket.create_connection(("127.0.0.1", bridge.port), timeout=5) as sock:
+        sock.sendall(request.encode("ascii"))
+        chunks = []
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    head, _, body = b"".join(chunks).partition(b"\r\n\r\n")
+    assert b" 200 " in head
+    payload = _json(body)
+    # An unseeded store answers with the stop armed; the point here is that the request
+    # was served at all instead of being refused as host_not_allowed.
+    assert "kill_switch_active" in payload
+
+
 def test_an_origin_header_is_refused(make_bridge):
     module = _bridge()
     bridge = make_bridge().start()
