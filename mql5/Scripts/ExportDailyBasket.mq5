@@ -32,9 +32,20 @@ void OnStart()
    FileDelete(StatusFile);
    FileDelete(CsvFile);
 
-   if(!TerminalInfoInteger(TERMINAL_CONNECTED))
+   bool connected = false;
+   for(int attempt = 0; attempt < 300; attempt++)
    {
-      WriteFailure("TERMINAL_NOT_CONNECTED");
+      if(TerminalInfoInteger(TERMINAL_CONNECTED))
+      {
+         connected = true;
+         break;
+      }
+      Sleep(1000);
+   }
+
+   if(!connected)
+   {
+      WriteFailure("TERMINAL_NOT_CONNECTED_AFTER_300_SECONDS");
       return;
    }
 
