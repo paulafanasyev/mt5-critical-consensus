@@ -232,11 +232,12 @@ def pass_gates(terminal: FakeTerminal) -> runner.PostApprovalGates:
 
 def entry_deal(*, order_id: str, magic: int = runner.MAGIC_NUMBER, symbol: str = "EURUSD",
                entry: int = 0, ticket: int = 1001, price: float = 1.10010,
-               volume: float = 0.05) -> dict:
+               volume: float = 0.05, at: datetime | None = None) -> dict:
+    moment = at or NOW
     return {"magic": magic, "comment": runner.COMMENT_PREFIX + order_id[:20], "entry": entry,
             "symbol": symbol, "ticket": ticket, "position_id": ticket, "price": price,
             "volume": volume, "profit": 0.0, "swap": 0.0, "commission": 0.0, "fee": 0.0,
-            "time_epoch": NOW.timestamp(), "time": NOW.isoformat()}
+            "time_epoch": moment.timestamp(), "time": moment.isoformat()}
 
 
 @pytest.fixture
@@ -410,6 +411,59 @@ def test_unresolved_served_reports_only_ids_inside_the_window_without_a_deal():
     assert unresolved == ["ord-missing"]
 
 
+def test_unresolved_served_does_not_let_an_older_deal_answer_a_newer_command():
+    """The client order id is a hash, so a reused signal really can collide with its own past.
+
+    A deal that predates the tombstone cannot be the fill of that command. Resolving it would
+    drop the id from the reconciliation list and let the run start on top of a position nobody
+    accounted for.
+    """
+    records = [{"client_order_id": "ord-1", "at": NOW.isoformat()}]
+    deals = [entry_deal(order_id="ord-1", at=NOW - timedelta(hours=3))]
+    assert runner.unresolved_served(records, deals, magic=runner.MAGIC_NUMBER,
+                                    since=NOW - timedelta(hours=24)) == ["ord-1"]
+    # The same deal does resolve it once the command is the older of the two.
+    older = [{"client_order_id": "ord-1", "at": (NOW - timedelta(hours=4)).isoformat()}]
+    assert runner.unresolved_served(older, deals, magic=runner.MAGIC_NUMBER,
+                                    since=NOW - timedelta(hours=24)) == []
+
+
+def test_match_entry_deal_refuses_a_deal_stamped_before_the_command():
+    deal = entry_deal(order_id="ord-1", at=NOW - timedelta(minutes=10))
+    assert runner.match_entry_deal([deal], magic=runner.MAGIC_NUMBER, order_id="ord-1",
+                                   symbol="EURUSD", not_before=NOW) is None
+    # The tolerance is for clock disagreement, not for a different trade.
+    assert runner.match_entry_deal([deal], magic=runner.MAGIC_NUMBER, order_id="ord-1",
+                                   symbol="EURUSD",
+                                   not_before=NOW - timedelta(minutes=11))["ticket"] == 1001
+
+
+def test_match_entry_deal_needs_a_time_when_a_floor_is_demanded():
+    """A row the terminal gave no timestamp for cannot be placed after the command."""
+    deal = entry_deal(order_id="ord-1")
+    del deal["time_epoch"]
+    assert runner.match_entry_deal([deal], magic=runner.MAGIC_NUMBER, order_id="ord-1",
+                                   not_before=NOW) is None
+
+
+def test_deal_mismatches_compares_the_fill_to_the_order_actually_sent():
+    command = {"size": 0.05, "expected_price": 1.10010}
+    assert runner.deal_mismatches(entry_deal(order_id="ord-1"), command,
+                                  point=0.00001, max_slippage_points=20) == []
+    wrong_lot = runner.deal_mismatches(entry_deal(order_id="ord-1", volume=0.50), command,
+                                       point=0.00001, max_slippage_points=20)
+    assert wrong_lot == ["FILL_VOLUME_MISMATCH"]
+    # 20 points is the bound the command was approved against; 30 points is another trade.
+    slipped = runner.deal_mismatches(entry_deal(order_id="ord-1", price=1.10040), command,
+                                    point=0.00001, max_slippage_points=20)
+    assert slipped == ["FILL_PRICE_OUTSIDE_SLIPPAGE_BOUND"]
+    assert runner.deal_mismatches(entry_deal(order_id="ord-1", price=1.10011), command,
+                                  point=0.00001, max_slippage_points=20) == []
+    assert runner.deal_mismatches({"comment": "CC:ord-1"}, command, point=0.00001,
+                                  max_slippage_points=20) == ["FILL_VOLUME_UNVERIFIABLE",
+                                                              "FILL_PRICE_UNVERIFIABLE"]
+
+
 # ------------------------------------------------------------------------- executor
 def test_a_fill_is_journaled_as_sent_only_after_the_broker_deal_is_seen(journal):
     order_id = runner.client_order_id_for("run-1", proposal(), 0.05)
@@ -426,6 +480,51 @@ def test_a_fill_is_journaled_as_sent_only_after_the_broker_deal_is_seen(journal)
     assert commands[0]["decision"] == "AUTO"
     assert payloads(journal, runner.SERVED_EVENT)[0]["broker_order_sent"] is None
     assert len(queue.commands) == 1
+
+
+def test_a_deal_from_before_the_command_is_not_read_as_its_fill(journal):
+    """The client order id is a hash of run, proposal and lot, so an old fill can match it.
+
+    Accepting it would book a position this command never opened as ``FILLED`` and let the run
+    continue trading on the strength of a deal from a previous attempt.
+    """
+    order_id = runner.client_order_id_for("run-1", proposal(), 0.05)
+    stale = entry_deal(order_id=order_id, at=NOW - timedelta(hours=2))
+    executor, _, _, _ = make_executor(journal=journal, terminal=FakeTerminal(deals=[stale]),
+                                      fill_timeout=2)
+    outcome = executor.offer(proposal(), sizing())
+    assert outcome.state == runner.STATE_UNCONFIRMED
+    assert outcome.reason == "NO_FILL_OBSERVED"
+    assert outcome.deal is None and outcome.stop_run
+    assert payloads(journal, runner.OUTCOME_EVENT)[-1]["broker_order_sent"] is None
+
+
+def test_a_deal_for_another_lot_is_not_booked_as_the_fill_of_this_command(journal):
+    """The comment proves the EA wrote the deal; only the size proves it is ours."""
+    order_id = runner.client_order_id_for("run-1", proposal(), 0.05)
+    executor, _, _, _ = make_executor(
+        journal=journal, terminal=FakeTerminal(deals=[entry_deal(order_id=order_id,
+                                                                 volume=1.00)]))
+    outcome = executor.offer(proposal(), sizing())
+    assert outcome.state == runner.STATE_UNCONFIRMED
+    assert outcome.reason == "FILL_VOLUME_MISMATCH"
+    assert outcome.stop_run and outcome.requires_reconciliation
+    assert outcome.deal is not None and outcome.deal["volume"] == 1.00
+    payload = payloads(journal, runner.OUTCOME_EVENT)[-1]
+    assert payload["broker_order_sent"] is None
+    assert payload["deal"]["ticket"] == 1001
+
+
+def test_a_fill_outside_the_approved_slippage_is_not_booked_as_a_fill(journal):
+    """The slippage bound the command was approved against has to hold at the deal too."""
+    order_id = runner.client_order_id_for("run-1", proposal(), 0.05)
+    executor, _, _, _ = make_executor(
+        journal=journal, terminal=FakeTerminal(deals=[entry_deal(order_id=order_id,
+                                                                 price=1.10500)]))
+    outcome = executor.offer(proposal(), sizing())
+    assert outcome.state == runner.STATE_UNCONFIRMED
+    assert outcome.reason == "FILL_PRICE_OUTSIDE_SLIPPAGE_BOUND"
+    assert outcome.stop_run and outcome.requires_reconciliation
 
 
 def test_a_known_outcome_leaves_no_pending_send_for_an_interrupt_to_inherit(journal):
@@ -451,9 +550,8 @@ def test_a_known_outcome_leaves_no_pending_send_for_an_interrupt_to_inherit(jour
 
 def test_a_send_the_interrupt_arrived_over_is_journalled_as_unconfirmed(journal):
     """The command left this process; only the broker's deals can say what happened to it."""
-    executor, queue, _, _ = make_executor(journal=journal,
-                                          terminal=FakeTerminal(deals=[],
-                                                                 deals_error=KeyboardInterrupt()))
+    terminal = FakeTerminal(deals=[], deals_error=KeyboardInterrupt())
+    executor, queue, _, _ = make_executor(journal=journal, terminal=terminal)
     with pytest.raises(KeyboardInterrupt):
         executor.offer(proposal(), sizing())
     assert len(queue.commands) == 1
@@ -1185,7 +1283,9 @@ def test_a_run_that_reaches_the_queue_is_served_and_matched_to_a_broker_deal(
     bridge as its queue, and an unarmed reading of the durable stop.
     """
     order_id = runner.client_order_id_for("run-1", proposal(), 0.05)
-    terminal = FakeTerminal(deals=[entry_deal(order_id=order_id)])
+    # ``_run`` keeps the wall clock, so the deal has to postdate the command it answers: a
+    # fill stamped in the fixture's fixed NOW would be a deal from before the run started.
+    terminal = FakeTerminal(deals=[entry_deal(order_id=order_id, at=datetime.now(UTC))])
     capsys.readouterr()
     code, summary, _err, bridge = _run_with_real_bridge(
         tmp_path, monkeypatch, capsys, policy=make_policy(execution_mode="auto"),

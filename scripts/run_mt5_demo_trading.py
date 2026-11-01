@@ -74,6 +74,11 @@ DEMO_UNIVERSE = ("EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZ
 # so a mis-sized proposal is refused here instead of consuming the EA's whole allowance.
 MAX_DEMO_VOLUME = 0.20
 MAX_SLIPPAGE_POINTS = 20
+# The most the terminal clock and this process's clock may disagree by and a deal still be
+# accepted as the answer to a command. ``entry_deals`` converts broker history to UTC with the
+# server offset, so the residual is the offset's own granularity plus drift; a minute covers
+# both without letting a stale deal through, which is what the floor is there to catch.
+DEAL_CLOCK_SKEW_SECONDS = 60
 DEFAULT_TTL_SECONDS = 60
 MAX_TTL_SECONDS = 600
 COMMAND_EVENT = "demo_order_command"
@@ -224,8 +229,18 @@ def volume_gates(volume: float, spec: Any, *,
 
 
 def match_entry_deal(deals: Any, *, magic: int, order_id: str,
-                     symbol: str | None = None) -> dict[str, Any] | None:
-    """The broker's entry deal for one command, found by magic and the EA's comment."""
+                     symbol: str | None = None,
+                     not_before: datetime | None = None) -> dict[str, Any] | None:
+    """The broker's entry deal for one command, found by magic and the EA's comment.
+
+    ``not_before`` is the moment this process built the command. MT5 history is a time range
+    and the comment is text the EA wrote, so without a floor a deal left over from an earlier
+    attempt of the same signal - the id is a hash of run, proposal and lot, so two identical
+    cycles really do share one - reads as the fill of an order that was never sent. A deal
+    with no usable timestamp is skipped for the same reason: it cannot be placed after the
+    command, so it cannot be proven to belong to it. The allowance is for the residual
+    difference between the terminal clock and this one after the server offset is applied.
+    """
     comment = COMMENT_PREFIX + str(order_id)[:20]
     for deal in deals:
         try:
@@ -239,8 +254,39 @@ def match_entry_deal(deals: Any, *, magic: int, order_id: str,
             continue
         if symbol is not None and str(deal.get("symbol", "")).upper() != symbol.upper():
             continue
+        if not_before is not None:
+            moment = _number(deal.get("time_epoch"))
+            if moment is None or moment < not_before.timestamp() - DEAL_CLOCK_SKEW_SECONDS:
+                continue
         return dict(deal)
     return None
+
+
+def deal_mismatches(deal: Mapping[str, Any], command: Mapping[str, Any], *, point: float,
+                    max_slippage_points: int) -> list[str]:
+    """Why a comment-matched deal is not the order this command sent, if it is not.
+
+    Matching the comment proves only that the EA wrote it. The lot and the price are what
+    prove that the broker filled *this* order, and the slippage bound is the one the command
+    was approved against: a fill 40 points away from the approved entry is a different trade,
+    and a deal for another lot is a different risk. Claiming either as ``FILLED`` would put a
+    number in the journal the broker never honoured.
+    """
+    reasons: list[str] = []
+    size = _number(command.get("size"))
+    volume = _number(deal.get("volume"))
+    if size is None or volume is None or volume <= 0:
+        reasons.append("FILL_VOLUME_UNVERIFIABLE")
+    elif abs(volume - size) > 1e-9:
+        reasons.append("FILL_VOLUME_MISMATCH")
+    expected = _number(command.get("expected_price"))
+    price = _number(deal.get("price"))
+    if expected is None or price is None or price <= 0 or not math.isfinite(point) \
+            or point <= 0:
+        reasons.append("FILL_PRICE_UNVERIFIABLE")
+    elif abs(price - expected) / point > max_slippage_points:
+        reasons.append("FILL_PRICE_OUTSIDE_SLIPPAGE_BOUND")
+    return reasons
 
 
 def _record_time(record: Mapping[str, Any]) -> datetime | None:
@@ -267,7 +313,7 @@ def unresolved_served(records: Any, deals: Any, *, magic: int,
         order_id = record.get("client_order_id")
         if not isinstance(order_id, str):
             continue
-        if match_entry_deal(deals, magic=magic, order_id=order_id) is None:
+        if match_entry_deal(deals, magic=magic, order_id=order_id, not_before=moment) is None:
             unresolved.append(order_id)
     return unresolved
 
@@ -692,8 +738,8 @@ class DemoExecutor:
         self._journal.record(SERVED_EVENT, {
             "symbol": self._symbol, "command_id": command_id, "client_order_id": order_id,
             "broker_order_sent": None, "state": "SERVED"})
-        outcome = self._await_fill(command_id=command_id, order_id=order_id,
-                                   since=now - timedelta(minutes=10))
+        outcome = self._await_fill(command=queued, command_id=command_id, order_id=order_id,
+                                   commanded_at=now, point=spec.point)
         # Only a fill we actually read, or a timeout that reported itself, ends the uncertainty.
         self.pending_send = None
         return outcome
@@ -744,7 +790,11 @@ class DemoExecutor:
             self._sleep(self._poll)
         return False
 
-    def _await_fill(self, *, command_id: str, order_id: str, since: datetime) -> Outcome:
+    def _await_fill(self, *, command: Mapping[str, Any], command_id: str, order_id: str,
+                    commanded_at: datetime, point: float) -> Outcome:
+        # Read a little history for the clock skew, but only accept a deal that postdates the
+        # command: the window is how wide to look, the floor is what counts as an answer.
+        since = commanded_at - timedelta(minutes=10)
         deadline = self._now().timestamp() + self._fill_timeout
         last_error = ""
         while True:
@@ -755,8 +805,23 @@ class DemoExecutor:
                 last_error = type(exc).__name__
                 deals = []
             deal = match_entry_deal(deals, magic=MAGIC_NUMBER, order_id=order_id,
-                                    symbol=self._symbol)
+                                    symbol=self._symbol, not_before=commanded_at)
             if deal is not None:
+                mismatches = deal_mismatches(deal, command, point=point,
+                                             max_slippage_points=self._max_slippage)
+                if mismatches:
+                    # The comment proves the EA wrote this deal, not that it is the order we
+                    # asked for. A different lot or a price outside the approved slippage is a
+                    # position on the account this run cannot describe, so nothing here claims
+                    # it as a fill: the operator reconciles it with the broker.
+                    self._say(text("runner.fill_mismatch", self._language,
+                                   ticket=deal.get("ticket"),
+                                   reasons=", ".join(mismatches)))
+                    return self._outcome(STATE_UNCONFIRMED, reason=",".join(mismatches),
+                                         command_id=command_id, client_order_id=order_id,
+                                         deal=deal, stop_run=True,
+                                         requires_reconciliation=True, queued=True,
+                                         broker_order_sent=None)
                 self._say(text("runner.filled", self._language, ticket=deal.get("ticket"),
                                price=f"{float(deal.get('price', 0.0)):.5f}",
                                volume=f"{float(deal.get('volume', 0.0)):.2f}"))

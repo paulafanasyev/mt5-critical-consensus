@@ -558,6 +558,13 @@ TEXT: dict[str, tuple[str, str, str]] = {
         "Демо-сделка подтверждена: тикет {ticket}, цена {price}, объём {volume}.",
         "Demo fill confirmed: ticket {ticket}, price {price}, volume {volume}.",
         "Đã xác nhận khớp lệnh demo: ticket {ticket}, giá {price}, khối lượng {volume}."),
+    "runner.fill_mismatch": (
+        "Сделка {ticket} не соответствует команде: {reasons}; она не записана как исполнение,"
+        " нужна ручная сверка.",
+        "Deal {ticket} does not match the command: {reasons}; it is not booked as a fill and"
+        " manual reconciliation is required.",
+        "Giao dịch {ticket} không khớp với lệnh: {reasons}; không được ghi nhận là khớp lệnh"
+        " và cần đối soát thủ công."),
     "runner.expired": (
         "EA не забрал команду за отведённое время; ничего не отправлено.",
         "The EA did not pick up the command within its TTL; nothing was sent.",
