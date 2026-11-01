@@ -39,7 +39,7 @@ class FakeMT5:
         return self.initialize_result
 
     def last_error(self):
-        return (-10004, "credentials intentionally not reproduced")
+        return (-10004, "IPC transport unavailable")
 
     def login(self, **kwargs):
         self.login_kwargs = kwargs
@@ -170,7 +170,7 @@ def test_readonly_smoke_redacts_terminal_initialization_failure():
                         symbols=["EURUSD"])
     except PROBE.ProbeError as exc:
         assert "error code -10004" in str(exc)
-        assert "credentials intentionally" not in str(exc)
+        assert "IPC transport unavailable" in str(exc)
         assert "top-secret" not in str(exc)
     else:
         raise AssertionError("failed initialization was accepted")
