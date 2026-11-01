@@ -28,10 +28,12 @@ Ngôn ngữ khác: [English](MT5_AGENT.en.md) · [Русский](MT5_AGENT.md).
 | `LiveMT5Backend` ánh xạ đúng phản hồi terminal và trừ offset giờ của server | **ĐÃ XÁC MINH bằng package giả lập** | `test_live_backend_*`, `test_cli_live_source_subtracts_the_server_offset` |
 | Đọc terminal MT5 thật trên máy này | **ĐÃ XÁC MINH** | 2026-10-31: `MetaTrader5` 5.0.6231, `terminal64.exe` build 6296, tài khoản demo 10013404855 trên `MetaQuotes-Demo` (số dư 10.00 USD, đòn bẩy 100), các đặc tả thật và 120 nến H1 cho EURUSD/GBPUSD/AUDUSD/NZDUSD/XAUUSD/XAGUSD; offset server 7200 s |
 | EA demo biên dịch và cài được vào terminal | **ĐÃ XÁC MINH** | 2026-10-31: `scripts/build_demo_ea.py` lật đúng một dòng cổng trong một bản sao được sinh ra, MetaEditor báo 0 lỗi và 0 cảnh báo, và `MQL5/Experts/CriticalConsensusEA_Demo.ex5` (37780 byte) đã được cài |
-| Cấu hình terminal cho phép giao dịch thuật toán và WebRequest loopback | **ĐÃ XÁC MINH** | 2026-10-31: `Config/common.ini` mang `Enabled=1`, `WebRequest=1`, `WebRequestUrl=http://127.0.0.1:8000`, vẫn là UTF-16 LE kèm BOM và CRLF, đã xác minh theo byte so với một bản sao lưu |
-| EA thực sự thăm dò cầu nối (một `WebRequest` thật từ một biểu đồ) | **CHƯA XÁC MINH** | đòi hỏi phải gắn advisor vào một biểu đồ bằng tay; `MQL5/Logs` không chứa dòng `OnInit` nào từ EA demo. `WebRequest` không chạy trong Strategy Tester — đó là giới hạn của MT5, không phải lỗ hổng trong mã này |
-| Một lệnh demo được broker thực thi | **CHƯA XÁC MINH** | ngày 2026-10-31 thị trường đóng cửa (tick EURUSD cuối cùng 2026-10-30T21:00:00Z), nên mọi vòng lặp bị chặn ở `QUOTE_STALE`; không lệnh nào từng được xếp hàng và mọi bản ghi nhật ký đều ghi `broker_order_sent: false` |
-| Lợi nhuận của chiến lược và tỉ lệ lệnh thắng | **CHƯA XÁC MINH** | backtest trên chuỗi tổng hợp; `confidence` là điểm heuristic, không phải xác suất đã hiệu chuẩn. Tỉ lệ thắng 98% không được đo ở đây và mã này không thể đạt được |
+| Cấu hình terminal cho phép giao dịch thuật toán và WebRequest loopback | **ĐÃ XÁC MINH, nhưng không durable** | 2026-10-31: `Config/common.ini` mang `Enabled=1`, `WebRequest=1`, `WebRequestUrl=http://127.0.0.1:8000`, vẫn là UTF-16 LE kèm BOM và CRLF, đã xác minh theo byte và có một bản sao lưu nằm cạnh. Việc một terminal sống ghi đè tệp này không phải là giả thuyết: ngày 2026-11-01 lúc 00:21, MT5 đã đặt `Enabled=0` và xóa trắng `WebRequestUrl` sau khi `setup_demo_terminal.py --apply` áp các khóa lúc 00:11. Trạng thái hiện tại lại được kiểm ngày 2026-11-01: `Enabled=1`, `WebRequest=1`, `WebRequestUrl=http://127.0.0.1:8000;http://127.0.0.1;http://localhost:8000;http://localhost`. Sự cho phép cần được giữ trong một terminal đang chạy, chứ không phải một lần ghi vào tệp |
+| EA thực sự thăm dò cầu nối (một `WebRequest` thật từ một biểu đồ) | **ĐÃ XÁC MINH** | 2026-11-01 13:52–13:55 UTC, tài khoản demo 114929502 trên `MetaQuotes-Demo`, `CriticalConsensusEA_Demo` nằm trên biểu đồ XAUUSD,H1. Phép kiểm được mô tả trong mục «Cách kiểm tra transport khi thị trường đóng cửa»: việc bật công tắc ngừng qua cầu nối đã tạo trong `MQL5/Logs/20261101.log` (UTF-16) các dòng `BLOCKED: kill switch is active or state is invalid.` đúng theo nhịp poll 3 s, và việc gỡ công tắc đã dừng chúng lại — nghĩa là advisor đã nhận HTTP 200 trên `/v1/risk/kill-switch` và 204 trên `/v1/execution/next` với cùng `BridgeToken` đã được nhập vào các trường của biểu đồ. Trước khi nhập token, chính tệp log đó cho thấy các dòng `BLOCKED: kill-switch state unavailable; HTTP 401` |
+| Tên công cụ đến từ broker, không được giả định | **ĐÃ XÁC MINH** | `resolve_broker_symbol` + `LiveMT5Backend.symbols()`/`use_broker_names` trong `src/critical_consensus/mt5_agent/backend.py` và `scripts/run_mt5_demo_trading.py`; các test `tests/test_broker_symbol_alias.py` (11 test). `XAUUSDm`/`XAUUSDc`/`xauusd` được phân giải về đúng cách viết của chính server, nhiều kết quả khớp là một sự từ chối chứ không phải một phép đoán |
+| Số học cổng của advisor và runner trùng nhau | **ĐÃ XÁC MINH** | `scripts/ea_logic_mirror.py` — bản phản ánh từng dòng của `CriticalConsensusEA.mq5` sang Python, `tests/test_ea_logic_parity.py` — 109 phép đối chiếu (các trường bắt buộc, ngữ pháp số và định danh, token, URL loopback, tombstone, khối lượng, lưới 200 giá SL/TP so với `stops_level`). Chính test này đã tìm ra một lệch làm tròn thật trong `price_gates` và nó đã được sửa |
+| Một lệnh demo được broker thực thi | **CHƯA XÁC MINH** | vận chuyển chạy, nhưng không có hàng đợi nào: ngày 2026-11-01 thị trường đóng từ 23:59 Thứ Sáu và chính sách chặn Chủ nhật, nên mọi vòng lặp cho ra `OUTSIDE_TRADING_WINDOW` với `broker_order_sent: false` trong tất cả các bản ghi (1386 bản ghi tính đến 14:27:34 UTC, chuỗi hợp lệ; con số là ảnh chụp — một lượt chạy đang sống thêm 12 bản ghi mỗi phút). Chu kỳ đầu tiên có khả năng dựng một lệnh là Thứ Hai 2026-11-02 00:00 UTC |
+| Lợi nhuận của chiến lược và tỉ lệ lệnh thắng | **CHƯA XÁC MINH** | backtest trên chuỗi tổng hợp; `confidence` là điểm heuristic, không phải xác suất đã hiệu chuẩn. Tỉ lệ thắng 98% không được đo ở đây và mã này không thể đạt được. Các lượt chạy đã đo trên nến thật thì lỗ ([DEMO_RESULTS.md](DEMO_RESULTS.md)) |
 | Thực thi trên tài khoản thật | **CHƯA XÁC MINH và không được triển khai** | package Python và CLI không chứa lời gọi gửi lệnh nào, theo thiết kế; đường demo từ chối mọi thứ không phải tài khoản demo (`AllowLiveExecution=false`, `require_demo`, bước kiểm `ACCOUNT_TRADE_MODE`), và một chính sách có `mode: live` bị từ chối khi tải |
 
 Bản xem trước cục bộ dùng khi viết tài liệu này phát lại chuỗi EURUSD H1 **tổng hợp** (random walk
@@ -40,6 +42,16 @@ có trend, có seed); nó không được commit như một artifact, và các t
 ra chỉ minh hoạ cơ chế, **không phải** ước tính lợi nhuận. Không có gì ở đây quyết định khi nào được
 dùng tiền thật: đó là một quyết định riêng, rõ ràng, nằm ngoài mã này, và package hiện tại không thể
 thực thi quyết định đó theo cả hai chiều.
+
+Tình trạng kiểm tra tính đến ngày 2026-11-01: `.venv\Scripts\python.exe -m pytest -q` — **971 test
+đạt, 10 test bỏ qua** (các
+bước bỏ qua cần `TEST_DATABASE_URL` và/hoặc `TEST_REDIS_URL`; interpreter từ `.venv` ở đây là bắt
+buộc chứ không phải lịch sự: một phần suite spawn `sys.executable` như một tiến trình con, nên một
+`python` hệ thống không có package đã cài sẽ báo 36 lỗi `ModuleNotFoundError` thay vì một kết quả);
+`python scripts/check_mql5_safety.py`
+— **473 bất biến tĩnh của advisor và 105 phép làm suy yếu bị từ chối**. Bước kiểm tĩnh không biên
+dịch mã nguồn advisor: MetaEditor là thứ xác nhận việc biên dịch, còn việc thực thi trên tài khoản
+thì chỉ broker mới xác nhận được.
 
 ## Thành phần package
 
@@ -177,9 +189,36 @@ Các cổng phải đồng thời thỏa trước khi một lệnh tồn tại:
    phải câu trả lời.
 7. Advisor độc lập kiểm lại tất cả điều trên, cộng công tắc ngừng lệnh qua một GET mới, TTL, cổng
    compile-time `ENABLE_DEMO_EXECUTION` của nó, `AllowLiveExecution`, symbol, khối lượng và các
-   stop, và nó ghi các tombstone idempotency trước khi gửi.
+   stop, và nó ghi các tombstone idempotency trước khi gửi. Nó cũng kiểm các giới hạn của chính mình
+   ngay từ lúc khởi động và từ chối khởi tạo khi `PollSeconds` nằm ngoài 1–60, `MaxVolume` nằm ngoài
+   (0; 0.20], `MaxSlippagePoints` nằm ngoài 1–20, `MaxCommandTtlSeconds` nằm ngoài 1–600 hoặc
+   `MagicNumber` không phải số magic: mọi giá trị đó đến từ các trường của biểu đồ, và một advisor
+   chấp nhận `MaxVolume = 100` sẽ thực thi một khối lượng mà không ai thương lượng từ bất kỳ phía
+   nào.
 8. Một kết quả không chắc chắn (lệnh đã được phục vụ, không thấy khớp) dừng lượt chạy và cần
    `--acknowledge-uncertain` rõ ràng; không có đường mã nào gửi lại.
+
+### Cùng một số học cho advisor và runner
+
+Khoảng lệch giữa «Python kiểm tra gì» và «MQL5 kiểm tra gì» rẻ đóng lại bằng một phép tính hơn là
+bằng sự chú ý. `scripts/ea_logic_mirror.py` là bản phản ánh từng dòng của advisor sang Python: cùng
+các `JsonString`/`JsonNumber`/`JsonTrue`/`JsonFalse` đặt trên đúng bộ phân tích một đối tượng JSON
+phẳng đó, cùng ngữ pháp cho số và cho định danh, cùng FNV-1a (nó đi theo từng byte của UTF-16LE, nên
+`"a"` cho `089BE207B544F1E4` chứ không đi theo ASCII), cùng các khoá tombstone, cùng bộ phân tích URL
+loopback và cùng hàng đợi kiểm tra của `ExecuteDemoCommand` — theo đúng thứ tự đó và với đúng các văn
+bản từ chối đó. Các test trong `tests/test_ea_logic_parity.py` (109 phép đối chiếu) so bản phản ánh
+với cầu nối đang sống (thân thật của lệnh arm/disarm lấy trực tiếp từ socket), với `json.loads` kèm
+từ chối nghiêm ngặt `NaN`/`Infinity`, với các biểu thức chính quy của cầu nối, với chính văn bản
+`.mq5` (các trường bắt buộc, giá trị mặc định, giới hạn và số magic được đối chiếu bằng ba cách), và
+với một lưới 200 giá mà điểm vào và stop được làm tròn theo các hướng khác nhau so với `stops_level`.
+
+Lưới đầu tiên đó đã tìm ra một lỗi thật nằm phía chúng tôi. MT5 gửi cho broker những con số đã được
+làm tròn tới `digits`, còn `price_gates` lại so với `stops_level` những con số chưa làm tròn; tại giá
+4000.005, với một stop 1.02 point và mức stops là 2 point, Python chặn lệnh còn advisor thì sẽ chấp
+nhận nó. Một cổng đo một con số mà broker không bao giờ nhận thì không phải là một cổng. Giờ
+`broker_level()` làm tròn điểm vào, stop và take-profit đúng như `NormalizeDouble` (làm tròn nửa ra
+xa giá trị không), và mọi phép kiểm hình học, trượt giá cũng như `stops_level` đều đi theo các mức đã
+làm tròn; test parity đòi tập hợp các lần từ chối phải trùng nhau trên toàn bộ lưới.
 
 ### Công tắc ngừng khẩn cấp trên đường demo
 
@@ -212,13 +251,84 @@ tiếp đã là câu trả lời mới. Vì vậy `scripts/activate_kill_switch.
   "NOT_SEEDED"}`; `kill_switch.json` hỏng hoặc không đọc được khiến runner từ chối ngay trước khi bắt
   đầu và khiến GET của advisor trả 503; một bản ghi từng tồn tại rồi biến mất — tức là tệp bị xóa —
   cũng là 503 chứ không phải một khởi đầu sạch. Vì vậy xóa tệp trạng thái không thể tắt công tắc.
-- Lượt chạy đầu tiên không tìm thấy bản ghi sẽ viết một bản ghi từ mục `kill_switch` trong chính sách,
-  vì ý định của người vận hành sống ở đó; còn bản ghi do người vận hành POST hoặc do một lượt chạy bị
-  dừng để lại thì không bao giờ bị ghi đè, bởi một công tắc ai đó đã bật nặng hơn một chính sách quên
-  nó. Điều duy nhất giữ trong bộ nhớ là một lần bật không ghi xuống đĩa được: nó vẫn chặn (câu trả lời
-  nói `MEMORY_ONLY`), còn một lần tắt không ghi được để công tắc ở trạng thái bật.
+- Lượt chạy đầu tiên không tìm thấy bản ghi nào sẽ tạo bản ghi đó ở trạng thái **bật**
+  (`kill_switch_reason: "SEEDED_ARMED"`), chứ không lấy từ section `kill_switch` của chính sách. Một
+  chính sách mô tả cách giao dịch, không phải là quyền được giao dịch; sự im lặng trong tệp cấu hình
+  không thể gỡ một lệnh dừng. Một bản ghi do người vận hành để lại qua HTTP, hay do một lượt chạy bị
+  dừng, không bao giờ bị ghi đè. Trong bộ nhớ chỉ giữ một điều duy nhất: một lần bật không ghi xuống
+  đĩa được thì vẫn tiếp tục chặn (câu trả lời nói `MEMORY_ONLY`), còn một lần tắt không ghi được để
+  công tắc ở trạng thái bật.
 - Mọi kết quả dừng một lượt chạy — "stop" ở bước xác nhận, một lần gửi không xác nhận, một id lệnh bị
-  trùng — bật đúng bản ghi bền đó, nên kết thúc tiến trình không kết thúc lệnh dừng.
+  trùng — bật đúng bản ghi bền đó, nên kết thúc tiến trình không kết thúc lệnh dừng. Một Ctrl-C tới
+  sau khi lệnh đã được đưa vào cầu nối không được coi riêng là một kết thúc sạch: lượt chạy đánh dấu
+  lệnh là chưa xác nhận, bật đúng tệp đó và thoát với mã `4` (`interrupted_with_send_in_flight`), vì
+  chỉ lịch giao dịch của broker mới biết lệnh có thực sự đi hay không.
+
+### Cách kiểm tra transport khi thị trường đóng cửa
+
+Transport được kiểm mà không cần một lệnh nào, và đó chính xác là cách phải làm, thay vì «chờ tới
+Thứ Hai». Advisor gọi cầu nối trong mỗi nhịp timer, nên trạng thái công tắc ngừng hiện ra ngay trong
+log của nó:
+
+1. Khởi động runner và chắc chắn rằng `terminal64.exe` đang chạy, advisor đang gắn trên một biểu đồ,
+   và nút AutoTrading đang bật.
+2. Chụp một bản log: `MQL5/Logs/<YYYYMMDD>.log` là UTF-16, đọc bằng
+   `iconv -f UTF-16LE -t UTF-8`.
+3. Bật công tắc ngừng qua cầu nối: `POST /v1/risk/kill-switch` với `X-Bridge-Key` và thân
+   `{"active": true, "reason": "…"}`; câu trả lời bắt buộc là 200 kèm `status: "PERSISTED"`,
+   `updated_at` và `event_hash`.
+4. Chờ không ít hơn một chu kỳ poll. Dấu hiệu của sự lành mạnh là các dòng `BLOCKED: kill switch is
+   active or state is invalid.` cách đều nhau; chúng nghĩa là advisor đã nhận và phân tích được câu
+   trả lời của cầu nối, tức `BridgeToken` trong các trường của biểu đồ trùng với khóa của cầu nối.
+5. Gỡ công tắc (`--release-kill-switch`, xem ở trên) và chắc chắn các dòng đó dừng lại, đồng thời
+   không có dòng `Bridge returned HTTP` hay `fail closed` nào cả: im lặng sau khi gỡ nghĩa là một 200
+   trên đường dẫn của công tắc và một 204 trên đường dẫn lệnh, tức cả hai tuyến đều được xác thực.
+
+Ba kết luận sai ở đây đã một lần làm mất thời gian: **một log rỗng không có nghĩa là advisor đã
+dừng** (một EA lành mạnh với công tắc đã gỡ và hàng đợi rỗng thì không viết gì cả); **MT5 ghi log của
+nó với một độ trễ**, nên «không có dòng mới» phải được kiểm lại sau khoảng ba mươi giây thay vì tuyên
+bố ngay; và `BLOCKED: kill-switch state unavailable; HTTP 401` không phải là thiếu thị trường cũng
+chẳng phải thiếu lệnh, mà đúng một điều: khóa đã không khớp.
+
+### Tên công cụ đến từ broker
+
+`MetaQuotes-Demo` không phải chuẩn chính tả của tên công cụ, và runner không còn giả vờ rằng nó là
+chuẩn đó. Tên được yêu cầu được đối chiếu với những gì server thực sự trả về: khớp chính xác thì thắng;
+nếu không, phần cơ sở sáu ký tự (`XAUUSD`, `EURUSD`) được thử với các hậu tố dài một tới ba ký tự —
+broker nào có dạng gì là câu hỏi cho server của họ, không phải cho mã. Cùng một yêu cầu mà khớp với
+nhiều cách viết được phân giải thành một sự từ chối (`MT5 offers several variants of …; refusing to
+guess which one this account trades`), chứ không phải dòng đầu tiên của danh sách: `XAUUSD` và
+`XAUUSDc` là hai công cụ khác nhau, và đoán nghĩa là giao dịch bằng lot cent thay vì lot thường. Từ đó
+trở đi cả lượt chạy dùng cách viết của server, sự kiện đổi tên được ghi vào nhật ký
+(`demo_symbol_alias`), và một tên khoá nội bộ không cho hai cách viết chạm nhau trong cùng một bảng.
+Nhờ vậy `EURUSDm` của nhóm giao dịch Exness, `XAUUSDc` của tài khoản cent và dạng chữ thường `xauusd`
+không còn là «symbol không khả dụng».
+
+### Quan sát ngày 2026-11-01 (bốn công cụ, terminal thật, thị trường đóng cửa)
+
+Tài khoản demo `114929502` trên `MetaQuotes-Demo`, số dư và equity 100 000 USD, đòn bẩy 100,
+`trade_allowed`. Chính sách `agent_data/live_gold_ema_policy.yaml`: `mode: paper`,
+`execution_mode: auto`, cửa sổ 00:00–22:00 UTC, `blocked_weekdays_utc: [6]`. Lượt chạy: 4 công cụ ×
+một chu kỳ mỗi 20 s, và nhật ký của tiến trình đó dừng ở **1386 bản ghi `agent_cycle` lúc
+14:27:34 UTC**, mọi bản ghi đều mang lý do chặn `OUTSIDE_TRADING_WINDOW` và
+`broker_order_sent: false`, chuỗi hợp lệ. Con số này là một ảnh chụp chứ không phải bất biến: một
+lượt chạy đang sống ghi 12 bản ghi mỗi phút (4 công cụ × 3 chu kỳ), và vào lúc chỉnh sửa tài liệu
+này, cầu nối đã thuộc về một runner khác với cùng `run_id` — vì định danh lượt chạy, tệp công tắc
+ngừng và lịch sử các id đã phục vụ đều suy ra từ đường dẫn tombstone, chứ không từ số tiến trình.
+`BTCUSD` vắng mặt trong
+danh sách này là có chủ ý: broker không cung cấp nó (`MetaQuotes-Demo` không giao dịch tiền mã hóa),
+và runner ghi sự không khả dụng thành một dòng riêng, chứ không âm thầm loại công cụ.
+
+Trong nhật ký đó không có lấy một blocker `KILL_SWITCH_ACTIVE`, và lý do không phải là một công tắc
+chết: trên đường demo, stop có hai vật mang khác nhau. Cổng số 2 của thứ tự chu kỳ đọc section
+`kill_switch` của **chính sách** (`agent_data/live_gold_ema_policy.yaml` khai `active: false`), còn
+tệp `kill_switch.json` bền vững được `DemoExecutor.offer()` kiểm tra — nơi duy nhất một lệnh được
+dựng ra. Khi thị trường đóng cửa, chu kỳ chết ở cổng cửa sổ và không bao giờ tới `offer()`, nên công
+tắc bật từ 13:52 đến 14:27:59 UTC không để lại dấu vết nào trong nhật ký quyết định; nó để lại dấu
+vết trong log của advisor, và chính vì vậy mà transport được kiểm qua log EA chứ không qua bộ đếm
+blocker. Cũng chính tệp log đó cho thấy sự chặn đến từ cửa sổ chứ không từ transport hỏng: trước
+13:52 UTC các dòng là `HTTP 401`, sau khi nhập token là `kill switch is active`, và sau
+khi gỡ là im lặng.
 
 ### Quan sát trực tiếp ngày 2026-10-31 (`--symbols all`, terminal thật)
 
@@ -240,18 +350,26 @@ thật và các nến H1 thật (một phép tính, không phải một sự t�
 `0.005 × min(equity, balance) = 0.05 USD` ở số dư 10.00 USD, trong khi rủi ro của lot tối thiểu theo
 broker là 3.27 USD trên EURUSD, 3.35 trên GBPUSD, 1.93 trên AUDUSD, 1.98 trên NZDUSD, 3.97 trên
 XAUUSD và 4.24 trên XAGUSD. Mọi symbol đều dừng ở `MINIMUM_LOT_EXCEEDS_RISK_BUDGET`. Một tài khoản
-demo 10 USD không chứa nổi một lệnh đơn lẻ đúng chính sách; ở 10 000 USD thì cùng 0.5% cho ngân
-sách 50 USD và những con số đó lọt qua.
+demo 10 USD không chứa nổi một lệnh đơn lẻ đúng chính sách; ở 10 000 USD thì cùng 0.5% cho ngân sách
+50 USD và những con số đó lọt qua. Từ 2026-11-01 lượt chạy đi trên tài khoản 114929502 với số dư
+100 000 USD — cũng chính vì vậy mà câu hỏi «vì sao không có gì được thực thi» không còn là một câu
+hỏi về tính khối lượng nữa: nó chỉ còn là thị trường đóng cửa và một ngày trong tuần bị chặn.
 
 ### Cách chạy nó
+
+Các bí mật chỉ được lấy từ môi trường. Không tồn tại `--bridge-token`, cũng không có admin token trên
+dòng tham số: dòng tham số do những người dùng khác của cùng máy nhìn thấy và xuất hiện trong một ảnh
+chụp `Win32_Process`, còn tệp trạng thái của cầu nối lẫn nhật ký đều không ghi khóa hay thân câu trả
+lời.
 
 ```powershell
 # 1. terminal phải ở trạng thái ĐÓNG: MT5 ghi lại common.ini khi nó thoát
 python scripts/setup_demo_terminal.py                       # dry run: điều gì sẽ thay đổi
 python scripts/setup_demo_terminal.py --apply               # build, cài, cho phép WebRequest loopback
 # 2. khởi động terminal, đăng nhập tài khoản demo, gắn CriticalConsensusEA_Demo vào một biểu đồ bằng tay
-# 3. bật nút AutoTrading và giữ runner sống
+# 3. bật nút AutoTrading và giữ cho cầu nối mở
 $env:MT5_BRIDGE_TOKEN = "<24-256 ký tự>"
+$env:MT5_KILL_SWITCH_ADMIN_TOKEN = "<không ngắn hơn 32 ký tự, khác khóa cầu nối>"
 python scripts/run_mt5_demo_trading.py --policy agent_data/live_demo_policy.yaml `
   --db agent_data/mt5_demo.db --symbols all --cycles 0 --execution confirm --verbose
 ```
@@ -260,7 +378,35 @@ python scripts/run_mt5_demo_trading.py --policy agent_data/live_demo_policy.yaml
 lệnh đơn giản hết hạn dưới TTL — nhật ký báo chúng một cách trung thực là `expired`, và không lệnh
 nào tới được broker. Nút AutoTrading và `[Experts] Enabled=1` là hai công tắc khác nhau: nút GUI tắt
 mọi thứ, nên phải chạy lại `setup_demo_terminal.py` sau bất kỳ lần bật/tắt nào thực hiện bên trong
-terminal.
+terminal; phép kiểm transport ở mục trên chính là thứ phân biệt «không có thị trường» với «không có
+sự cho phép».
+
+Đường dẫn trạng thái và định danh lượt chạy không phụ thuộc vào nơi nó được khởi động. `--tombstones`
+được phân giải so với gốc repository, chứ không phải thư mục hiện tại, nên một lệnh `cd` không thể di
+dời được tệp công tắc ngừng lẫn lịch sử các id đã phục vụ; định danh lượt chạy mặc định được suy ra
+từ đường dẫn đó cộng với tệp chính sách, chứ không phải một giá trị ngẫu nhiên. Điều này quan trọng vì
+`client_order_id` được dựng từ nó: một id ngẫu nhiên cho mỗi tiến trình sẽ biến mọi lần khởi động lại
+thành «lệnh đầu tiên trong đời», và lớp chống trùng tín hiệu sẽ chẳng còn bảo vệ được gì.
+
+Mã thoát của runner: `0` — lượt chạy kết thúc theo `--cycles` hoặc bị người vận hành dừng, và không có
+lệnh nào còn chưa được xác nhận; `2` — cấu hình bị từ chối trước khi ra tới thị trường (chính sách,
+ràng buộc tài khoản, admin token thiếu hoặc quá ngắn khi dùng `--release-kill-switch`); `3` — lượt
+chạy không thể bắt đầu một cách trung thực: không công cụ nào được broker cho phép, cầu nối không
+mở được socket trên `127.0.0.1`, lịch sử giao dịch của terminal không đọc được khi đã có lệnh được
+phục vụ, hoặc trong tombstone vẫn còn những lệnh đã phục vụ mà chưa xác nhận được khớp,
+điều đòi `--acknowledge-uncertain` rõ ràng; `4` — Ctrl-C tới sau khi lệnh đã được đưa vào cầu nối
+(`interrupted_with_send_in_flight`): đúng tệp công tắc ngừng bền đó đang bật, và chỉ được chạm lại id
+ấy sau khi đối chiếu với các giao dịch của broker. Một công tắc ngừng đang bật không phải là một mã
+thoát và cũng không phải một tạm dừng: lượt chạy in lý do một lần lúc khởi động và tiếp tục đếm chu
+kỳ, vì stop bền vững nằm trong `offer()`, còn `offer()` chỉ chạy khi tín hiệu đã tồn tại (hai vật
+mang của stop được mô tả ở phần Quan sát 2026-11-01).
+
+Gỡ công tắc ngừng khi không có runner nào đang sống chỉ được thực hiện qua một bí mật riêng:
+
+```powershell
+python scripts/run_mt5_demo_trading.py --policy agent_data/live_demo_policy.yaml `
+  --db agent_data/mt5_demo.db --release-kill-switch
+```
 
 ## Ngôn ngữ
 
@@ -408,7 +554,9 @@ symbol.
    `risk_per_trade_fraction: 0.005` ngân sách rủi ro là 0.05 USD, trong khi lot tối thiểu của bất kỳ
    symbol nào ở trên đều rủi ro 1.93–4.24 USD (xem «Thực thi demo qua cầu nối loopback»), nên vòng
    lặp dừng ở `MINIMUM_LOT_EXCEEDS_RISK_BUDGET`. Hãy mở một tài khoản demo 10 000 USD hoặc nâng tỉ
-   lệ rủi ro một cách có ý thức và kiểm lại ngân sách.
+   lệ rủi ro một cách có ý thức và kiểm lại ngân sách. Trên tài khoản đang được dùng hiện nay
+   (114929502, 100 000 USD), cổng này được đi qua với một biên dư, và lệnh chặn chỉ còn đến từ thị
+   trường đóng cửa và ngày trong tuần bị chặn.
 10. Chỉ khi đó mới đáng chuẩn bị terminal cho việc thực thi demo:
     `python scripts/setup_demo_terminal.py` (dry run), rồi `--apply` khi terminal đã đóng, rồi gắn
     `CriticalConsensusEA_Demo` vào một biểu đồ bằng tay và bật AutoTrading.
@@ -418,7 +566,12 @@ symbol.
 - Swap, hoa hồng và chi phí qua đêm; trượt giá trong nến (lệnh mô phỏng khớp theo báo giá sau khi
   duyệt, bị giới hạn ở 10% khoảng cách stop); khớp một phần và requote vượt biên đó; trôi
   `tick_value` khi đồng tiền định giá biến động; broker đổi DST giữa lượt chạy (offset là hằng số
-  bạn khai báo); các mốc equity chỉ sống trong một tiến trình, không lưu qua lần khởi động lại.
+  bạn khai báo). Các mốc trong ngày được tính trong phạm vi tiến trình `PaperBroker` và không sống
+  qua một lần khởi động lại của lượt chạy paper; còn mốc rủi ro của demo-runner là ngoại lệ, cả theo
+  thiết kế lẫn theo test: `demo_risk_baseline` được ghi vào cùng nhật ký append-only và được khôi phục
+  theo ràng buộc `(login, server, ngày của broker)`, nên một lần khởi động lại tiến trình không xoá
+  sạch mốc đầu ngày và không kéo đỉnh equity lùi lại
+  (`test_risk_baselines_survive_runner_restart_and_are_scoped_to_the_broker_account`).
 - Package Python không có `order_send` hay bất kỳ đường ghi giao dịch nào; bước quét mã nguồn
   `test_package_source_contains_no_order_sending_surface` chỉ bao phủ package `mt5_agent`, còn các
   test subprocess riêng của CLI kiểm tra JSON của nó không bao giờ báo đã gửi lệnh. Template MQL5

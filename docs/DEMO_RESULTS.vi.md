@@ -88,6 +88,40 @@ nhà môi giới), và họ duy nhất sống sót ở đó — Bollinger(20, 2.
 lập** trên nến thật của nhà môi giới (−22,4% chỉ với 5 bps mỗi chiều). Số dư "live" của họ:
 1000 → 1004, 1000 → 996, 996,70, 998,33, +0,08, −0,57.
 
+## Đường truyền còn sống, thị trường đóng cửa: trạng thái ngày 2026-11-01
+
+Thay đổi lớn nhất trong ngày: đường "runner → bridge → EA" hoạt động, và đây là điều đo được chứ
+không phải giả định. EA `CriticalConsensusEA_Demo` trên đồ thị XAUUSD,H1 hỏi bridge mỗi 3 giây; việc
+bật stop bền vững qua `POST /v1/risk/kill-switch` đã tạo trong `MQL5/Logs/20261101.log` đúng những
+dòng mà một `GET` đã xác thực thành công phải tạo ra (`BLOCKED: kill switch is active or state is
+invalid.` theo nhịp hỏi), còn việc nhả stop bằng `--release-kill-switch` đã khiến chúng dừng lại.
+Trước khi dán token vào các ô tham số của đồ thị, cũng chính nhật ký đó báo `HTTP 401` ở mỗi tick.
+Phương pháp cùng ba kết luận sai mà nó loại trừ được mô tả trong [MT5_AGENT.md](MT5_AGENT.md).
+
+Những gì vẫn chưa khớp lệnh — và vì sao:
+
+| Phiên chạy | Lệnh | Trạng thái |
+|---|---|---|
+| Trình chạy demo MT5 | `python scripts/run_mt5_demo_trading.py --policy agent_data/live_gold_ema_policy.yaml --db agent_data/demo_live_20261101.db --symbols XAUUSD,XAGUSD,EURUSD,GBPUSD,BTCUSD --cycles 0 --interval-seconds 20 --execution auto` | nhật ký của tiến trình đó dừng ở 1386 bản ghi `agent_cycle` lúc 14:27:34 UTC, tất cả `OUTSIDE_TRADING_WINDOW` (luồng giá đóng băng từ thứ Sáu 23:59 và chính sách chặn Chủ nhật), `broker_order_sent: false`, vốn 100.000 không đổi, chuỗi hợp lệ; tệp lệnh đã giao `agent_data/demo_bridge/served.jsonl` không tồn tại — hàng đợi chưa giao gì cả |
+| Phiên chạy giấy đa sàn | `python standalone/scripts/live_multi_venue.py --interval-sec 60` | Bybit, OKX và Kraken, 6 ô (BTC và ETH trên mỗi sàn), EMA 50/200 + stop 2×ATR + target 2R, 0,5% của 10.000. Đang mở 6 vị thế (BTC 77.838,70–77.949,50; ETH 2.264,11–2.267,07), 0 lệnh đóng, số dư vẫn là 10.000,00: stop 2×ATR rộng hơn những gì cửa sổ quan sát được cho phép |
+| Danh mục live | `python standalone/live_portfolio.py --minutes 0 --interval-sec 30 --balance 10000` | 5 ô, chế độ `evidence`, 2 vị thế mở (gold SELL từ 3.898,90, EUR SELL), 0 lệnh đóng, vốn 9.996,17 lúc 14:45 UTC |
+
+Các con số trong bảng là ảnh chụp, không phải bất biến. Nhật ký ở dòng đầu dừng lại vì tiến trình đã
+ghi nó không còn giữ cầu nối: cổng `127.0.0.1:8000` hiện thuộc về một runner khác chạy cùng chính
+sách và cùng đường dẫn tombstone (nên cũng cùng `run_id`), và tiến trình đó ghi vào
+`agent_data/demo_live_mine.db`. Một lượt chạy đang sống thêm 12 bản ghi `agent_cycle` mỗi phút
+(4 công cụ × 3 chu kỳ), nên một con số như vậy chỉ có nghĩa kèm theo mốc thời gian của nó.
+
+Hai điểm cần nói thẳng sau bảng. Phiên đầu chạy trên tài khoản 114929502 (100.000 USD) — nên câu hỏi
+"vì sao không có gì mở" không còn là chuyện tính khối lượng, mà chỉ là thị trường đóng cửa cộng với
+một ngày trong tuần bị chặn. Hai phiên sau là các lệnh **giấy** trên giá công khai thật của các sàn
+crypto — chúng không đi qua MT5, không đi qua các cổng của agent, không chứng minh điều gì về việc
+khớp lệnh tại nhà môi giới; chúng chỉ chứng minh rằng quy tắc kịp theo một chuỗi sống. Tệp
+`agent_data/multi_venue.jsonl` trong ngày đã bị ba lần khởi động khác nhau ghi vào (nó không có cơ
+chế chống instance thứ hai): 3 × 6 = 18 dòng `OPEN` và không một dòng `CLOSE`, nên "18 lệnh mở" là số
+tổng hợp qua nhiều phiên chứ không phải lịch sử của một tiến trình; còn bộ đếm "6 mở, 0 đóng" trong
+các dòng tick là trạng thái của tiến trình hiện tại.
+
 ## Phiên chạy này chứng minh gì và không chứng minh gì
 
 Đã chứng minh: chuỗi "nến thật nhà môi giới → cổng chính sách → tính khối lượng → khớp lệnh giấy →
@@ -97,6 +131,11 @@ stop −18…−20 USD so với ngân sách 20 USD); không có lệnh nào tớ
 Chưa chứng minh: khớp lệnh thật tại nhà môi giới. Khi chạy, thị trường đóng cửa cuối tuần (tick
 EURUSD cuối đã quá tuổi cho phép 20,4 giờ, XAGUSD không có tick, US500 báo `trade_mode = 0`), nên
 đường `scripts/run_mt5_demo_trading.py` + `scripts/mt5_demo_bridge.py` + EA bị cổng `QUOTE_STALE`
-chặn — đó là hành vi đúng thiết kế, không phải kết quả khớp lệnh. EA cũng chưa gắn lên đồ thị và
-`Config/common.ini` chưa có allowlist, nên xác nhận khớp lệnh phía nhà môi giới vẫn là
-PENDING EXTERNAL.
+chặn (còn trong phiên chạy 2026-11-01 là `OUTSIDE_TRADING_WINDOW`) — đó là hành vi đúng thiết kế,
+không phải kết quả khớp lệnh. Khẳng định "EA chưa gắn lên đồ thị và `Config/common.ini` chưa có
+allowlist" tính đến ngày 2026-11-01 là **sai và đã được rút lại**: EA đã nằm trên đồ thị, còn
+`Enabled=1`, `WebRequest=1` cùng bốn địa chỉ loopback trong `WebRequestUrl` đã được kiểm lại trong
+file, và đường truyền được nhật ký xác nhận. Phía nhà môi giới vẫn chỉ chờ đúng một xác nhận: một
+lệnh có magic `8172026` kèm bình luận `CC:` trong chính lịch sử tài khoản. Đó vẫn là
+PENDING EXTERNAL, và khung thời gian đầu tiên mà một chu kỳ như vậy có thể xảy ra là thứ Hai
+2026-11-02 00:00 UTC.

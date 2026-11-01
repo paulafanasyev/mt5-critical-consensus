@@ -29,10 +29,12 @@ Other languages: [Русский](MT5_AGENT.md) · [Tiếng Việt](MT5_AGENT.vi
 | The `LiveMT5Backend` adapter maps terminal replies and subtracts the server offset | **PROVEN against a stubbed package** | `test_live_backend_*`, `test_cli_live_source_subtracts_the_server_offset` |
 | Reading a real MT5 terminal on this host | **PROVEN** | 2026-10-31: `MetaTrader5` 5.0.6231, `terminal64.exe` build 6296, demo account 10013404855 on `MetaQuotes-Demo` (balance 10.00 USD, leverage 100), live specifications and 120 H1 bars for EURUSD/GBPUSD/AUDUSD/NZDUSD/XAUUSD/XAGUSD; server offset 7200 s |
 | The demo EA compiles and installs into the terminal | **PROVEN** | 2026-10-31: `scripts/build_demo_ea.py` flipped exactly one gate line in a generated copy, MetaEditor reported 0 errors and 0 warnings, and `MQL5/Experts/CriticalConsensusEA_Demo.ex5` (37780 bytes) was installed |
-| The terminal configuration allows algo trading and loopback WebRequest | **PROVEN** | 2026-10-31: `Config/common.ini` carries `Enabled=1`, `WebRequest=1`, `WebRequestUrl=http://127.0.0.1:8000`, still UTF-16 LE with BOM and CRLF, byte-verified against a backup |
-| The EA actually polls the bridge (a real `WebRequest` from a chart) | **NOT PROVEN** | requires attaching the advisor to a chart by hand; `MQL5/Logs` contains no `OnInit` line from the demo EA. `WebRequest` does not execute in the Strategy Tester — that is an MT5 limitation, not a gap in this code |
-| A demo order executed by the broker | **NOT PROVEN** | on 2026-10-31 the market was closed (last EURUSD tick 2026-10-30T21:00:00Z), so every cycle blocked on `QUOTE_STALE`; no command was ever queued and every journal record says `broker_order_sent: false` |
-| Strategy profitability, and any trade-success rate | **NOT PROVEN** | backtest on a synthetic series; `confidence` is a heuristic score, not a calibrated probability. A 98% success rate is neither measured here nor achievable by this code |
+| The terminal configuration allows algo trading and loopback WebRequest | **PROVEN, but not durable** | 2026-10-31: `Config/common.ini` carries `Enabled=1`, `WebRequest=1`, `WebRequestUrl=http://127.0.0.1:8000`; the file is saved as UTF-16 LE with BOM and CRLF, byte-verified, with a backup next to it. Being overwritten by the live terminal is not a hypothesis for this file: on 2026-11-01 at 00:21 MT5 set `Enabled=0` and cleared `WebRequestUrl` after `setup_demo_terminal.py --apply` had applied the keys at 00:11. The current state was verified again on 2026-11-01: `Enabled=1`, `WebRequest=1`, `WebRequestUrl=http://127.0.0.1:8000;http://127.0.0.1;http://localhost:8000;http://localhost`. The permission has to be kept alive in a running terminal, not written into a file once |
+| The EA actually polls the bridge (a real `WebRequest` from a chart) | **PROVEN** | 2026-11-01 13:52–13:55 UTC, demo account 114929502 on `MetaQuotes-Demo`, `CriticalConsensusEA_Demo` on a XAUUSD,H1 chart. The check is described in "How to check the transport when the market is closed": arming the durable stop through the bridge made `MQL5/Logs/20261101.log` (UTF-16) print `BLOCKED: kill switch is active or state is invalid.` exactly at the 3 s poll period, and releasing the stop stopped those lines — that is, the advisor got HTTP 200 on `/v1/risk/kill-switch` and 204 on `/v1/execution/next` with the same `BridgeToken` that was typed into the chart fields. Before that token was entered, the same log showed `BLOCKED: kill-switch state unavailable; HTTP 401` |
+| Instrument names come from the broker, not from a guess | **PROVEN** | `resolve_broker_symbol` + `LiveMT5Backend.symbols()`/`use_broker_names` in `src/critical_consensus/mt5_agent/backend.py` and `scripts/run_mt5_demo_trading.py`; the tests in `tests/test_broker_symbol_alias.py` (11 of them). `XAUUSDm`/`XAUUSDc`/`xauusd` resolve to the server's own spelling, and several matches are a refusal, not a guess |
+| The advisor's and the runner's gate arithmetic agree | **PROVEN** | `scripts/ea_logic_mirror.py` — a line-by-line Python mirror of `CriticalConsensusEA.mq5`; `tests/test_ea_logic_parity.py` — 109 comparisons (required fields, number and identifier grammar, tokens, the loopback URL, tombstones, volume, a grid of 200 prices for SL/TP against `stops_level`). This test found a real rounding divergence in `price_gates`, and it is fixed |
+| A demo order executed by the broker | **NOT PROVEN** | the transport works, there is no queue: on 2026-11-01 the market has been closed since Friday 23:59 and the policy blocks Sunday, so every cycle yields `OUTSIDE_TRADING_WINDOW` and `broker_order_sent: false` in every record (1386 records as of 14:27:34 UTC, chain valid; the number is a snapshot — a live run writes 12 records a minute). The first cycle that could build a command is Monday 2026-11-02 00:00 UTC |
+| Strategy profitability, and any trade-success rate | **NOT PROVEN** | backtest on a synthetic series; `confidence` is a heuristic score, not a calibrated probability. A 98% success rate is neither measured here nor achievable by this code. Measured runs on real bars are loss-making ([DEMO_RESULTS.md](DEMO_RESULTS.md)) |
 | Execution on a real account | **NOT PROVEN and not implemented** | the Python package and the CLI contain no order-sending call, by design; the demo path refuses anything but a demo account (`AllowLiveExecution=false`, `require_demo`, the `ACCOUNT_TRADE_MODE` check), and a policy with `mode: live` is rejected at load |
 
 The local preview used while writing this document replays a **synthetic** EURUSD H1 series
@@ -41,6 +43,15 @@ same series with their own `make_bars()` helper. The tests exercise the journal 
 that series; any numbers they print illustrate mechanics, **not** a return estimate. Nothing here
 decides when real money may be used: that is a separate, explicit decision outside this code, and
 the current package cannot execute it either way.
+
+Check status as of 2026-11-01: `.venv\Scripts\python.exe -m pytest -q` — **971 passed, 10 skipped**
+(the skips need `TEST_DATABASE_URL` and/or `TEST_REDIS_URL`; the `.venv` interpreter is required
+rather than polite — part of the suite spawns `sys.executable` as a subprocess, so a system `python`
+without the installed package reports 36 `ModuleNotFoundError` failures instead of a result);
+`python scripts/check_mql5_safety.py` — **473 static
+advisor invariants and 105 rejected weakening mutations**. The static check does not compile the
+advisor source: MetaEditor is what confirms compilation, and only the broker confirms execution on
+an account.
 
 ## Package layout
 
@@ -181,9 +192,37 @@ Gates that must all hold before a command exists:
    answer.
 7. The advisor re-checks all of the above independently, plus the kill switch through a fresh GET,
    the TTL, its compile-time `ENABLE_DEMO_EXECUTION` gate, `AllowLiveExecution`, the symbol, the
-   volume and the stops, and it writes its idempotency tombstones before sending.
+   volume and the stops, and it writes its idempotency tombstones before sending. It checks its own
+   ceilings already at start-up and refuses to initialize when `PollSeconds` is outside 1–60,
+   `MaxVolume` outside (0; 0.20], `MaxSlippagePoints` outside 1–20, `MaxCommandTtlSeconds` outside
+   1–600, or `MagicNumber` is not positive: all of these values come from the chart fields, and an
+   advisor that accepts `MaxVolume = 100` would execute a size that nobody agreed to from either
+   side.
 8. An uncertain result (command served, no fill observed) stops the run and needs an explicit
    `--acknowledge-uncertain`; there is no code path that re-sends.
+
+### The advisor and the runner gate the same numbers
+
+A gap between "what Python checks" and "what MQL5 checks" is cheaper to close by computation than
+by attention. `scripts/ea_logic_mirror.py` is a line-by-line Python mirror of the advisor: the same
+`JsonString`/`JsonNumber`/`JsonTrue`/`JsonFalse` on top of the same flat JSON-object parser, the
+same grammar for numbers and identifiers, the same FNV-1a (it walks the UTF-16LE bytes, which is
+why `"a"` → `089BE207B544F1E4`, not ASCII), the same tombstone keys, the same loopback URL parsing
+and the same queue of checks in `ExecuteDemoCommand` — in the same order and with the same refusal
+texts. The tests in `tests/test_ea_logic_parity.py` (109 comparisons) compare that mirror against
+the live bridge (the real arm and disarm bodies are taken from the socket), against `json.loads`
+with a strict `NaN`/`Infinity` refusal, against the bridge's regular expressions, against the text
+of the `.mq5` itself (required fields, defaults, ceilings and the magic number are cross-checked
+three ways), and against a grid of 200 prices where entry and stop are rounded in opposite
+directions relative to `stops_level`.
+
+The very first such grid found a live defect on our side. MT5 hands the broker numbers rounded to
+`digits`, while `price_gates` compared unrounded ones against `stops_level`; at a price of 4000.005
+with a 1.02-point stop and a stops level of 2 points, Python blocked the command while the advisor
+would have accepted it. A gate that measures a number which never reaches the broker is not a gate.
+Now `broker_level()` rounds entry, stop and take profit exactly the way `NormalizeDouble` does
+(half away from zero), and every geometry, slippage and `stops_level` check runs on the rounded
+levels; the parity test requires the two sets of refusals to match across the whole grid.
 
 ### The emergency stop on the demo path
 
@@ -217,14 +256,86 @@ is still pulled after it.
   answer 503 (which the advisor treats as blocked), and a record that existed and then disappeared —
   a deleted file — is the same 503, never a fresh start. Deleting the state file therefore cannot
   disarm anything.
-- The first run that finds no record writes one from `kill_switch` in the policy, which is where an
-  operator's stated intent lives; a record an operator POSTed or an earlier halted run wrote is never
-  overwritten, because a stop somebody pulled outranks a policy that forgot it. The one thing held in
-  memory is an arm whose disk write failed: it keeps blocking (the answer says `MEMORY_ONLY`), and a
-  disarm whose write fails leaves the stop armed.
+- The first run that finds no record creates one **armed** (`kill_switch_reason: "SEEDED_ARMED"`),
+  not from the policy's `kill_switch` section. A policy describes how to trade, not permission to
+  trade; silence in a settings file cannot release a stop. A record an operator left over HTTP or a
+  halted run wrote is never overwritten. The one thing held in memory is an arm whose disk write
+  failed: it keeps blocking (the answer says `MEMORY_ONLY`), and a disarm whose write fails leaves
+  the stop armed.
 - Every outcome that stops a run arms the same durable record — an operator's "stop" at the
   confirmation prompt, an unconfirmed send, a duplicate command id — so finishing the process does
-  not finish the stop.
+  not finish the stop. A Ctrl-C that arrives after a command was already handed to the bridge is
+  not counted as a clean finale either: the run marks the command unconfirmed, arms that same
+  record and exits with code `4` (`interrupted_with_send_in_flight`), because only the broker's
+  deals know whether the order went out.
+
+### How to check the transport when the market is closed
+
+The transport is verified without a single trade, and that is exactly how it should be done rather
+than "wait for Monday". The advisor talks to the bridge on every timer tick, so the state of the
+stop is visible in its log:
+
+1. Start the runner and confirm that `terminal64.exe` is running, the advisor is attached to a
+   chart, and the AutoTrading button is on.
+2. Take a snapshot of the log: `MQL5/Logs/<YYYYMMDD>.log` is UTF-16, read it with
+   `iconv -f UTF-16LE -t UTF-8`.
+3. Arm the stop through the bridge: `POST /v1/risk/kill-switch` with `X-Bridge-Key` and a body of
+   `{"active": true, "reason": "…"}`; the answer must be 200 with `status: "PERSISTED"`,
+   `updated_at` and `event_hash`.
+4. Wait at least one poll period. The sign of health is lines of
+   `BLOCKED: kill switch is active or state is invalid.` at an even spacing; they mean the advisor
+   received and parsed the bridge's answer, i.e. the `BridgeToken` in the chart fields matches the
+   bridge key.
+5. Release the stop (`--release-kill-switch`, see above) and confirm that those lines stopped and
+   that there is no `Bridge returned HTTP` or `fail closed` line at all: silence after a release is
+   a 200 on the stop path and a 204 on the command path, so both routes are authenticated.
+
+Three false conclusions that already cost us time here: **an empty log is not a stopped advisor**
+(a healthy EA with the stop released and an empty queue writes nothing); **MT5 flushes its log with
+a delay**, so "no new lines" must be re-checked after half a minute instead of being declared at
+once; and `BLOCKED: kill-switch state unavailable; HTTP 401` is neither a missing market nor a
+missing command but exactly one thing: the key did not match.
+
+### Instrument names come from the broker
+
+`MetaQuotes-Demo` is not the reference spelling of an instrument, and the runner no longer pretends
+it is. A requested name is matched against what the server actually serves: an exact match wins,
+otherwise a six-character base (`XAUUSD`, `EURUSD`) is tried with suffixes of 1–3 characters, and
+which suffix a given broker uses is that server's question, not the code's. One request that
+several spellings match is resolved by refusal (`MT5 offers several variants of …; refusing to
+guess which one this account trades`) rather than by the first line of a list: `XAUUSD` and
+`XAUUSDc` are different instruments, and guessing means trading a cent lot instead of a full one.
+The rest of the run then uses the server's own spelling, the renaming is written to the journal as
+a `demo_symbol_alias` event, and the internal key name keeps two spellings from colliding in one
+table. That is why `EURUSDm` from an Exness group, `XAUUSDc` on a cent account and the lowercase
+`xauusd` stop being "symbol unavailable".
+
+### Observation 2026-11-01 (four instruments, real terminal, market closed)
+
+Demo account `114929502` on `MetaQuotes-Demo`, balance and equity 100 000 USD, leverage 100,
+`trade_allowed`. Policy `agent_data/live_gold_ema_policy.yaml`: `mode: paper`,
+`execution_mode: auto`, window 00:00–22:00 UTC, `blocked_weekdays_utc: [6]`. The run: 4 instruments
+× one cycle every 20 s, and that process's journal stops at **1386 `agent_cycle` records, at
+14:27:34 UTC**, every one with blocker `OUTSIDE_TRADING_WINDOW` and `broker_order_sent: false`,
+chain valid. The number is a snapshot, not an invariant: a live run writes 12 records a minute
+(4 instruments × 3 cycles), and by the time of this edit the bridge was held by a different runner
+with the same `run_id` — because the run id, the kill-switch file and the served-id history all
+derive from the tombstone path, not from a process number.
+
+`BTCUSD` is deliberately absent from that list: the
+broker does not offer it (`MetaQuotes-Demo` does not trade crypto), and the runner writes the
+unavailability as its own line instead of silently dropping the instrument.
+
+That journal contains no `KILL_SWITCH_ACTIVE` blocker at all, and the reason is not a dead stop: on
+the demo path the stop has two different carriers. Gate 2 of the cycle order reads the
+`kill_switch` section of the **policy** (`agent_data/live_gold_ema_policy.yaml` declares
+`active: false`), while the durable `kill_switch.json` is checked by `DemoExecutor.offer()` — the
+only place a command is ever built. With the market closed the cycle dies at the window gate and
+never reaches `offer()`, so the stop armed from 13:52 to 14:27:59 UTC left no trace in the decision
+journal; it left one in the advisor's log, which is exactly why transport is verified from the EA
+log rather than from a blocker counter. That same log shows the block comes from the window, not
+from broken transport: before 13:52 UTC the lines said `HTTP 401`, after the token was entered they
+said `kill switch is active`, and after the release there was silence.
 
 ### Live observation on 2026-10-31 (`--symbols all`, real terminal)
 
@@ -247,17 +358,25 @@ specifications and the live H1 bars (a calculation, not a measured refusal): the
 minimum lot is 3.27 USD on EURUSD, 3.35 on GBPUSD, 1.93 on AUDUSD, 1.98 on NZDUSD, 3.97 on XAUUSD
 and 4.24 on XAGUSD. Every symbol would stop at `MINIMUM_LOT_EXCEEDS_RISK_BUDGET`. A 10 USD demo
 account cannot host a single policy-compliant trade; at 10 000 USD the same 0.5% gives a 50 USD
-budget and those numbers pass.
+budget and those numbers pass. From 2026-11-01 the run is on account 114929502 with a 100 000 USD
+balance, which is exactly why "why is nothing executing" is no longer a sizing question: it is only
+a question of the closed market and the blocked weekday.
 
 ### Running it
+
+Secrets come from the environment only. Neither a `--bridge-token` nor an admin token on the
+command line exists: an argument line is visible to the other users of the host and lands in a
+`Win32_Process` snapshot, and neither the bridge state file nor the journal writes the key or the
+response body.
 
 ```powershell
 # 1. the terminal must be CLOSED: MT5 rewrites common.ini when it exits
 python scripts/setup_demo_terminal.py                       # dry run: what would change
-python scripts/setup_demo_terminal.py --apply               # build, install, allow loopback WebRequest
+python scripts/setup_demo_terminal.py --apply               # build, install the EA, allow WebRequest
 # 2. start the terminal, log into the demo account, attach CriticalConsensusEA_Demo to a chart by hand
-# 3. turn the AutoTrading button on and keep the runner alive
+# 3. turn AutoTrading on and keep the bridge open
 $env:MT5_BRIDGE_TOKEN = "<24-256 characters>"
+$env:MT5_KILL_SWITCH_ADMIN_TOKEN = "<at least 32 characters, different from the bridge key>"
 python scripts/run_mt5_demo_trading.py --policy agent_data/live_demo_policy.yaml `
   --db agent_data/mt5_demo.db --symbols all --cycles 0 --execution confirm --verbose
 ```
@@ -266,7 +385,35 @@ python scripts/run_mt5_demo_trading.py --policy agent_data/live_demo_policy.yaml
 commands simply expire under the TTL — the journal reports them honestly as `expired`, and no order
 reaches the broker. The AutoTrading button and `[Experts] Enabled=1` are two different switches: the
 GUI button turns off everything, so `setup_demo_terminal.py` has to be re-run after any toggle made
-inside the terminal.
+inside the terminal; the transport check in the section above is precisely what separates "no
+market" from "no permission".
+
+The state paths and the run id do not depend on where the process was launched from. `--tombstones`
+is resolved against the repository root, not the current directory, so a `cd` cannot move either the
+stop file or the history of served ids; and the run id is derived by default from that path plus the
+policy file instead of being random. That matters because `client_order_id` is built from it: a
+random id per process would make every restart "the first order of its life", and the
+duplicate-signal protection would stop protecting anything.
+
+The runner's exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | the run finished because of `--cycles` or was stopped by the operator, and no command was left unconfirmed |
+| `2` | the configuration was rejected before the run ever reached the market (policy, account binding, a missing or too short admin token with `--release-kill-switch`) |
+| `3` | the run cannot start honestly: not one instrument is allowed by the broker, the bridge cannot open its `127.0.0.1` socket, the terminal's deal history cannot be read while commands were served, or the tombstones still hold served commands without a confirmed fill, which needs an explicit `--acknowledge-uncertain` |
+| `4` | Ctrl-C after the command had already gone to the bridge (`interrupted_with_send_in_flight`): the same durable stop is armed, and that id may be touched again only after reconciling with the broker's deals |
+
+An armed kill switch is neither an exit code nor a pause: the run prints the reason once at startup
+and keeps counting cycles, because the durable stop lives in `offer()` and `offer()` runs only when
+a signal already exists (the two carriers of the stop are described in the 2026-11-01 observation).
+
+Releasing the stop while no runner is alive is possible only through the separate secret:
+
+```powershell
+python scripts/run_mt5_demo_trading.py --policy agent_data/live_demo_policy.yaml `
+  --db agent_data/mt5_demo.db --release-kill-switch
+```
 
 ## Languages
 
@@ -420,7 +567,9 @@ and the account identity, not the symbol specification.
    `risk_per_trade_fraction: 0.005` the risk budget is 0.05 USD, while the minimum lot of any of
    the symbols above risks 1.93–4.24 USD (see "Demo execution over the loopback bridge"), so the
    cycle stops at `MINIMUM_LOT_EXCEEDS_RISK_BUDGET`. Either open a 10 000 USD demo or raise the
-   risk fraction knowingly and re-check the budget.
+   risk fraction knowingly and re-check the budget. On the account actually in use now (114929502,
+   100 000 USD) this gate passes with margin, and the only block left comes from the closed market
+   and the blocked weekday.
 10. Only then is it worth preparing the terminal for demo execution:
     `python scripts/setup_demo_terminal.py` (dry run), then `--apply` with the terminal closed,
     then attaching `CriticalConsensusEA_Demo` to a chart by hand and switching AutoTrading on.
@@ -430,7 +579,12 @@ and the account identity, not the symbol specification.
 - Swap, commission and financing; intra-bar slippage (paper fills use the post-approval quote,
   bounded to 10% of the stop distance); partial fills and requotes beyond that bound;
   `tick_value` drift when a quote currency moves; broker DST changes mid-run (the offset is a
-  constant you declare); baselines are per process, not persisted across restarts.
+  constant you declare). Intraday baselines live inside the `PaperBroker` process and do not survive
+  a restart of a paper run; the demo runner's risk baselines are the exception both by design and by
+  test: `demo_risk_baseline` is written to that same append-only journal and restored per
+  `(login, server, broker day)`, so a process restart neither zeroes the daily baseline nor rolls
+  back the equity peak
+  (`test_risk_baselines_survive_runner_restart_and_are_scoped_to_the_broker_account`).
 - No `order_send` or any other trading write in the Python package; the source scan
   `test_package_source_contains_no_order_sending_surface` covers the `mt5_agent` package only,
   while the CLI's own subprocess tests assert its JSON never reports a sent order. The MQL5

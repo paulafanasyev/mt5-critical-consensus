@@ -87,6 +87,39 @@ collapse out-of-sample (PF 1.4 → 0.48), gold is mean-reverting (their lag-1 �
 +7.1% — **does not reproduce** on the broker's real bars (−22.4% already at 5 bps per side). Their
 "live" outcome balances: 1000 → 1004, 1000 → 996, 996.70, 998.33, +0.08, −0.57.
 
+## The transport is alive, the market is closed: state as of 2026-11-01
+
+The main change of the day: the path "runner → bridge → EA" works, and this is measured, not
+assumed. The EA `CriticalConsensusEA_Demo` on the XAUUSD,H1 chart polls the bridge every 3 s;
+arming the durable stop through `POST /v1/risk/kill-switch` produced in `MQL5/Logs/20261101.log`
+exactly the lines an authenticated `GET` must produce (`BLOCKED: kill switch is active or state
+is invalid.` on the poll cadence), and releasing it with `--release-kill-switch` stopped them.
+Before the token was pasted into the chart inputs the same log gave `HTTP 401` on every tick. The
+method and the three false conclusions it rules out are described in [MT5_AGENT.md](MT5_AGENT.md).
+
+What does not execute despite that — and why:
+
+| Run | Command | State |
+|---|---|---|
+| MT5 demo runner | `python scripts/run_mt5_demo_trading.py --policy agent_data/live_gold_ema_policy.yaml --db agent_data/demo_live_20261101.db --symbols XAUUSD,XAGUSD,EURUSD,GBPUSD,BTCUSD --cycles 0 --interval-seconds 20 --execution auto` | that process's journal stops at 1386 `agent_cycle` records, at 14:27:34 UTC, all `OUTSIDE_TRADING_WINDOW` (feed frozen since Friday 23:59 and the policy blocks Sunday), `broker_order_sent: false`, equity 100,000 unchanged, chain valid; the served-command file `agent_data/demo_bridge/served.jsonl` does not exist — the queue never served anything |
+| Multi-venue paper run | `python standalone/scripts/live_multi_venue.py --interval-sec 60` | Bybit, OKX and Kraken, 6 slots (BTC and ETH on each), EMA 50/200 + a 2×ATR stop + a 2R target, 0.5% of 10,000. 6 positions open (BTC 77,838.70–77,949.50; ETH 2,264.11–2,267.07), 0 closed, the bankroll stays 10,000.00: a 2×ATR stop is wider than what the observed window allowed |
+| Live portfolio | `python standalone/live_portfolio.py --minutes 0 --interval-sec 30 --balance 10000` | 5 slots, `evidence` mode, 2 open positions (gold SELL from 3,898.90, EUR SELL), 0 closed, equity 9,996.17 at 14:45 UTC |
+
+The numbers in that table are a snapshot, not an invariant. The journal in the first row is stopped
+because the process that wrote it no longer holds the bridge: port `127.0.0.1:8000` is now
+held by a different runner on the same policy and the same tombstone path — hence the same `run_id` —
+and that one writes to `agent_data/demo_live_mine.db`. A live run adds 12 `agent_cycle` rows a minute
+(4 instruments × 3 cycles), so such a figure only means anything together with its timestamp.
+
+Two honest caveats after the table. The first run goes on account 114929502 (100,000 USD) — so
+"why is nothing opening" is no longer a sizing question, only a closed market plus a blocked
+weekday. The last two runs are **paper** trades on real public crypto-exchange prices: they do not
+go through MT5, do not go through the agent's gates and prove nothing about broker execution; they
+prove only that the rule can keep up with a live series. `agent_data/multi_venue.jsonl` was written
+during the day by three different launches (it has no single-instance guard): 3 × 6 = 18 `OPEN` lines
+and no `CLOSE` line, so "18 opens" is an aggregate over sessions and not one process's history, while
+the "6 open, 0 closed" counters in the ticks are the current process's state.
+
 ## What this run proves and what it does not
 
 Proven: the chain "real broker bars → policy gates → sizing → paper execution → hash-linked journal"
@@ -96,6 +129,11 @@ against a 20 USD budget); no order reached a broker.
 Not proven: live execution at the broker. At the time of the run the market was closed for the
 weekend (the last EURUSD tick was 20.4 hours past the allowed age, XAGUSD had no tick, US500 reported
 `trade_mode = 0`), so the path `scripts/run_mt5_demo_trading.py` + `scripts/mt5_demo_bridge.py` + the
-EA is blocked by the `QUOTE_STALE` gate — that is expected behaviour, not an execution result. The EA
-is also not attached to a chart and `Config/common.ini` carries no allowlist yet, so broker-side
-execution confirmation remains PENDING EXTERNAL.
+EA is blocked by the `QUOTE_STALE` gate (and in the 2026-11-01 run by `OUTSIDE_TRADING_WINDOW`) —
+that is expected behaviour, not an execution result. The claim that "the EA is not attached to a
+chart and `Config/common.ini` carries no allowlist" is, as of 2026-11-01, **untrue and withdrawn**:
+the EA is on the chart, and `Enabled=1`, `WebRequest=1` and four loopback origins in `WebRequestUrl`
+were re-verified in the file, with the transport confirmed by the log. Only one thing still awaits
+broker-side confirmation: a deal with magic `8172026` and a `CC:` comment in the account's own
+history. That remains PENDING EXTERNAL, and the first window where such a cycle is possible at all
+is Monday 2026-11-02 00:00 UTC.
