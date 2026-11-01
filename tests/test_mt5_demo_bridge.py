@@ -830,6 +830,52 @@ def test_a_stop_released_elsewhere_is_seen_without_a_restart(tmp_path, clock):
     assert watcher.payload() == {"kill_switch_active": False, "kill_switch_reason": "checked"}
 
 
+def test_each_switch_write_gets_its_own_temporary_file(tmp_path, clock, monkeypatch):
+    """Two stores on one path must not meet on one scratch name.
+
+    A fixed ``.tmp`` name is a rendezvous: whichever process renames first hands the other's
+    half-written body to the state path, which is exactly the corruption the file is supposed
+    to make loud rather than cause.
+    """
+    module = _bridge()
+    path = tmp_path / "kill_switch.json"
+    store = module.KillSwitchStore(path)
+    names: list[str] = []
+    real_mkstemp = module.tempfile.mkstemp
+
+    def spy(**kwargs):
+        descriptor, name = real_mkstemp(**kwargs)
+        names.append(name)
+        return descriptor, name
+
+    monkeypatch.setattr(module.tempfile, "mkstemp", spy)
+    store.record(active=True, actor_id="operator", reason="first", now=clock())
+    store.record(active=False, actor_id="admin", reason="second", now=clock())
+    assert len(names) == 2 and len(set(names)) == 2
+    assert all(Path(name).parent == path.parent for name in names)
+    assert not [leftover for leftover in path.parent.iterdir() if leftover != path]
+    assert json.loads(path.read_text(encoding="utf-8"))["kill_switch_reason"] == "second"
+
+
+def test_a_failed_switch_rename_leaves_the_old_record_and_no_scratch(tmp_path, clock,
+                                                                     monkeypatch):
+    module = _bridge()
+    path = tmp_path / "kill_switch.json"
+    store = module.KillSwitchStore(path)
+    store.record(active=False, actor_id="admin", reason="checked", now=clock())
+
+    def refuse(*_args, **_kwargs):
+        raise OSError("rename blocked")
+
+    monkeypatch.setattr(module.os, "replace", refuse)
+    with pytest.raises(OSError):
+        store.record(active=True, actor_id="operator", reason="breaker", now=clock())
+    assert json.loads(path.read_text(encoding="utf-8"))["kill_switch_reason"] == "checked"
+    assert not [leftover for leftover in path.parent.iterdir() if leftover != path]
+    # The arm still holds in this process even though the rename failed.
+    assert store.payload()["kill_switch_active"] is True
+
+
 @pytest.mark.parametrize("reason, expected", [
     ('quoted "stop" and \\backslash', "quoted stop and backslash"),
     ("line\nbreak\tand tab", "line break and tab"),

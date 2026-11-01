@@ -30,6 +30,13 @@ armed.
 An interrupt is not a clean finish either: a Ctrl-C that lands after a command reached the
 bridge queues that command as unconfirmed, arms the durable stop and exits 4, because only
 the broker's deals can say whether the EA sent the order.
+
+What makes those two records durable is where they live. ``--tombstones`` is resolved against
+the repository rather than the directory the command was typed in, so no `cd` can move the
+stop or the served-id history, and the default run id is derived from that state path plus the
+policy file. The id matters because the order ids are built from it: a random one per process
+would make every restart look like a first-ever order to the bridge, and the refusal that
+stops a duplicate signal from being sent twice would only ever have protected one process.
 """
 from __future__ import annotations
 
@@ -48,6 +55,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _SCRIPTS_DIR.parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
@@ -119,6 +127,32 @@ def client_order_id_for(run_id: str, proposal: Mapping[str, Any], volume: float)
                            f"{float(volume):.8f}", f"{float(proposal['entry_price']):.10f}",
                            f"{float(proposal['stop_loss']):.10f}",
                            f"{float(proposal['take_profit']):.10f}")[:28]
+
+
+def resolve_state_path(raw: str | Path) -> Path:
+    """Pin durable state to the repository, not to whichever directory the command was typed in.
+
+    The tombstones and the kill switch beside them are the only memory that outlives a
+    process: which order ids were already served, and whether an operator pulled the stop.
+    Resolved against the current directory, the same command would trade against a different
+    record set depending on where it was launched from, and running it from an empty
+    directory would look exactly like a first-ever run.
+    """
+    path = Path(raw)
+    return path if path.is_absolute() else (_REPO_ROOT / path).resolve()
+
+
+def default_run_id_for(tombstones_path: str | Path, policy_path: str | Path) -> str:
+    """A run id that survives a restart, because the order ids are built from it.
+
+    ``client_order_id_for`` is deterministic in (run id, signal, volume) so the bridge can
+    refuse a second order for the same signal. A random run id would keep that promise only
+    inside one process: restart after an unknown outcome and the retry carries a fresh id the
+    tombstones have never seen, which is how a dedup guard becomes a duplicate order. Deriving
+    the id from the state file and the policy still separates different accounts and policies.
+    """
+    return "demo-" + _digest(str(resolve_state_path(tombstones_path)),
+                             str(Path(policy_path).resolve()))[:12]
 
 
 def permission_id_for(run_id: str, policy_version: int) -> str:
@@ -1248,6 +1282,7 @@ def main(argv: list[str] | None = None) -> int:
         language = _policy_language(policy, args)
         args._fallback_language = language
         _validate_run_args(args, language)
+        args.tombstones = str(resolve_state_path(args.tombstones))
         if not policy.require_demo or policy.mode not in ("observe", "paper"):
             raise ValueError(text("runner.policy_gate", language))
         if args.execution is not None:
@@ -1266,7 +1301,7 @@ def main(argv: list[str] | None = None) -> int:
         print(text("out.error", language, reason=str(exc)), file=sys.stderr)
         return 2
 
-    run_id = args.run_id or f"demo-{uuid.uuid4().hex[:8]}"
+    run_id = args.run_id or default_run_id_for(args.tombstones, args.policy)
     if args.release_kill_switch:
         # Lifting a stop is not a trade: no terminal, no journal, no bridge, no cycle runs.
         return _release_kill_switch(args, language, token)

@@ -40,7 +40,6 @@ symbol: EURUSD
 timeframe: H1
 history_bars: 120
 server_utc_offset_seconds: 0
-require_demo: true
 kill_switch: {active: false, reason: runner test}
 schedule: {blocked_weekdays_utc: [], window_start_minute_utc: 0, window_end_minute_utc: 1440}
 symbol_spec: {symbol: EURUSD, point: 0.00001, digits: 5, tick_size: 0.00001,
@@ -978,6 +977,55 @@ def test_acceptable_run_arguments_pass():
     runner._validate_run_args(args_namespace(ttl_seconds=600, cycles=0), "vi")
 
 
+def test_relative_durable_state_is_anchored_to_the_repository(tmp_path):
+    """A `cd` must not move the tombstones, or a stop armed elsewhere stops existing.
+
+    The default ``--tombstones`` is written relative, so resolved against the current
+    directory the same command would trade against a different record set — and from an empty
+    directory it would look like a first-ever run, which after #68 is a run that arms a stop.
+    """
+    anchored = runner.resolve_state_path("agent_data/demo_bridge/served.jsonl")
+    assert anchored == (runner._REPO_ROOT / "agent_data" / "demo_bridge"
+                        / "served.jsonl").resolve()
+    assert anchored.is_absolute()
+    assert runner.resolve_state_path(tmp_path / "served.jsonl") == tmp_path / "served.jsonl"
+
+
+def test_the_default_run_id_is_reused_by_the_next_process(tmp_path):
+    module_root = tmp_path / "state"
+    module_root.mkdir()
+    policy_path = tmp_path / "policy.yaml"
+    policy_path.write_text(POLICY_YAML, encoding="utf-8")
+    first = runner.default_run_id_for(module_root / "served.jsonl", policy_path)
+    assert first.startswith("demo-")
+    assert first == runner.default_run_id_for(module_root / "served.jsonl", policy_path)
+    # A different state file or a different policy is a different set of orders, not a replay.
+    assert first != runner.default_run_id_for(module_root / "other.jsonl", policy_path)
+    gold = tmp_path / "gold.yaml"
+    gold.write_text(POLICY_YAML.replace("symbol: EURUSD", "symbol: XAUUSD"), encoding="utf-8")
+    assert first != runner.default_run_id_for(module_root / "served.jsonl", gold)
+
+
+def test_the_command_line_reuses_one_run_id_across_two_processes(tmp_path, monkeypatch):
+    """Restarting without ``--run-id`` must not mint order ids the tombstones have never seen."""
+    policy_path = tmp_path / "policy.yaml"
+    policy_path.write_text(POLICY_YAML, encoding="utf-8")
+    monkeypatch.setenv(runner.BRIDGE_TOKEN_ENV, TOKEN)
+    monkeypatch.setattr(runner, "DemoTerminal", lambda **_kwargs: FakeTerminal())
+    seen: list[str] = []
+    monkeypatch.setattr(runner, "_run",
+                        lambda *_args, **_kwargs: seen.append(_args[4]) or 0)
+    argv = ["--policy", str(policy_path), "--db", str(tmp_path / "journal.db"),
+            "--tombstones", str(tmp_path / "served.jsonl"), "--language", "en"]
+    assert runner.main(list(argv)) == 0
+    assert runner.main(list(argv)) == 0
+    assert len(seen) == 2 and len(set(seen)) == 1
+    assert seen[0].startswith("demo-")
+    explicit = argv + ["--run-id", "operator-chosen"]
+    assert runner.main(explicit) == 0
+    assert seen[-1] == "operator-chosen"
+
+
 def test_language_resolution_order_is_flag_then_environment_then_default(monkeypatch):
     monkeypatch.setenv("MT5_AGENT_LANGUAGE", "en")
     assert runner._argv_language(["--language", "vi"]) == "vi"
@@ -1011,6 +1059,9 @@ def test_a_missing_bridge_token_fails_cleanly_without_creating_the_journal(tmp_p
     assert result.returncode == 2
     assert "Traceback" not in result.stderr
     assert not (tmp_path / "journal.db").exists()
+    # The refusal is the missing secret, not a policy that failed to load: the run has to say
+    # which gate stopped it, or an operator reads a green policy and a real failure alike.
+    assert text("runner.bridge_token_missing", "ru") in result.stderr
 
 
 # ------------------------------------------------------------------- startup gates

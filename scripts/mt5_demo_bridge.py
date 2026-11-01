@@ -21,6 +21,7 @@ import ipaddress
 import json
 import os
 import re
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -355,13 +356,28 @@ class KillSwitchStore:
 
     def _write(self, record: Mapping[str, Any]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self._path.with_name(self._path.name + ".tmp")
         body = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-            handle.write(body + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, self._path)
+        # Each write gets its own temporary file. A single shared ``.tmp`` name is a
+        # rendezvous between any two processes pointed at this path: one can rename the
+        # other's half-written body, or unlink the file it is still filling, and the atomic
+        # rename stops being atomic. An unrenamed temporary is removed below; if that fails
+        # too, the name is unique enough to leave for the next operator to find.
+        descriptor, temporary_name = tempfile.mkstemp(dir=str(self._path.parent),
+                                                      prefix=self._path.name + ".",
+                                                      suffix=".tmp")
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(body + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self._path)
+        except BaseException:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+            raise
         # From this moment the state exists, so its later disappearance is corruption.
         self._known = True
 
