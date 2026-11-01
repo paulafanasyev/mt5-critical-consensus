@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -534,11 +535,25 @@ class DemoBridge:
                     # MQL5's WebRequest sends only the headers it is given, so the EA
                     # arrives without a Host header. A browser cannot omit Host, so the
                     # DNS-rebinding rule below still covers every request that can come
-                    # from a page; the socket itself is bound to loopback.
-                    return self.client_address[0] in {"127.0.0.1", "::1"}
+                    # from a page; the socket itself is bound to loopback. The address
+                    # is normalised because a dual-stack peer shows up as ::ffff:127.0.0.1.
+                    try:
+                        return ipaddress.ip_address(self.client_address[0]).is_loopback
+                    except ValueError:
+                        return False
                 # Refuse DNS-rebinding style requests: the only hosts this bridge answers
-                # for are the loopback names it is bound to.
-                return host in {f"127.0.0.1:{bridge.port}", f"localhost:{bridge.port}"}
+                # for are the loopback names it is bound to. MQL5 puts the bare address in
+                # Host ("127.0.0.1"), so a missing port is the same name, not a foreign one;
+                # a port that is present must still be the bridge's own.
+                if host.startswith("["):
+                    end = host.find("]")
+                    name = host[: end + 1] if end != -1 else host
+                    port_text = host[end + 2:] if end != -1 and host[end + 1:end + 2] == ":" else ""
+                else:
+                    name, _, port_text = host.partition(":")
+                if name not in {"127.0.0.1", "localhost", "[::1]"}:
+                    return False
+                return port_text == "" or (port_text.isdigit() and int(port_text) == bridge.port)
 
             def _authorized(self) -> bool:
                 if self.headers.get("Origin"):

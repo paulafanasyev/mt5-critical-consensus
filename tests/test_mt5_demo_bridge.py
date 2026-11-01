@@ -406,14 +406,32 @@ def test_a_bad_or_missing_token_is_unauthorized(make_bridge, clock):
 def test_a_foreign_host_header_is_refused(make_bridge):
     module = _bridge()
     bridge = make_bridge().start()
-    for host in ("evil.example:8000", "127.0.0.1", f"127.0.0.1:{bridge.port + 1}"):
+    for host in ("evil.example:8000", "evil.example", f"192.168.1.5:{bridge.port}"):
         status, body, _ = _request(bridge, "GET", module.KILL_SWITCH_PATH,
                                    headers={"Host": host})
         assert status == 403
         assert _json(body) == {"error": "host_not_allowed"}
+    for host in (f"localhost:{bridge.port}", "localhost", "127.0.0.1", f"127.0.0.1:{bridge.port}"):
+        status, _, _ = _request(bridge, "GET", module.KILL_SWITCH_PATH,
+                                headers={"Host": host})
+        assert status == 200
+
+
+def test_mql5_bare_host_header_is_accepted(make_bridge):
+    """MQL5 WebRequest sends ``Host: 127.0.0.1`` - the bare address, no port.
+
+    The bridge refused that as host_not_allowed, so every EA poll was a 403 while a
+    browser or a script that fills in the port was served. A bare loopback name is the
+    same host, not a foreign one; a foreign name is still refused.
+    """
+    module = _bridge()
+    bridge = make_bridge().start()
     status, _, _ = _request(bridge, "GET", module.KILL_SWITCH_PATH,
-                            headers={"Host": f"localhost:{bridge.port}"})
+                            headers={"Host": "127.0.0.1"})
     assert status == 200
+    status, body, _ = _request(bridge, "GET", module.KILL_SWITCH_PATH,
+                               headers={"Host": "evil.example"})
+    assert status == 403 and _json(body) == {"error": "host_not_allowed"}
 
 
 def test_a_request_without_a_host_header_is_served(make_bridge):
