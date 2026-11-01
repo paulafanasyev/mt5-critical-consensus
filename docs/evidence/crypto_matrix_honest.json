@@ -1,0 +1,106 @@
+{
+  "BTCUSDT": {
+    "sma": {
+      "trades": 170,
+      "wins": 46,
+      "pnl": -1557.78,
+      "return": -0.1558
+    },
+    "ema": {
+      "trades": 149,
+      "wins": 38,
+      "pnl": -1675.41,
+      "return": -0.1675
+    },
+    "bollinger": {
+      "trades": 147,
+      "wins": 43,
+      "pnl": -956.88,
+      "return": -0.0957
+    },
+    "donchian": {
+      "trades": 125,
+      "wins": 33,
+      "pnl": -1294.85,
+      "return": -0.1295
+    }
+  },
+  "ETHUSDT": {
+    "sma": {
+      "trades": 178,
+      "wins": 42,
+      "pnl": -2280.05,
+      "return": -0.228
+    },
+    "ema": {
+      "trades": 175,
+      "wins": 47,
+      "pnl": -1569.25,
+      "return": -0.1569
+    },
+    "bollinger": {
+      "trades": 135,
+      "wins": 40,
+      "pnl": -812.66,
+      "return": -0.0813
+    },
+    "donchian": {
+      "trades": 130,
+      "wins": 34,
+      "pnl": -1303.08,
+      "return": -0.1303
+    }
+  },
+  "SOLUSDT": {
+    "sma": {
+      "trades": 148,
+      "wins": 58,
+      "pnl": 1246.32,
+      "return": 0.1246
+    },
+    "ema": {
+      "trades": 186,
+      "wins": 54,
+      "pnl": -1231.6,
+      "return": -0.1232
+    },
+    "bollinger": {
+      "trades": 134,
+      "wins": 45,
+      "pnl": -73.76,
+      "return": -0.0074
+    },
+    "donchian": {
+      "trades": 125,
+      "wins": 40,
+      "pnl": -276.62,
+      "return": -0.0277
+    }
+  },
+  "XRPUSDT": {
+    "sma": {
+      "trades": 193,
+      "wins": 50,
+      "pnl": -784.51,
+      "return": -0.0785
+    },
+    "ema": {
+      "trades": 192,
+      "wins": 55,
+      "pnl": -777.45,
+      "return": -0.0777
+    },
+    "bollinger": {
+      "trades": 141,
+      "wins": 38,
+      "pnl": -399.49,
+      "return": -0.0399
+    },
+    "donchian": {
+      "trades": 144,
+      "wins": 45,
+      "pnl": -322.18,
+      "return": -0.0322
+    }
+  }
+}

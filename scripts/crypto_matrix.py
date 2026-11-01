@@ -58,8 +58,9 @@ def fetch_bars(symbol: str, bars: int) -> list:
                       close=float(item[4]), tick_volume=int(float(item[5])),
                       # The paper broker prefers the bar's spread over the spec's, so the
                       # round-trip taker fee has to be carried here or it is not charged
-                      # at all. 0.2% of price, capped by the policy's spread gate.
-                      spread_points=max(1, min(round(float(item[4]) * 0.002 / tick), 9_999)))
+                      # at all: 0.2% of price (0.1% per side), uncapped - the policy's own
+                      # spread gate is raised to accept a high-priced asset's real fee.
+                      spread_points=max(1, round(float(item[4]) * 0.002 / tick)))
             for item in batch
         ] + rows
         end_time = batch[0][0] - 1
@@ -111,7 +112,7 @@ risk:
   max_daily_loss_fraction: 0.25
   max_drawdown_fraction: 0.5
   min_risk_reward: 1.5
-  max_spread_points: 10000
+  max_spread_points: 10000000
   max_quote_age_seconds: 300
 
 strategy:

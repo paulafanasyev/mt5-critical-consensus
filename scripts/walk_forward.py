@@ -188,7 +188,8 @@ def main(argv: list[str] | None = None) -> int:
         report[family] = rows
         cells = " ".join(f"{row['return'] * 100:+6.1f}%" for row in rows)
         positive = sum(1 for row in rows if row["return"] > 0)
-        print(f"{family:10} warmup={warmup:4} folds: {cells}   positive {positive}/{len(rows)}")
+        print(f"{family:10} warmup={warmup:4} folds (marked to market, not closed): "
+              f"{cells}   positive {positive}/{len(rows)}")
 
     if args.report:
         Path(args.report).write_text(json.dumps(report, indent=2), encoding="utf-8")

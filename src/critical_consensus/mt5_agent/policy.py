@@ -143,7 +143,7 @@ class RiskLimits:
                   low=0.0001, high=0.25)
         _fraction(self.max_drawdown_fraction, name="max_drawdown_fraction", low=0.001, high=0.5)
         _fraction(self.min_risk_reward, name="min_risk_reward", low=0.5, high=50.0)
-        _integer(self.max_spread_points, name="max_spread_points", low=0, high=10_000)
+        _integer(self.max_spread_points, name="max_spread_points", low=0, high=10_000_000)
         _integer(self.max_quote_age_seconds, name="max_quote_age_seconds", low=1, high=300)
         if self.max_daily_loss_fraction > self.max_drawdown_fraction:
             raise ValueError("max_daily_loss_fraction cannot exceed max_drawdown_fraction")
