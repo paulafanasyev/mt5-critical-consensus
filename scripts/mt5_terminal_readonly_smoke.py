@@ -82,32 +82,46 @@ def run_probe(
     if not 10_000 <= timeout_ms <= 600_000:
         raise ProbeError("MT5_INITIALIZE_TIMEOUT_MS must be between 10000 and 600000")
 
-    kwargs: dict[str, Any] = {
-        "login": login,
-        "password": password,
-        "server": server.strip(),
-        "timeout": timeout_ms,
-    }
+    # Establish local terminal IPC separately from broker authentication.
+    # This distinguishes terminal/IPC failures from credential or server-discovery failures.
+    kwargs: dict[str, Any] = {"timeout": timeout_ms}
     if terminal_path:
         kwargs["path"] = terminal_path
-    if os.environ.get("MT5_PORTABLE", "").strip() == "1":
-        kwargs["portable"] = True
-
     try:
         initialized = bool(mt5.initialize(**kwargs))
     except Exception:
         raise ProbeError("MetaTrader5.initialize raised an exception; credentials were not logged") from None
     if not initialized:
-        code = -1
+        code, description = -1, "unknown terminal IPC error"
         try:
             error = mt5.last_error()
-            if isinstance(error, (tuple, list)) and error and isinstance(error[0], int):
-                code = error[0]
+            if isinstance(error, (tuple, list)) and error:
+                if isinstance(error[0], int):
+                    code = error[0]
+                if len(error) > 1 and isinstance(error[1], str):
+                    description = error[1]
         except Exception:
             pass
-        raise ProbeError(f"MetaTrader 5 initialization failed (error code {code})")
+        raise ProbeError(f"MetaTrader 5 terminal IPC initialization failed (error code {code}: {description})")
 
     try:
+        try:
+            logged_in = bool(mt5.login(login=login, password=password, server=server.strip()))
+        except Exception:
+            raise ProbeError("MetaTrader 5 demo login raised an exception; credentials were not logged") from None
+        if not logged_in:
+            code, description = -1, "unknown broker authentication error"
+            try:
+                error = mt5.last_error()
+                if isinstance(error, (tuple, list)) and error:
+                    if isinstance(error[0], int):
+                        code = error[0]
+                    if len(error) > 1 and isinstance(error[1], str):
+                        description = error[1]
+            except Exception:
+                pass
+            raise ProbeError(f"MetaTrader 5 demo login failed (error code {code}: {description})")
+
         terminal = mt5.terminal_info()
         if terminal is None or getattr(terminal, "connected", False) is not True:
             raise ProbeError("MT5 terminal is not connected to the broker")
