@@ -28,7 +28,7 @@
 - `src/critical_consensus/persistence.py` — PostgreSQL repository for immutable market bars, pre-outcome forecasts, one-time labels, kill-switch/risk evidence, Redis inbox events and full pipeline decision/audit persistence. `db/postgres_schema.sql` + `db/migrations/` — base schema plus ordered, forward-only migrations (immutable evidence tables and insert-only nonce tombstones); `neo4j/schema.cypher` — graph schema.
 - `tests/` — adversarial unit tests.
 - `.github/workflows/security-audit.yml`, `tests.yml` and `validation-suite.yml` — dependency/source security scans, unit contracts and PostgreSQL/Redis integration checks.
-- `docs/` — архитектура, формулы, пример trace, недельный roadmap и `MT5_AGENT.md` в трёх языках (`MT5_AGENT.md`, `MT5_AGENT.en.md`, `MT5_AGENT.vi.md`).
+- `docs/` — архитектура, формулы, пример trace, недельный roadmap, `MT5_AGENT.md` в трёх языках (`MT5_AGENT.md`, `MT5_AGENT.en.md`, `MT5_AGENT.vi.md`) и `DEMO_RESULTS.md` в трёх языках с графиками прогона на реальных барах (`docs/charts/`).
 
 ## Быстрый запуск (Linux, Python 3.11+)
 

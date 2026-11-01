@@ -62,7 +62,11 @@ def equity_series(events: Sequence[dict[str, Any]]) -> list[tuple[datetime, floa
         equity = event.get("equity")
         if not isinstance(at, str) or isinstance(equity, bool) or not isinstance(equity, (int, float)):
             continue
-        points.append((datetime.fromisoformat(at), float(equity)))
+        try:
+            moment = datetime.fromisoformat(at)
+        except ValueError:
+            continue
+        points.append((moment, float(equity)))
     points.sort(key=lambda item: item[0])
     return points
 
@@ -383,7 +387,8 @@ def render_demo_journals(specs: Sequence[tuple[str, Path, Path]], out_dir: Path,
         if not equity:
             raise ValueError(f"{db_path}: journal has no equity_point events, so nothing to plot")
         origin = equity[0][0].timestamp()
-        curves.append((label, [((at - origin) / 86_400.0, value) for at, value in equity]))
+        curves.append((label, [((at.timestamp() - origin) / 86_400.0, value)
+                               for at, value in equity]))
         multiples = r_multiples(events, tick_size=tick_size, tick_value=tick_value)
         keys = [f"{i + 1}" for i in range(len(multiples))]
         r_bars.append((label, list(zip(keys, [value for _, value in multiples]))))
@@ -393,6 +398,9 @@ def render_demo_journals(specs: Sequence[tuple[str, Path, Path]], out_dir: Path,
         wins = sum(1 for event in closed if float(event.get("pnl", 0.0)) > 0)
         evidence.setdefault("demos", {})[label] = {
             "journal": str(db_path),
+            "policy": str(policy_path),
+            "tick_size": tick_size,
+            "tick_value": tick_value,
             "cycles": sum(1 for event in events if event.get("event_type") == "agent_cycle"),
             "closed_trades": len(closed),
             "winning_trades": wins,
@@ -402,6 +410,11 @@ def render_demo_journals(specs: Sequence[tuple[str, Path, Path]], out_dir: Path,
             "final_equity": equity[-1][1],
             "max_equity": max(value for _, value in equity),
             "min_equity": min(value for _, value in equity),
+            "r_multiples": [round(value, 4) for _, value in multiples],
+            "planned_risk_currency_per_trade": [
+                round(risk, 4) for risk in (
+                    planned_risk_currency(event, tick_size=tick_size, tick_value=tick_value)
+                    for event in closed if event.get("pnl") is not None) if risk is not None],
             "broker_order_sent_anywhere": any(bool(event.get("broker_order_sent"))
                                               for event in events),
         }
@@ -457,16 +470,15 @@ def render_research(symbols: Sequence[str], *, days: int, cost_steps: Sequence[f
                           [(cost, entry["cost_sweep"][f"{cost:g}"]["SMA(5/20)"]["chained_return_pct"])
                            for cost in cost_steps]))
             hour_labels = [f"{hour:02d}" for hour, _, _ in profile] or hour_labels
-            hourly.append((symbol, [f"{hour:02d}" for hour, _, _ in profile]
-                           and list(zip([f"{hour:02d}" for hour, _, _ in profile],
-                                         [t for _, _, t in profile]))))
+            if profile:
+                hourly.append((symbol, [(f"{hour:02d}", t) for hour, _, t in profile]))
     finally:
         mt5.shutdown()
     if sweep:
         svg = line_chart(title="Chained equity return vs cost per side, real H1 bars",
                          subtitle="One year of broker history per symbol, walk-forward, "
                                   "nothing fitted to the test window.",
-                         series=sweep, x_format="value", y_label="chained return, %")
+                         series=sweep, y_format="decimal", y_label="chained return, %")
         written.append(_write(out_dir / "real_bar_cost_sweep.svg", svg))
     if hourly and hour_labels:
         svg = bar_chart(title="Hour-of-day t-statistic of the next H1 return",

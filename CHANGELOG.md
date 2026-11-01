@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased — real-data demo run, and the evidence that came out of it
+
+- `scripts/render_demo_evidence.py` (new): turns a decision journal and a year of the broker's own
+  H1 bars into four charts and one machine-readable `docs/charts/demo_evidence.json` — equity curves,
+  the realised R multiple of every closed paper trade, a chained cost sweep from 0 to 30 bps per side
+  for two strategy families, and the hour-of-day t-statistics. It reads the journal through
+  `mode=ro` and refuses a database without `audit_events`, drops journal rows whose timestamp or
+  number is not usable instead of coercing them, divides P/L by the risk the trade was actually sized
+  for (from the policy's own tick spec), and emits hand-built SVG with every label escaped. It uses
+  `copy_rates_range` only; this file contains no MT5 trading call. Charts are SVG rather than PNG
+  because the repository venv has no plotting library, and a text format keeps them reviewable in a
+  diff.
+- `docs/DEMO_RESULTS.md` / `.en.md` / `.vi.md` (new) and `docs/charts/`: the first paper demo of the
+  agent on real broker data for both instruments the operator asked for — MetaQuotes-Demo account
+  `114929502`, 100 000 USD, 540 cycles per symbol: **XAUUSD 23 closed trades, 5 wins, −159.96;
+  EURUSD 24 closed trades, 4 wins, −203.39; journal chain `valid: true` (1104 events for gold) and
+  `broker_order_sent: false` in every record.** The docs say why rather than burying it: the stop is
+  2 × ATR and the target is 2R, so a driftless walk wins exactly 1/3 of the time with zero expectancy
+  before costs, and the observed 0.217 / 0.167 sit **below** that line. A lag-1 autocorrelation of
+  −0.019 (XAUUSD) and −0.0067 (EURUSD) over 5742 / 6185 real bars explains the mechanism — the series
+  retraces and SMA(5/20) enters after the retrace has already run. With 23 and 24 trades the losses are
+  not statistically established (t = −1.57, −1.95), which the doc states instead of dressing them up.
+- The same file records a cross-check against an independent workspace on public Binance candles whose
+  single out-of-sample survivor, Bollinger(20, 2.0) on EURUSDT at +7.1%, **does not reproduce** on the
+  broker's real bars: −22.4% at 5 bps per side, −66.1% at 20. Cost sweep, not a headline number: the
+  0 bps row is physically impossible and is kept to show that neither family has a margin of safety.
+- Tests on this tree: **744 passed, 10 skipped** (DB/Redis), up from 715 — 17 of those are new cases in
+  `tests/test_render_demo_evidence.py` (a non-journal database refused, unusable rows skipped and
+  points sorted, R computed against the sized risk, three unusable-trade fields, autocorrelation
+  separating reversion from trend, costs only ever hurting by exactly the spread of the sweep, flat
+  history trading nothing, SVG escaping that a `<script>` label cannot break, empty charts as loud
+  errors, `--journal LABEL=POLICY=DB` parsing, and two renderer end-to-end cases that assert the exact
+  numbers it writes into the evidence JSON). The remaining 12 landed with the read-only terminal smoke
+  probe and the durable-baseline work on this branch, not with the evidence renderer.
+- `standalone/docs/install_ru.md` / `install_vi.md`: the Telegram token shown as a format example was a
+  string that no scanner can tell apart from a live credential (`1234567890:AA…`), so it is now
+  `123456789:REPLACE_WITH_TOKEN_FROM_BOTFATHER` in all four places. The example still teaches the shape;
+  it can no longer be mistaken for a secret or copy-pasted as one.
+
 ## Unreleased — round 11 review fixes
 
 - `MT5Agent.post_approval_gates(proposal, sizing)` (new): the whole post-approval check a paper fill gets — kill switch, account identity and demo requirement, equity/daily-loss/drawdown baselines, trading window and blackout, position caps and the open book, quote age, spread, the 10% slippage bound against the approved entry, risk/reward recomputed at the fill, the re-sized lot, funded margin, and the broker `stops_level` at that fill — callable on the dicts a cycle already journaled, journaling nothing itself. `run_cycle` stops at `STATUS_OBSERVED` for a policy that does not open a paper position, so on the demo path these gates had never run.

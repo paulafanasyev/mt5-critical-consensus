@@ -76,7 +76,7 @@ python -m pytest -q
 
 1. В Telegram найди **@BotFather** → команда `/newbot`.
 2. Придумай имя и username бота (username должен кончаться на `bot`).
-3. BotFather выдаст **токен** вида `1234567890:AAEhBOweik6ad9r_QXMENQjcrGbqCr5G-p4` — сохрани его.
+3. BotFather выдаст **токен** вида `123456789:REPLACE_WITH_TOKEN_FROM_BOTFATHER` — сохрани его.
 4. Теперь узнай свой **chat_id**: напиши своему боту любое сообщение (например `/start`), затем открой в браузере:
    ```
    https://api.telegram.org/bot<ТВОЙ_ТОКЕН>/getUpdates
@@ -87,7 +87,7 @@ python -m pytest -q
 
 В cmd (или сохрани в `.env` и используй как шаблон `env.example`):
 ```
-set TELEGRAM_BOT_TOKEN=1234567890:AAEhBOweik6ad9r_QXMENQjcrGbqCr5G-p4
+set TELEGRAM_BOT_TOKEN=123456789:REPLACE_WITH_TOKEN_FROM_BOTFATHER
 set TELEGRAM_CHAT_ID=123456789
 ```
 Для постоянной работы задай их через «Переменные среды Windows» (Win → "Изменение системных переменных среды").

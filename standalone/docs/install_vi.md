@@ -76,7 +76,7 @@ Kết quả mong đợi: `176 passed` (một warning từ starlette là bình th
 
 1. Trong Telegram tìm **@BotFather** → lệnh `/newbot`.
 2. Đặt tên và username cho bot (username phải kết thúc bằng `bot`).
-3. BotFather đưa cho bạn **token** dạng `1234567890:AAEhBOweik6ad9r_QXMENQjcrGbqCr5G-p4` — lưu lại.
+3. BotFather đưa cho bạn **token** dạng `123456789:REPLACE_WITH_TOKEN_FROM_BOTFATHER` — lưu lại.
 4. Lấy **chat_id**: gửi cho bot của bạn một tin nhắn bất kỳ (ví dụ `/start`), rồi mở trong trình duyệt:
    ```
    https://api.telegram.org/bot<TOKEN_CỦA_BẠN>/getUpdates
@@ -87,7 +87,7 @@ Kết quả mong đợi: `176 passed` (một warning từ starlette là bình th
 
 Trong cmd (hoặc lưu vào `.env`, dùng `env.example` làm mẫu):
 ```
-set TELEGRAM_BOT_TOKEN=1234567890:AAEhBOweik6ad9r_QXMENQjcrGbqCr5G-p4
+set TELEGRAM_BOT_TOKEN=123456789:REPLACE_WITH_TOKEN_FROM_BOTFATHER
 set TELEGRAM_CHAT_ID=123456789
 ```
 Để chạy vĩnh viễn, đặt biến trong "Environment Variables" của Windows.
