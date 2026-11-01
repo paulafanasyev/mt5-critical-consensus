@@ -21,6 +21,7 @@ jobs:
       - name: Unit and contract tests
         run: pytest -q
       - name: Static MQL5 safety guards (not a compile)
+        if: always()
         run: python scripts/check_mql5_safety.py
 
   security:
