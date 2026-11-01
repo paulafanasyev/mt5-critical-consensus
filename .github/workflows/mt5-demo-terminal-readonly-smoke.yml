@@ -115,78 +115,11 @@ jobs:
           "MT5_TERMINAL_EXE=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "MetaTrader terminal file version: $version" | Add-Content $env:GITHUB_STEP_SUMMARY
 
-      - name: Start the demo terminal in portable mode
-        if: steps.demo_credentials.outputs.ready == 'true'
-        shell: pwsh
-        env:
-          MT5_DEMO_LOGIN: ${{ secrets.MT5_DEMO_LOGIN }}
-          MT5_DEMO_PASSWORD: ${{ secrets.MT5_DEMO_PASSWORD }}
-          MT5_DEMO_SERVER: ${{ secrets.MT5_DEMO_SERVER }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          $installDir = Split-Path $env:MT5_TERMINAL_EXE
-          $ini = Join-Path $installDir "start-demo.ini"
-          $body = @(
-            "[Common]",
-            "Login=$env:MT5_DEMO_LOGIN",
-            "Password=$env:MT5_DEMO_PASSWORD",
-            "Server=$env:MT5_DEMO_SERVER",
-            "ProxyEnable=0",
-            "CertInstall=0",
-            "NewsEnable=0"
-          ) -join "`r`n"
-          $body | Out-File -FilePath $ini -Encoding unicode
-          # The runner service lives in session 0, where the terminal starts but never gets a
-          # desktop and never talks to the broker. This task runs the same command in the
-          # interactive console session (the runner user is logged on), with a direct start
-          # as the fallback. The command line is visible to this throwaway runner only and
-          # the step can place no order - it only opens the terminal.
-          $cmdFile = Join-Path $installDir "start-demo.cmd"
-          @(
-            "@echo off",
-            "`"$env:MT5_TERMINAL_EXE`" /portable /config:`"$ini`" /login:$env:MT5_DEMO_LOGIN /password:$env:MT5_DEMO_PASSWORD /server:$env:MT5_DEMO_SERVER"
-          ) -join "`r`n" | Out-File -FilePath $cmdFile -Encoding ascii
-          $taskName = "mt5-demo-terminal-smoke"
-          schtasks /create /tn $taskName /tr "`"$cmdFile`"" /sc once /st 00:00 /it /f | Out-Null
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "Scheduled the terminal in the interactive session."
-            schtasks /run /tn $taskName | Out-Null
-          } else {
-            Write-Host "The interactive task could not be created; starting directly."
-            Start-Process -FilePath $env:MT5_TERMINAL_EXE -ArgumentList "/portable", "/config:$ini" | Out-Null
-          }
-          # A first start also compiles every bundled MQL5 example, which can take minutes
-          # before the terminal ever talks to the broker, so the wait is generous and ends
-          # early as soon as the authorization line appears.
-          $logDir = Join-Path $installDir "logs"
-          $terminalLog = $null
-          $connected = $false
-          $deadline = (Get-Date).AddSeconds(600)
-          while (-not $connected -and (Get-Date) -lt $deadline) {
-            Start-Sleep -Seconds 10
-            if (-not (Get-Process terminal64 -ErrorAction SilentlyContinue)) {
-              throw "No MetaTrader terminal process is running."
-            }
-            if (-not $terminalLog -and (Test-Path $logDir)) {
-              $terminalLog = Get-ChildItem $logDir -Filter "*.log" -ErrorAction SilentlyContinue |
-                Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            }
-            if ($terminalLog) {
-              $text = Get-Content $terminalLog.FullName -Encoding unicode -ErrorAction SilentlyContinue
-              if ($text -match "authorized on|trading has been enabled|terminal synchronized") {
-                $connected = $true
-              }
-            }
-          }
-          if (-not $connected) {
-            Write-Host "Terminal log tail:"
-            if ($terminalLog) { Get-Content $terminalLog.FullName -Encoding unicode -Tail 40 }
-            throw "The MetaTrader terminal did not reach the broker within 600 s."
-          }
-          "The demo terminal is running in portable mode and reached the broker." |
-            Add-Content $env:GITHUB_STEP_SUMMARY
+      # The MetaTrader5 Python API is given the exact executable path and demo credentials.
+      # initialize() starts or attaches to the terminal in this same runner session; this
+      # avoids Task Scheduler's separate interactive session and gives a direct API result.
 
-      - name: Run read-only demo-account and quote probe
+      - name: Initialize the demo terminal and verify account and live quotes (read-only)
         id: mt5_probe
         if: steps.demo_credentials.outputs.ready == 'true'
         shell: pwsh
