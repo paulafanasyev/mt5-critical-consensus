@@ -151,7 +151,7 @@ def verify_and_write(basket: dict[str, list[dict]]) -> int:
 
     parent = CACHE.parent
     parent.mkdir(parents=True, exist_ok=True)
-    if CACHE.exists() and any(CACHE.iterdir()):
+    if CACHE.exists():
         raise ExportError(f"Refusing to overwrite existing research evidence: {CACHE}")
 
     manifest = {
