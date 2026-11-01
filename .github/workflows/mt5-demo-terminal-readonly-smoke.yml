@@ -136,16 +136,25 @@ jobs:
             "NewsEnable=0"
           ) -join "`r`n"
           $body | Out-File -FilePath $ini -Encoding unicode
-          # A first start compiles the bundled MQL5 examples and otherwise opens the
-          # "open an account" wizard, which never logs in. The documented startup
-          # parameters below make the terminal sign in to the demo account directly.
-          # They are visible to this throwaway runner only; nothing prints them, and
-          # this step can place no order - it only opens the terminal.
-          $process = Start-Process -FilePath $env:MT5_TERMINAL_EXE `
-            -ArgumentList "/portable", "/config:$ini",
-              "/login:$env:MT5_DEMO_LOGIN",
-              "/password:$env:MT5_DEMO_PASSWORD",
-              "/server:$env:MT5_DEMO_SERVER" -PassThru
+          # The runner service lives in session 0, where the terminal starts but never gets a
+          # desktop and never talks to the broker. This task runs the same command in the
+          # interactive console session (the runner user is logged on), with a direct start
+          # as the fallback. The command line is visible to this throwaway runner only and
+          # the step can place no order - it only opens the terminal.
+          $cmdFile = Join-Path $installDir "start-demo.cmd"
+          @(
+            "@echo off",
+            "`"$env:MT5_TERMINAL_EXE`" /portable /config:`"$ini`" /login:$env:MT5_DEMO_LOGIN /password:$env:MT5_DEMO_PASSWORD /server:$env:MT5_DEMO_SERVER"
+          ) -join "`r`n" | Out-File -FilePath $cmdFile -Encoding ascii
+          $taskName = "mt5-demo-terminal-smoke"
+          schtasks /create /tn $taskName /tr "`"$cmdFile`"" /sc once /st 00:00 /it /f | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Scheduled the terminal in the interactive session."
+            schtasks /run /tn $taskName | Out-Null
+          } else {
+            Write-Host "The interactive task could not be created; starting directly."
+            Start-Process -FilePath $env:MT5_TERMINAL_EXE -ArgumentList "/portable", "/config:$ini" | Out-Null
+          }
           # A first start also compiles every bundled MQL5 example, which can take minutes
           # before the terminal ever talks to the broker, so the wait is generous and ends
           # early as soon as the authorization line appears.
@@ -155,8 +164,8 @@ jobs:
           $deadline = (Get-Date).AddSeconds(600)
           while (-not $connected -and (Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 10
-            if ($process.HasExited) {
-              throw "The MetaTrader terminal exited before reaching the broker (exit code $($process.ExitCode))."
+            if (-not (Get-Process terminal64 -ErrorAction SilentlyContinue)) {
+              throw "No MetaTrader terminal process is running."
             }
             if (-not $terminalLog -and (Test-Path $logDir)) {
               $terminalLog = Get-ChildItem $logDir -Filter "*.log" -ErrorAction SilentlyContinue |
