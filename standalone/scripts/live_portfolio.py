@@ -130,9 +130,9 @@ def signal_bollinger(candles: list[dict]) -> str | None:
     return "HOLD"  # inside bands: keep/neutral
 
 
-def signal_ematrend(candles: list[dict]) -> str | None:
-    e_fast = ema([c["close"] for c in candles], 12)
-    e_slow = ema([c["close"] for c in candles], 26)
+def signal_ematrend(candles: list[dict], fast: int = 12, slow: int = 26) -> str | None:
+    e_fast = ema([c["close"] for c in candles], fast)
+    e_slow = ema([c["close"] for c in candles], slow)
     if e_fast > e_slow:
         return "BUY"
     if e_fast < e_slow:
@@ -252,7 +252,9 @@ def main() -> int:
         while deadline is None or time.monotonic() < deadline:
             for slot in slots:
                 try:
-                    candles = fetch_candles(slot.market)
+                    # The slot's timeframe is the one the rule was researched on: fetching
+                    # 1-minute candles for a 1-hour rule changes the strategy silently.
+                    candles = fetch_candles(slot.market, limit=400, interval=slot.tf)
                     price = candles[-1]["close"]
                     price_cache[slot.market] = price
                 except Exception as exc:
@@ -305,8 +307,13 @@ def main() -> int:
                 if "GOLD" in slot.name and hour_utc == 13 and slot.position is None:
                     continue
 
-                # new signal?
-                sig = STRATEGY_FN[slot.family](candles)
+                # new signal? The EMA slot carries its own fast/slow pair, researched as 50/200
+                # on gold; calling the generic 12/26 rule would trade a different strategy.
+                if slot.family == "EMATREND":
+                    sig = signal_ematrend(candles, getattr(slot, "ema_fast", 12),
+                                          getattr(slot, "ema_slow", 26))
+                else:
+                    sig = STRATEGY_FN[slot.family](candles)
                 if slot.position is None and sig in ("BUY", "SELL") and not slot.frozen:
                     # v3 (applied from the MT5 agent repo): ATR-based stop geometry and
                     # risk-based sizing — a stop hit costs exactly RISK_FRACTION of the slot.
