@@ -2,11 +2,6 @@ name: mt5-demo-terminal-readonly-smoke
 
 on:
   workflow_dispatch:
-    inputs:
-      symbols:
-        description: "Comma-separated broker symbols to inspect (no orders are submitted)"
-        required: true
-        default: "EURUSD"
   pull_request:
     types: [ready_for_review, synchronize]
 
@@ -19,9 +14,9 @@ concurrency:
 
 jobs:
   read-only-demo-terminal:
-    # Draft smoke is permitted only for the repository owner; fork PRs never receive demo secrets.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false || github.event.pull_request.user.login == 'paulafanasyev' }}
-    name: Read-only MT5 demo account and quotes (Windows)
+    # Run only on this repository's trusted checkout. Owner draft PRs are explicitly allowed.
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.pull_request.head.repo.full_name == github.repository && (github.event.pull_request.draft == false || github.event.pull_request.user.login == 'paulafanasyev')) }}
+    name: Read-only MT5 demo history export (Windows)
     runs-on: windows-2022
     timeout-minutes: 35
     steps:
@@ -44,13 +39,13 @@ jobs:
           }
           if ($missing.Count -gt 0) {
             "ready=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-            "## MT5 demo terminal smoke: NOT PROVEN" | Add-Content $env:GITHUB_STEP_SUMMARY
-            "The check did not start. Configure these repository Actions secrets: $($missing -join ', ')." | Add-Content $env:GITHUB_STEP_SUMMARY
-            "No terminal was connected and no trading request was sent." | Add-Content $env:GITHUB_STEP_SUMMARY
-          } else {
-            "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-            "Demo credentials are configured (values are not printed)." | Write-Host
+            "## MT5 demo history export: NOT PROVEN" | Add-Content $env:GITHUB_STEP_SUMMARY
+            "Required repository Actions secrets are missing or invalid: $($missing -join ', ')." | Add-Content $env:GITHUB_STEP_SUMMARY
+            "No terminal connection or history verification was performed." | Add-Content $env:GITHUB_STEP_SUMMARY
+            throw "Demo credentials are required; refusing a false PASS."
           }
+          "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "Demo credentials are configured (values are not printed)." | Write-Host
 
       - name: Check out source
         if: steps.demo_credentials.outputs.ready == 'true'
@@ -61,16 +56,6 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-
-      - name: Install MetaTrader 5 Python package
-        if: steps.demo_credentials.outputs.ready == 'true'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          python -m pip install --upgrade pip
-          if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed" }
-          python -m pip install MetaTrader5
-          if ($LASTEXITCODE -ne 0) { throw "MetaTrader5 Python package installation failed" }
 
       - name: Download signed MetaTrader 5 installer
         if: steps.demo_credentials.outputs.ready == 'true'
@@ -100,61 +85,169 @@ jobs:
           $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
           Write-Host "Bootstrap installer exit code: $($process.ExitCode)"
           $terminal = Join-Path $installDir "terminal64.exe"
+          $metaeditor = Join-Path $installDir "metaeditor64.exe"
           $deadline = (Get-Date).AddMinutes(5)
-          while (-not (Test-Path $terminal) -and (Get-Date) -lt $deadline) {
+          while ((-not (Test-Path $terminal) -or -not (Test-Path $metaeditor)) -and (Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 5
           }
-          if (-not (Test-Path $terminal)) {
-            Write-Host "Install directory diagnostics:"
-            if (Test-Path $installDir) {
-              Get-ChildItem $installDir -Force -Recurse -ErrorAction SilentlyContinue |
-                Select-Object -First 40 FullName, Length | Format-Table
-            }
-            throw "MetaTrader terminal64.exe was not installed."
+          if (-not (Test-Path $terminal) -or -not (Test-Path $metaeditor)) {
+            throw "The official installer did not provide both terminal64.exe and metaeditor64.exe."
           }
-          $version = (Get-Item $terminal).VersionInfo.FileVersion
-          "MT5_TERMINAL_EXE=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "MT5_INSTALLER_EXIT_CODE=$($process.ExitCode)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "MetaTrader terminal file version: $version" | Add-Content $env:GITHUB_STEP_SUMMARY
-          "Installer bootstrap exit code: $($process.ExitCode)" | Add-Content $env:GITHUB_STEP_SUMMARY
           $terminalSignature = Get-AuthenticodeSignature $terminal
-          "Terminal executable signature status: $($terminalSignature.Status)" | Add-Content $env:GITHUB_STEP_SUMMARY
           if ($terminalSignature.Status -ne "Valid" -or $terminalSignature.SignerCertificate.Subject -notlike "*MetaQuotes*") {
             throw "Installed terminal executable does not have a valid MetaQuotes signature."
           }
+          "MT5_TERMINAL_EXE=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "MT5_INSTALL_DIR=$installDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "MetaTrader terminal file version: $((Get-Item $terminal).VersionInfo.FileVersion)" | Add-Content $env:GITHUB_STEP_SUMMARY
+          "MetaTrader terminal and MetaEditor signatures verified." | Add-Content $env:GITHUB_STEP_SUMMARY
 
-      # The MetaTrader5 Python API is given the exact executable path and demo credentials.
-      # initialize() starts or attaches to the terminal in this same runner session; this
-      # avoids Task Scheduler's separate interactive session and gives a direct API result.
+      - name: Compile the native read-only D1 history exporter
+        if: steps.demo_credentials.outputs.ready == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $scriptSource = Join-Path $env:GITHUB_WORKSPACE "mql5\Scripts\ExportDailyBasket.mq5"
+          $scriptDir = Join-Path $env:MT5_INSTALL_DIR "MQL5\Scripts"
+          $metaeditor = Join-Path $env:MT5_INSTALL_DIR "metaeditor64.exe"
+          New-Item -ItemType Directory -Path $scriptDir -Force | Out-Null
+          $installedSource = Join-Path $scriptDir "ExportDailyBasket.mq5"
+          Copy-Item -LiteralPath $scriptSource -Destination $installedSource -Force
+          $compileLog = Join-Path $env:RUNNER_TEMP "ExportDailyBasket-compile.log"
+          $argumentLine = '/compile:"' + $installedSource + '" /log:"' + $compileLog + '"'
+          $compiler = Start-Process -FilePath $metaeditor -ArgumentList $argumentLine -Wait -PassThru
+          $deadline = (Get-Date).AddMinutes(2)
+          while (-not (Test-Path $compileLog) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 250
+          }
+          if (-not (Test-Path $compileLog)) { throw "MetaEditor did not produce a compiler log." }
+          $compileText = [System.IO.File]::ReadAllText($compileLog, [System.Text.Encoding]::Unicode)
+          if ($compileText -notmatch 'Result:\s*0\s+errors,\s*\d+\s+warnings') {
+            Write-Host $compileText
+            throw "The native read-only history exporter did not compile with zero errors."
+          }
+          $binary = Join-Path $scriptDir "ExportDailyBasket.ex5"
+          if (-not (Test-Path $binary)) { throw "MetaEditor did not create ExportDailyBasket.ex5." }
+          New-Item -ItemType Directory -Path "artifacts" -Force | Out-Null
+          Copy-Item -LiteralPath $compileLog -Destination "artifacts/ExportDailyBasket-compile.log" -Force
+          "Native MT5 exporter compiled: 0 errors; warnings recorded in artifact." | Add-Content $env:GITHUB_STEP_SUMMARY
 
-      - name: Initialize the demo terminal and verify account and live quotes (read-only)
-        id: mt5_probe
+      - name: Run the broker-native read-only export from MT5 startup
+        id: mt5_export
         if: steps.demo_credentials.outputs.ready == 'true'
         shell: pwsh
         env:
           MT5_DEMO_LOGIN: ${{ secrets.MT5_DEMO_LOGIN }}
           MT5_DEMO_PASSWORD: ${{ secrets.MT5_DEMO_PASSWORD }}
           MT5_DEMO_SERVER: ${{ secrets.MT5_DEMO_SERVER }}
-          MT5_SMOKE_SYMBOLS: ${{ inputs.symbols || 'EURUSD' }}
-          MT5_INITIALIZE_TIMEOUT_MS: "300000"
         run: |
           $ErrorActionPreference = "Stop"
-          New-Item -ItemType Directory -Path "artifacts" -Force | Out-Null
-          python scripts/mt5_terminal_readonly_smoke.py --terminal-path "$env:MT5_TERMINAL_EXE" --symbols "$env:MT5_SMOKE_SYMBOLS" 2>&1 |
-            Tee-Object -FilePath "artifacts/mt5-readonly-smoke.log"
-          if ($LASTEXITCODE -ne 0) {
-            "## MT5 demo terminal smoke: FAILED / NOT PROVEN" | Add-Content $env:GITHUB_STEP_SUMMARY
-            Get-Content "artifacts/mt5-readonly-smoke.log" | Add-Content $env:GITHUB_STEP_SUMMARY
-            throw "Read-only MetaTrader demo terminal probe failed."
-          }
-          "## MT5 demo terminal smoke: VERIFIED" | Add-Content $env:GITHUB_STEP_SUMMARY
-          Get-Content "artifacts/mt5-readonly-smoke.log" | Add-Content $env:GITHUB_STEP_SUMMARY
+          $dataDir = Join-Path $env:MT5_INSTALL_DIR "MQL5\Files"
+          New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
+          $statusFile = Join-Path $dataDir "daily_basket.status"
+          $csvFile = Join-Path $dataDir "daily_basket.csv"
+          Remove-Item -LiteralPath $statusFile, $csvFile -Force -ErrorAction SilentlyContinue
 
-      - name: Upload sanitized read-only probe evidence
+          $ini = Join-Path $env:RUNNER_TEMP "mt5-daily-export.ini"
+          $config = @(
+            "[Common]",
+            "Login=$env:MT5_DEMO_LOGIN",
+            "Password=$env:MT5_DEMO_PASSWORD",
+            "Server=$env:MT5_DEMO_SERVER",
+            "ProxyEnable=0",
+            "NewsEnable=0",
+            "CertInstall=0",
+            "",
+            "[Charts]",
+            "MaxBars=50000",
+            "",
+            "[Experts]",
+            "Enabled=1",
+            "AllowLiveTrading=0",
+            "AllowDllImport=0",
+            "",
+            "[StartUp]",
+            "Script=ExportDailyBasket",
+            "Symbol=EURUSD",
+            "Period=D1",
+            "ShutdownTerminal=1"
+          ) -join "`r`n"
+          [System.IO.File]::WriteAllText($ini, $config + "`r`n", [System.Text.Encoding]::Unicode)
+
+          try {
+            $terminal = Start-Process -FilePath $env:MT5_TERMINAL_EXE -ArgumentList @("/portable", "/config:$ini") -PassThru
+            $deadline = (Get-Date).AddMinutes(20)
+            while (-not (Test-Path $statusFile) -and (Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds 5
+            }
+            if (-not (Test-Path $statusFile)) {
+              throw "MT5 did not produce the broker export status file within 20 minutes."
+            }
+
+            $statusLines = Get-Content -LiteralPath $statusFile -Encoding Default
+            if ($statusLines.Count -lt 6 -or $statusLines[0] -ne "PASS") {
+              $detail = if ($statusLines.Count -gt 1) { $statusLines[1] } else { "status file is incomplete" }
+              throw "MT5 native exporter failed: $detail"
+            }
+            if ($statusLines[1] -ne "DEMO") { throw "MT5 native exporter did not verify a DEMO account." }
+            if ($statusLines[2] -ne $env:MT5_DEMO_LOGIN) { throw "MT5 connected login does not match the configured demo login." }
+            if ($statusLines[3] -ne $env:MT5_DEMO_SERVER) { throw "MT5 connected server does not match the configured demo server." }
+            if ($statusLines[4] -ne "5" -or $statusLines[5] -ne "28182") {
+              throw "MT5 native exporter did not complete the registered five-symbol bar basket."
+            }
+            if (-not (Test-Path $csvFile) -or (Get-Item $csvFile).Length -lt 1000000) {
+              throw "MT5 native exporter CSV is missing or unexpectedly small."
+            }
+            Copy-Item -LiteralPath $statusFile -Destination "artifacts/daily_basket.status" -Force
+            "MetaTrader connected to the configured DEMO account and exported all five D1 histories. No orders were submitted." | Add-Content $env:GITHUB_STEP_SUMMARY
+          }
+          finally {
+            Remove-Item -LiteralPath $ini -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Verify the broker export against the frozen original hashes
+        if: steps.demo_credentials.outputs.ready == 'true'
+        shell: pwsh
+        env:
+          MT5_DEMO_LOGIN: ${{ secrets.MT5_DEMO_LOGIN }}
+          MT5_DEMO_SERVER: ${{ secrets.MT5_DEMO_SERVER }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $csvFile = Join-Path $env:MT5_INSTALL_DIR "MQL5\Files\daily_basket.csv"
+          $statusFile = Join-Path $env:MT5_INSTALL_DIR "MQL5\Files\daily_basket.status"
+          python scripts/convert_mt5_daily_basket.py --csv "$csvFile" --status "$statusFile" 2>&1 |
+            Tee-Object -FilePath "artifacts/mt5-d1-hash-verification.log"
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content "artifacts/mt5-d1-hash-verification.log" | Add-Content $env:GITHUB_STEP_SUMMARY
+            throw "The live MT5 export did not match the original frozen SHA-256 data registry."
+          }
+          Get-Content "artifacts/mt5-d1-hash-verification.log" | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: Run the actual candidate research tests on hash-verified MT5 bars
+        if: steps.demo_credentials.outputs.ready == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --upgrade pytest
+          if ($LASTEXITCODE -ne 0) { throw "pytest installation failed." }
+          python -m pytest -q tests/test_candidate_study.py 2>&1 |
+            Tee-Object -FilePath "artifacts/mt5-candidate-study-tests.log"
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content "artifacts/mt5-candidate-study-tests.log" | Add-Content $env:GITHUB_STEP_SUMMARY
+            throw "The real-data candidate research tests failed."
+          }
+          Get-Content "artifacts/mt5-candidate-study-tests.log" | Add-Content $env:GITHUB_STEP_SUMMARY
+          "Candidate research tests executed against five original broker datasets after full SHA-256 verification." | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload sanitized read-only MT5 evidence
         if: always() && steps.demo_credentials.outputs.ready == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: mt5-demo-terminal-readonly-smoke
-          path: artifacts/mt5-readonly-smoke.log
+          path: |
+            artifacts/ExportDailyBasket-compile.log
+            artifacts/daily_basket.status
+            artifacts/mt5-d1-hash-verification.log
+            artifacts/mt5-candidate-study-tests.log
           if-no-files-found: ignore
           retention-days: 7
