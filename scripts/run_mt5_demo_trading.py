@@ -228,15 +228,28 @@ def build_command(*, command_id: str, client_order_id: str, permission_id: str,
 
 
 # ------------------------------------------------------------------------- gates
+def broker_level(value: float, spec: Any) -> float:
+    """The number the broker receives: MT5 rounds every price to the symbol's digits."""
+    factor = 10 ** int(spec.digits)
+    return math.floor(value * factor + 0.5) / factor
+
+
 def price_gates(proposal: Mapping[str, Any], tick: Any, spec: Any,
                 *, max_slippage_points: int = MAX_SLIPPAGE_POINTS) -> tuple[float, list[str]]:
-    """Fresh executable price plus the reasons the quote no longer fits the proposal."""
+    """Fresh executable price plus the reasons the quote no longer fits the proposal.
+
+    Each guard measures the rounded level, because that is what the order carries: checking the
+    unrounded pair queues a stop that rounds onto the price, or onto the broker's stops level,
+    after the check passed - and the reference EA refuses it on the chart, so the journal shows a
+    send attempt with no matching refusal here.
+    """
     direction = proposal["direction"]
-    live = float(tick.ask if direction == "BUY" else tick.bid)
+    live = broker_level(float(tick.ask if direction == "BUY" else tick.bid), spec)
+    sl = broker_level(float(proposal["stop_loss"]), spec)
+    tp = broker_level(float(proposal["take_profit"]), spec)
     reasons: list[str] = []
     if abs(live - float(proposal["entry_price"])) / spec.point > max_slippage_points:
         reasons.append(codes.PRICE_MOVED_DURING_CONFIRMATION)
-    sl, tp = float(proposal["stop_loss"]), float(proposal["take_profit"])
     if direction == "BUY" and not sl < live < tp:
         reasons.append(codes.BUY_GEOMETRY_INVALID)
     if direction == "SELL" and not tp < live < sl:
