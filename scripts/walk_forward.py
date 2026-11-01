@@ -33,7 +33,9 @@ def load_bars(symbol: str, bars: int) -> list:
         raise SystemExit("MetaTrader5.initialize failed")
     try:
         mt5.symbol_select(symbol, True)
-        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 0, bars)
+        # Position 0 is the bar still forming: its close is not a close yet, so a replay
+        # that reads it looks one hour into the future.
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 1, bars)
     finally:
         mt5.shutdown()
     rows = []
@@ -119,12 +121,16 @@ def run_fold(bars: list, spec: dict, policy, *, balance: float, warmup: int) -> 
         broker.seek(bar.time)
         agent.run_cycle()
         cycles += 1
-    agent.close_positions("END_OF_FOLD")
+    # No forced close at the boundary: closing the last position at the boundary bid makes a
+    # fold's sign depend on where the fold happened to end. The position is marked to market
+    # instead, and the fold's result is the equity change, open trade included.
+    equity = broker.equity()
     trades = list(broker.trades)
     wins = sum(1 for trade in trades if trade.pnl > 0)
     return {"cycles": cycles, "trades": len(trades), "wins": wins,
-            "pnl": round(broker.realized_pnl, 2),
-            "return": round(broker.realized_pnl / balance, 4)}
+            "pnl": round(equity - balance, 2),
+            "return": round((equity - balance) / balance, 4),
+            "open_at_end": len(broker.positions())}
 
 
 def _spec(raw: dict):
@@ -165,16 +171,19 @@ def main(argv: list[str] | None = None) -> int:
         # still carries ~8% of its first value, so each fold would be judging a different
         # rule. Three lookbacks, never less than 300 bars.
         warmup = max(300, 3 * policy.strategy.lookback)
-        usable = bars[warmup:]
-        fold_size = len(usable) // args.folds
+        usable_len = len(bars) - warmup
+        fold_size = usable_len // args.folds
         if fold_size < 50:
             print("not enough history for that many folds", file=sys.stderr)
             return 2
         rows = []
         for index in range(args.folds):
-            start = index * fold_size
-            end = start + fold_size if index < args.folds - 1 else len(usable)
-            chunk = usable[max(0, start - warmup):end]
+            # Each fold gets its own warm-up prefix taken from the bars before it, so fold 0
+            # is not shorter than the rest and no fold sees a bar from its own future.
+            fold_start = warmup + index * fold_size
+            fold_end = warmup + usable_len if index == args.folds - 1 \
+                else fold_start + fold_size
+            chunk = bars[fold_start - warmup:fold_end]
             rows.append(run_fold(chunk, spec, policy, balance=args.balance, warmup=warmup))
         report[family] = rows
         cells = " ".join(f"{row['return'] * 100:+6.1f}%" for row in rows)
