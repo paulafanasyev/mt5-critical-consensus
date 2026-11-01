@@ -9,7 +9,9 @@ without an observed fill stops the run and is reported as requiring manual
 reconciliation.
 
 Hard gates before a command is built: the terminal account must be demo, the policy
-must require a demo account, the fresh quote must still match the approved entry,
+must require a demo account and must name the account it expects — an unbound
+`expected_login` would match every account the broker has, and the order goes to
+whichever one the terminal holds — the fresh quote must still match the approved entry,
 geometry and broker stops levels must hold, the volume must be inside the broker's
 step/min/max and the runner's cap, and the margin must be funded. After the operator
 answers, the agent's own post-approval gates are re-run on the proposal — quote age,
@@ -62,7 +64,8 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from critical_consensus.mt5_agent import (AgentPolicy, DecisionJournal, MT5Agent, codes, i18n,
                                           load_policy)
 from critical_consensus.mt5_agent.backend import LiveMT5Backend
-from critical_consensus.mt5_agent.i18n import describe, normalize_language, text
+from critical_consensus.mt5_agent.i18n import (DEFAULT_LANGUAGE, describe, normalize_language,
+                                               text)
 from mt5_demo_bridge import (ADMIN_TOKEN_ENV, BRIDGE_TOKEN_ENV, IDENTIFIER_PATTERN,
                              BridgeError, DemoBridge, KillSwitchStore, SEEDED_REASON,
                              kill_switch_state_path, release_refusal, validate_token)
@@ -369,12 +372,22 @@ class DemoTerminal(LiveMT5Backend):
     keyed by broker account and server day, so restarting this process cannot reset drawdown.
     """
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, *, out: Any = None, language: str = DEFAULT_LANGUAGE,
+                 **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._peak: float | None = None
         self._day: Any = None
         self._day_start: float | None = None
         self._journal: DecisionJournal | None = None
+        # One of this adapter's behaviours cannot be read off a number, only witnessed: a day's
+        # risk budget starting over. The runner gives it the operator's stream and language; a
+        # library caller keeps a silent adapter.
+        self._out = out
+        self._language = normalize_language(language)
+
+    def _say(self, key: str, **placeholders: Any) -> None:
+        if self._out is not None:
+            print(text(key, self._language, **placeholders), file=self._out)
 
     def attach_journal(self, journal: DecisionJournal) -> None:
         """Attach the durable audit journal before any risk-gated cycle can run."""
@@ -418,6 +431,13 @@ class DemoTerminal(LiveMT5Backend):
             matching.append((start, peak))
 
         if not matching:
+            if records:
+                # The journal holds baselines, just none for this account, server and broker
+                # day. Either the server day rolled over or the terminal reconnected elsewhere:
+                # in both cases the drawdown and the daily loss budget start again from live
+                # equity, which is indistinguishable from an unbroken run unless it is said.
+                self._say("runner.risk_baseline_seeded", login=account.login,
+                          server=account.server, day=day_key, equity=f"{equity:.2f}")
             return equity, equity, True
         day_start = matching[0][0]
         if any(start != day_start for start, _peak in matching):
@@ -477,6 +497,10 @@ class DemoTerminal(LiveMT5Backend):
         day_start_epoch = (server_epoch // 86400) * 86400 - self.server_utc_offset_seconds
         start = datetime.fromtimestamp(day_start_epoch - 3600, tz=UTC)
         rows = self.entry_deals(start)
+        # Every unusable row on this path is a refusal, not a skip. The agent reads the property
+        # through a gate that blocks the cycle when it raises, so an unreadable day is one it
+        # declines to trade; silently dropping the row would instead report a day that looks
+        # better than it is and let the budget keep spending.
         total = 0.0
         for deal in rows:
             if int(deal.get("magic", 0)) != MAGIC_NUMBER:
@@ -484,18 +508,22 @@ class DemoTerminal(LiveMT5Backend):
             if int(deal.get("entry", -1)) != 1:  # DEAL_ENTRY_OUT
                 continue
             moment = deal.get("time_epoch")
-            if not isinstance(moment, (int, float)) or moment < day_start_epoch:
+            if isinstance(moment, bool) or not isinstance(moment, (int, float)):
+                raise RuntimeError("risk baseline deal row has no usable time")
+            if moment < day_start_epoch:
                 continue
             profit = _number(deal.get("profit"))
             if profit is None:
-                # A row whose profit cannot be read is not partially counted: half a deal
-                # silently shifts the daily loss budget the agent gates on.
-                continue
+                raise RuntimeError("risk baseline deal profit is unreadable")
             total += profit
             for name in ("swap", "commission", "fee"):
-                value = _number(deal.get(name))
-                if value is not None:
-                    total += value
+                if name not in deal:
+                    # Absent is a broker that does not report the column, which is ordinary.
+                    continue
+                value = _number(deal[name])
+                if value is None:
+                    raise RuntimeError(f"risk baseline deal {name} is unreadable")
+                total += value
         return total
 
     def entry_deals(self, since: datetime) -> list[dict[str, Any]]:
@@ -894,7 +922,8 @@ def _build_parser(language: str) -> argparse.ArgumentParser:
     parser.add_argument("--symbols", help=text("cli.symbols", language))
     parser.add_argument("--bridge-port", type=int, default=8000,
                         help=text("cli.bridge_port", language))
-    parser.add_argument("--bridge-token", help=text("cli.bridge_token", language))
+    # No --bridge-token: a secret in argv is readable by anyone who can see a process list,
+    # and stays in the shell history the operator pasted it into. MT5_BRIDGE_TOKEN only.
     parser.add_argument("--tombstones", default="agent_data/demo_bridge/served.jsonl",
                         help=text("cli.tombstones", language))
     parser.add_argument("--cycles", type=int, default=0,
@@ -1043,9 +1072,14 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
         if not account.is_demo:
             print(text("runner.not_demo", language), file=sys.stderr)
             return 2
-        login_ok = policy.expected_login is None or account.login == policy.expected_login
-        server_ok = policy.expected_server is None or account.server == policy.expected_server
-        if not (login_ok and server_ok):
+        if policy.expected_login is None or policy.expected_server is None:
+            # The order goes to whichever account this terminal happens to be signed into, so
+            # the policy has to name it. A comparison against nothing passes for every account
+            # on earth: the demo flag says only how the account is funded, and a broker-side
+            # or operator-side change of login would otherwise be silently traded on.
+            print(text("runner.identity_unbound", language), file=sys.stderr)
+            return 2
+        if account.login != policy.expected_login or account.server != policy.expected_server:
             print(text("runner.identity_mismatch", language, login=account.login,
                        server=account.server), file=sys.stderr)
             return 2
@@ -1292,7 +1326,7 @@ def main(argv: list[str] | None = None) -> int:
         symbols = parse_symbols(args.symbols, language=language) or [policy.symbol]
         if len(symbols) > 50:
             raise ValueError(text("err.symbols", language, value=f"{len(symbols)} symbols"))
-        token = args.bridge_token or os.environ.get(BRIDGE_TOKEN_ENV)
+        token = os.environ.get(BRIDGE_TOKEN_ENV)
         try:
             token = validate_token(token)
         except BridgeError:
@@ -1307,7 +1341,8 @@ def main(argv: list[str] | None = None) -> int:
         return _release_kill_switch(args, language, token)
     try:
         terminal = DemoTerminal(server_utc_offset_seconds=policy.server_utc_offset_seconds,
-                                terminal_path=args.terminal_path, timeout_ms=args.timeout_ms)
+                                terminal_path=args.terminal_path, timeout_ms=args.timeout_ms,
+                                out=sys.stderr, language=language)
     except Exception as exc:
         print(text("out.error", language, reason=f"{type(exc).__name__}: {exc}"),
               file=sys.stderr)

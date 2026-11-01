@@ -275,8 +275,12 @@ TEXT: dict[str, tuple[str, str, str]] = {
         "инструменты через запятую или all (EURUSD,XAUUSD,...)",
         "comma-separated instruments or all (EURUSD,XAUUSD,...)",
         "các mã cách nhau bằng dấu phẩy hoặc all (EURUSD,XAUUSD,...)"),
-    "cli.run_id": ("идентификатор прогона для журнала", "journal run identifier",
-                   "mã định danh lượt chạy cho nhật ký"),
+    "cli.run_id": ("идентификатор прогона для журнала; без него он выводится из файла состояния"
+                   " и политики, так что перезапуск остаётся тем же прогоном",
+                   "journal run identifier; without it one is derived from the state file and"
+                   " policy, so a restart is still the same run",
+                   "mã lượt chạy cho nhật ký; nếu không có, mã được suy ra từ tệp trạng thái và"
+                   " chính sách, nên khởi động lại vẫn là cùng lượt chạy"),
     "cli.fresh": ("очистить весь общий журнал перед прогоном, включая прогоны других run-id"
                   " (требует --confirm)",
                   "clear the whole shared journal before running, including other run ids"
@@ -304,12 +308,11 @@ TEXT: dict[str, tuple[str, str, str]] = {
     "cli.bridge_port": ("порт локального моста (только 127.0.0.1)",
                         "localhost bridge port (127.0.0.1 only)",
                         "cổng cầu nối nội bộ (chỉ 127.0.0.1)"),
-    "cli.bridge_token": ("токен моста; по умолчанию MT5_BRIDGE_TOKEN",
-                         "bridge token; defaults to MT5_BRIDGE_TOKEN",
-                         "mã cầu nối; mặc định MT5_BRIDGE_TOKEN"),
-    "cli.tombstones": ("файл защищённых идентификаторов команд",
-                       "durable command-id tombstone file",
-                       "tệp mã lệnh đã ghi nhận"),
+    "cli.tombstones": ("файл защищённых идентификаторов команд (относительный путь считается"
+                       " от корня репозитория)",
+                       "durable command-id tombstone file (a relative path is resolved from the"
+                       " repository root)",
+                       "tệp mã lệnh đã ghi nhận (đường dẫn tương đối tính từ gốc repository)"),
     "cli.interval_seconds": ("пауза между циклами, секунды", "pause between cycles, seconds",
                              "khoảng nghỉ giữa các vòng, giây"),
     "cli.fill_timeout": ("сколько ждать подтверждения сделки, секунды",
@@ -489,6 +492,20 @@ TEXT: dict[str, tuple[str, str, str]] = {
         "Счёт {login} на сервере {server} не совпадает с политикой; демо-исполнение отклонено.",
         "Account {login} on {server} does not match the policy; demo execution refused.",
         "Tài khoản {login} trên {server} không khớp chính sách; từ chối thực thi demo."),
+    "runner.identity_unbound": (
+        "В политике не заданы account.expected_login и account.expected_server; демо-исполнение"
+        " отклонено: ордер ушёл бы на любой счёт, куда подключён терминал.",
+        "The policy sets neither account.expected_login nor account.expected_server; demo"
+        " execution refused: the order would go to whichever account the terminal holds.",
+        "Chính sách không đặt account.expected_login hay account.expected_server; từ chối thực"
+        " thi demo: lệnh sẽ gửi tới bất kỳ tài khoản nào terminal đang đăng nhập."),
+    "runner.risk_baseline_seeded": (
+        "Дневной бюджет риска для счёта {login} на {server} начат заново за день {day}: отсчёт"
+        " от {equity}. Просадка предыдущего дня в него не входит.",
+        "The daily risk budget for account {login} on {server} starts fresh for day {day},"
+        " counting from {equity}; the previous day's drawdown is not part of it.",
+        "Ngân sách rủi ro trong ngày của tài khoản {login} trên {server} bắt đầu lại cho ngày"
+        " {day}, tính từ {equity}; mức sụt giảm của ngày trước không được tính."),
     "runner.ready": (
         "Демо-счёт {login} ({server}), баланс {balance}, плечо {leverage}. Мост {url}.",
         "Demo account {login} ({server}), balance {balance}, leverage {leverage}. Bridge {url}.",

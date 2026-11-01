@@ -14,9 +14,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from critical_consensus.mt5_agent import (AccountInfo, DecisionJournal, SymbolSpec, codes)
+from critical_consensus.mt5_agent import (AccountInfo, AgentPolicy, DecisionJournal, SymbolSpec,
+                                          codes)
 from critical_consensus.mt5_agent.i18n import text
-from test_mt5_agent import make_policy
+from test_mt5_agent import make_policy as agent_policy
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -47,6 +48,18 @@ symbol_spec: {symbol: EURUSD, point: 0.00001, digits: 5, tick_size: 0.00001,
   spread_points: 10, stops_level_points: 0}
 account: {require_demo: true}
 """
+
+
+def make_policy(**overrides) -> AgentPolicy:
+    """A policy bound to one demo account, because the send path refuses any other.
+
+    ``AgentPolicy`` leaves ``expected_login`` optional for read-only research, and the shared
+    fixture builds such a policy. Here every run is one that can put an order on the broker, so
+    it states the account the fake terminal reports: login 42 on MetaQuotes-Demo.
+    """
+    base = {"account__expected_login": 42, "account__expected_server": "MetaQuotes-Demo"}
+    base.update(overrides)
+    return agent_policy(**base)
 
 
 # ------------------------------------------------------------------------ fixtures
@@ -1026,6 +1039,35 @@ def test_the_command_line_reuses_one_run_id_across_two_processes(tmp_path, monke
     assert seen[-1] == "operator-chosen"
 
 
+def test_the_bridge_secret_cannot_be_put_on_the_command_line(monkeypatch):
+    """A token in argv is readable from any process list and stays in the shell history.
+
+    ``MT5_BRIDGE_TOKEN`` is the only way in, so there is no flag left to misuse by accident.
+    """
+    monkeypatch.delenv(runner.BRIDGE_TOKEN_ENV, raising=False)
+    parser = runner._build_parser("en")
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--policy", "p.yaml", "--db", "j.db", "--bridge-token", "s" * 40])
+    assert "--bridge-token" not in parser.format_help()
+
+
+@pytest.mark.parametrize("unbound", [
+    {"account__expected_login": None},
+    {"account__expected_server": None},
+    {"account__expected_login": None, "account__expected_server": None},
+])
+def test_a_policy_that_names_no_account_never_reaches_the_queue(unbound, tmp_path, capsys):
+    """The identity check is a comparison, so an empty side of it has to be a refusal.
+
+    ``expected_login: null`` used to pass for every account on the broker, which is precisely
+    the account the order would have gone to: the demo flag says only how an account is funded.
+    """
+    policy = make_policy(execution_mode="auto", **unbound)
+    assert runner._run(run_args(tmp_path), policy, "en", TOKEN, "run-1", FakeTerminal()) == 2
+    assert text("runner.identity_unbound", "en") in capsys.readouterr().err
+    assert not (tmp_path / "journal.db").exists()
+
+
 def test_language_resolution_order_is_flag_then_environment_then_default(monkeypatch):
     monkeypatch.setenv("MT5_AGENT_LANGUAGE", "en")
     assert runner._argv_language(["--language", "vi"]) == "vi"
@@ -1502,6 +1544,8 @@ def bare_terminal() -> runner.DemoTerminal:
     terminal._day_start = None
     terminal._journal = None
     terminal._offset = 0
+    terminal._out = None
+    terminal._language = "ru"
     return terminal
 
 
@@ -1560,6 +1604,35 @@ def test_risk_baselines_survive_runner_restart_and_are_scoped_to_the_broker_acco
     second_journal.close()
 
 
+def test_a_day_budget_that_starts_over_says_so(tmp_path, capsys):
+    """Re-seeding the daily risk budget is invisible in the numbers, so it has to be audible.
+
+    A fresh account on a journal that already holds baselines legitimately counts from live
+    equity — but that is also what a day rollover looks like, and an operator reading only
+    ``day_start_equity`` cannot tell it from a run that has never lost anything. A first-ever
+    journal stays quiet, because there is nothing there to have been lost.
+    """
+    journal = DecisionJournal(tmp_path / "announced-baselines.db", run_id="run-1")
+
+    def standing(login: int, server: str, equity: float) -> runner.DemoTerminal:
+        terminal = bare_terminal()
+        terminal.attach_journal(journal)
+        terminal._server_day = lambda: date(2026, 10, 30)
+        terminal._out, terminal._language = sys.stderr, "en"
+        terminal.account = lambda: AccountInfo(login=login, server=server, currency="USD",
+                                               balance=equity, equity=equity,
+                                               margin_free=equity, leverage=100,
+                                               trade_mode="demo")
+        return terminal
+
+    assert standing(501, "Broker-Demo", 10_000.0).day_start_equity == 10_000.0
+    assert "risk budget" not in capsys.readouterr().err
+    assert standing(502, "Other-Demo", 20_000.0).day_start_equity == 20_000.0
+    err = capsys.readouterr().err
+    assert "daily risk budget" in err and "502" in err and "20000.00" in err
+    journal.close()
+
+
 def test_corrupt_risk_baseline_journal_fails_closed(tmp_path):
     journal = DecisionJournal(tmp_path / "corrupt-risk-baselines.db", run_id="run-1")
     terminal = bare_terminal()
@@ -1583,9 +1656,36 @@ def test_realized_daily_pnl_comes_from_closed_deals_of_this_magic_only():
         server_deal(stamp=now_stamp, entry=0, profit=999.0),          # entry deals are not P&L
         server_deal(stamp=now_stamp, magic=1, profit=555.0),          # another EA's trade
         server_deal(stamp=old_stamp, profit=777.0),                   # previous server day
-        server_deal(stamp=now_stamp, profit="nan"),                   # unusable amount
     ]
     assert terminal.realized_daily_pnl == pytest.approx(10.0 - 0.5 - 0.7)
+
+
+@pytest.mark.parametrize("junk", [
+    {"profit": "nan"}, {"profit": None}, {"profit": float("nan")},
+    {"time_epoch": "not a stamp"}, {"time_epoch": None}, {"commission": "nan"},
+])
+def test_a_closed_deal_that_cannot_be_read_refuses_the_day_rather_than_undercounting_it(junk):
+    """A day this adapter cannot add up is a day it must not trade.
+
+    Dropping the row would hand the agent a smaller realised loss than the account carries and
+    let the daily budget keep spending. Raising is what the gate already understands: the agent
+    reads this through a property and blocks the cycle with EQUITY_BASELINES_UNAVAILABLE.
+    """
+    terminal = bare_terminal()
+    deal = server_deal(stamp=datetime.now(UTC).timestamp(), profit=10.0)
+    deal.update(junk)
+    terminal.entry_deals = lambda since: [deal]
+    with pytest.raises(RuntimeError):
+        _ = terminal.realized_daily_pnl
+
+
+def test_a_cost_column_a_broker_does_not_report_is_still_a_number():
+    """An absent swap column is not an unreadable one; the day must still add up."""
+    terminal = bare_terminal()
+    deal = server_deal(stamp=datetime.now(UTC).timestamp(), profit=10.0)
+    del deal["swap"]
+    terminal.entry_deals = lambda since: [deal]
+    assert terminal.realized_daily_pnl == pytest.approx(10.0 - 0.7)
 
 
 def test_entry_deals_normalizes_terminal_rows():
