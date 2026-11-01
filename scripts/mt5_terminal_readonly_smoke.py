@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Read-only smoke test for a MetaTrader 5 demo terminal.
 
-This module initializes the specified terminal with explicit demo credentials, verifies
-the exact requested account, reads terminal connectivity and selected-symbol quotes, and
-shuts the terminal connection down. It has no order submission, position modification,
-or trade-management calls.
+This module initializes the specified terminal's local IPC channel, authenticates to the
+configured demo account in a separate step, verifies that exact account, reads selected
+symbol quotes, and shuts the connection down. It never submits orders or modifies positions.
 """
 from __future__ import annotations
 
@@ -90,7 +89,7 @@ def run_probe(
     try:
         initialized = bool(mt5.initialize(**kwargs))
     except Exception:
-        raise ProbeError("MetaTrader5.initialize raised an exception; credentials were not logged") from None
+        raise ProbeError("MetaTrader5.initialize raised an exception during terminal IPC initialization") from None
     if not initialized:
         code, description = -1, "unknown terminal IPC error"
         try:
