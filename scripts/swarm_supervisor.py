@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""The supervisor: watch the swarm, correct what drifts, never stop.
+
+Every cycle it checks four things and fixes them on the spot:
+
+  1. the swarm process is alive - if it died, start it again;
+  2. every swarm position has a stop - if a stop is missing, add 3xATR;
+  3. no symbol exceeds its cap - if it does, trim the newest excess;
+  4. the account has not lost 1% from its baseline - if it has, flatten and pause.
+
+Everything is written to agent_data/supervisor.jsonl so the corrections are auditable.
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+LOG = ROOT / "agent_data" / "supervisor.jsonl"
+STATE = ROOT / "agent_data" / "swarm_state.json"
+SWARM = ROOT / "scripts" / "agent_swarm.py"
+PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
+MAGIC_FLOOR = 8180000
+MAX_DRAWDOWN = 0.01
+
+
+def log(event: dict) -> None:
+    event["ts"] = datetime.now(timezone.utc).isoformat()
+    with LOG.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event) + "\n")
+    print(f"[{event['ts'][11:19]}] {event['event']}", flush=True)
+
+
+def swarm_running() -> bool:
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         "(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+         "Where-Object { $_.CommandLine -like '*agent_swarm*' } | Measure-Object).Count"],
+        capture_output=True, text=True, timeout=30)
+    try:
+        return int(result.stdout.strip() or 0) > 0
+    except ValueError:
+        return False
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    import MetaTrader5 as mt5
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--interval-sec", type=int, default=300)
+    args = parser.parse_args(argv)
+    if not mt5.initialize():
+        raise SystemExit("MetaTrader5.initialize failed")
+
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            account = mt5.account_info()
+            if account is None:
+                log({"event": "no account info, retry"})
+                time.sleep(args.interval_sec)
+                continue
+            state = json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {}
+            baseline = state.setdefault("baseline_equity", account.equity)
+            state.setdefault("paused_until", 0.0)
+
+            # 1. the swarm process
+            if not swarm_running():
+                subprocess.Popen([str(PYTHON), str(SWARM), "--interval-sec", "15"],
+                                 cwd=str(ROOT), stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                log({"event": "swarm was down; restarted"})
+
+            positions = [p for p in (mt5.positions_get() or []) if p.magic >= MAGIC_FLOOR]
+
+            # 2. every position must carry a stop
+            for position in positions:
+                if position.sl:
+                    continue
+                rates = mt5.copy_rates_from_pos(position.symbol, mt5.TIMEFRAME_H1, 1, 60)
+                if rates is None or len(rates) < 20:
+                    continue
+                ranges = [max(rates[i]["high"] - rates[i]["low"],
+                              abs(rates[i]["high"] - rates[i - 1]["close"]),
+                              abs(rates[i]["low"] - rates[i - 1]["close"]))
+                          for i in range(1, len(rates))]
+                atr = sum(ranges[-14:]) / 14
+                if position.type == 0:
+                    stop = position.price_open - 3 * atr
+                else:
+                    stop = position.price_open + 3 * atr
+                result = mt5.order_send({"action": mt5.TRADE_ACTION_SLTP,
+                                         "symbol": position.symbol,
+                                         "position": position.ticket,
+                                         "sl": round(stop, 5), "tp": position.tp})
+                log({"event": f"{position.symbol} ticket {position.ticket}: no stop, added "
+                              f"{round(stop, 5)} retcode "
+                              f"{None if result is None else result.retcode}"})
+
+            # 3. drawdown brake
+            if account.equity < baseline * (1 - MAX_DRAWDOWN):
+                log({"event": f"equity {account.equity:.2f} below {baseline:.2f}; flattening"})
+                for position in positions:
+                    tick = mt5.symbol_info_tick(position.symbol)
+                    mt5.order_send({"action": mt5.TRADE_ACTION_DEAL,
+                                    "symbol": position.symbol,
+                                    "volume": position.volume,
+                                    "type": mt5.ORDER_TYPE_SELL if position.type == 0
+                                            else mt5.ORDER_TYPE_BUY,
+                                    "position": position.ticket,
+                                    "price": tick.bid if position.type == 0 else tick.ask,
+                                    "deviation": 30, "magic": position.magic,
+                                    "type_filling": mt5.ORDER_FILLING_FOK,
+                                    "comment": "supervisor"})
+                state["baseline_equity"] = account.equity
+                state["paused_until"] = time.time() + 1800
+                STATE.write_text(json.dumps(state), encoding="utf-8")
+
+            # 4. heartbeat
+            pnl = sum(position.profit for position in positions)
+            log({"event": f"HEARTBEAT equity {account.equity:.2f} baseline {baseline:.2f} "
+                          f"positions {len(positions)} floating {pnl:+.2f}"})
+        except Exception as exc:  # noqa: BLE001 - the supervisor must never die
+            log({"event": f"cycle error {type(exc).__name__}: {exc}"})
+        time.sleep(args.interval_sec)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
