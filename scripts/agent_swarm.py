@@ -197,6 +197,25 @@ def h1_ema_state(symbol: str) -> tuple[str, float] | None:
     return None
 
 
+def atr_stop_fraction(symbol: str, multiple: float = 3.0) -> float:
+    """Stop distance as a fraction of price: three hourly ATRs."""
+    import statistics as st
+
+    import MetaTrader5 as mt5
+
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 1, 60)
+    if rates is None or len(rates) < 20:
+        return 0.02
+    ranges = [max(rates[i]["high"] - rates[i]["low"],
+                  abs(rates[i]["high"] - rates[i - 1]["close"]),
+                  abs(rates[i]["low"] - rates[i - 1]["close"]))
+              for i in range(1, len(rates))]
+    atr = st.fmean(ranges[-14:])
+    tick = mt5.symbol_info_tick(symbol)
+    price = (tick.ask + tick.bid) / 2 if tick and tick.bid else 0
+    return (multiple * atr / price) if price else 0.02
+
+
 def open_trade(mt5, spec: dict, side: str, tick, *, stop: float | None,
                take: float | None = None) -> None:
     order_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
@@ -316,11 +335,12 @@ def main(argv: list[str] | None = None) -> int:
                     if state is None:
                         continue
                     side = "BUY" if state == "BUY" else "SELL"
+                    stop_fraction = atr_stop_fraction(spec["symbol"])
                     if position is None:
-                        open_trade(mt5, spec, side, tick, stop=0.05)
+                        open_trade(mt5, spec, side, tick, stop=stop_fraction)
                     elif (position.type == 0 and side == "SELL") or (position.type == 1 and side == "BUY"):
                         close_trade(mt5, spec, position)
-                        open_trade(mt5, spec, side, tick, stop=0.05)
+                        open_trade(mt5, spec, side, tick, stop=stop_fraction)
 
                 elif spec["kind"] == "first_hour":
                     day_key = now.strftime("%Y-%m-%d")
