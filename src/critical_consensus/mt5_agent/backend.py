@@ -123,6 +123,17 @@ class AccountInfo:
 
 @dataclass(frozen=True)
 class SymbolSpec:
+    # ENUM_SYMBOL_TRADE_MODE values the terminal can report. The reference EA sends only when an
+    # instrument is in mode 4, and everything below it is the broker having taken away the right
+    # to open a position here - a disabled or close-only instrument is still quoted all day.
+    # Measured on MetaQuotes-Demo 2026-11-02: US500 reports trade_mode=0 while EURUSD, XAUUSD and
+    # XAGUSD report 4, so the runner signalled US500, the EA refused it before it placed the
+    # order, and the
+    # send was left with no deal to confirm.
+    TRADE_MODE_FULL = 4
+    TRADE_MODE_NAMES = {0: "disabled", 1: "long_only", 2: "short_only", 3: "close_only",
+                        4: "full"}
+
     symbol: str
     point: float
     digits: int
@@ -136,6 +147,10 @@ class SymbolSpec:
     # Units of the base contract behind one lot: 100 000 EUR, 100 troy ounces, 5 000 silver
     # ounces. Optional because a policy-written spec may predate it; a terminal always has it.
     contract_size: float | None = None
+    # The terminal's trade mode for this instrument, or None when the reader did not supply one.
+    # Measurement keeps working for any mode - a position already open on a close-only instrument
+    # still has to be priced - but an opening cycle refuses anything that is not full.
+    trade_mode: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", self.symbol.strip().upper())
@@ -160,6 +175,10 @@ class SymbolSpec:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
+        if self.trade_mode is not None and (isinstance(self.trade_mode, bool)
+                                            or not isinstance(self.trade_mode, int)
+                                            or not 0 <= self.trade_mode <= 4):
+            raise ValueError("trade_mode must be an integer in [0, 4] or None")
 
     @classmethod
     def from_terminal(cls, info: Any, account_currency: str) -> "SymbolSpec":
@@ -209,12 +228,29 @@ class SymbolSpec:
         contract_size = _finite(getattr(info, "trade_contract_size", None))
         if contract_size is not None and contract_size <= 0:
             contract_size = None
+        # An unreadable mode is recorded as unknown rather than refused: absence of the field is
+        # not evidence that the broker forbids the instrument, and the EA checks the live value
+        # again before it sends.
+        mode = getattr(info, "trade_mode", None)
+        if isinstance(mode, bool) or not isinstance(mode, int) or not 0 <= mode <= 4:
+            mode = None
         return cls(symbol=name, point=numbers["point"], digits=digits,
                    tick_size=numbers["trade_tick_size"], tick_value=tick_value,
                    volume_min=numbers["volume_min"], volume_max=numbers["volume_max"],
                    volume_step=numbers["volume_step"], spread_points=integers["spread"],
                    stops_level_points=integers["trade_stops_level"],
-                   contract_size=contract_size)
+                   contract_size=contract_size, trade_mode=mode)
+
+    @property
+    def can_open(self) -> bool:
+        """Whether the broker currently allows a new position on this instrument."""
+        return self.trade_mode is None or self.trade_mode == self.TRADE_MODE_FULL
+
+    @property
+    def trade_mode_name(self) -> str:
+        if self.trade_mode is None:
+            return "unknown"
+        return self.TRADE_MODE_NAMES.get(self.trade_mode, f"mode_{self.trade_mode}")
 
     def price_to_volume(self, volume: float) -> float:
         """Round a requested volume down to the broker step, minimum and maximum lot."""

@@ -677,6 +677,15 @@ class MT5Agent:
             # symbol, so the cycle must not reach the strategy or the paper book.
             return self._finish(codes.STATUS_BLOCKED, (codes.BAR_SYMBOL_MISMATCH,), None, None,
                                 None, moment)
+        if not spec.can_open:
+            # The reference EA applies the same rule before it places the order, and it is right:
+            # a disabled or close-only instrument still quotes all day, so the signal looks
+            # tradeable while no lot can be opened on it. Blocking here is what keeps the cycle
+            # from queueing an order the broker will never take - measured on MetaQuotes-Demo,
+            # where US500 reports trade_mode=0 and an unconfirmed send of that kind stops the
+            # whole run with the kill switch armed.
+            return self._finish(codes.STATUS_BLOCKED, (codes.SYMBOL_TRADING_DISABLED,), None,
+                                None, None, moment)
         age = (moment - tick.server_time).total_seconds()
         if age < -5:
             return self._finish(codes.STATUS_BLOCKED, (codes.QUOTE_FROM_THE_FUTURE,), None, None,
