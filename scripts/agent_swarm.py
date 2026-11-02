@@ -47,7 +47,7 @@ def agent(name: str, kind: str, symbol: str, lots: float, *, experimental: bool 
 AGENTS: list[dict] = [
     # --- gold and silver: the only instruments with a real edge on this venue --------
     agent("ema-xau", "h1_ema", "XAUUSD", 0.02),
-    agent("ema-xag", "h1_ema", "XAGUSD", 0.02),
+    agent("ema-xag", "h1_ema", "XAGUSD", 0.01),
     # --- Monday long, the strongest calendar effect -------------------------------
     agent("mon-long-gbp", "monday_long", "GBPUSD", 0.02),
     agent("mon-long-aud", "monday_long", "AUDUSD", 0.02),
@@ -183,7 +183,7 @@ def h1_ema_state(symbol: str) -> tuple[str, float] | None:
 
 
 STATE = ROOT / "agent_data" / "swarm_state.json"
-SYMBOL_CAP = {"XAUUSD": 0.04, "XAGUSD": 0.04, "EURUSD": 0.04, "GBPUSD": 0.04,
+SYMBOL_CAP = {"XAUUSD": 0.03, "XAGUSD": 0.02, "EURUSD": 0.04, "GBPUSD": 0.04,
               "USDJPY": 0.04, "AUDUSD": 0.04, "USDCHF": 0.04, "USDCAD": 0.04,
               "NZDUSD": 0.04, "US500": 0.2, "UK100": 0.2, "US30": 0.2, "JPN225": 1.0}
 MAX_DRAWDOWN = 0.01      # close everything if the account loses 1% from the baseline
