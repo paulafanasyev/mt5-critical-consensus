@@ -74,6 +74,12 @@ AGENTS: list[dict] = [
     agent("trend-jpy", "daily_trend", "USDJPY", 0.02),
     agent("trend-us500", "daily_trend", "US500", 0.1),
     agent("trend-xag-cont", "daily_trend", "XAGUSD", 0.01, experimental=True),
+    agent("trend-aud", "daily_trend", "AUDUSD", 0.02),
+    agent("trend-cad", "daily_trend", "USDCAD", 0.02),
+    agent("trend-nzd", "daily_trend", "NZDUSD", 0.02),
+    agent("trend-uki", "daily_trend", "UK100", 0.1),
+    agent("trend-jpn", "daily_trend", "JPN225", 1.0),
+    agent("trend-us30", "daily_trend", "US30", 0.1),
     # --- experimental, weaker evidence, quarter size ------------------------------
     agent("x-mon-long-xag", "monday_long", "XAGUSD", 0.01, experimental=True),
     agent("x-mon-long-uki", "monday_long", "UK100", 0.1, experimental=True),
