@@ -46,27 +46,30 @@ def agent(name: str, kind: str, symbol: str, lots: float, *, experimental: bool 
 
 AGENTS: list[dict] = [
     # --- gold and silver: the only instruments with a real edge on this venue --------
-    agent("ema-xau", "h1_ema", "XAUUSD", 0.02),
-    agent("ema-xag", "h1_ema", "XAGUSD", 0.01),
+    agent("ema-xau", "h1_ema", "XAUUSD", 0.03),
+    agent("ema-xag", "h1_ema", "XAGUSD", 0.02),
     # --- Monday long, the strongest calendar effect -------------------------------
-    agent("mon-long-gbp", "monday_long", "GBPUSD", 0.02),
-    agent("mon-long-aud", "monday_long", "AUDUSD", 0.02),
-    agent("mon-long-chf", "monday_long", "USDCHF", 0.02),
-    agent("mon-long-eur", "monday_long", "EURUSD", 0.02),
-    agent("mon-long-jpy", "monday_long", "USDJPY", 0.02),
+    agent("mon-long-gbp", "monday_long", "GBPUSD", 0.03),
+    agent("mon-long-aud", "monday_long", "AUDUSD", 0.03),
+    agent("mon-long-chf", "monday_long", "USDCHF", 0.03),
+    agent("mon-long-eur", "monday_long", "EURUSD", 0.03),
+    agent("mon-long-jpy", "monday_long", "USDJPY", 0.03),
     # --- Monday gap fill -----------------------------------------------------------
-    agent("gap-gbp", "monday_gap_fill", "GBPUSD", 0.02),
-    agent("gap-chf", "monday_gap_fill", "USDCHF", 0.02),
-    agent("gap-aud", "monday_gap_fill", "AUDUSD", 0.02),
-    agent("gap-cad", "monday_gap_fill", "USDCAD", 0.02),
+    agent("gap-gbp", "monday_gap_fill", "GBPUSD", 0.03),
+    agent("gap-chf", "monday_gap_fill", "USDCHF", 0.03),
+    agent("gap-aud", "monday_gap_fill", "AUDUSD", 0.03),
+    agent("gap-cad", "monday_gap_fill", "USDCAD", 0.03),
     agent("gold-gap", "monday_gap_continue", "XAUUSD", 0.01),
     # --- First hour of the server day ---------------------------------------------
-    agent("fh-chf", "first_hour", "USDCHF", 0.02),
-    agent("fh-aud", "first_hour", "AUDUSD", 0.02),
-    agent("fh-gbp", "first_hour", "GBPUSD", 0.02),
-    agent("fh-eur", "first_hour", "EURUSD", 0.02),
-    agent("fh-jpy", "first_hour", "USDJPY", 0.02),
-    agent("fh-cad", "first_hour", "USDCAD", 0.02),
+    agent("fh-chf", "first_hour", "USDCHF", 0.03),
+    agent("fh-aud", "first_hour", "AUDUSD", 0.03),
+    agent("fh-gbp", "first_hour", "GBPUSD", 0.03),
+    agent("fh-eur", "first_hour", "EURUSD", 0.03),
+    agent("fh-jpy", "first_hour", "USDJPY", 0.03),
+    agent("fh-cad", "first_hour", "USDCAD", 0.03),
+    # --- scaling units on the two schemes currently in profit --------------------
+    agent("ema-xau-b", "h1_ema", "XAUUSD", 0.02),
+    agent("mon-long-gbp-b", "monday_long", "GBPUSD", 0.02),
     # --- session drift: US index rises inside the US session ----------------------
     agent("us500-session", "session_long", "US500", 0.1),
     agent("us500-mon-session", "session_long", "US500", 0.1),
@@ -183,9 +186,9 @@ def h1_ema_state(symbol: str) -> tuple[str, float] | None:
 
 
 STATE = ROOT / "agent_data" / "swarm_state.json"
-SYMBOL_CAP = {"XAUUSD": 0.03, "XAGUSD": 0.02, "EURUSD": 0.04, "GBPUSD": 0.04,
-              "USDJPY": 0.04, "AUDUSD": 0.04, "USDCHF": 0.04, "USDCAD": 0.04,
-              "NZDUSD": 0.04, "US500": 0.2, "UK100": 0.2, "US30": 0.2, "JPN225": 1.0}
+SYMBOL_CAP = {"XAUUSD": 0.06, "XAGUSD": 0.04, "EURUSD": 0.07, "GBPUSD": 0.07,
+              "USDJPY": 0.07, "AUDUSD": 0.07, "USDCHF": 0.07, "USDCAD": 0.07,
+              "NZDUSD": 0.07, "US500": 0.3, "UK100": 0.3, "US30": 0.3, "JPN225": 1.0}
 MAX_DRAWDOWN = 0.01      # close everything if the account loses 1% from the baseline
 PAUSE_SECONDS = 1800
 
