@@ -46,8 +46,8 @@ def agent(name: str, kind: str, symbol: str, lots: float, *, experimental: bool 
 
 AGENTS: list[dict] = [
     # --- gold and silver: the only instruments with a real edge on this venue --------
-    agent("ema-xau", "h1_ema", "XAUUSD", 0.03),
-    agent("ema-xag", "h1_ema", "XAGUSD", 0.02),
+    agent("ema-xau", "h1_ema", "XAUUSD", 0.05),
+    agent("ema-xag", "h1_ema", "XAGUSD", 0.03),
     # --- Monday long, the strongest calendar effect -------------------------------
     agent("mon-long-gbp", "monday_long", "GBPUSD", 0.03),
     agent("mon-long-aud", "monday_long", "AUDUSD", 0.03),
@@ -68,7 +68,7 @@ AGENTS: list[dict] = [
     agent("fh-jpy", "first_hour", "USDJPY", 0.03),
     agent("fh-cad", "first_hour", "USDCAD", 0.03),
     # --- scaling units on the two schemes currently in profit --------------------
-    agent("ema-xau-b", "h1_ema", "XAUUSD", 0.02),
+    agent("ema-xau-b", "h1_ema", "XAUUSD", 0.03),
     agent("mon-long-gbp-b", "monday_long", "GBPUSD", 0.02),
     # --- session drift: US index rises inside the US session ----------------------
     agent("us500-session", "session_long", "US500", 0.1),
@@ -194,7 +194,7 @@ def h1_ema_state(symbol: str) -> tuple[str, float] | None:
 
 
 STATE = ROOT / "agent_data" / "swarm_state.json"
-SYMBOL_CAP = {"XAUUSD": 0.06, "XAGUSD": 0.04, "EURUSD": 0.07, "GBPUSD": 0.07,
+SYMBOL_CAP = {"XAUUSD": 0.10, "XAGUSD": 0.06, "EURUSD": 0.07, "GBPUSD": 0.07,
               "USDJPY": 0.07, "AUDUSD": 0.07, "USDCHF": 0.07, "USDCAD": 0.07,
               "NZDUSD": 0.07, "US500": 0.3, "UK100": 0.3, "US30": 0.3, "JPN225": 1.0}
 MAX_DRAWDOWN = 0.01      # close everything if the account loses 1% from the baseline
@@ -219,7 +219,8 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
     account = mt5.account_info()
     if account is None:
         return
-    baseline = state.setdefault("baseline_equity", account.equity)
+    baseline = max(state.get("baseline_equity", 0), account.equity)
+        state["baseline_equity"] = baseline
     if account.equity < baseline * (1 - MAX_DRAWDOWN):
         log({"event": f"BREAKER: equity {account.equity:.2f} below {baseline:.2f} "
                       f"(-{MAX_DRAWDOWN * 100:.0f}%); flattening the swarm"})

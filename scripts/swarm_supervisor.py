@@ -68,7 +68,8 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(args.interval_sec)
                 continue
             state = json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {}
-            baseline = state.setdefault("baseline_equity", account.equity)
+            baseline = max(state.get("baseline_equity", 0), account.equity)
+        state["baseline_equity"] = baseline
             state.setdefault("paused_until", 0.0)
 
             # 1. the swarm process
