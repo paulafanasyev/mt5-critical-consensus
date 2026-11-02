@@ -67,11 +67,19 @@ AGENTS: list[dict] = [
     agent("fh-eur", "first_hour", "EURUSD", 0.02),
     agent("fh-jpy", "first_hour", "USDJPY", 0.02),
     agent("fh-cad", "first_hour", "USDCAD", 0.02),
+    # --- session drift: US index rises inside the US session ----------------------
+    agent("us500-session", "session_long", "US500", 0.1),
+    agent("us500-mon-session", "session_long", "US500", 0.1),
+    # --- weekly momentum on metals (5-day return, hold 5 days) --------------------
+    agent("wm-xau", "weekly_momentum", "XAUUSD", 0.02),
+    agent("wm-xag", "weekly_momentum", "XAGUSD", 0.01),
     # --- experimental, weaker evidence, quarter size ------------------------------
     agent("x-ema-xag", "h1_ema", "XAGUSD", 0.01, experimental=True),
     agent("x-mon-long-uki", "monday_long", "UK100", 0.1, experimental=True),
     agent("x-gap-eur", "monday_gap_fill", "EURUSD", 0.01, experimental=True),
     agent("x-fh-xau", "first_hour", "XAUUSD", 0.01, experimental=True),
+    agent("x-wm-xag", "weekly_momentum", "XAGUSD", 0.01, experimental=True),
+    agent("x-tom-xau", "turn_of_month", "XAUUSD", 0.01, experimental=True),
 ]
 for index, item in enumerate(AGENTS):
     item["magic"] = MAGIC_BASE + index
@@ -175,7 +183,7 @@ def h1_ema_state(symbol: str) -> tuple[str, float] | None:
 
 
 STATE = ROOT / "agent_data" / "swarm_state.json"
-SYMBOL_CAP = {"XAUUSD": 0.02, "XAGUSD": 0.02, "EURUSD": 0.04, "GBPUSD": 0.04,
+SYMBOL_CAP = {"XAUUSD": 0.04, "XAGUSD": 0.04, "EURUSD": 0.04, "GBPUSD": 0.04,
               "USDJPY": 0.04, "AUDUSD": 0.04, "USDCHF": 0.04, "USDCAD": 0.04,
               "NZDUSD": 0.04, "US500": 0.2, "UK100": 0.2, "US30": 0.2, "JPN225": 1.0}
 MAX_DRAWDOWN = 0.01      # close everything if the account loses 1% from the baseline
@@ -282,6 +290,19 @@ def atr_stop_fraction(symbol: str, multiple: float = 3.0) -> float:
     tick = mt5.symbol_info_tick(symbol)
     price = (tick.ask + tick.bid) / 2 if tick and tick.bid else 0
     return (multiple * atr / price) if price else 0.02
+
+
+def daily_closes(symbol: str, count: int = 30) -> list[float]:
+    import MetaTrader5 as mt5
+
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 1, 4000)
+    if rates is None or len(rates) < 200:
+        return []
+    days: dict[str, float] = {}
+    for rate in rates:
+        stamp = datetime.fromtimestamp(int(rate["time"]), tz=timezone.utc)
+        days[(stamp + timedelta(hours=SERVER_OFFSET)).date().isoformat()] = float(rate["close"])
+    return [days[key] for key in sorted(days)][-count:]
 
 
 def swarm_exposure(symbol: str) -> float:
@@ -425,6 +446,39 @@ def main(argv: list[str] | None = None) -> int:
                     elif (position.type == 0 and side == "SELL") or (position.type == 1 and side == "BUY"):
                         close_trade(mt5, spec, position)
                         open_trade(mt5, spec, side, tick, stop=stop_fraction)
+
+                elif spec["kind"] == "session_long":
+                    # US index drifts up during the US session; Monday is the strongest day
+                    monday_only = spec["name"] == "us500-mon-session"
+                    in_window = 14 <= now.hour < 20 and (not monday_only or now.weekday() == 0)
+                    if in_window and position is None:
+                        open_trade(mt5, spec, "BUY", tick,
+                                   stop=atr_stop_fraction(spec["symbol"]))
+                    elif position is not None and (now.hour >= 20 or now.hour < 14):
+                        close_trade(mt5, spec, position)
+
+                elif spec["kind"] == "weekly_momentum":
+                    closes = daily_closes(spec["symbol"], 8)
+                    if len(closes) >= 6:
+                        momentum = closes[-1] / closes[-6] - 1
+                        side = "BUY" if momentum > 0 else "SELL"
+                        if position is None:
+                            open_trade(mt5, spec, side, tick,
+                                       stop=atr_stop_fraction(spec["symbol"]))
+                        elif (position.type == 0 and side == "SELL") or \
+                             (position.type == 1 and side == "BUY"):
+                            close_trade(mt5, spec, position)
+                            open_trade(mt5, spec, side, tick,
+                                       stop=atr_stop_fraction(spec["symbol"]))
+
+                elif spec["kind"] == "turn_of_month":
+                    server_date = server.date()
+                    is_month_end = (server_date + timedelta(days=1)).month != server_date.month
+                    if is_month_end and server.hour >= 21 and position is None:
+                        open_trade(mt5, spec, "BUY", tick,
+                                   stop=atr_stop_fraction(spec["symbol"]))
+                    elif position is not None and server.day >= 3 and not is_month_end:
+                        close_trade(mt5, spec, position)
 
                 elif spec["kind"] == "first_hour":
                     day_key = now.strftime("%Y-%m-%d")
