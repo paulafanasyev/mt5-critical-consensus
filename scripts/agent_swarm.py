@@ -66,6 +66,14 @@ AGENTS: list[dict] = [
     agent("fh-eur", "first_hour", "EURUSD", 0.02),
     agent("fh-jpy", "first_hour", "USDJPY", 0.02),
     agent("fh-cad", "first_hour", "USDCAD", 0.02),
+    # --- daily trend: hold until the 200-day average flips -----------------------
+    agent("trend-xau", "daily_trend", "XAUUSD", 0.02),
+    agent("trend-xag", "daily_trend", "XAGUSD", 0.01),
+    agent("trend-eur", "daily_trend", "EURUSD", 0.02),
+    agent("trend-gbp", "daily_trend", "GBPUSD", 0.02),
+    agent("trend-jpy", "daily_trend", "USDJPY", 0.02),
+    agent("trend-us500", "daily_trend", "US500", 0.1),
+    agent("trend-xag-cont", "daily_trend", "XAGUSD", 0.01, experimental=True),
     # --- experimental, weaker evidence, quarter size ------------------------------
     agent("x-mon-long-xag", "monday_long", "XAGUSD", 0.01, experimental=True),
     agent("x-mon-long-uki", "monday_long", "UK100", 0.1, experimental=True),
@@ -107,6 +115,31 @@ def open_for(mt5, spec: dict) -> dict | None:
     for position in positions:
         if position.magic == spec["magic"]:
             return position
+    return None
+
+
+def daily_trend_state(symbol: str) -> str | None:
+    """Return BUY if the last daily close is above its 200-day average, SELL if below."""
+    import MetaTrader5 as mt5
+
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 1, 20000)
+    if rates is None or len(rates) < 3000:
+        return None
+    days: dict[str, float] = {}
+    for rate in rates:
+        stamp = datetime.fromtimestamp(int(rate["time"]), tz=timezone.utc)
+        days[(stamp + timedelta(hours=SERVER_OFFSET)).date().isoformat()] = float(rate["close"])
+    closes = [days[key] for key in sorted(days)]
+    if len(closes) < 201:
+        return None
+    weight = 2 / 201
+    ema = closes[0]
+    for value in closes[1:]:
+        ema = value * weight + ema * (1 - weight)
+    if closes[-1] > ema * 1.001:
+        return "BUY"
+    if closes[-1] < ema * 0.999:
+        return "SELL"
     return None
 
 
@@ -198,6 +231,17 @@ def main(argv: list[str] | None = None) -> int:
                     elif position is not None and (server.weekday() != 0
                                                    or server.hour >= EXIT_SERVER_HOUR):
                         close_trade(mt5, spec, position)
+
+                elif spec["kind"] == "daily_trend":
+                    state = daily_trend_state(spec["symbol"])
+                    if state is None:
+                        continue
+                    side = "BUY" if state == "BUY" else "SELL"
+                    if position is None:
+                        open_trade(mt5, spec, side, tick, stop=0.05)
+                    elif (position.type == 0 and side == "SELL") or (position.type == 1 and side == "BUY"):
+                        close_trade(mt5, spec, position)
+                        open_trade(mt5, spec, side, tick, stop=0.05)
 
                 elif spec["kind"] == "first_hour":
                     day_key = now.strftime("%Y-%m-%d")
