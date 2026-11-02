@@ -220,7 +220,7 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
     if account is None:
         return
     baseline = max(state.get("baseline_equity", 0), account.equity)
-        state["baseline_equity"] = baseline
+    state["baseline_equity"] = baseline
     if account.equity < baseline * (1 - MAX_DRAWDOWN):
         log({"event": f"BREAKER: equity {account.equity:.2f} below {baseline:.2f} "
                       f"(-{MAX_DRAWDOWN * 100:.0f}%); flattening the swarm"})
