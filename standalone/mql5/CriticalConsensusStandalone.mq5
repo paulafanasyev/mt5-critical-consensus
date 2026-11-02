@@ -338,14 +338,18 @@ bool PlaceDemoOrder(const string direction, const double volume, string &card_te
    { Print("BLOCKED: ", reason); return false; }
 
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double pip = PipSize();
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick)) { Print("BLOCKED: no tick"); return false; }
+   if(point <= 0.0 || pip <= 0.0) { Print("BLOCKED: invalid symbol point/pip size"); return false; }
    double price = (direction == "BUY") ? tick.ask : tick.bid;
-   double sl = (direction == "BUY") ? price - SlPips * point : price + SlPips * point;
-   double tp = (direction == "BUY") ? price + TpPips * point : price - TpPips * point;
+   double sl = (direction == "BUY") ? price - SlPips * pip : price + SlPips * pip;
+   double tp = 0.0;
+   if(TakeProfitPips > 0)
+      tp = (direction == "BUY") ? price + TakeProfitPips * pip : price - TakeProfitPips * pip;
    sl = NormalizeDouble(sl, digits);
-   tp = NormalizeDouble(tp, digits);
+   if(tp > 0.0) tp = NormalizeDouble(tp, digits);
 
    // Volume constraints, same as the repo's bridge EA.
    double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
@@ -376,9 +380,11 @@ bool PlaceDemoOrder(const string direction, const double volume, string &card_te
    { Print("ORDER NOT CONFIRMED: sent=", result.retcode, " error=", GetLastError()); return false; }
 
    trades_today++;
-   card_text = "✅ OPENED " + direction + " " + DoubleToString(volume, 2) + " lot " + _Symbol +
+   string tp_text = (tp > 0.0) ? DoubleToString(tp, digits) : "TRAILING EXIT";
+   card_text = "✅ OPENED " + direction + " " + DoubleToString(volume, 3) + " lot " + _Symbol +
                " @ " + DoubleToString(price, digits) +
-               "\nSL " + DoubleToString(sl, digits) + "  TP " + DoubleToString(tp, digits) +
+               "\nSL " + DoubleToString(sl, digits) + "  TP " + tp_text +
+               "\nRisk budget " + DoubleToString(RiskPercentPerTrade, 2) + "% equity" +
                "\nDemo money. Trades today: " + IntegerToString(trades_today) + "/" + IntegerToString(MaxTradesPerDay);
    return true;
 }
