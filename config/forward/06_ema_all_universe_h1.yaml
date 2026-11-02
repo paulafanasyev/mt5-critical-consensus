@@ -16,6 +16,16 @@ account:
   expected_login: 114929502
   expected_server: MetaQuotes-Demo
   require_demo: true
+  # MAGIC_NUMBER in scripts/run_mt5_demo_trading.py, and what the broker stamps on every deal
+  # this run sends - measured on the live book, where this run's three positions carried
+  # 8172026 and the rest of the account's fifteen carried other magics or none. The demo is
+  # shared with another agent's swarm, so a position count that reads the whole account is not
+  # measuring this strategy's concentration: at 15 foreign positions against a cap of 7 every
+  # symbol journaled POSITION_CAP_EXCEEDED and the run traded nothing at all. Only the count and
+  # the one-per-symbol rule are scoped this way; max_daily_loss_fraction, max_drawdown_fraction
+  # and the aggregate stop risk still measure every lot on the account, because another
+  # strategy's open risk is still this equity's exposure.
+  position_magic: 8172026
 
 symbol_spec:
   symbol: XAUUSD
@@ -52,6 +62,15 @@ risk:
   min_risk_reward: 1.5
   max_spread_points: 200
   max_quote_age_seconds: 15
+  # The lot ceiling the demo runner and the reference EA both refuse to cross, declared here so
+  # the position is sized inside it. Measured at 0.0005: the 2x-ATR stop on EURUSD and GBPUSD
+  # wants 0.31 lots, AUDUSD 0.35, NZDUSD 0.39, US500 1.50 - every one of them over the ceiling,
+  # while the metals sit under it at their 0.01 minimum. Checked only after sizing, that is five
+  # of the seven tradeable instruments journaled as VOLUME_ABOVE_DEMO_CAP on every cycle and two
+  # carrying the whole book; clipped here, they trade at 0.20 and journal the smaller risk they
+  # actually carry. Nothing here raises the ceiling - it is the same 0.20 the executor enforces,
+  # so the worst case stays 7 x 0.20 lots.
+  max_volume_lots: 0.20
 
 strategy:
   family: ema

@@ -401,16 +401,21 @@ def test_paper_broker_reports_the_server_offset_it_applies():
 
 
 # ------------------------------------------------------------ order surface
+# order_calc_profit is a calculator, not a request: it answers "what would a position of this
+# volume between these two prices be worth, in this account's currency" and the terminal neither
+# validates nor sends anything. It is here because a pair whose profit currency differs from the
+# account's cannot be priced from a SymbolSpec at all, and the open-position reserve has to know
+# what somebody else's leg would cost.
 ALLOWED_TERMINAL_CALLS = {"initialize", "shutdown", "last_error", "account_info", "symbol_info",
                           "symbol_select", "symbol_info_tick", "copy_rates_from_pos",
-                          "positions_get"}
+                          "positions_get", "order_calc_profit"}
 FORBIDDEN_TERMS = ("order_send", "OrderSend", "order_check", "OrderCheck", "OrderCalcMargin",
                    "OrderCalcProfit", "trade_transaction", "TradeTransaction", "order_place",
                    "deal_get", "HistoryDeals")
 
 
 def test_package_source_contains_no_order_sending_surface():
-    """A grep-level promise: the only terminal calls here are the nine order-free ones.
+    """A grep-level promise: the only terminal calls here are the ten order-free ones.
 
     ``symbol_select`` is the one mutating call — it adds a missing symbol to
     Market Watch so ``symbol_info``/``copy_rates`` have data; it never sends an order.

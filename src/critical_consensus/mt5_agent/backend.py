@@ -178,9 +178,13 @@ class SymbolSpec:
             if value is None:
                 raise RuntimeError(f"MT5 symbol {name.strip().upper()} has no {field_name}")
             numbers[field_name] = value
-        tick_value = _finite(getattr(info, "trade_tick_value_loss", None)) \
-            or _finite(getattr(info, "trade_tick_value", None))
-        if tick_value is None:
+        # Written out rather than chained with ``or``: ``or`` cannot tell an absent field from a
+        # broker that publishes 0.0, and a 0.0 that reached the dataclass would surface as a
+        # generic geometry complaint instead of naming the field the broker left empty.
+        tick_value = _finite(getattr(info, "trade_tick_value_loss", None))
+        if tick_value is None or tick_value <= 0:
+            tick_value = _finite(getattr(info, "trade_tick_value", None))
+        if tick_value is None or tick_value <= 0:
             raise RuntimeError(f"MT5 symbol {name.strip().upper()} has no trade_tick_value")
         digits = getattr(info, "digits", None)
         if isinstance(digits, bool) or not isinstance(digits, int):
@@ -319,10 +323,17 @@ class PositionSnapshot:
     stop_loss: float
     take_profit: float
     open_time: datetime
+    # The EA magic the broker stamped on the position, or None when the reader could not tell.
+    # 0 is a position a person opened by hand, which is a known attribution and not an unknown
+    # one. None must never be read as ours: an unreadable attribution has to keep counting.
+    magic: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.ticket, bool) or self.ticket <= 0:
             raise ValueError("position ticket must be a positive integer")
+        if self.magic is not None and (isinstance(self.magic, bool)
+                                       or not isinstance(self.magic, int) or self.magic < 0):
+            raise ValueError("position magic must be a non-negative integer or null")
         object.__setattr__(self, "symbol", self.symbol.strip().upper())
         direction = self.direction.strip().upper()
         if direction not in {"BUY", "SELL"}:
@@ -353,6 +364,11 @@ class MT5Backend(Protocol):
     it, raises from it, or reports ``None``, a string, a bool or a non-finite number is
     blocked with ``EQUITY_BASELINES_UNAVAILABLE``. A terminal adapter that cannot
     reconstruct a baseline must not guess it.
+
+    ``position_stop_risk(position)`` is optional for the same reason, and the agent reads it
+    with ``getattr``: only a live terminal can price a leg whose profit currency is not the
+    account's. A paper book that never holds such a position does not have to answer, and the
+    agent falls back to blocking when a real book cannot be measured.
     """
 
     def account(self) -> AccountInfo: ...
@@ -594,13 +610,44 @@ class LiveMT5Backend:
             code = int(row.type)
             if code not in (0, 1):
                 raise RuntimeError(f"MT5 returned an unknown position type {code}")
+            # A terminal that reports no magic is not the same as a magic of zero: zero is a
+            # hand-opened position, a missing field says the reader could not attribute it, and
+            # the two must not be collapsed into the same value.
+            raw_magic = getattr(row, "magic", None)
+            magic = None if _finite(raw_magic) is None else int(raw_magic)
             positions.append(PositionSnapshot(
                 ticket=int(row.ticket), symbol=str(row.symbol),
                 direction="BUY" if code == 0 else "SELL", volume=float(row.volume),
                 entry_price=float(row.price_open), stop_loss=float(row.sl),
-                take_profit=float(row.tp),
+                take_profit=float(row.tp), magic=magic,
                 open_time=self._offset_datetime(row, f"{str(row.symbol).upper()} position")))
         return positions
+
+    def position_stop_risk(self, position: PositionSnapshot) -> float | None:
+        """What one open leg costs if its stop is taken, in account currency, by broker math.
+
+        ``SymbolSpec.from_terminal`` refuses instruments whose profit currency differs from the
+        account's, which is correct before opening a trade — the lot would be sized in a currency
+        this run cannot price — and obstructive for a leg that is already on the same account:
+        somebody else's USDJPY on a USD demo made the whole book unpriceable and froze every
+        cycle. The terminal's own ``order_calc_profit`` answers the measurement question, at the
+        conversion rate it would settle at, without granting this run a licence to trade there.
+
+        ``None`` means the terminal cannot price this leg, or its stop cannot cost anything:
+        the caller must treat that as unmeasurable, never as zero risk.
+        """
+        distance = (position.entry_price - position.stop_loss) \
+            if position.direction == "BUY" else (position.stop_loss - position.entry_price)
+        if position.stop_loss <= 0 or distance <= 0:
+            return None
+        action = (self._mt5.ORDER_TYPE_BUY if position.direction == "BUY"
+                  else self._mt5.ORDER_TYPE_SELL)
+        profit = _finite(self._mt5.order_calc_profit(action, self._name(position.symbol),
+                                                     position.volume, position.entry_price,
+                                                     position.stop_loss))
+        if profit is None or profit >= 0:
+            return None
+        return -profit
 
     def shutdown(self) -> None:
         self._mt5.shutdown()

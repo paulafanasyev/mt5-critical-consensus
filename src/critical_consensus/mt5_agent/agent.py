@@ -176,13 +176,24 @@ def _fill_geometry_blockers(trade: Proposal, fill: float, spec: SymbolSpec) -> t
     return tuple(blockers)
 
 
-def _position_stop_risk(spec: SymbolSpec, position: PositionSnapshot) -> float | None:
-    """Account-currency loss if this position's stop is taken, or ``None`` when unmeasurable."""
+def _stop_distance(position: PositionSnapshot) -> float | None:
+    """How far price must travel against this position before its stop is taken, or ``None``.
+
+    Pure geometry, so it needs no symbol data: an unset stop, or one on the profitable side of
+    entry, is not a measurable loss however the instrument is quoted or whichever currency it
+    pays profit in.
+    """
     if position.stop_loss <= 0:
         return None
     distance = (position.entry_price - position.stop_loss) \
         if position.direction == "BUY" else (position.stop_loss - position.entry_price)
-    if distance <= 0:
+    return distance if distance > 0 else None
+
+
+def _position_stop_risk(spec: SymbolSpec, position: PositionSnapshot) -> float | None:
+    """Account-currency loss if this position's stop is taken, or ``None`` when unmeasurable."""
+    distance = _stop_distance(position)
+    if distance is None:
         return None
     return distance * spec.cash_per_price_unit * position.volume
 
@@ -320,7 +331,8 @@ class MT5Agent:
                                margin_available=account.margin_free,
                                price=tick.reference[proposal.direction],
                                max_notional=min(equity, account.balance)
-                               * policy.risk.max_notional_fraction)
+                               * policy.risk.max_notional_fraction,
+                               max_volume=policy.risk.max_volume_lots)
         if not sizing.accepted:
             return self._finish(codes.STATUS_BLOCKED, (sizing.denial,), proposal.as_dict(), None,
                                 None, moment, equity=equity, open_positions=len(positions))
@@ -534,14 +546,27 @@ class MT5Agent:
             return self._finish(codes.STATUS_BLOCKED, (code,), None, None, None, moment)
         return positions
 
+    def _ours_on_the_book(self, positions: list[PositionSnapshot]) -> list[PositionSnapshot]:
+        """The positions this run opened, for the caps that mean "ours" not "the account".
+
+        A policy with no magic owns the whole book. An unattributed row still counts: a reader
+        that could not tell who opened it has not proved it was somebody else.
+        """
+        magic = self._policy.position_magic
+        if magic is None:
+            return positions
+        return [position for position in positions
+                if position.magic is None or position.magic == magic]
+
     def _position_cap_blockers(self, positions: list[PositionSnapshot]) -> tuple[str, ...]:
         cap = self._policy.risk.max_open_positions
+        ours = self._ours_on_the_book(positions)
         blockers: list[str] = []
-        if len(positions) > cap:
+        if len(ours) > cap:
             blockers.append(codes.POSITION_CAP_EXCEEDED)
-        elif len(positions) == cap:
+        elif len(ours) == cap:
             blockers.append(codes.POSITION_CAP_REACHED)
-        if any(position.symbol == self._policy.symbol for position in positions):
+        if any(position.symbol == self._policy.symbol for position in ours):
             blockers.append(codes.SYMBOL_ALREADY_OPEN)
         return tuple(blockers)
 
@@ -594,18 +619,53 @@ class MT5Agent:
         self._spec_cache[symbol] = spec
         return spec
 
-    def _open_book_blockers(self, positions: list[PositionSnapshot], *, equity: float,
-                            daily_budget: float, realized_loss: float = 0.0) -> tuple[str, ...]:
-        """Positions already on the book can spend the daily allowance before we add another."""
+    def _stop_risks(self, positions: list[PositionSnapshot]
+                    ) -> tuple[tuple[float, ...], str | None]:
+        """Each leg's stop cost in account currency, or the code for the first unmeasurable one.
+
+        Our own legs are priced from the same spec the sizing path uses. A leg this run could
+        never have opened — a pair whose profit currency is not the account's, so ``symbol_spec``
+        refuses it — still holds money on this account, and the daily budget has to see it: the
+        terminal's own money math prices it without borrowing the run's licence to trade there.
+        A book that neither method can price yields a blocker, never a smaller reserve.
+        """
+        risks: list[float] = []
         for position in positions:
             spec = self._spec_for(position.symbol)
             if spec is None:
-                return (codes.MARKET_DATA_READ_FAILED,)
-            if _position_stop_risk(spec, position) is None:
+                if _stop_distance(position) is None:
+                    return (), codes.POSITION_STOP_UNSET
+                broker_risk = self._broker_stop_risk(position)
+                if broker_risk is None:
+                    return (), codes.MARKET_DATA_READ_FAILED
+                risks.append(broker_risk)
+                continue
+            risk = _position_stop_risk(spec, position)
+            if risk is None:
                 # An open position with no stop, or a stop on the wrong side of entry, has no
                 # measurable loss; the daily budget cannot be reserved against it.
-                return (codes.POSITION_STOP_UNSET,)
-        total = self._aggregate_stop_risk(positions)
+                return (), codes.POSITION_STOP_UNSET
+            risks.append(risk)
+        return tuple(risks), None
+
+    def _broker_stop_risk(self, position: PositionSnapshot) -> float | None:
+        """Ask an optional terminal reader for a leg's stop cost, refusing a bad answer."""
+        reader = getattr(self._backend, "position_stop_risk", None)
+        if not callable(reader):
+            return None
+        try:
+            value = _number(reader(position))
+        except Exception:
+            return None
+        return value if value is not None and value >= 0 else None
+
+    def _open_book_blockers(self, positions: list[PositionSnapshot], *, equity: float,
+                            daily_budget: float, realized_loss: float = 0.0) -> tuple[str, ...]:
+        """Positions already on the book can spend the daily allowance before we add another."""
+        risks, unmeasurable = self._stop_risks(positions)
+        if unmeasurable is not None:
+            return (unmeasurable,)
+        total = math.fsum(risks)
         # Banked loss and the loss still open in stops come out of the same budget.
         if realized_loss + total >= daily_budget or equity - total <= 0:
             return (codes.LOSS_FLOOR_BREACHED,)
@@ -614,20 +674,12 @@ class MT5Agent:
     def _aggregate_stop_risk(self, positions: list[PositionSnapshot]) -> float:
         """Total open stop risk; ``inf`` when any position cannot be measured.
 
-        ``_open_book_blockers`` rejects a missing spec or stop before this is used for sizing,
-        so an unmeasurable entry here can only mean the two helpers disagree. Spending the
-        whole budget is the fail-closed answer rather than silently dropping that position.
+        Both this and ``_open_book_blockers`` read the same measurement, so the number the
+        daily budget is checked against is the number sizing is reduced by. ``inf`` is the
+        fail-closed answer for a book they cannot price, not a licence to drop that leg.
         """
-        total = 0.0
-        for position in positions:
-            spec = self._spec_cache.get(position.symbol)
-            if spec is None:
-                return math.inf
-            risk = _position_stop_risk(spec, position)
-            if risk is None:
-                return math.inf
-            total += risk
-        return total
+        risks, unmeasurable = self._stop_risks(positions)
+        return math.inf if unmeasurable is not None else math.fsum(risks)
 
     def _confirmation_blockers(self, proposal: dict[str, Any],
                                sizing: dict[str, Any]) -> tuple[str, ...]:
@@ -700,7 +752,8 @@ class MT5Agent:
                                 risk_fraction_limit=policy.risk.risk_per_trade_fraction,
                                 stop_distance=stop_distance, leverage=leverage,
                                 margin_available=margin_available, price=fill,
-                                max_notional=risk_equity * policy.risk.max_notional_fraction)
+                                max_notional=risk_equity * policy.risk.max_notional_fraction,
+                                max_volume=policy.risk.max_volume_lots)
         if not resized.accepted:
             return (resized.denial,), None, info
         candidate = resized.order

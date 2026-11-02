@@ -132,12 +132,20 @@ class RiskLimits:
     # bound left - which is how twenty-five lots of silver were opened on a ten-thousand
     # dollar account.
     max_notional_fraction: float = 3.0
+    # A lot ceiling the execution layer also enforces (the demo runner and the reference EA both
+    # refuse anything above their own). Declaring it here is what makes the position take it:
+    # sized from the risk budget alone, one instrument's legal lot is another's five, so a
+    # ceiling checked only after sizing removes the cheap contracts from the book and leaves
+    # the expensive ones exactly where they were.
+    max_volume_lots: float | None = None
 
     def __post_init__(self) -> None:
         _fraction(self.risk_per_trade_fraction, name="risk_per_trade_fraction",
                   low=0.0001, high=0.05)
         _fraction(self.max_notional_fraction, name="max_notional_fraction",
                   low=0.1, high=1_000.0)
+        if self.max_volume_lots is not None:
+            _fraction(self.max_volume_lots, name="max_volume_lots", low=0.01, high=100.0)
         _integer(self.max_open_positions, name="max_open_positions", low=0, high=50)
         _fraction(self.max_daily_loss_fraction, name="max_daily_loss_fraction",
                   low=0.0001, high=0.25)
@@ -207,6 +215,13 @@ class AgentPolicy:
     symbol_spec: Mapping[str, Any] | None = None
     execution_mode: str = "confirm"
     ui_language: str = "ru"
+    # The EA magic this run's orders carry. A demo account is often shared by more than one
+    # automated strategy, and a position count cap written for a single-strategy account reads
+    # another strategy's book as our own concentration. Attribution scopes the count and the
+    # one-position-per-symbol rule to the positions we actually opened; the money caps - daily
+    # loss, drawdown, aggregate stop risk - keep measuring the whole account, because a loss
+    # someone else caused is still a loss on our equity.
+    position_magic: int | None = None
 
     def __post_init__(self) -> None:
         _integer(self.version, name="version", low=1, high=10)
@@ -235,6 +250,10 @@ class AgentPolicy:
             _integer(self.expected_login, name="expected_login", low=1, high=2 ** 62)
         if self.expected_server is not None and not str(self.expected_server).strip():
             raise ValueError("expected_server must be non-empty or null")
+        if self.position_magic is not None:
+            # Zero is MT5's "a person opened this by hand", so it can never identify a run; an
+            # attribution of 0 would claim every manual position for the strategy.
+            _integer(self.position_magic, name="position_magic", low=1, high=2 ** 62)
         _boolean(self.require_demo, name="require_demo")
         execution = str(self.execution_mode).strip().lower()
         if execution not in EXECUTION_MODES:
@@ -305,11 +324,11 @@ class AgentPolicy:
         if unknown:
             raise ValueError(f"unknown policy keys: {sorted(unknown)}")
         account = _section(raw, "account", {
-            "expected_login", "expected_server", "require_demo"})
+            "expected_login", "expected_server", "require_demo", "position_magic"})
         risk = _section(raw, "risk", {
             "risk_per_trade_fraction", "max_open_positions", "max_daily_loss_fraction",
             "max_drawdown_fraction", "min_risk_reward", "max_spread_points",
-            "max_quote_age_seconds", "max_notional_fraction"})
+            "max_quote_age_seconds", "max_notional_fraction", "max_volume_lots"})
         strategy = _section(raw, "strategy", {
             "family", "min_bars", "sma_fast", "sma_slow", "ema_fast", "ema_slow",
             "bollinger_period", "bollinger_dev", "donchian_period", "atr_period",
@@ -326,6 +345,7 @@ class AgentPolicy:
         }
         login = account.get("expected_login")
         server = account.get("expected_server")
+        magic = account.get("position_magic")
         spec_raw = raw.get("symbol_spec")
         if spec_raw is not None and not isinstance(spec_raw, Mapping):
             raise ValueError("symbol_spec must be a mapping or null")
@@ -355,6 +375,8 @@ class AgentPolicy:
             symbol_spec=dict(spec_raw) if spec_raw is not None else None,
             execution_mode=str(raw.get("execution_mode", "confirm")),
             ui_language=str(raw.get("ui_language", "ru")),
+            position_magic=None if magic is None else _integer(
+                magic, name="position_magic", low=1, high=2 ** 62),
         )
 
 
