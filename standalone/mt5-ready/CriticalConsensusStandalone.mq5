@@ -22,22 +22,79 @@ enum WorkModeEnum { MODE_CONFIRMATION = 0, MODE_AUTONOMOUS = 1 };
 input WorkModeEnum WorkMode          = MODE_CONFIRMATION; // Work mode: confirmation or autonomous
 input string TelegramToken         = "";            // Telegram bot token from @BotFather
 input string TelegramChatID        = "";            // Chat ID (leave empty: auto-detected after you /start the bot)
-input double LotSize               = 0.01;          // Lot size (demo)
+input double LotSize               = 0.01;          // Fixed lot only when risk sizing is disabled
+input bool   UseRiskBasedSizing    = true;          // Size from equity and stop distance
+input double RiskPercentPerTrade   = 0.50;          // Planned stop loss as % of equity; hard cap 1%
 input double MaxAutonomousLot      = 0.05;          // Autonomous mode lot cap
-input int    SlPips                = 50;            // Stop loss, pips
-input int    TpPips                = 100;           // Take profit, pips
+input int    SlPips                = 20;            // Initial stop loss, true pips (not points)
+input int    TakeProfitPips        = 0;             // 0 = no fixed TP; trailing stop manages exit
+input int    BreakEvenAfterPips    = 10;            // Move SL beyond entry after favourable move
+input int    TrailStartPips        = 20;            // Start trailing after favourable move
+input int    TrailDistancePips     = 10;            // Keep SL this far behind market
 input int    MaxTradesPerDay       = 3;             // Max trades per day (demo safety)
 input int    MaxSpreadPoints       = 30;            // Max spread, points
 input int    FastMaPeriod          = 12;            // Trend agent: fast EMA
 input int    SlowMaPeriod          = 26;            // Trend agent: slow EMA
 input int    RsiPeriod             = 14;            // Momentum agent: RSI period
 input int    AtrPeriod             = 14;            // Volatility agent: ATR period
-input double ConfidenceThreshold   = 0.98;          // Certainty threshold (conjunction of agents)
 input long   MagicNumber           = 8172027;       // Magic number
 input int    ApprovalTimeoutMin    = 5;             // Confirmation mode: approval timeout, minutes
 
 //--- indicator handles
 int hFastMa = INVALID_HANDLE, hSlowMa = INVALID_HANDLE, hRsi = INVALID_HANDLE, hAtr = INVALID_HANDLE;
+
+// MT5 quotes use points; on 5/3-digit FX symbols one pip is 10 points.
+double PipSize()
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   if(point <= 0.0) return 0.0;
+   return point * ((digits == 3 || digits == 5) ? 10.0 : 1.0);
+}
+
+int VolumeDigits(const double step)
+{
+   for(int digits = 0; digits <= 8; digits++)
+      if(MathAbs(NormalizeDouble(step, digits) - step) < 0.00000001)
+         return digits;
+   return 8;
+}
+
+double CalculateOrderVolume(const double stop_distance, string &reason)
+{
+   if(!UseRiskBasedSizing) return LotSize;
+   if(RiskPercentPerTrade <= 0.0 || RiskPercentPerTrade > 1.0)
+   { reason = "risk percent must be > 0 and <= 1.0"; return 0.0; }
+
+   double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE_LOSS);
+   if(tick_value <= 0.0) tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double minvol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxvol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+
+   if(stop_distance <= 0.0 || tick_size <= 0.0 || tick_value <= 0.0 ||
+      step <= 0.0 || minvol <= 0.0 || maxvol < minvol || equity <= 0.0)
+   { reason = "invalid broker tick/volume specification or equity"; return 0.0; }
+
+   double loss_per_lot = (stop_distance / tick_size) * tick_value;
+   double risk_budget = equity * RiskPercentPerTrade / 100.0;
+   if(loss_per_lot <= 0.0 || risk_budget <= 0.0)
+   { reason = "invalid calculated risk budget"; return 0.0; }
+
+   double raw_volume = risk_budget / loss_per_lot;
+   double volume = MathFloor(raw_volume / step + 0.000000001) * step;
+   if(volume < minvol - step * 0.000001)
+   { reason = "risk budget is below broker minimum lot; trade refused"; return 0.0; }
+   if(volume > maxvol) volume = maxvol;
+   volume = NormalizeDouble(volume, VolumeDigits(step));
+
+   if(volume < minvol || volume > maxvol ||
+      MathAbs(volume / step - MathRound(volume / step)) > 0.000001)
+   { reason = "risk-sized volume violates broker constraints"; return 0.0; }
+   return volume;
+}
 
 //--- telegram state
 string bot_username = "";
@@ -222,34 +279,53 @@ string AgentVerdict(const string agent, const bool agree, const string reason,
 }
 
 bool CertaintyGate(const double &fast[], const double &slow[], const double &rsi[],
-                   const double &atr[], const double atr_avg, string &direction, string &log)
+                   const double &atr[], const double atr_baseline, string &direction, string &log)
 {
-   // Agent 1 — Trend: EMA cross direction.
-   bool up = fast[1] > slow[1];
+   // CopyBuffer static arrays are oldest-first. Compare two completed bars.
+   // A bearish EMA alignment is not a SELL signal if the fast EMA is already turning up.
+   bool up = fast[1] > slow[1] && fast[1] > fast[0] && slow[1] >= slow[0];
+   bool down = fast[1] < slow[1] && fast[1] < fast[0] && slow[1] <= slow[0];
+   if(!up && !down)
+   {
+      direction = "";
+      log = "TrendAgent=VETO (EMA direction/slope not aligned)";
+      Print("CERTAINTY GATE: ", log);
+      return false;
+   }
    direction = up ? "BUY" : "SELL";
-   string v1 = AgentVerdict("TrendAgent", true, "", log);
 
-   // Agent 2 — Momentum (RSI zone): no entries into overbought/oversold extremes.
-   bool rsi_ok = (up && rsi[1] > 45.0 && rsi[1] < 70.0) || (!up && rsi[1] > 30.0 && rsi[1] < 55.0);
-   string v2 = AgentVerdict("MomentumAgent", rsi_ok, "RSI " + DoubleToString(rsi[1], 1), log);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double gap = MathAbs(fast[1] - slow[1]);
+   bool trend_ok = gap >= MathMax(atr[1] * 0.10, point * 3.0);
+   string v1 = AgentVerdict("TrendAgent", trend_ok,
+                            "EMA gap below 0.10 ATR / 3 points", log);
 
-   // Agent 3 — Volatility: ATR must be alive but not exploding.
-   bool atr_ok = atr[1] > 0.00005 && atr[1] < atr_avg * 3.0;
-   string v3 = AgentVerdict("VolatilityAgent", atr_ok, "ATR extreme", log);
+   bool rsi_ok = (up && rsi[1] > 45.0 && rsi[1] < 70.0) ||
+                 (down && rsi[1] > 30.0 && rsi[1] < 55.0);
+   string v2 = AgentVerdict("MomentumAgent", rsi_ok,
+                            "RSI " + DoubleToString(rsi[1], 1), log);
 
-   // Agent 4 — Price action: last closed candle agrees with direction.
+   long spread_points = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   double spread_price = spread_points * point;
+   bool atr_ok = atr[1] > MathMax(point * 5.0, spread_price * 2.0) &&
+                 atr_baseline > 0.0 && atr[1] < atr_baseline * 2.5;
+   string v3 = AgentVerdict("VolatilityAgent", atr_ok,
+                            "ATR too low or abnormal", log);
+
    double open_i = iOpen(_Symbol, PERIOD_CURRENT, 1);
    double close_i = iClose(_Symbol, PERIOD_CURRENT, 1);
-   bool candle_ok = (up && close_i > open_i) || (!up && close_i < open_i);
-   string v4 = AgentVerdict("PriceActionAgent", candle_ok, "candle against direction", log);
+   bool candle_ok = (up && close_i > open_i) || (down && close_i < open_i);
+   string v4 = AgentVerdict("PriceActionAgent", candle_ok,
+                            "last completed candle against direction", log);
 
-   // Agent 5 — Session: skip rollover hours (thin liquidity).
-   MqlDateTime tm; TimeToStruct(TimeCurrent(), tm);
+   MqlDateTime tm;
+   TimeToStruct(TimeCurrent(), tm);
    bool session_ok = !(tm.hour >= 23 || tm.hour < 1);
    string v5 = AgentVerdict("SessionAgent", session_ok, "rollover hours", log);
 
    Print("CERTAINTY GATE: ", log);
-   return (v1 == "APPROVE" && v2 == "APPROVE" && v3 == "APPROVE" && v4 == "APPROVE" && v5 == "APPROVE");
+   return (v1 == "APPROVE" && v2 == "APPROVE" && v3 == "APPROVE" &&
+           v4 == "APPROVE" && v5 == "APPROVE");
 }
 
 //+------------------------------------------------------------------+
@@ -262,14 +338,18 @@ bool PlaceDemoOrder(const string direction, const double volume, string &card_te
    { Print("BLOCKED: ", reason); return false; }
 
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double pip = PipSize();
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick)) { Print("BLOCKED: no tick"); return false; }
+   if(point <= 0.0 || pip <= 0.0) { Print("BLOCKED: invalid symbol point/pip size"); return false; }
    double price = (direction == "BUY") ? tick.ask : tick.bid;
-   double sl = (direction == "BUY") ? price - SlPips * point : price + SlPips * point;
-   double tp = (direction == "BUY") ? price + TpPips * point : price - TpPips * point;
+   double sl = (direction == "BUY") ? price - SlPips * pip : price + SlPips * pip;
+   double tp = 0.0;
+   if(TakeProfitPips > 0)
+      tp = (direction == "BUY") ? price + TakeProfitPips * pip : price - TakeProfitPips * pip;
    sl = NormalizeDouble(sl, digits);
-   tp = NormalizeDouble(tp, digits);
+   if(tp > 0.0) tp = NormalizeDouble(tp, digits);
 
    // Volume constraints, same as the repo's bridge EA.
    double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
@@ -300,9 +380,11 @@ bool PlaceDemoOrder(const string direction, const double volume, string &card_te
    { Print("ORDER NOT CONFIRMED: sent=", result.retcode, " error=", GetLastError()); return false; }
 
    trades_today++;
-   card_text = "✅ OPENED " + direction + " " + DoubleToString(volume, 2) + " lot " + _Symbol +
+   string tp_text = (tp > 0.0) ? DoubleToString(tp, digits) : "TRAILING EXIT";
+   card_text = "✅ OPENED " + direction + " " + DoubleToString(volume, 3) + " lot " + _Symbol +
                " @ " + DoubleToString(price, digits) +
-               "\nSL " + DoubleToString(sl, digits) + "  TP " + DoubleToString(tp, digits) +
+               "\nSL " + DoubleToString(sl, digits) + "  TP " + tp_text +
+               "\nRisk budget " + DoubleToString(RiskPercentPerTrade, 2) + "% equity" +
                "\nDemo money. Trades today: " + IntegerToString(trades_today) + "/" + IntegerToString(MaxTradesPerDay);
    return true;
 }
@@ -311,49 +393,61 @@ bool PlaceDemoOrder(const string direction, const double volume, string &card_te
 //| Work modes                                                        |
 //+------------------------------------------------------------------+
 void HandleSignal(const double &fast[], const double &slow[], const double &rsi[],
-                  const double &atr[], const double atr_avg)
+                  const double &atr[], const double atr_baseline)
 {
    string direction = "", log = "";
-   if(!CertaintyGate(fast, slow, rsi, atr, atr_avg, direction, log))
-      return; // consensus not reached — gather more, do nothing (fail closed)
+   if(!CertaintyGate(fast, slow, rsi, atr, atr_baseline, direction, log))
+      return;
 
    string reason = "";
    if(!SafetyOk(reason))
    { Print("BLOCKED: ", reason); return; }
 
-   double volume = LotSize;
+   double pip = PipSize();
+   MqlTick tick;
+   if(pip <= 0.0 || !SymbolInfoTick(_Symbol, tick))
+   { Print("BLOCKED: pip size or quote unavailable"); return; }
+   double stop_distance = SlPips * pip;
+   double volume = CalculateOrderVolume(stop_distance, reason);
+   if(volume <= 0.0)
+   { Print("BLOCKED: ", reason); return; }
+
    if(WorkMode == MODE_AUTONOMOUS)
    {
       if(volume > MaxAutonomousLot)
-      { Print("BLOCKED: lot ", DoubleToString(volume, 2), " above autonomous cap ", DoubleToString(MaxAutonomousLot, 2)); return; }
+      { Print("BLOCKED: risk-sized lot ", DoubleToString(volume, 3),
+              " above autonomous cap ", DoubleToString(MaxAutonomousLot, 2)); return; }
       string card = "";
       if(PlaceDemoOrder(direction, volume, card))
          TelegramSend("🤖 AUTONOMOUS (demo)\n" + card);
       return;
    }
 
-   // Confirmation mode: ask the operator on Telegram.
    if(!chat_known)
    { Print("BLOCKED: Telegram chat is not configured — confirmation mode requires the phone."); return; }
 
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   MqlTick tick; SymbolInfoTick(_Symbol, tick);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    double price = (direction == "BUY") ? tick.ask : tick.bid;
-   double sl = (direction == "BUY") ? price - SlPips * point : price + SlPips * point;
-   double tp = (direction == "BUY") ? price + TpPips * point : price - TpPips * point;
+   double sl = (direction == "BUY") ? price - stop_distance : price + stop_distance;
+   double tp = 0.0;
+   if(TakeProfitPips > 0)
+      tp = (direction == "BUY") ? price + TakeProfitPips * pip : price - TakeProfitPips * pip;
    pending_direction = direction;
-   pending_sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-   pending_tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+   pending_sl = NormalizeDouble(sl, digits);
+   pending_tp = (tp > 0.0) ? NormalizeDouble(tp, digits) : 0.0;
    pending_volume = volume;
    pending_expires = TimeCurrent() + ApprovalTimeoutMin * 60;
    pending_active = true;
 
+   string target_text = (pending_tp > 0.0) ? DoubleToString(pending_tp, digits) : "TRAILING EXIT";
    string card = "🤖 Signal " + _Symbol + " — needs your approval\n" +
-                 "Direction: " + direction + "  Lot: " + DoubleToString(volume, 2) +
+                 "Direction: " + direction + "  Lot: " + DoubleToString(volume, 3) +
+                 "\nSL: " + DoubleToString(pending_sl, digits) + "  TP: " + target_text +
+                 "\nRisk budget: " + DoubleToString(RiskPercentPerTrade, 2) + "% equity" +
                  "\nGate: " + log +
                  "\nDemo money, " + IntegerToString(ApprovalTimeoutMin) + " min to answer";
    string response = "";
-   string payload = "{\"chat_id\":\"" + TelegramChatID + "\",\"text\":\"" + JsonEscapeText(card) + "\","
+   string payload = "{\"chat_id\":\"" + TelegramChatID + "\",\"text\":\"" + JsonEscapeText(card) + "\"," 
                     "\"reply_markup\":{\"inline_keyboard\":[[{\"text\":\"✅ Approve\",\"callback_data\":\"approve\"},"
                     "{\"text\":\"❌ Reject\",\"callback_data\":\"reject\"}]]}}";
    if(TelegramCall("sendMessage", payload, response))
@@ -363,8 +457,100 @@ void HandleSignal(const double &fast[], const double &slow[], const double &rsi[
    }
    else
    {
-      pending_active = false; // fail closed: no channel -> no autonomous confirmation fallback
+      pending_active = false;
       Print("BLOCKED: Telegram unavailable; signal discarded.");
+   }
+}
+
+// Tighten the broker-side stop only in the profitable direction; never widen risk.
+void ManageOpenPositions()
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double pip = PipSize();
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   if(point <= 0.0 || pip <= 0.0) return;
+
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick)) return;
+
+   long stops_points = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   long freeze_points = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   double min_distance = MathMax((double)stops_points, (double)freeze_points) * point;
+   double spread_buffer = MathMax(tick.ask - tick.bid, pip);
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long magic = PositionGetInteger(POSITION_MAGIC);
+      if(symbol != _Symbol || magic != MagicNumber) continue;
+
+      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      double old_sl = PositionGetDouble(POSITION_SL);
+      double old_tp = PositionGetDouble(POSITION_TP);
+      if(entry <= 0.0) continue;
+
+      double favourable_pips = 0.0;
+      double candidate_sl = old_sl;
+      if(type == POSITION_TYPE_BUY)
+      {
+         favourable_pips = (tick.bid - entry) / pip;
+         if(favourable_pips >= BreakEvenAfterPips)
+         {
+            double breakeven = entry + spread_buffer;
+            if(candidate_sl <= 0.0 || breakeven > candidate_sl) candidate_sl = breakeven;
+         }
+         if(favourable_pips >= TrailStartPips)
+         {
+            double trailing = tick.bid - TrailDistancePips * pip;
+            if(candidate_sl <= 0.0 || trailing > candidate_sl) candidate_sl = trailing;
+         }
+         if(candidate_sl <= 0.0 || (old_sl > 0.0 && candidate_sl <= old_sl + point * 0.5))
+            continue;
+         candidate_sl = NormalizeDouble(candidate_sl, digits);
+         if(candidate_sl >= tick.bid - min_distance) continue;
+      }
+      else if(type == POSITION_TYPE_SELL)
+      {
+         favourable_pips = (entry - tick.ask) / pip;
+         if(favourable_pips >= BreakEvenAfterPips)
+         {
+            double breakeven = entry - spread_buffer;
+            if(candidate_sl <= 0.0 || breakeven < candidate_sl) candidate_sl = breakeven;
+         }
+         if(favourable_pips >= TrailStartPips)
+         {
+            double trailing = tick.ask + TrailDistancePips * pip;
+            if(candidate_sl <= 0.0 || trailing < candidate_sl) candidate_sl = trailing;
+         }
+         if(candidate_sl <= 0.0 || (old_sl > 0.0 && candidate_sl >= old_sl - point * 0.5))
+            continue;
+         candidate_sl = NormalizeDouble(candidate_sl, digits);
+         if(candidate_sl <= tick.ask + min_distance) continue;
+      }
+      else continue;
+
+      MqlTradeRequest request = {};
+      MqlTradeResult result = {};
+      request.action = TRADE_ACTION_SLTP;
+      request.position = ticket;
+      request.symbol = symbol;
+      request.sl = candidate_sl;
+      request.tp = old_tp;
+
+      ResetLastError();
+      if(!OrderSend(request, result) || result.retcode != TRADE_RETCODE_DONE)
+      {
+         Print("TRAILING STOP NOT CONFIRMED: ticket=", ticket,
+               " retcode=", result.retcode, " error=", GetLastError(),
+               " comment=", result.comment);
+         continue;
+      }
+      Print("PROTECTIVE STOP MOVED: ticket=", ticket,
+            " SL=", DoubleToString(candidate_sl, digits),
+            " favourable_pips=", DoubleToString(favourable_pips, 1));
    }
 }
 
@@ -400,9 +586,14 @@ int OnInit()
       Print("WARNING: this is NOT a demo account. The EA will refuse to trade.");
    if(StringLen(TelegramToken) == 0)
       Print("WARNING: TelegramToken is empty — confirmation mode cannot ask; autonomous will only log.");
-   if(WorkMode == MODE_CONFIRMATION && LotSize > MaxAutonomousLot)
-      Print("NOTE: LotSize ", DoubleToString(LotSize, 2), " > autonomous cap ",
-            DoubleToString(MaxAutonomousLot, 2), " — autonomous mode would block this size.");
+   if(SlPips <= 0 || TakeProfitPips < 0 || BreakEvenAfterPips <= 0 ||
+      TrailStartPips < BreakEvenAfterPips || TrailDistancePips <= 0 ||
+      (UseRiskBasedSizing && (RiskPercentPerTrade <= 0.0 || RiskPercentPerTrade > 1.0)) ||
+      (!UseRiskBasedSizing && LotSize <= 0.0))
+   {
+      Print("BLOCKED: invalid stop, trailing or risk-sizing inputs.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
 
    hFastMa = iMA(_Symbol, PERIOD_CURRENT, FastMaPeriod, 0, MODE_EMA, PRICE_CLOSE);
    hSlowMa = iMA(_Symbol, PERIOD_CURRENT, SlowMaPeriod, 0, MODE_EMA, PRICE_CLOSE);
@@ -429,12 +620,15 @@ void OnDeinit(const int reason)
 
 void OnTick()
 {
+   // Exit protection must run on every tick, including while the bar is forming.
+   ManageOpenPositions();
+
    datetime bar_time = iTime(_Symbol, PERIOD_CURRENT, 0);
-   if(bar_time == last_bar_time) return;   // evaluate once per bar
+   if(bar_time == last_bar_time) return;
    last_bar_time = bar_time;
 
-   if(pending_active) return;              // one pending confirmation at a time
-   if(PositionsTotal() > 0) return;        // one position at a time
+   if(pending_active) return;
+   if(PositionsTotal() > 0) return;
 
    double fast[3], slow[3], rsi[3], atr[3];
    if(CopyBuffer(hFastMa, 0, 0, 3, fast) < 3) return;
@@ -442,9 +636,8 @@ void OnTick()
    if(CopyBuffer(hRsi, 0, 0, 3, rsi) < 3) return;
    if(CopyBuffer(hAtr, 0, 0, 3, atr) < 3) return;
 
-   double atr_sum = 0.0;
-   for(int i = 1; i <= 2; i++) atr_sum += atr[i];
-   HandleSignal(fast, slow, rsi, atr, atr_sum / 2.0);
+   // Index 0 is the older completed candle; index 1 is the latest completed candle.
+   HandleSignal(fast, slow, rsi, atr, atr[0]);
 }
 
 void OnTimer()
