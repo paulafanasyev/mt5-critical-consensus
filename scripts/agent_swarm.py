@@ -192,9 +192,11 @@ def h1_ema_state(symbol: str) -> tuple[str, float] | None:
     tick = mt5.symbol_info_tick(symbol)
     spread = (tick.ask - tick.bid) if tick else 0.0
     risk = max(2 * atr, spread * 3)
-    if fast > slow and closes[-1] > slow:
+    # the slow pair alone is not a trend: price must also sit on the right side of the fast
+    # average, otherwise a bounce inside a downtrend keeps triggering shorts into strength.
+    if fast > slow and closes[-1] > slow and closes[-1] > fast:
         return "BUY", risk
-    if fast < slow and closes[-1] < slow:
+    if fast < slow and closes[-1] < slow and closes[-1] < fast:
         return "SELL", risk
     return None
 
