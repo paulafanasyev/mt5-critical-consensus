@@ -45,20 +45,21 @@ def agent(name: str, kind: str, symbol: str, lots: float, *, experimental: bool 
 
 
 AGENTS: list[dict] = [
+    # --- gold and silver: the only instruments with a real edge on this venue --------
+    agent("ema-xau", "h1_ema", "XAUUSD", 0.02),
+    agent("ema-xag", "h1_ema", "XAGUSD", 0.02),
     # --- Monday long, the strongest calendar effect -------------------------------
-    agent("mon-long-gbp", "monday_long", "GBPUSD", 0.05),
-    agent("mon-long-aud", "monday_long", "AUDUSD", 0.05),
-    agent("mon-long-chf", "monday_long", "USDCHF", 0.05),
-    agent("mon-long-eur", "monday_long", "EURUSD", 0.05),
-    agent("mon-long-jpy", "monday_long", "USDJPY", 0.05),
-    agent("mon-long-us500", "monday_long", "US500", 1.0),
+    agent("mon-long-gbp", "monday_long", "GBPUSD", 0.02),
+    agent("mon-long-aud", "monday_long", "AUDUSD", 0.02),
+    agent("mon-long-chf", "monday_long", "USDCHF", 0.02),
+    agent("mon-long-eur", "monday_long", "EURUSD", 0.02),
+    agent("mon-long-jpy", "monday_long", "USDJPY", 0.02),
     # --- Monday gap fill -----------------------------------------------------------
     agent("gap-gbp", "monday_gap_fill", "GBPUSD", 0.02),
     agent("gap-chf", "monday_gap_fill", "USDCHF", 0.02),
     agent("gap-aud", "monday_gap_fill", "AUDUSD", 0.02),
     agent("gap-cad", "monday_gap_fill", "USDCAD", 0.02),
-    # --- Monday gap continuation on gold ------------------------------------------
-    agent("gold-gap", "monday_gap_continue", "XAUUSD", 0.02),
+    agent("gold-gap", "monday_gap_continue", "XAUUSD", 0.01),
     # --- First hour of the server day ---------------------------------------------
     agent("fh-chf", "first_hour", "USDCHF", 0.02),
     agent("fh-aud", "first_hour", "AUDUSD", 0.02),
@@ -66,39 +67,15 @@ AGENTS: list[dict] = [
     agent("fh-eur", "first_hour", "EURUSD", 0.02),
     agent("fh-jpy", "first_hour", "USDJPY", 0.02),
     agent("fh-cad", "first_hour", "USDCAD", 0.02),
-    # --- daily trend: hold until the 200-day average flips -----------------------
-    agent("trend-xau", "daily_trend", "XAUUSD", 0.02),
-    agent("trend-xag", "daily_trend", "XAGUSD", 0.01),
-    agent("trend-eur", "daily_trend", "EURUSD", 0.02),
-    agent("trend-gbp", "daily_trend", "GBPUSD", 0.02),
-    agent("trend-jpy", "daily_trend", "USDJPY", 0.02),
-    agent("trend-us500", "daily_trend", "US500", 0.1),
-    agent("trend-xag-cont", "daily_trend", "XAGUSD", 0.01, experimental=True),
-    agent("ema-xau", "h1_ema", "XAUUSD", 0.02),
-    agent("ema-xag", "h1_ema", "XAGUSD", 0.01),
-    agent("ema-eur", "h1_ema", "EURUSD", 0.02),
-    agent("ema-gbp", "h1_ema", "GBPUSD", 0.02),
-    agent("ema-jpy", "h1_ema", "USDJPY", 0.02),
-    agent("trend-aud", "daily_trend", "AUDUSD", 0.02),
-    agent("trend-cad", "daily_trend", "USDCAD", 0.02),
-    agent("trend-nzd", "daily_trend", "NZDUSD", 0.02),
-    agent("trend-uki", "daily_trend", "UK100", 0.1),
-    agent("trend-jpn", "daily_trend", "JPN225", 1.0),
-    agent("trend-us30", "daily_trend", "US30", 0.1),
     # --- experimental, weaker evidence, quarter size ------------------------------
-    agent("x-mon-long-xag", "monday_long", "XAGUSD", 0.01, experimental=True),
+    agent("x-ema-xag", "h1_ema", "XAGUSD", 0.01, experimental=True),
     agent("x-mon-long-uki", "monday_long", "UK100", 0.1, experimental=True),
-    agent("x-mon-long-xau", "monday_long", "XAUUSD", 0.01, experimental=True),
     agent("x-gap-eur", "monday_gap_fill", "EURUSD", 0.01, experimental=True),
-    agent("x-gap-jpy", "monday_gap_fill", "USDJPY", 0.01, experimental=True),
-    agent("x-gap-us500", "monday_gap_fill", "US500", 0.1, experimental=True),
-    agent("x-gap-cont-xag", "monday_gap_continue", "XAGUSD", 0.01, experimental=True),
     agent("x-fh-xau", "first_hour", "XAUUSD", 0.01, experimental=True),
-    agent("x-fh-us500", "first_hour", "US500", 0.1, experimental=True),
-    agent("x-fh-uki", "first_hour", "UK100", 0.1, experimental=True),
 ]
 for index, item in enumerate(AGENTS):
     item["magic"] = MAGIC_BASE + index
+MAGIC_SET = {item["magic"] for item in AGENTS}
 
 
 def log(event: dict) -> None:
@@ -197,6 +174,97 @@ def h1_ema_state(symbol: str) -> tuple[str, float] | None:
     return None
 
 
+STATE = ROOT / "agent_data" / "swarm_state.json"
+SYMBOL_CAP = {"XAUUSD": 0.02, "XAGUSD": 0.02, "EURUSD": 0.04, "GBPUSD": 0.04,
+              "USDJPY": 0.04, "AUDUSD": 0.04, "USDCHF": 0.04, "USDCAD": 0.04,
+              "NZDUSD": 0.04, "US500": 0.2, "UK100": 0.2, "US30": 0.2, "JPN225": 1.0}
+MAX_DRAWDOWN = 0.01      # close everything if the account loses 1% from the baseline
+PAUSE_SECONDS = 1800
+
+
+def load_state() -> dict:
+    if STATE.exists():
+        try:
+            return json.loads(STATE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
+def save_state(state: dict) -> None:
+    STATE.write_text(json.dumps(state), encoding="utf-8")
+
+
+def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
+    """One position per symbol per direction, capped size, and a global drawdown brake."""
+    account = mt5.account_info()
+    if account is None:
+        return
+    baseline = state.setdefault("baseline_equity", account.equity)
+    if account.equity < baseline * (1 - MAX_DRAWDOWN):
+        log({"event": f"BREAKER: equity {account.equity:.2f} below {baseline:.2f} "
+                      f"(-{MAX_DRAWDOWN * 100:.0f}%); flattening the swarm"})
+        for position in mt5.positions_get() or []:
+            if position.magic in magics:
+                tick = mt5.symbol_info_tick(position.symbol)
+                mt5.order_send({"action": mt5.TRADE_ACTION_DEAL,
+                                "symbol": position.symbol, "volume": position.volume,
+                                "type": mt5.ORDER_TYPE_SELL if position.type == 0
+                                        else mt5.ORDER_TYPE_BUY,
+                                "position": position.ticket,
+                                "price": tick.bid if position.type == 0 else tick.ask,
+                                "deviation": 30, "magic": position.magic,
+                                "type_filling": mt5.ORDER_FILLING_FOK,
+                                "comment": "breaker"})
+        state["baseline_equity"] = account.equity
+        state["paused_until"] = time.time() + PAUSE_SECONDS
+        save_state(state)
+        return
+
+    by_symbol: dict[str, list] = {}
+    for position in mt5.positions_get() or []:
+        if position.magic in magics:
+            by_symbol.setdefault(position.symbol, []).append(position)
+    for symbol, positions in by_symbol.items():
+        directions = {position.type for position in positions}
+        if len(directions) > 1:
+            log({"event": f"{symbol}: conflicting directions in the swarm, closing both"})
+            for position in positions:
+                tick = mt5.symbol_info_tick(symbol)
+                mt5.order_send({"action": mt5.TRADE_ACTION_DEAL, "symbol": symbol,
+                                "volume": position.volume,
+                                "type": mt5.ORDER_TYPE_SELL if position.type == 0
+                                        else mt5.ORDER_TYPE_BUY,
+                                "position": position.ticket,
+                                "price": tick.bid if position.type == 0 else tick.ask,
+                                "deviation": 30, "magic": position.magic,
+                                "type_filling": mt5.ORDER_FILLING_FOK,
+                                "comment": "conflict"})
+            continue
+        cap = SYMBOL_CAP.get(symbol, 0.04)
+        total = sum(position.volume for position in positions)
+        if total > cap + 1e-9:
+            excess = total - cap
+            for position in sorted(positions, key=lambda item: item.time):
+                close_volume = min(position.volume, excess)
+                if close_volume <= 0:
+                    break
+                tick = mt5.symbol_info_tick(symbol)
+                result = mt5.order_send({"action": mt5.TRADE_ACTION_DEAL,
+                                         "symbol": symbol, "volume": round(close_volume, 2),
+                                         "type": mt5.ORDER_TYPE_SELL if position.type == 0
+                                                 else mt5.ORDER_TYPE_BUY,
+                                         "position": position.ticket,
+                                         "price": tick.bid if position.type == 0 else tick.ask,
+                                         "deviation": 30, "magic": position.magic,
+                                         "type_filling": mt5.ORDER_FILLING_FOK,
+                                         "comment": "cap"})
+                log({"event": f"{symbol}: cap {cap} exceeded by {excess:.2f}, trimming "
+                              f"{close_volume:.2f} from ticket {position.ticket} retcode "
+                              f"{None if result is None else result.retcode}"})
+                excess -= close_volume
+
+
 def atr_stop_fraction(symbol: str, multiple: float = 3.0) -> float:
     """Stop distance as a fraction of price: three hourly ATRs."""
     import statistics as st
@@ -216,8 +284,19 @@ def atr_stop_fraction(symbol: str, multiple: float = 3.0) -> float:
     return (multiple * atr / price) if price else 0.02
 
 
+def swarm_exposure(symbol: str) -> float:
+    import MetaTrader5 as mt5
+
+    return sum(position.volume for position in (mt5.positions_get(symbol=symbol) or [])
+               if position.magic in MAGIC_SET)
+
+
 def open_trade(mt5, spec: dict, side: str, tick, *, stop: float | None,
                take: float | None = None) -> None:
+    cap = SYMBOL_CAP.get(spec["symbol"], 0.04)
+    if swarm_exposure(spec["symbol"]) + spec["lots"] > cap + 1e-9:
+        log({"event": f"{spec['name']} skipped: {spec['symbol']} already at cap {cap}"})
+        return
     order_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
     price = tick.ask if side == "BUY" else tick.bid
     request = {"action": mt5.TRADE_ACTION_DEAL, "symbol": spec["symbol"],
@@ -276,6 +355,11 @@ def main(argv: list[str] | None = None) -> int:
         try:
             now = datetime.now(timezone.utc)
             server = now + timedelta(hours=SERVER_OFFSET)
+            state = load_state()
+            if state.get("paused_until", 0) > time.time():
+                time.sleep(args.interval_sec)
+                continue
+            manage_portfolio(mt5, {spec["magic"] for spec in AGENTS}, state)
             for spec in AGENTS:
                 if market_retry_blocked(spec):
                     continue
