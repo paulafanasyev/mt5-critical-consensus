@@ -60,7 +60,7 @@ thì chỉ broker mới xác nhận được.
 | `mt5_agent/backend.py` | truy cập terminal không gửi lệnh: `AccountInfo`, `SymbolSpec`, `Tick`, `PositionSnapshot`, protocol `MT5Backend`, adapter `LiveMT5Backend` |
 | `mt5_agent/policy.py` | `AgentPolicy`/`RiskLimits`/`StrategyConfig`/`TradingWindow`, tải YAML, từ chối khoá lạ, `execution_mode`, `ui_language` |
 | `mt5_agent/strategy.py` | tín hiệu tất định SMA/ATR + momentum, hình học stop/take, các lý do chặn |
-| `mt5_agent/sizing.py` | khối lượng từ `tick_size`/`tick_value`/`volume_step` trong ngân sách rủi ro và margin khả dụng |
+| `mt5_agent/sizing.py` | khối lượng từ `cash_per_price_unit` (kích thước hợp đồng, nếu không thì cặp tick) và `volume_step` trong ngân sách rủi ro và margin khả dụng |
 | `mt5_agent/paper.py` | `PaperBroker`: phát lại theo nến, không nhìn trước, khớp theo bid/ask, gap, mốc equity theo ngày |
 | `mt5_agent/journal.py` | một chuỗi băm SQLite (`audit_events`, điểm equity nằm trong đó), `verify_chain`, `report` |
 | `mt5_agent/agent.py` | `MT5Agent.run_cycle()` — thứ tự cổng, cổng xác nhận, ghi quyết định |
@@ -441,11 +441,16 @@ vẫn bằng tiếng Anh.
   Cả hai mức phải tôn trọng `stops_level` của broker.
 - `confidence = 0.5 + 0.5·strength`, bị chặn bởi `max_confidence` và gắn nhãn
   `heuristic_score_not_calibrated_probability`. Đây là điểm xếp hạng tình huống, không phải xác suất.
-- Khối lượng: `risk_per_lot = stop_distance / tick_size · tick_value`; chọn bậc `volume_step` lớn
-  nhất sao cho lỗ khi chạm stop vẫn nằm trong `min(equity, balance) · risk_per_trade_fraction` và
-  margin cần thiết — `khối lượng × (tick_value / tick_size) × giá vào / đòn bẩy` tại giá vào — vừa
-  với margin khả dụng. Nếu ngay cả lot tối thiểu đã vượt ngân sách thì từ chối — stop không bao giờ
-  bị nới rộng.
+- Khối lượng: `risk_per_lot = stop_distance · cash_per_price_unit`, trong đó `cash_per_price_unit`
+  là giá trị một bước giá của một lot tính theo tiền tệ tài khoản: `trade_contract_size` khi
+  `currency_profit` trùng tiền tệ tài khoản, ngược lại là `trade_tick_value / trade_tick_size`.
+  Chọn bậc `volume_step` lớn nhất sao cho lỗ khi chạm stop vẫn nằm trong
+  `min(equity, balance) · risk_per_trade_fraction` và margin cần thiết —
+  `khối lượng × cash_per_price_unit × giá vào / đòn bẩy` — vừa với margin khả dụng. Nếu ngay cả lot
+  tối thiểu đã vượt ngân sách thì từ chối — stop không bao giờ bị nới rộng. Chỉ dùng cặp tick sẽ
+  đánh giá thấp kim loại: trên MetaQuotes-Demo nó cho XAUUSD 10 $ mỗi bước giá mỗi lot, trong khi
+  hợp đồng, `order_calc_profit` và margin thực sự bị phong toả đều nói 100 $; lệnh tính theo tick
+  vượt ngân sách gấp mười lần (`tests/test_mt5_contract_sizing.py`).
 
 ## Paper broker
 

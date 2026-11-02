@@ -184,7 +184,7 @@ def _position_stop_risk(spec: SymbolSpec, position: PositionSnapshot) -> float |
         if position.direction == "BUY" else (position.stop_loss - position.entry_price)
     if distance <= 0:
         return None
-    return distance / spec.tick_size * spec.tick_value * position.volume
+    return distance * spec.cash_per_price_unit * position.volume
 
 
 class MT5Agent:

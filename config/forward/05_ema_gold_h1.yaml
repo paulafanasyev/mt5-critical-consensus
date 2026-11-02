@@ -20,6 +20,11 @@ symbol_spec:
   digits: 2
   tick_size: 0.01
   tick_value: 0.1
+  # One lot is 100 troy ounces, so a price unit is worth 100 $ -- not the 10 $ the tick
+  # pair above implies. MetaQuotes-Demo really reports these tick fields (measured
+  # 2026-11-02 against order_calc_profit and the margin actually blocked); sizing from
+  # them sized gold ten times over the risk budget.
+  contract_size: 100.0
   volume_min: 0.01
   volume_max: 100.0
   volume_step: 0.01

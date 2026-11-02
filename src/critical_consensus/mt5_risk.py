@@ -6,8 +6,10 @@ call that changes terminal state, and no order is ever sent.
 This module never sends/places/modifies/cancels orders. It requires a verified
 broker-server-day-start equity, equity high-water mark, and the broker server's UTC
 offset (MT5 timestamps are server wall-clock, not UTC). Proposed risk is computed from the
-terminal's tick size/loss value and the exact requested volume/entry/SL; no user-entered
-risk percentage is trusted as if it were a measured broker value.
+terminal's contract size, falling back to its tick size/loss value, and the exact requested
+volume/entry/SL; no user-entered risk percentage is trusted as if it were a measured broker
+value. The figure used is published as ``risk_cash_per_price_unit`` so the verifier recomputes
+from the same number rather than re-deriving it.
 """
 from __future__ import annotations
 
@@ -27,6 +29,46 @@ def _number(value: Any) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _usable_contract_size(spec: Any, account_currency: str) -> float | None:
+    """``trade_contract_size``, but only when it already denotes account-currency cash.
+
+    A lot's contract size is a count of *base* units, so it equals the money at risk per price
+    unit only while profit is paid in the account currency. On a EUR-funded account a gold lot
+    moves 100 troy ounces but the loss is quoted in dollars, and 100 is no longer a dollar
+    figure. ``mt5_agent.SymbolSpec.from_terminal`` refuses such symbols outright; the collector
+    downgrades to the tick value instead, which the broker defines in account currency.
+    """
+    contract_size = _number(getattr(spec, "trade_contract_size", None))
+    if contract_size is None or contract_size <= 0:
+        return None
+    profit_currency = str(getattr(spec, "currency_profit", "") or "").strip().upper()
+    if not profit_currency or profit_currency != str(account_currency).strip().upper():
+        return None
+    return contract_size
+
+
+def _cash_per_price_unit(spec: Any, account_currency: str) -> float | None:
+    """Account-currency value of a one-unit price move of one lot, or None if unusable.
+
+    The contract size is the preferred source because it is definitional -- an ounce of gold is
+    an ounce whatever a quote field says -- and on this broker the tick pair is simply wrong for
+    metals: MetaQuotes-Demo reports gold ``trade_tick_value_loss / trade_tick_size`` as 10 $ per
+    unit per lot while ``order_calc_profit``, the terminal's own money math, and the margin it
+    actually blocked all say 100 $. Risk taken from the tick ratio alone sized and gated a
+    position ten times the approved budget.
+    """
+    contract_size = _usable_contract_size(spec, account_currency)
+    if contract_size is not None:
+        return contract_size
+    tick_size = _number(getattr(spec, "trade_tick_size", None))
+    tick_value_loss = _number(getattr(spec, "trade_tick_value_loss", None))
+    if tick_value_loss is None or tick_value_loss <= 0:
+        tick_value_loss = _number(getattr(spec, "trade_tick_value", None))
+    if tick_size is None or tick_size <= 0 or tick_value_loss is None or tick_value_loss <= 0:
+        return None
+    return tick_value_loss / tick_size
 
 
 def _tick_utc(tick: Any, offset_seconds: int) -> float | None:
@@ -121,6 +163,9 @@ def collect_mt5_risk_snapshot(
         account_server = str(getattr(info, "server", "")).strip()
         if not account_server:
             return {"status": "DENY", "blockers": ["MT5_ACCOUNT_SERVER_MISSING"], "trade_allowed": False}
+        # The contract size counts base units, so it is a cash figure only in an account whose
+        # profit currency matches it; see _usable_contract_size.
+        account_currency = str(getattr(info, "currency", "")).strip().upper()
         trade_mode = int(getattr(info, "trade_mode", -1))
         demo_mode = int(getattr(mt5, "ACCOUNT_TRADE_MODE_DEMO", 0))
         contest_mode = int(getattr(mt5, "ACCOUNT_TRADE_MODE_CONTEST", -2))
@@ -147,8 +192,9 @@ def collect_mt5_risk_snapshot(
         tick_value_loss = _number(getattr(symbol_info, "trade_tick_value_loss", None))
         if tick_value_loss is None or tick_value_loss <= 0:
             tick_value_loss = _number(getattr(symbol_info, "trade_tick_value", None))
+        cash_per_price_unit = _cash_per_price_unit(symbol_info, account_currency)
         point = _number(getattr(symbol_info, "point", None))
-        if tick_size is None or tick_size <= 0 or tick_value_loss is None or tick_value_loss <= 0:
+        if cash_per_price_unit is None:
             return {"status": "DENY", "blockers": ["MT5_TICK_RISK_SPECIFICATION_INVALID"], "account_mode": mode, "trade_allowed": False}
         if point is None or point <= 0:
             return {"status": "DENY", "blockers": ["MT5_SYMBOL_POINT_INVALID"], "account_mode": mode, "trade_allowed": False}
@@ -214,7 +260,7 @@ def collect_mt5_risk_snapshot(
         # Equity can be above balance on floating profit; sizing on equity alone would let
         # the same absolute risk look smaller than it is relative to starting capital.
         risk_base = min(equity, balance)
-        risk_value_account_currency = abs(risk_entry_price - stop_loss) / tick_size * tick_value_loss * size
+        risk_value_account_currency = abs(risk_entry_price - stop_loss) * cash_per_price_unit * size
         risk_fraction = risk_value_account_currency / risk_base
 
         def _position_stop_risk(position: Any) -> float | None:
@@ -228,11 +274,8 @@ def collect_mt5_risk_snapshot(
             spec = symbol_info if pos_symbol == symbol else mt5.symbol_info(pos_symbol)
             if spec is None:
                 return None
-            pos_tick_size = _number(getattr(spec, "trade_tick_size", None))
-            pos_tick_value = _number(getattr(spec, "trade_tick_value_loss", None))
-            if pos_tick_value is None or pos_tick_value <= 0:
-                pos_tick_value = _number(getattr(spec, "trade_tick_value", None))
-            if pos_tick_size is None or pos_tick_size <= 0 or pos_tick_value is None or pos_tick_value <= 0:
+            pos_cash_per_price_unit = _cash_per_price_unit(spec, account_currency)
+            if pos_cash_per_price_unit is None:
                 return None
             # Remaining risk is the distance from the *current* price to the stop, not from
             # the entry: a position moved to break-even has no loss left to realize.
@@ -255,7 +298,7 @@ def collect_mt5_risk_snapshot(
                 distance = pos_stop - price if price is not None and price > 0 else None
             if distance is None:
                 return None
-            return max(0.0, distance) / pos_tick_size * pos_tick_value * pos_volume
+            return max(0.0, distance) * pos_cash_per_price_unit * pos_volume
 
         open_stop_risk_value = 0.0
         for position in positions:
@@ -289,7 +332,7 @@ def collect_mt5_risk_snapshot(
             "status": "PASS" if not blockers else "DENY", "observed_at": current.isoformat(),
             "account_mode": mode, "account_login": login, "account_server": account_server,
             "terminal_server": account_server,
-            "symbol": symbol, "symbol_group": group, "account_currency": str(getattr(info, "currency", "")),
+            "symbol": symbol, "symbol_group": group, "account_currency": account_currency,
             "account_equity": equity, "account_balance": balance,
             "day_start_equity": float(day_start), "equity_high_watermark": float(equity_peak),
             "daily_pnl": daily_pnl, "daily_loss_fraction": daily_loss_fraction,
@@ -298,6 +341,13 @@ def collect_mt5_risk_snapshot(
             "open_stop_risk_value_account_currency": open_stop_risk_value,
             "open_stop_risk_fraction": open_stop_risk_fraction,
             "risk_tick_size": tick_size, "risk_tick_value_loss": tick_value_loss,
+            # The number the risk was actually priced with. Recorded so the verifier can
+            # recompute the same figure instead of re-deriving it from the tick pair, which
+            # disagrees with the contract size on this broker's metals.
+            "risk_cash_per_price_unit": cash_per_price_unit,
+            # Recorded only when it was actually usable as cash (profit paid in the account
+            # currency), so the verifier can insist the figure used is this one.
+            "risk_contract_size": _usable_contract_size(symbol_info, account_currency),
             "risk_entry_price": risk_entry_price,
             "request_binding_sha256": request_hash,
             "request_binding": {"instrument": symbol, "direction": direction, "size": size,

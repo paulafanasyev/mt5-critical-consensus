@@ -1,7 +1,7 @@
 # All-universe forward run: the EMA 50/200 trend variant applied to every instrument the
 # broker actually serves, not only gold. The strategy block is identical to 05_ema_gold_h1.yaml
 # except for sizing; --symbols all expands to the runner's curated DEMO_UNIVERSE and the live
-# terminal is the only source of contract data for every symbol but the base one, so no
+# terminal is the source of contract data for every symbol, including this base one, so no
 # instrument inherits gold's point/tick_value. Demo-only; the EA refuses a live account.
 version: 1
 mode: paper
@@ -22,7 +22,11 @@ symbol_spec:
   point: 0.01
   digits: 2
   tick_size: 0.01
+  # What MetaQuotes-Demo reports, kept as measured - but this broker's own order_calc_profit
+  # pays 4480 $ for 1 lot over a 44.8-point move, i.e. 100 $ per price unit per lot, which is
+  # the contract size below and not this field. A live run sizes from the terminal regardless.
   tick_value: 0.1
+  contract_size: 100.0
   volume_min: 0.01
   volume_max: 100.0
   volume_step: 0.01
@@ -30,7 +34,10 @@ symbol_spec:
   stops_level_points: 0
 
 risk:
-  risk_per_trade_fraction: 0.0002
+  # The smallest sendable gold lot (0.01) at a 2x-ATR stop costs 44.8 $ on this broker. The
+  # 0.0002 fraction this run started with sizes a ~20 $ budget, which no legal lot fits, so
+  # metals would be refused outright; 0.0005 is the smallest fraction the contract allows.
+  risk_per_trade_fraction: 0.0005
   max_open_positions: 1
   max_daily_loss_fraction: 0.02
   max_drawdown_fraction: 0.06

@@ -267,6 +267,27 @@ def risk_snapshot_matches_order(
     balance = _finite(snapshot.get("account_balance"))
     tick_size = _finite(snapshot.get("risk_tick_size"))
     tick_value_loss = _finite(snapshot.get("risk_tick_value_loss"))
+    # The collector publishes the figure it priced risk with: the terminal's contract size,
+    # which agrees with its own order_calc_profit, where the tick pair does not -- on
+    # MetaQuotes-Demo the gold tick fields say 10 $ per price unit per lot and the contract
+    # says 100. Recomputing from the tick ratio here would reject every correctly sized metal
+    # order as a tenfold understatement, so the published figure is what gets reconciled.
+    cash_per_price_unit = _finite(snapshot.get("risk_cash_per_price_unit"))
+    contract_size = _finite(snapshot.get("risk_contract_size"))
+    tick_cash = None
+    if (tick_size is not None and tick_size > 0
+            and tick_value_loss is not None and tick_value_loss > 0):
+        tick_cash = tick_value_loss / tick_size
+    if cash_per_price_unit is None or cash_per_price_unit <= 0:
+        # A row journalled before the contract field existed carried only the tick pair, and
+        # reconciling it against itself is still the check that was possible when it was made.
+        cash_per_price_unit = tick_cash
+    elif contract_size is not None and contract_size > 0 and not (
+            abs(cash_per_price_unit - contract_size) <= max(1e-12, contract_size * tolerance)):
+        # A snapshot that agrees with its own wrong number is worthless: when the collector
+        # recorded a usable contract size, the figure it used has to be that size. Choosing the
+        # smaller tick estimate instead is precisely the tenfold understatement this gates.
+        return sorted(set(blockers + ["RISK_CASH_PER_PRICE_UNIT_NOT_THE_CONTRACT_SIZE"]))
     reference = _finite(snapshot.get("reference_price"))
     if (size is None or entry is None or stop is None or take is None
             or direction not in {"BUY", "SELL"}):
@@ -275,7 +296,7 @@ def risk_snapshot_matches_order(
         return sorted(set(blockers + ["RISK_SNAPSHOT_ACCOUNT_EQUITY_MISSING_OR_INVALID"]))
     if balance is None or balance <= 0:
         return sorted(set(blockers + ["RISK_SNAPSHOT_ACCOUNT_BALANCE_MISSING_OR_INVALID"]))
-    if tick_size is None or tick_size <= 0 or tick_value_loss is None or tick_value_loss <= 0:
+    if cash_per_price_unit is None:
         return sorted(set(blockers + ["RISK_SNAPSHOT_TICK_SPEC_MISSING_OR_INVALID"]))
     if reference is None or reference <= 0:
         return sorted(set(blockers + ["RISK_SNAPSHOT_REFERENCE_PRICE_MISSING_OR_INVALID"]))
@@ -293,7 +314,7 @@ def risk_snapshot_matches_order(
     if not geometry_ok:
         blockers.append("RISK_CONSERVATIVE_ENTRY_OUTSIDE_GEOMETRY")
 
-    expected_value = abs(conservative_entry - stop) / tick_size * tick_value_loss * size
+    expected_value = abs(conservative_entry - stop) * cash_per_price_unit * size
     # Denominating risk in equity alone lets an inflated equity shrink every fraction while
     # the balance stays small; the conservative base is the lower of the two.
     risk_base = min(equity, balance)

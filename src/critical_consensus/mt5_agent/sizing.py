@@ -65,7 +65,10 @@ def size_position(*, spec: SymbolSpec, equity: float, risk_fraction_limit: float
     if max_notional is not None and (not math.isfinite(max_notional) or max_notional <= 0):
         raise ValueError("max_notional must be positive and finite when given")
 
-    risk_per_lot = stop_distance / spec.tick_size * spec.tick_value
+    # One money source for risk, margin and notional: whatever the spec says a price unit is
+    # worth per lot. Deriving this from tick_value/tick_size instead under-stated gold tenfold
+    # on MetaQuotes-Demo, which sized ten times the lot the risk budget allowed.
+    risk_per_lot = stop_distance * spec.cash_per_price_unit
     if not math.isfinite(risk_per_lot) or risk_per_lot <= 0:
         raise ValueError("computed risk per lot is not positive and finite")
     budget = equity * risk_fraction_limit

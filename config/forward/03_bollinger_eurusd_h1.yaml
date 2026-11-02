@@ -19,6 +19,9 @@ symbol_spec:
   digits: 5
   tick_size: 0.00001
   tick_value: 1.0
+  # One lot is 100 000 EUR. It agrees with tick_value/tick_size here, and stating it
+  # means a broker whose tick field drifts cannot silently change the lot's cash value.
+  contract_size: 100000.0
   volume_min: 0.01
   volume_max: 500.0
   volume_step: 0.01

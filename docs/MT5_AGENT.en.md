@@ -60,7 +60,7 @@ an account.
 | `mt5_agent/backend.py` | terminal access without order-sending: `AccountInfo`, `SymbolSpec`, `Tick`, `PositionSnapshot`, the `MT5Backend` protocol, the `LiveMT5Backend` adapter |
 | `mt5_agent/policy.py` | `AgentPolicy`/`RiskLimits`/`StrategyConfig`/`TradingWindow`, YAML loading, refusal on unknown keys, `execution_mode`, `ui_language` |
 | `mt5_agent/strategy.py` | deterministic SMA/ATR + momentum signal, stop/target geometry, blockers |
-| `mt5_agent/sizing.py` | volume from `tick_size`/`tick_value`/`volume_step` under the risk budget and free margin |
+| `mt5_agent/sizing.py` | volume from `cash_per_price_unit` (contract size, else the tick pair) and `volume_step` under the risk budget and free margin |
 | `mt5_agent/paper.py` | `PaperBroker`: bar replay without look-ahead, bid/ask-side fills, gaps, daily equity baselines |
 | `mt5_agent/journal.py` | one SQLite hash chain (`audit_events`, equity points included), `verify_chain`, `report` |
 | `mt5_agent/agent.py` | `MT5Agent.run_cycle()` — the gate order, confirmation gate, decision record |
@@ -449,11 +449,16 @@ while other policy-validation text and terminal, CSV and backend failure reasons
   Both must respect the broker's `stops_level`.
 - `confidence = 0.5 + 0.5·strength`, capped by `max_confidence` and tagged
   `heuristic_score_not_calibrated_probability`. It ranks setups; it is not a probability.
-- Volume: `risk_per_lot = stop_distance / tick_size · tick_value`; the largest `volume_step` whose
-  stop-out loss stays inside `min(equity, balance) · risk_per_trade_fraction` and whose margin —
-  `volume × (tick_value / tick_size) × entry price / leverage` at the entry price — fits free
-  margin. If even the minimum lot breaks the budget, the trade is refused — the stop is never
-  widened.
+- Volume: `risk_per_lot = stop_distance · cash_per_price_unit`, where `cash_per_price_unit` is the
+  account-currency value of a one-unit price move of one lot: `trade_contract_size` while
+  `currency_profit` matches the account currency, otherwise `trade_tick_value / trade_tick_size`.
+  The largest `volume_step` whose stop-out loss stays inside
+  `min(equity, balance) · risk_per_trade_fraction`, and whose margin —
+  `volume × cash_per_price_unit × entry price / leverage` — fits free margin. If even the minimum
+  lot breaks the budget, the trade is refused — the stop is never widened. The tick pair alone
+  understates metals: on MetaQuotes-Demo it says 10 $ per price unit per lot for XAUUSD against 100 $
+  from the contract size, `order_calc_profit` and the margin actually blocked, and an order sized
+  from it came out ten times the budget (`tests/test_mt5_contract_sizing.py`).
 
 ## Paper broker
 

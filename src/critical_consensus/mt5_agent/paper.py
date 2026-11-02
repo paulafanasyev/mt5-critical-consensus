@@ -48,7 +48,7 @@ class PaperTrade:
 def _pnl(spec: SymbolSpec, direction: str, entry: float, exit_price: float,
          volume: float) -> float:
     sign = 1.0 if direction == "BUY" else -1.0
-    return (exit_price - entry) / spec.tick_size * spec.tick_value * volume * sign
+    return (exit_price - entry) * spec.cash_per_price_unit * volume * sign
 
 
 class PaperBroker:

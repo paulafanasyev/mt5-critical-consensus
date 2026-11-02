@@ -58,7 +58,7 @@ EURUSD H1 (сидированный random-walk с трендами); как а�
 | `mt5_agent/backend.py` | доступ к терминалу без отправки ордеров: `AccountInfo`, `SymbolSpec`, `Tick`, `PositionSnapshot`, протокол `MT5Backend`, адаптер `LiveMT5Backend` |
 | `mt5_agent/policy.py` | `AgentPolicy`/`RiskLimits`/`StrategyConfig`/`TradingWindow`, загрузка YAML, отказ на неизвестных ключах, `execution_mode`, `ui_language` |
 | `mt5_agent/strategy.py` | детерминированный сигнал SMA/ATR + momentum, геометрия стопа/тейка, блокеры |
-| `mt5_agent/sizing.py` | объём из `tick_size`/`tick_value`/`volume_step` под риск-бюджет и свободную маржу |
+| `mt5_agent/sizing.py` | объём из `cash_per_price_unit` (контракт, иначе тик-пара) и `volume_step` под риск-бюджет и свободную маржу |
 | `mt5_agent/paper.py` | `PaperBroker`: replay по барам без подглядывания вперёд, исполнение по bid/ask, гэпы, дневные базы equity |
 | `mt5_agent/journal.py` | одна SQLite hash-цепочка (`audit_events`, точки equity внутри неё), `verify_chain`, `report` |
 | `mt5_agent/agent.py` | `MT5Agent.run_cycle()` — порядок гейтов, гейт подтверждения, запись решения |
@@ -436,11 +436,16 @@ MT5_AGENT_LANGUAGE=vi python scripts/run_mt5_agent.py --language en run ...   # 
   Оба уровня обязаны уважать брокерский `stops_level`.
 - `confidence = 0.5 + 0.5·strength`, ограниченная `max_confidence` и помеченная
   `heuristic_score_not_calibrated_probability`. Это ранжирование сетапов, а не вероятность.
-- Объём: `risk_per_lot = stop_distance / tick_size · tick_value`; берётся максимальный шаг
-  `volume_step`, при котором убыток по стопу остаётся внутри
+- Объём: `risk_per_lot = stop_distance · cash_per_price_unit`, где `cash_per_price_unit` —
+  стоимость одного изменения цены для одного лота в валюте счёта: `trade_contract_size`, когда
+  `currency_profit` совпадает с валютой счёта, иначе `trade_tick_value / trade_tick_size`.
+  Берётся максимальный шаг `volume_step`, при котором убыток по стопу остаётся внутри
   `min(equity, balance) · risk_per_trade_fraction`, а требуемая маржа —
-  `объём × (tick_value / tick_size) × цена / плечо` на цене входа — укладывается в свободную.
+  `объём × cash_per_price_unit × цена / плечо` на цене входа — укладывается в свободную.
   Если уже минимальный лот ломает бюджет — отказ, стоп никогда не расширяется.
+  Только тик-пара занижает металлы: на MetaQuotes-Demo она даёт для XAUUSD 10 $ за единицу цены
+  на лот против 100 $ у контракта, `order_calc_profit` и реально заблокированной маржи; ордер,
+  посчитанный по ней, вышел в десять раз больше бюджета (`tests/test_mt5_contract_sizing.py`).
 
 ## Бумажный брокер
 

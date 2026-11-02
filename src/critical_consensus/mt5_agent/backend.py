@@ -133,6 +133,9 @@ class SymbolSpec:
     volume_step: float
     spread_points: int
     stops_level_points: int
+    # Units of the base contract behind one lot: 100 000 EUR, 100 troy ounces, 5 000 silver
+    # ounces. Optional because a policy-written spec may predate it; a terminal always has it.
+    contract_size: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", self.symbol.strip().upper())
@@ -144,6 +147,8 @@ class SymbolSpec:
         # absurd tick_size (1e-320) would make that ratio overflow and raise mid-cycle.
         if not math.isfinite(self.tick_value / self.tick_size):
             raise ValueError("tick_value / tick_size must be a finite cash amount per price unit")
+        if self.contract_size is not None:
+            object.__setattr__(self, "contract_size", _positive(self.contract_size))
         if self.volume_min > self.volume_max:
             raise ValueError("volume_min cannot exceed volume_max")
         if self.volume_step > self.volume_min:
@@ -194,11 +199,18 @@ class SymbolSpec:
                 f"MT5 symbol {name.strip().upper()} pays profit in {profit_currency.strip().upper()},"
                 f" not in the account currency {str(account_currency).strip().upper()}; sizing in"
                 " account currency would be wrong")
+        # A broker that does not fill this field reports 0.0, which is "unknown", not "free";
+        # keeping it would divide the whole position's value by zero later. The tick ratio stays
+        # as the fallback in that case.
+        contract_size = _finite(getattr(info, "trade_contract_size", None))
+        if contract_size is not None and contract_size <= 0:
+            contract_size = None
         return cls(symbol=name, point=numbers["point"], digits=digits,
                    tick_size=numbers["trade_tick_size"], tick_value=tick_value,
                    volume_min=numbers["volume_min"], volume_max=numbers["volume_max"],
                    volume_step=numbers["volume_step"], spread_points=integers["spread"],
-                   stops_level_points=integers["trade_stops_level"])
+                   stops_level_points=integers["trade_stops_level"],
+                   contract_size=contract_size)
 
     def price_to_volume(self, volume: float) -> float:
         """Round a requested volume down to the broker step, minimum and maximum lot."""
@@ -211,9 +223,41 @@ class SymbolSpec:
             return 0.0
         return round(rounded, 8)
 
+    @property
+    def cash_per_price_unit(self) -> float:
+        """Account-currency value of a one-unit move of the price for one lot.
+
+        The contract size is definitional - an ounce of gold is an ounce whatever a quote field
+        says - and it is exact here because ``from_terminal`` refuses instruments whose profit
+        currency differs from the account's, so no conversion factor is missing. The tick ratio
+        is kept only for brokers that do not publish a contract size, and it is not trustworthy:
+        measured on MetaQuotes-Demo, XAUUSD reports ``trade_tick_value_loss=0.1`` at
+        ``trade_tick_size=0.01`` - 10 $ per price unit per lot - while the same terminal's
+        ``order_calc_profit`` pays 4 480 $ for 1 lot over a 44.8-point move, i.e. 100 $. Risk
+        and margin sized from the tick field came out ten times too small, and the lots ten
+        times too big. Silver behaves the same way; FX pairs agree, which is why only metals
+        were affected.
+        """
+        if self.contract_size is not None:
+            return self.contract_size
+        return self.tick_value / self.tick_size
+
+    @property
+    def cash_estimate_divergence(self) -> float | None:
+        """Relative disagreement between the two cash estimates, or None if only one exists.
+
+        Zero means the broker's fields agree. Ten (the MetaQuotes-Demo metals case) means the
+        tick field describes a different lot basis than the contract does; callers that show
+        risk to an operator should not present either number without saying which was used.
+        """
+        if self.contract_size is None:
+            return None
+        tick_based = self.tick_value / self.tick_size
+        return abs(self.contract_size - tick_based) / self.contract_size
+
     def value_per_price_unit(self, volume: float) -> float:
         """Account-currency value of a one-unit move of the price for ``volume`` lots."""
-        value = volume * self.tick_value / self.tick_size
+        value = volume * self.cash_per_price_unit
         if not math.isfinite(value) or value < 0:
             raise ValueError("computed position value is not usable")
         return value

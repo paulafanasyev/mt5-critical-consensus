@@ -1200,14 +1200,13 @@ def _run(args: argparse.Namespace, policy: AgentPolicy, language: str, token: st
         operator_state = ApprovalState()
         agents: dict[str, tuple[MT5Agent, DemoExecutor]] = {}
         for symbol in active:
-            # The declared spec belongs to the policy's own symbol; for any other instrument
-            # the live terminal is the only source of contract data, so it is dropped rather
-            # than re-declared (a wrong declaration would silently mis-size gold).
-            # The declared spec belongs to the policy's own symbol *under that name*: an
-            # aliased instrument is a different broker contract, so its numbers come from
-            # the terminal even when the base name matches the policy.
-            per_policy = (policy if (symbol == policy.symbol and symbol not in aliases.values())
-                          else replace(policy, symbol=symbol, symbol_spec=None))
+            # A live run takes contract data from the live terminal for every instrument,
+            # including the policy's own symbol: the declared spec is a record of what was
+            # measured once, and a stale or broker-inconsistent number in it silently mis-sizes
+            # real orders. Measured here: MetaQuotes-Demo's XAUUSD tick fields understate a
+            # lot's cash per price unit tenfold, so sizing from the declaration sent 0.04 lots
+            # where the risk budget allowed 0.01. The declaration still serves offline callers.
+            per_policy = replace(policy, symbol=symbol, symbol_spec=None)
             approver = None
             if per_policy.execution_mode == "confirm":
                 approver = _make_approver(language=language, state=operator_state,
