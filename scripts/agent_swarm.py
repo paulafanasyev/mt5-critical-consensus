@@ -207,7 +207,8 @@ SCALE_TRIGGER = 15.0     # once a position is fifteen dollars up, add half again
 COOLDOWN_SECONDS = 1800  # after a stop, that symbol rests for half an hour
 MAX_ENTRIES_PER_HOUR = 3 # more than this on one symbol is churn, not trading
 TRAIL_ARM = 12.0         # once a position is twelve dollars up, protect it
-GIVEBACK_FRACTION = 0.5  # close when it gives back half of the peak profit
+GIVEBACK_FRACTION = 0.35 # close once a third of the peak profit is given back
+SCALE_TIERS = (15.0, 30.0, 50.0, 75.0)  # add half again at each of these
 KILL_SWITCH = ROOT / "agent_data" / "demo_bridge" / "kill_switch.json"
 
 
@@ -345,16 +346,19 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
                           f"{None if result is None else result.retcode}"})
             survivors = [p for p in survivors if p.ticket != position.ticket]
 
-    # 2. scale into a winner: add half the position once it is up SCALE_TRIGGER
-    scaled = set(state.get("scaled_tickets", []))
+    # 2. scale into a winner in steps: the stronger the profit, the more is added
+    levels = state.setdefault("scale_levels", {})
     for position in survivors:
-        if position.profit < SCALE_TRIGGER or position.ticket in scaled:
+        key = str(position.ticket)
+        level = levels.get(key, 0)
+        if level >= len(SCALE_TIERS) or position.profit < SCALE_TIERS[level]:
             continue
         add = round(position.volume * 0.5, 2)
         if add <= 0:
             continue
         cap = SYMBOL_CAP.get(position.symbol, 0.04)
         if swarm_exposure(position.symbol) + add > cap + 1e-9:
+            levels[key] = level + 1
             continue
         tick = mt5.symbol_info_tick(position.symbol)
         result = mt5.order_send({
@@ -365,11 +369,12 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
             "type_filling": mt5.ORDER_FILLING_FOK,
             "comment": "scale-in"})
         if result is not None and result.retcode == 10009:
-            scaled.add(position.ticket)
-            state["scaled_tickets"] = sorted(scaled)
+            levels[key] = level + 1
+            state["scale_levels"] = levels
             save_state(state)
             log({"event": f"{position.symbol} ticket {position.ticket}: up "
-                          f"{position.profit:+.2f}, added {add} lots"})
+                          f"{position.profit:+.2f} at tier "
+                          f"{SCALE_TIERS[level]:.0f}, added {add} lots"})
 
     by_symbol: dict[str, list] = {}
     for position in mt5.positions_get() or []:
