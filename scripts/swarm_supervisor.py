@@ -25,6 +25,7 @@ STATE = ROOT / "agent_data" / "swarm_state.json"
 SWARM = ROOT / "scripts" / "agent_swarm.py"
 PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 MAGIC_FLOOR = 8180000
+MAGIC_BASE = 8180000
 MAX_DRAWDOWN = 0.01
 
 
@@ -76,6 +77,38 @@ def main(argv: list[str] | None = None) -> int:
                                  cwd=str(ROOT), stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL)
                 log({"event": "swarm was down; restarted"})
+
+            positions = [p for p in (mt5.positions_get() or []) if p.magic >= MAGIC_FLOOR]
+
+            # 1b. every position must belong to the agent whose magic it carries
+            import re as _re
+
+            source = SWARM.read_text(encoding="utf-8")
+            registry = _re.findall(r'agent\("([^"]+)", "[a-z0-9_]+", "([A-Z0-9]+)", [0-9.]+',
+                                   source)
+            symbol_by_name = {name: symbol for name, symbol in registry}
+            import zlib as _zlib
+
+            for position in positions:
+                name = None
+                for candidate, symbol in registry:
+                    if MAGIC_BASE + (_zlib.crc32(candidate.encode()) % 5000) == position.magic:
+                        name = candidate
+                        break
+                if name is None or symbol_by_name.get(name) != position.symbol:
+                    tick = mt5.symbol_info_tick(position.symbol)
+                    mt5.order_send({"action": mt5.TRADE_ACTION_DEAL,
+                                    "symbol": position.symbol,
+                                    "volume": position.volume,
+                                    "type": mt5.ORDER_TYPE_SELL if position.type == 0
+                                            else mt5.ORDER_TYPE_BUY,
+                                    "position": position.ticket,
+                                    "price": tick.bid if position.type == 0 else tick.ask,
+                                    "deviation": 30, "magic": position.magic,
+                                    "type_filling": mt5.ORDER_FILLING_FOK,
+                                    "comment": "orphan"})
+                    log({"event": f"orphan closed: {position.symbol} ticket {position.ticket} "
+                                  f"magic {position.magic} (agent {name})"})
 
             positions = [p for p in (mt5.positions_get() or []) if p.magic >= MAGIC_FLOOR]
 

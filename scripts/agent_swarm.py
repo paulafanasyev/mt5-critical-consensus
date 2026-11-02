@@ -84,9 +84,17 @@ AGENTS: list[dict] = [
     agent("x-wm-xag", "weekly_momentum", "XAGUSD", 0.01, experimental=True),
     agent("x-tom-xau", "turn_of_month", "XAUUSD", 0.01, experimental=True),
 ]
+# Magic numbers are derived from the agent NAME, not its position in the list: reordering
+# or inserting agents must never hand an existing position to a different agent.
+import zlib as _zlib
+
 for index, item in enumerate(AGENTS):
-    item["magic"] = MAGIC_BASE + index
+    item["magic"] = MAGIC_BASE + (_zlib.crc32(item["name"].encode("utf-8")) % 5000)
+_duplicates = len(AGENTS) - len({item["magic"] for item in AGENTS})
+if _duplicates:
+    raise SystemExit(f"magic collision between agents: {_duplicates} duplicates")
 MAGIC_SET = {item["magic"] for item in AGENTS}
+AGENT_BY_MAGIC = {item["magic"]: item for item in AGENTS}
 
 
 def log(event: dict) -> None:
