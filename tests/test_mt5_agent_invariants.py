@@ -406,9 +406,12 @@ def test_paper_broker_reports_the_server_offset_it_applies():
 # validates nor sends anything. It is here because a pair whose profit currency differs from the
 # account's cannot be priced from a SymbolSpec at all, and the open-position reserve has to know
 # what somebody else's leg would cost.
+# account's. history_deals_get reads what the broker already settled: it takes no position, changes
+# no order, and is the only place a leg that opened and died between two cycles still leaves a
+# trace. Both are reads the churn and reserve gates need; neither is a way to trade.
 ALLOWED_TERMINAL_CALLS = {"initialize", "shutdown", "last_error", "account_info", "symbol_info",
                           "symbol_select", "symbol_info_tick", "copy_rates_from_pos",
-                          "positions_get", "order_calc_profit"}
+                          "positions_get", "order_calc_profit", "history_deals_get"}
 FORBIDDEN_TERMS = ("order_send", "OrderSend", "order_check", "OrderCheck", "OrderCalcMargin",
                    "OrderCalcProfit", "trade_transaction", "TradeTransaction", "order_place",
                    "deal_get", "HistoryDeals")

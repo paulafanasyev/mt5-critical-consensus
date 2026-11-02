@@ -623,8 +623,9 @@ class MT5Agent:
         Measured on the shared demo: four FX legs opened 20 seconds apart were flattened by
         another process 21 seconds later, each for exactly the spread it had just paid, and the
         next cycle would have opened all four again. Reopening into a book somebody else is
-        closing buys their exit forever, so the count of distinct recent tickets - durable rows
-        plus what this process has seen - is what decides whether the signal is worth a lot.
+        closing buys their exit forever, so the count of distinct recent tickets - durable rows,
+        what this process has seen, and whatever the broker's own history can add - is what
+        decides whether the signal is worth a lot.
         """
         limit = self._policy.risk.churn_max_legs_per_symbol
         if limit is None:
@@ -652,7 +653,35 @@ class MT5Agent:
                 seen = _iso_datetime(seen_at if seen_at is not None else event.get("timestamp"))
                 if seen is None or seen >= window_start:
                     tickets.add(ticket)
+        history = self._legs_from_broker_history(window_start)
+        if history is None:
+            return (codes.LEG_HISTORY_UNREADABLE,)
+        tickets |= history
         return (codes.LEG_CHURN_DETECTED,) if len(tickets) > limit else ()
+
+    def _legs_from_broker_history(self, window_start: datetime) -> set[int] | None:
+        """Legs the terminal recorded on this symbol, or ``None`` if it would not say.
+
+        A position opened and flattened between two cycles is never in the book when the book is
+        read, so the journal rows this run writes from it under-count exactly the legs the gate
+        exists for. The deal history is not sampled: it holds every leg, dead or alive. A backend
+        with no history to offer (the paper book, whose journal is written by the process that
+        closes it) answers nothing and changes nothing.
+        """
+        counter = getattr(self._backend, "opened_leg_tickets", None)
+        if counter is None:
+            return set()
+        try:
+            recorded = counter(self._policy.symbol, self._policy.position_magic, window_start)
+        except Exception:
+            # Standing down is the only honest reading of a book this run cannot count: the
+            # alternative is to reopen into it and call the absence of evidence a clean record.
+            return None
+        if not isinstance(recorded, (set, frozenset, list, tuple)):
+            return None
+        return {int(ticket) for ticket in recorded
+                if not isinstance(ticket, bool) and isinstance(ticket, (int, float))
+                and int(ticket) > 0}
 
     def _read_market_data(self, moment: datetime) -> tuple[SymbolSpec, Tick, list[MarketBar]] \
             | CycleResult:

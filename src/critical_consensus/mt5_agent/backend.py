@@ -405,6 +405,12 @@ class MT5Backend(Protocol):
     with ``getattr``: only a live terminal can price a leg whose profit currency is not the
     account's. A paper book that never holds such a position does not have to answer, and the
     agent falls back to blocking when a real book cannot be measured.
+
+    ``opened_leg_tickets(symbol, magic, since)`` is optional in the same way. It answers how many
+    legs the broker recorded on this instrument, which the open book cannot say about a leg that
+    opened and died between two cycles. A paper book is closed by this process, so its journal is
+    complete and the adapter is not needed; a terminal that cannot answer stands the symbol down
+    rather than trading blind.
     """
 
     def account(self) -> AccountInfo: ...
@@ -684,6 +690,63 @@ class LiveMT5Backend:
         if profit is None or profit >= 0:
             return None
         return -profit
+
+    def opened_leg_tickets(self, symbol: str, magic: int | None,
+                           since: datetime) -> set[int]:
+        """Position ids of the legs opened on ``symbol`` since ``since``, from the broker's own history.
+
+        The churn gate wants the number of legs, and the open book cannot give it: a leg that is
+        opened and flattened inside the interval between two cycles is never in the book when the
+        book is read. Measured on MetaQuotes-Demo on 2026-11-02, a run whose six legs were closed
+        by another process sixty seconds after each fill had journaled two tickets per symbol for
+        four real round trips - the guard written to stand that down stayed silent because the
+        evidence it counted was sampled, not read. History holds every leg, dead or alive.
+
+        ``magic`` is the attribution this run has for its own orders; ``None`` means the policy
+        claims the whole book, which is what the same ``None`` means to the open-position filter.
+
+        Raises when the terminal gives no answer. The caller treats that as "the legs cannot be
+        counted", never as "no legs were opened".
+        """
+        if since.tzinfo is None or since.utcoffset() is None:
+            raise ValueError("since must be a timezone-aware datetime")
+        # Same oversized window the demo runner measures with: the terminal reads these naive
+        # values on the server clock, and a right edge taken from UTC silently clips the newest
+        # deals off the result, which is exactly the evidence this count is here to find.
+        start = (since - timedelta(days=7)).astimezone(UTC).replace(tzinfo=None)
+        end = (datetime.now(UTC) + timedelta(days=3)).replace(tzinfo=None)
+        rows = self._mt5.history_deals_get(start, end)
+        if rows is None:
+            raise RuntimeError("MT5 history_deals_get() returned no result set")
+        name = self._name(symbol)
+        tickets: set[int] = set()
+        for row in rows:
+            try:
+                if str(getattr(row, "symbol", "") or "").upper() != name.upper():
+                    continue
+                # DEAL_ENTRY_IN: the deal that put the leg on. A closing deal, an in/out or a
+                # partial is not another leg opened, and counting one would stand the symbol down
+                # for a trade that took its stop as designed.
+                if int(getattr(row, "entry", -1)) != 0:
+                    continue
+                row_magic = getattr(row, "magic", None)
+                if magic is not None and (row_magic is None or int(row_magic) != int(magic)):
+                    continue
+                position_id = int(getattr(row, "position_id", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if position_id <= 0:
+                continue
+            try:
+                moment = self._offset_datetime(row, "deal")
+            except RuntimeError:
+                # A leg we cannot date is a leg that might be the newest one. Counting it costs a
+                # stand-down; skipping it costs the gate its evidence.
+                tickets.add(position_id)
+                continue
+            if moment >= since:
+                tickets.add(position_id)
+        return tickets
 
     def shutdown(self) -> None:
         self._mt5.shutdown()
