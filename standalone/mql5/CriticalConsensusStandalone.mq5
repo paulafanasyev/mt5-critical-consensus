@@ -393,49 +393,61 @@ bool PlaceDemoOrder(const string direction, const double volume, string &card_te
 //| Work modes                                                        |
 //+------------------------------------------------------------------+
 void HandleSignal(const double &fast[], const double &slow[], const double &rsi[],
-                  const double &atr[], const double atr_avg)
+                  const double &atr[], const double atr_baseline)
 {
    string direction = "", log = "";
-   if(!CertaintyGate(fast, slow, rsi, atr, atr_avg, direction, log))
-      return; // consensus not reached — gather more, do nothing (fail closed)
+   if(!CertaintyGate(fast, slow, rsi, atr, atr_baseline, direction, log))
+      return;
 
    string reason = "";
    if(!SafetyOk(reason))
    { Print("BLOCKED: ", reason); return; }
 
-   double volume = LotSize;
+   double pip = PipSize();
+   MqlTick tick;
+   if(pip <= 0.0 || !SymbolInfoTick(_Symbol, tick))
+   { Print("BLOCKED: pip size or quote unavailable"); return; }
+   double stop_distance = SlPips * pip;
+   double volume = CalculateOrderVolume(stop_distance, reason);
+   if(volume <= 0.0)
+   { Print("BLOCKED: ", reason); return; }
+
    if(WorkMode == MODE_AUTONOMOUS)
    {
       if(volume > MaxAutonomousLot)
-      { Print("BLOCKED: lot ", DoubleToString(volume, 2), " above autonomous cap ", DoubleToString(MaxAutonomousLot, 2)); return; }
+      { Print("BLOCKED: risk-sized lot ", DoubleToString(volume, 3),
+              " above autonomous cap ", DoubleToString(MaxAutonomousLot, 2)); return; }
       string card = "";
       if(PlaceDemoOrder(direction, volume, card))
          TelegramSend("🤖 AUTONOMOUS (demo)\n" + card);
       return;
    }
 
-   // Confirmation mode: ask the operator on Telegram.
    if(!chat_known)
    { Print("BLOCKED: Telegram chat is not configured — confirmation mode requires the phone."); return; }
 
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   MqlTick tick; SymbolInfoTick(_Symbol, tick);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    double price = (direction == "BUY") ? tick.ask : tick.bid;
-   double sl = (direction == "BUY") ? price - SlPips * point : price + SlPips * point;
-   double tp = (direction == "BUY") ? price + TpPips * point : price - TpPips * point;
+   double sl = (direction == "BUY") ? price - stop_distance : price + stop_distance;
+   double tp = 0.0;
+   if(TakeProfitPips > 0)
+      tp = (direction == "BUY") ? price + TakeProfitPips * pip : price - TakeProfitPips * pip;
    pending_direction = direction;
-   pending_sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-   pending_tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+   pending_sl = NormalizeDouble(sl, digits);
+   pending_tp = (tp > 0.0) ? NormalizeDouble(tp, digits) : 0.0;
    pending_volume = volume;
    pending_expires = TimeCurrent() + ApprovalTimeoutMin * 60;
    pending_active = true;
 
+   string target_text = (pending_tp > 0.0) ? DoubleToString(pending_tp, digits) : "TRAILING EXIT";
    string card = "🤖 Signal " + _Symbol + " — needs your approval\n" +
-                 "Direction: " + direction + "  Lot: " + DoubleToString(volume, 2) +
+                 "Direction: " + direction + "  Lot: " + DoubleToString(volume, 3) +
+                 "\nSL: " + DoubleToString(pending_sl, digits) + "  TP: " + target_text +
+                 "\nRisk budget: " + DoubleToString(RiskPercentPerTrade, 2) + "% equity" +
                  "\nGate: " + log +
                  "\nDemo money, " + IntegerToString(ApprovalTimeoutMin) + " min to answer";
    string response = "";
-   string payload = "{\"chat_id\":\"" + TelegramChatID + "\",\"text\":\"" + JsonEscapeText(card) + "\","
+   string payload = "{\"chat_id\":\"" + TelegramChatID + "\",\"text\":\"" + JsonEscapeText(card) + "\"," 
                     "\"reply_markup\":{\"inline_keyboard\":[[{\"text\":\"✅ Approve\",\"callback_data\":\"approve\"},"
                     "{\"text\":\"❌ Reject\",\"callback_data\":\"reject\"}]]}}";
    if(TelegramCall("sendMessage", payload, response))
@@ -445,8 +457,100 @@ void HandleSignal(const double &fast[], const double &slow[], const double &rsi[
    }
    else
    {
-      pending_active = false; // fail closed: no channel -> no autonomous confirmation fallback
+      pending_active = false;
       Print("BLOCKED: Telegram unavailable; signal discarded.");
+   }
+}
+
+// Tighten the broker-side stop only in the profitable direction; never widen risk.
+void ManageOpenPositions()
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double pip = PipSize();
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   if(point <= 0.0 || pip <= 0.0) return;
+
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick)) return;
+
+   long stops_points = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   long freeze_points = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   double min_distance = MathMax((double)stops_points, (double)freeze_points) * point;
+   double spread_buffer = MathMax(tick.ask - tick.bid, pip);
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long magic = PositionGetInteger(POSITION_MAGIC);
+      if(symbol != _Symbol || magic != MagicNumber) continue;
+
+      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      double old_sl = PositionGetDouble(POSITION_SL);
+      double old_tp = PositionGetDouble(POSITION_TP);
+      if(entry <= 0.0) continue;
+
+      double favourable_pips = 0.0;
+      double candidate_sl = old_sl;
+      if(type == POSITION_TYPE_BUY)
+      {
+         favourable_pips = (tick.bid - entry) / pip;
+         if(favourable_pips >= BreakEvenAfterPips)
+         {
+            double breakeven = entry + spread_buffer;
+            if(candidate_sl <= 0.0 || breakeven > candidate_sl) candidate_sl = breakeven;
+         }
+         if(favourable_pips >= TrailStartPips)
+         {
+            double trailing = tick.bid - TrailDistancePips * pip;
+            if(candidate_sl <= 0.0 || trailing > candidate_sl) candidate_sl = trailing;
+         }
+         if(candidate_sl <= 0.0 || (old_sl > 0.0 && candidate_sl <= old_sl + point * 0.5))
+            continue;
+         candidate_sl = NormalizeDouble(candidate_sl, digits);
+         if(candidate_sl >= tick.bid - min_distance) continue;
+      }
+      else if(type == POSITION_TYPE_SELL)
+      {
+         favourable_pips = (entry - tick.ask) / pip;
+         if(favourable_pips >= BreakEvenAfterPips)
+         {
+            double breakeven = entry - spread_buffer;
+            if(candidate_sl <= 0.0 || breakeven < candidate_sl) candidate_sl = breakeven;
+         }
+         if(favourable_pips >= TrailStartPips)
+         {
+            double trailing = tick.ask + TrailDistancePips * pip;
+            if(candidate_sl <= 0.0 || trailing < candidate_sl) candidate_sl = trailing;
+         }
+         if(candidate_sl <= 0.0 || (old_sl > 0.0 && candidate_sl >= old_sl - point * 0.5))
+            continue;
+         candidate_sl = NormalizeDouble(candidate_sl, digits);
+         if(candidate_sl <= tick.ask + min_distance) continue;
+      }
+      else continue;
+
+      MqlTradeRequest request = {};
+      MqlTradeResult result = {};
+      request.action = TRADE_ACTION_SLTP;
+      request.position = ticket;
+      request.symbol = symbol;
+      request.sl = candidate_sl;
+      request.tp = old_tp;
+
+      ResetLastError();
+      if(!OrderSend(request, result) || result.retcode != TRADE_RETCODE_DONE)
+      {
+         Print("TRAILING STOP NOT CONFIRMED: ticket=", ticket,
+               " retcode=", result.retcode, " error=", GetLastError(),
+               " comment=", result.comment);
+         continue;
+      }
+      Print("PROTECTIVE STOP MOVED: ticket=", ticket,
+            " SL=", DoubleToString(candidate_sl, digits),
+            " favourable_pips=", DoubleToString(favourable_pips, 1));
    }
 }
 
