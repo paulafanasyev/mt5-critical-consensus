@@ -206,6 +206,8 @@ STOP_RISK_FRACTION = 0.4 # ...but at least a fraction of the position's own risk
 SCALE_TRIGGER = 15.0     # once a position is fifteen dollars up, add half again
 COOLDOWN_SECONDS = 1800  # after a stop, that symbol rests for half an hour
 MAX_ENTRIES_PER_HOUR = 3 # more than this on one symbol is churn, not trading
+TRAIL_ARM = 12.0         # once a position is twelve dollars up, protect it
+GIVEBACK_FRACTION = 0.5  # close when it gives back half of the peak profit
 KILL_SWITCH = ROOT / "agent_data" / "demo_bridge" / "kill_switch.json"
 
 
@@ -303,6 +305,45 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
             save_state(state)
             continue
         survivors.append(position)
+
+    # 1b. protect a winner: move the stop to breakeven when it is up TRAIL_ARM and close
+    # it if it gives back half of its peak profit. This is the "close before it falls"
+    # rule: a trade that was up twelve dollars must not turn into a ten dollar loss.
+    peaks = state.setdefault("peaks", {})
+    for position in survivors:
+        key = str(position.ticket)
+        peak = max(peaks.get(key, 0.0), position.profit)
+        peaks[key] = peak
+        if peak < TRAIL_ARM:
+            continue
+        entry = position.price_open
+        at_breakeven = (
+            (position.type == 0 and position.sl >= entry)
+            or (position.type == 1 and position.sl and position.sl <= entry)
+        )
+        if not at_breakeven:
+            result = mt5.order_send({"action": mt5.TRADE_ACTION_SLTP,
+                                     "symbol": position.symbol,
+                                     "position": position.ticket,
+                                     "sl": round(entry, 5), "tp": position.tp})
+            log({"event": f"{position.symbol} ticket {position.ticket}: peak "
+                          f"{peak:+.2f}, stop to breakeven retcode "
+                          f"{None if result is None else result.retcode}"})
+        if position.profit <= max(1.0, peak * GIVEBACK_FRACTION):
+            tick = mt5.symbol_info_tick(position.symbol)
+            result = mt5.order_send({
+                "action": mt5.TRADE_ACTION_DEAL, "symbol": position.symbol,
+                "volume": position.volume,
+                "type": mt5.ORDER_TYPE_SELL if position.type == 0 else mt5.ORDER_TYPE_BUY,
+                "position": position.ticket,
+                "price": tick.bid if position.type == 0 else tick.ask,
+                "deviation": 30, "magic": position.magic,
+                "type_filling": mt5.ORDER_FILLING_FOK,
+                "comment": "trail exit"})
+            log({"event": f"{position.symbol} ticket {position.ticket}: gave back "
+                          f"from {peak:+.2f} to {position.profit:+.2f}, closed retcode "
+                          f"{None if result is None else result.retcode}"})
+            survivors = [p for p in survivors if p.ticket != position.ticket]
 
     # 2. scale into a winner: add half the position once it is up SCALE_TRIGGER
     scaled = set(state.get("scaled_tickets", []))
