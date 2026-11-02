@@ -577,6 +577,17 @@ symbol.
   theo ràng buộc `(login, server, ngày của broker)`, nên một lần khởi động lại tiến trình không xoá
   sạch mốc đầu ngày và không kéo đỉnh equity lùi lại
   (`test_risk_baselines_survive_runner_restart_and_are_scoped_to_the_broker_account`).
+- Các công cụ trả lợi nhuận bằng tiền tệ khác tiền tệ tài khoản bị loại khỏi phiên live: trên tài
+  khoản USD, `SymbolSpec.from_terminal` từ chối USDJPY, USDCAD, USDCHF và EURGBP, và vòng
+  all-universe đang chạy ghi nhật ký chúng là `demo_symbol_unavailable` — nghĩa là chỉ 8 trong 13
+  công cụ được giao dịch (terminal này không cung cấp BTCUSD và NAS100). Lời từ chối không phải là
+  sự thận dư: kích thước lot của một cặp cross là `contract_size` quy đổi qua tỷ giá của tiền tệ
+  yết giá, nên nó thay đổi theo cặp. Đo trên MetaQuotes-Demo ngày 2026-11-02: cặp tick cho USDJPY
+  633,60 $ mỗi bước giá, còn `order_calc_profit` trên một tick cho 0,63 $ (630,00 mỗi bước giá),
+  USDCAD 71.567,62 so với 72.000 và USDCHF 121.228,29 so với 121.000 — với cặp cross, các trường
+  tick của broker thật sự nói bằng tiền tệ tài khoản. Phần còn thiếu là vế margin: với cặp cross,
+  `khối lượng × cash_per_price_unit × giá / đòn bẩy` cho ra đơn vị tiền tệ cơ sở chứ không phải
+  tiền tệ tài khoản, nên cần cách tính riêng theo đồng tiền cơ sở trước khi bỏ lời từ chối.
 - Package Python không có `order_send` hay bất kỳ đường ghi giao dịch nào; bước quét mã nguồn
   `test_package_source_contains_no_order_sending_surface` chỉ bao phủ package `mt5_agent`, còn các
   test subprocess riêng của CLI kiểm tra JSON của nó không bao giờ báo đã gửi lệnh. Template MQL5
