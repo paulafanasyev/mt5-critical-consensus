@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/critical-consensus/user_decision.schema.json",
+  "title": "User Decision",
+  "description": "Explicit human decision. Must travel inside a separate operator-domain HMAC envelope; live execution is not implemented.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision_id",
+    "permission_id",
+    "signal_id",
+    "chief_reasoning_hash",
+    "permission_request_sha256",
+    "user_id",
+    "decision",
+    "timestamp",
+    "reason",
+    "ttl_seconds",
+    "nonce"
+  ],
+  "properties": {
+    "decision_id": {
+      "type": "string"
+    },
+    "permission_id": {
+      "type": "string"
+    },
+    "signal_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Signal this approval covers; the pipeline rejects a mismatch."
+    },
+    "chief_reasoning_hash": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Exact ChiefReasoning hash reviewed by the human; the pipeline rejects a mismatch."
+    },
+    "permission_request_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "Canonical hash of the exact permission_request (size, prices, SL/TP, mode, expiry); the pipeline rejects a mismatch."
+    },
+    "user_id": {
+      "type": "string"
+    },
+    "decision": {
+      "enum": [
+        "APPROVE",
+        "REJECT"
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "ttl_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 600
+    },
+    "nonce": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{16,128}$",
+      "description": "One-time value consumed atomically by the authorization nonce store."
+    },
+    "two_fa_verified": {
+      "type": "boolean"
+    },
+    "signature_verified": {
+      "type": "boolean"
+    },
+    "ip_hash": {
+      "type": "string"
+    }
+  }
+}

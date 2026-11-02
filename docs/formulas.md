@@ -1,0 +1,78 @@
+# Метрики и формулы (начальные, требуют эмпирической валидации)
+
+## Brier score
+
+Для прогнозов `p_i` и бинарных исходов `y_i ∈ {0,1}`:
+
+`BS = (1/N) * Σ (p_i - y_i)^2`; меньше — лучше. Оценивать out-of-sample, по отдельным режимам рынка и с доверительными интервалами. При маленьком N рейтинг агента помечать `INSUFFICIENT_SAMPLE`, а не считать точным.
+
+## Штраф за плохую калибровку
+
+`excess = max(0, BS - BS_threshold)`
+
+`factor = clamp(0, 1, 1 - excess / penalty_scale)`
+
+`p_shrunk = base_rate + (p_raw - base_rate) * factor`
+
+При `p_raw >= 0.95` и empirical accuracy в этой confidence-bin `< 0.70` применяется дополнительный shrinkage. Это **защитная эвристика**, а не статистически корректная калибровка. Production должен использовать обученную Platt/isotonic calibration на разделённых во времени данных, reliability diagram, минимум наблюдений и мониторинг drift. Brier score сам по себе не определяет калиброванную вероятность.
+
+## Самокритика и минимальный confidence
+
+`APPROVE` допустим по первичной политике только при confidence `>= 0.75`; `< 0.50` приводит к `REJECT`, а диапазон `[0.50, 0.75)` — к `ABSTAIN` с блокирующей причиной. Это только локальный порог первичной оценки: он не отменяет более строгий `near_certainty_threshold: 0.98`, перекрёстную проверку, калибровку или остальные gates.
+
+## Weighted consensus (описательный индикатор, не voting)
+
+`w_i = max(0.01, 1 - BS_i)`
+
+`consensus_score = Σ(w_i * p_shrunk_i) / Σ(w_i)`
+
+Score не заменяет обязательные проверки каждого агента: все обязательные verdicts должны пройти индивидуальные условия, а один veto/reject/challenge блокирует gate. Для production лучше учесть uncertainty weights и временную стабильность качества.
+
+## Credibility источника
+
+Все входы нормированы `[0,1]`:
+
+`base = .30*verified_accuracy + .20*authenticity + .15*independence + .15*freshness + .10*transparency + .10*lead_time`
+
+`credibility = clamp(0,1, base * (1 - .50*fake_rate) * (1 - .25*bias_penalty))`
+
+`freshness = exp(-age_seconds / ttl_seconds)` можно вычислять на ingestion. Точные веса должны подбираться только на сохранённых исторических оценках источников. Независимость источников проверяется по общему первоисточнику/синдикации, а не по количеству URL.
+
+## Риск позиции (не завершён в MVP)
+
+Денежный риск по стопу: `risk_cash = equity * risk_fraction`, `volume = risk_cash / loss_per_lot_at_SL`, с нормализацией на `volume_min`, `volume_step`, `volume_max`, валюту счёта, `cash_per_price_unit`, комиссии и гэп-риск. Не вычисляйте объём только по расстоянию в пунктах. Нужны брокерские `order_calc_profit`/`order_check` или эквивалентная проверка.
+
+`cash_per_price_unit` — денежная стоимость одного изменения цены на одну единицу для одного лота, уже в валюте счёта. Источник по приоритету: `trade_contract_size`, если `currency_profit` совпадает с валютой счёта (контракт — это количество базовых единиц; вне валюты счёта это не деньги), иначе `trade_tick_value_loss / trade_tick_size`. Тик-пара сейчас является оценкой, а не фактом: на MetaQuotes-Demo 2026-11-02 для XAUUSD она даёт 10 $ за единицу цены на лот (`trade_tick_value_loss=0.1` при `trade_tick_size=0.01`), тогда как `trade_contract_size=100`, `mt5.order_calc_profit(ORDER_TYPE_BUY, "XAUUSD", 1.0, 3902.27, 3947.07) = 4480.0` и реально заблокированная маржа 156.09 $ для 0.04 лота говорят 100 $. Сайзинг только по тик-полям послал ордер золота в десять раз больше риск-бюджета (0.04 лота и 179 $ при бюджете 20 $). EURUSD и US500 в этом же терминале не расходятся (100000 и 1).
+
+## Сверка persisted risk snapshot с заказом
+
+Персистентный snapshot не считается доказательством сам по себе: перед допуском значения пересчитываются из точных параметров заказа и equity-баз. Риск считается по худшей цене входа, а знаменатель — консервативный (меньшее из equity и balance).
+
+```
+worst_entry = max(entry_price, reference_price)  # BUY
+worst_entry = min(entry_price, reference_price)  # SELL
+
+cash_per_price_unit = trade_contract_size            # если currency_profit == валюта счёта
+cash_per_price_unit = trade_tick_value_loss / trade_tick_size   # иначе
+risk_value_expected = |worst_entry - stop_loss| * cash_per_price_unit * size
+risk_fraction_expected = risk_value_expected / min(account_equity, account_balance)
+
+daily_loss_fraction_expected = max(0, day_start_equity - account_equity) / day_start_equity
+drawdown_fraction_expected = max(0, equity_high_watermark - account_equity) / equity_high_watermark
+```
+
+`open_stop_risk_value = Σ max(0, price_now - stop_loss) * cash_per_price_unit * volume` для BUY (для SELL — `max(0, stop_loss - price_now)` по ask), `open_stop_risk_fraction = open_stop_risk_value / min(account_equity, account_balance)`. Каждая открытая позиция требует собственного свежего тика своего символа: устаревший или отсутствующий тик делает `open_stop_risk_fraction` неизвестным и блокирует снимок (`OPEN_POSITION_STOP_RISK_UNKNOWN`), а не занижает риск нулём.
+
+Незакрытые позиции несут ещё не реализованный риск по стопу. Он считается от текущей цены (позиция, переведённая в безубыток, даёт ноль), а не от цены входа, и обязан присутствовать в snapshot числом `[0, 1]`; отсутствующее, строковое или `null` значение — DENY, а не ноль.
+
+Идентичность счёта обязательна: `account_login` (целое `>= 1`) и `account_server` (непустая строка без крайних пробелов). Политика может закрепить ожидаемые значения (`expected_account_login`, `expected_account_server`) — несовпадение блокирует (`RISK_SNAPSHOT_ACCOUNT_LOGIN_MISMATCH` / `RISK_SNAPSHOT_ACCOUNT_SERVER_MISMATCH`). Согласованность позиций: `position_symbols` — список непустых символов длиной ровно `open_positions`; `correlated_open_positions <= open_positions`; `open_stop_risk_fraction > 0` при `open_positions == 0` запрещён.
+
+Snapshot принимается, только если symbol совпадает, `request_binding_sha256` совпадает с заказом, `risk_cash_per_price_unit` положительна и — когда collector записал применимый `risk_contract_size` — равна именно ему (`RISK_CASH_PER_PRICE_UNIT_NOT_THE_CONTRACT_SIZE`), иначе тик-пара положительна (`RISK_SNAPSHOT_TICK_SPEC_MISSING_OR_INVALID`), equity high-water mark не ниже текущей equity, day-start equity согласуется с `balance - daily_pnl` в обе стороны (сверху — `DAY_START_EQUITY_ABOVE_DAILY_PNL_IMPLIED_BALANCE`, снизу — `DAY_START_EQUITY_MISMATCH`), а `risk_value`, `risk_fraction`, `daily_loss_fraction` и `drawdown_fraction` отличаются от пересчитанных не более чем на 1% (`RISK_*_DOES_NOT_MATCH_*`). Нечисловые/`NaN`/`Infinity` значения и отсутствующая tick-спецификация, пустая symbol group, отсутствующая идентичность счёта или нулевая equity/balance-база — DENY, а не допуск. Лимиты применяются проспективно и аддитивно: `daily_loss_fraction + open_stop_risk_fraction + risk_fraction` не должен превышать дневной лимит, а `drawdown_fraction + open_stop_risk_fraction + risk_fraction` — лимит просадки. RR-порог проверяется безусловно (в том числе для flat-снимка) по пересчитанному из SL/TP значению с допуском 1% к заявленному. Комиссии, спред и гэп-риск в эту оценку не входят; их должен проверять исполнительный слой.
+
+## False certainty rate
+
+Долю ложных высокоуверенных предсказаний считать только на outcome-верифицированных прогнозах и фиксированном горизонте. Не смешивать недоступные/неразрешённые наблюдения с проигрышами; показывать числитель, знаменатель и confidence interval.
+
+## Governance health gates
+
+`dissent_rate` рассчитывается на фиксированном окне валидированных peer-review; если он ниже `dissent_rate_floor` (по умолчанию 0.10) или исторических наблюдений меньше `min_dissent_samples`, CertaintyGate не проходит. `false_certainty_rate` считается только по разрешённым outcome-verified прогнозам; значение выше `false_certainty_rate_max` (0.05) или недостаточная выборка блокируют PASS. В текущей политике обе метрики требуют минимум 30 наблюдений. Это исходные защитные настройки, а не статистическая гарантия; размер окна, неопределённость и regime slicing надо проверить на фактическом out-of-sample наборе.

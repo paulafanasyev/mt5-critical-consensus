@@ -1,0 +1,56 @@
+{
+  "description": "Shared accept/reject fixtures for the EA's flat-object parser. The Python reference model in scripts/check_mql5_safety.py mirrors mql5/CriticalConsensusEA.mq5::ValidateFlatObject; the bridge encoder is expected to emit objects that all 'accept' cases cover.",
+  "accept": [
+    {
+      "name": "canonical compact command",
+      "json": "{\"command_id\":\"cmd-1\",\"client_order_id\":\"ord-1\",\"permission_id\":\"perm-1\",\"signal_id\":\"sig-1\",\"instrument\":\"EURUSD\",\"direction\":\"BUY\",\"size\":0.1,\"expected_price\":1.1,\"sl\":1.099,\"tp\":1.102,\"mode\":\"demo\",\"user_decision_id\":\"dec-1\",\"user_decision\":\"APPROVE\",\"user_approved\":true,\"expires_at_epoch\":1767225600,\"payload_hash\":\"sha256:0f1e2d\",\"created_at\":\"2026-10-30T12:00:00Z\"}"
+    },
+    {
+      "name": "whitespace and newlines between tokens",
+      "json": "{\n  \"a\" : \"x\" ,\n  \"b\" : -1.5e3 ,\n  \"c\" : true ,\n  \"d\" : false\n}"
+    },
+    {
+      "name": "empty object",
+      "json": "{}"
+    },
+    {
+      "name": "string value contains field-like text",
+      "json": "{\"note\":\"direction=SELL,size=99\",\"direction\":\"BUY\"}"
+    },
+    {
+      "name": "smallest negative number",
+      "json": "{\"n\":-0.0,\"e\":1E+2}"
+    }
+  ],
+  "reject": [
+    {"name": "duplicate key", "json": "{\"a\":1,\"a\":2}", "reason": "DUPLICATE JSON KEY"},
+    {"name": "nested object value", "json": "{\"a\":{\"b\":1}}", "reason": "nested value rejected"},
+    {"name": "array value", "json": "{\"a\":[1,2]}", "reason": "nested value rejected"},
+    {"name": "nested object as key position", "json": "{{\"a\":1}:2}", "reason": "nested object or array rejected"},
+    {"name": "escaped quote in value", "json": "{\"a\":\"x\\\"y\"}", "reason": "escape sequences rejected"},
+    {"name": "control character in value", "json": "{\"a\":\"x\u0001y\"}", "reason": "control character rejected"},
+    {"name": "trailing comma", "json": "{\"a\":1,}", "reason": "trailing comma"},
+    {"name": "empty key", "json": "{\"\":1}", "reason": "empty object key"},
+    {"name": "missing colon", "json": "{\"a\" 1}", "reason": "missing ':' after key"},
+    {"name": "trailing content", "json": "{\"a\":1} {\"b\":2}", "reason": "trailing content after object"},
+    {"name": "truncated boolean literal", "json": "{\"a\":tru}", "reason": "invalid boolean literal"},
+    {"name": "leading zero", "json": "{\"a\":01}", "reason": "invalid number literal"},
+    {"name": "bare minus", "json": "{\"a\":-}", "reason": "invalid number literal"},
+    {"name": "trailing decimal point", "json": "{\"a\":1.}", "reason": "invalid number literal"},
+    {"name": "empty exponent", "json": "{\"a\":1e}", "reason": "invalid number literal"},
+    {"name": "leading decimal point", "json": "{\"a\":.5}", "reason": "unsupported value type"},
+    {"name": "infinity", "json": "{\"a\":Infinity}", "reason": "unsupported value type"},
+    {"name": "overflowing exponent", "json": "{\"a\":1e400}", "reason": "invalid number literal"},
+    {"name": "single-quoted key", "json": "{'a':1}", "reason": "object key must be a string"},
+    {"name": "unquoted key", "json": "{a:1}", "reason": "object key must be a string"},
+    {"name": "null value", "json": "{\"a\":null}", "reason": "unsupported value type"},
+    {"name": "unterminated value", "json": "{\"a\":\"x}", "reason": "unterminated string value"},
+    {"name": "empty body", "json": "", "reason": "body must be exactly one JSON object"},
+    {"name": "value followed by junk", "json": "{\"a\":1 x}", "reason": "unexpected character after value"},
+    {"name": "missing closing brace rejected up front", "json": "{\"a\":1", "reason": "body must be exactly one JSON object"},
+    {"name": "unterminated key", "json": "{\"a}", "reason": "unterminated object key"},
+    {"name": "closing brace where a value is required", "json": "{\"a\":}", "reason": "unsupported value type"},
+    {"name": "trailing non-breaking space", "json": "{\"a\":1}\u00a0", "reason": "body must be exactly one JSON object"},
+    {"name": "leading vertical tab", "json": "\u000b{\"a\":1}", "reason": "body must be exactly one JSON object"}
+  ]
+}

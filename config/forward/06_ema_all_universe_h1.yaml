@@ -1,0 +1,110 @@
+# All-universe forward run: the EMA 50/200 trend variant applied to every instrument the
+# broker actually serves, not only gold. The strategy block is identical to 05_ema_gold_h1.yaml
+# except for sizing; --symbols all expands to the runner's curated DEMO_UNIVERSE and the live
+# terminal is the source of contract data for every symbol, including this base one, so no
+# instrument inherits gold's point/tick_value. Demo-only; the EA refuses a live account.
+version: 1
+mode: paper
+symbol: XAUUSD
+timeframe: H1
+history_bars: 400
+server_utc_offset_seconds: 7200
+execution_mode: auto
+ui_language: ru
+
+account:
+  expected_login: 114929502
+  expected_server: MetaQuotes-Demo
+  require_demo: true
+  # MAGIC_NUMBER in scripts/run_mt5_demo_trading.py, and what the broker stamps on every deal
+  # this run sends - measured on the live book, where this run's three positions carried
+  # 8172026 and the rest of the account's fifteen carried other magics or none. The demo is
+  # shared with another agent's swarm, so a position count that reads the whole account is not
+  # measuring this strategy's concentration: at 15 foreign positions against a cap of 7 every
+  # symbol journaled POSITION_CAP_EXCEEDED and the run traded nothing at all. Only the count and
+  # the one-per-symbol rule are scoped this way; max_daily_loss_fraction, max_drawdown_fraction
+  # and the aggregate stop risk still measure every lot on the account, because another
+  # strategy's open risk is still this equity's exposure.
+  position_magic: 8172026
+
+symbol_spec:
+  symbol: XAUUSD
+  point: 0.01
+  digits: 2
+  tick_size: 0.01
+  # What MetaQuotes-Demo reports, kept as measured - but this broker's own order_calc_profit
+  # pays 4480 $ for 1 lot over a 44.8-point move, i.e. 100 $ per price unit per lot, which is
+  # the contract size below and not this field. A live run sizes from the terminal regardless.
+  tick_value: 0.1
+  contract_size: 100.0
+  volume_min: 0.01
+  volume_max: 100.0
+  volume_step: 0.01
+  spread_points: 20
+  stops_level_points: 0
+
+risk:
+  # The smallest sendable gold lot (0.01) at a 2x-ATR stop costs 44.8 $ on this broker, so no
+  # fraction below ~0.0005 can size a metal at all. That is why this run started at the floor and
+  # not at a risk budget. Measured at the floor, the six legs the account actually filled carried
+  # 195 $ of stop risk between them - 0.195% of equity, and a 2R wave worth ~390 $ - because the
+  # four FX pairs are clipped to the 0.20-lot ceiling the executor enforces and cannot be grown
+  # from here. 0.002 keeps the same per-leg discipline at a number the contract allows: the FX
+  # legs stay where the ceiling puts them (44, 45, 32, 31 $) and the metals go from 34 $ and 38 $
+  # to ~171 $ and ~191 $ at 0.05 lots, which is still under the ceiling. Worst-case aggregate
+  # stop risk is 7 x 0.002 = 1.4% of equity, inside max_daily_loss_fraction, the relation policy
+  # validation refuses to let a policy break.
+  risk_per_trade_fraction: 0.002
+  # One position per instrument, so the universe can actually be in trades at the same time.
+  # With 1, the single gold position taken at the open froze the whole run: every other symbol
+  # came back POSITION_CAP_REACHED for the rest of the day, which makes "all-universe" a name
+  # and not a state. 7 is what this account reaches (the journal gives a cycle to EURUSD,
+  # GBPUSD, AUDUSD, NZDUSD, XAUUSD, XAGUSD, US500 and nothing else). Worst-case stop risk is
+  # 7 x 0.0005 = 0.0035 of equity, still well inside max_daily_loss_fraction, which is the
+  # relation policy validation refuses to let a policy break. SYMBOL_ALREADY_OPEN is unchanged,
+  # so this raises how many instruments are in, never how many times the same one is.
+  max_open_positions: 7
+  max_daily_loss_fraction: 0.02
+  max_drawdown_fraction: 0.06
+  min_risk_reward: 1.5
+  max_spread_points: 200
+  max_quote_age_seconds: 15
+  # The lot ceiling the demo runner and the reference EA both refuse to cross, declared here so
+  # the position is sized inside it. Measured at 0.0005: the 2x-ATR stop on EURUSD and GBPUSD
+  # wants 0.31 lots, AUDUSD 0.35, NZDUSD 0.39, US500 1.50 - every one of them over the ceiling,
+  # while the metals sit under it at their 0.01 minimum. Checked only after sizing, that is five
+  # of the seven tradeable instruments journaled as VOLUME_ABOVE_DEMO_CAP on every cycle and two
+  # carrying the whole book; clipped here, they trade at 0.20 and journal the smaller risk they
+  # actually carry. Nothing here raises the ceiling - it is the same 0.20 the executor enforces,
+  # so the worst case stays 7 x 0.20 lots.
+  max_volume_lots: 0.20
+  # Measured 2026-11-02 on this shared demo: four 0.20 FX legs this run opened and the broker
+  # confirmed were flattened by another process 21 seconds later - EURUSD -1.00, GBPUSD -0.20,
+  # AUDUSD -0.40, NZDUSD -0.80, exactly the spread paid at entry, -2.40 for a round trip that was
+  # never our decision. Re-entering the same symbol every cycle buys that exit again. Four
+  # distinct legs of ours on one instrument inside two hours means the book is not ours to hold,
+  # so the instrument stands down instead of bleeding. The default is the same value; it is
+  # written here because this file describes a contested account.
+  churn_max_legs_per_symbol: 3
+
+strategy:
+  family: ema
+  min_bars: 250
+  ema_fast: 50
+  ema_slow: 200
+  atr_period: 14
+  stop_atr_multiple: 2.0
+  take_profit_risk_multiple: 2.0
+  min_sma_gap_atr: 0.10
+  min_momentum_abs: 0.0
+  max_confidence: 0.95
+
+schedule:
+  window_start_minute_utc: 0
+  window_end_minute_utc: 1320
+  blocked_weekdays_utc: [6]
+  blackout_windows_utc: []
+
+kill_switch:
+  active: false
+  reason: "all-universe EMA forward run on demo"

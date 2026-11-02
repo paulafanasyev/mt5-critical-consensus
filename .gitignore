@@ -1,0 +1,16 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+.env
+.env.*.local
+*.log
+agent_data/
+# Terminal screenshots show the account holder's name and every login in the Navigator.
+docs/evidence/mt5_*.png

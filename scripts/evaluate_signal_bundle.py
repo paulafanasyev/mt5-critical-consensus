@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Evaluate a trusted, evidence-complete decision bundle through all deterministic gates.
+
+This CLI never accepts an operator approval, creates an order, or enables execution.
+It is intended for a local/internal evidence packet produced by trusted ingestion and
+review services, not an arbitrary public HTTP payload.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from critical_consensus.audit import canonical_hash
+from critical_consensus.persistence import PostgresRepository
+from critical_consensus.pipeline import evaluate_signal_bundle
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read decision bundle: {type(exc).__name__}") from exc
+    if not isinstance(value, dict):
+        raise ValueError("decision bundle root must be a JSON object")
+    return value
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    try:
+        value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"cannot read policy file: {type(exc).__name__}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"policy file must contain an object: {path.name}")
+    return value
+
+
+def _required_env(name: str) -> str:
+    value = os.getenv(name, "")
+    if not 32 <= len(value.encode("utf-8")) <= 256:
+        raise ValueError(f"{name} must be configured with a 32..256 byte key")
+    return value
+
+
+def _required_issuer(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise ValueError(f"{name} must be configured; issuer pinning is required")
+    return value
+
+
+def run(bundle_path: Path, output_path: Path, *, persist: bool,
+        policy_dir: Path = ROOT / "config") -> dict[str, Any]:
+    bundle = _load_json(bundle_path)
+    if "user_decision" in bundle:
+        raise ValueError(
+            "this CLI does not accept or process human approval; remove user_decision "
+            "and use the separately authenticated server-side authorization process"
+        )
+    evidence_key = _required_env("MT5_EVIDENCE_HMAC_KEY")
+    governance_key = _required_env("MT5_GOVERNANCE_HMAC_KEY")
+    review_key = _required_env("MT5_REVIEW_HMAC_KEY")
+    evidence_issuer = _required_issuer("MT5_EVIDENCE_ISSUER")
+    governance_issuer = _required_issuer("MT5_GOVERNANCE_ISSUER")
+    review_issuer = _required_issuer("MT5_REVIEW_ISSUER")
+    if evidence_key == governance_key or review_key in (evidence_key, governance_key):
+        raise ValueError("MT5_EVIDENCE_HMAC_KEY, MT5_GOVERNANCE_HMAC_KEY and "
+                         "MT5_REVIEW_HMAC_KEY must be different")
+    if evidence_issuer == governance_issuer or review_issuer in (evidence_issuer, governance_issuer):
+        raise ValueError("MT5_EVIDENCE_ISSUER, MT5_GOVERNANCE_ISSUER and "
+                         "MT5_REVIEW_ISSUER must be different")
+    verify_args = {
+        "evidence_key": evidence_key,
+        "governance_key": governance_key,
+        "expected_evidence_issuer": evidence_issuer,
+        "expected_governance_issuer": governance_issuer,
+        "review_key": review_key,
+        "expected_review_issuer": review_issuer,
+    }
+
+    certainty_policy = _load_yaml(policy_dir / "certainty_thresholds.yaml")
+    permission_matrix = _load_yaml(policy_dir / "permission_matrix.yaml")
+    report: dict[str, Any] = {
+        "result": None,
+        "execution_enabled": False,
+        "order_created": False,
+        "human_authorization_processed": False,
+        "persisted_risk_checked": False,
+        "source_bundle": bundle_path.name,
+        "source_bundle_sha256": canonical_hash(bundle),
+        "persistence": None,
+    }
+    if persist:
+        signal_input = bundle.get("signal_input")
+        signal_input_hash = bundle.get("signal_input_hash")
+        if not isinstance(signal_input, dict) or signal_input_hash != canonical_hash(signal_input):
+            raise ValueError("cannot persist a decision without a valid immutable signal_input hash")
+        repo = PostgresRepository()
+        repo.migrate()
+        permission_request = bundle.get("permission_request")
+        instrument = str(permission_request.get("instrument", "")).strip().upper() if isinstance(permission_request, dict) else ""
+        kill_switch_state = repo.get_kill_switch_state()
+        terminal_risk_snapshot = repo.get_latest_mt5_risk_snapshot(instrument) if instrument else None
+        result = evaluate_signal_bundle(
+            bundle, certainty_policy, permission_matrix,
+            require_persisted_risk=True,
+            kill_switch_state=kill_switch_state,
+            terminal_risk_snapshot=terminal_risk_snapshot,
+            **verify_args,
+        )
+        report["persisted_risk_checked"] = True
+        report["persistence"] = repo.persist_pipeline_result(
+            result, signal_input_sha256=signal_input_hash,
+        )
+    else:
+        # Local/offline evaluation does not attest to the current terminal state.
+        result = evaluate_signal_bundle(bundle, certainty_policy, permission_matrix, **verify_args)
+
+    report["result"] = result
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    return report
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("bundle", type=Path, help="trusted local JSON evidence bundle")
+    parser.add_argument("--output", type=Path, default=Path("decision-result.json"))
+    parser.add_argument("--policy-dir", type=Path, default=ROOT / "config")
+    parser.add_argument("--persist", action="store_true",
+                        help="require persisted kill-switch/risk evidence, then persist the verified audit chain and result to DATABASE_URL")
+    args = parser.parse_args()
+    try:
+        report = run(args.bundle, args.output, persist=args.persist, policy_dir=args.policy_dir)
+    except Exception as exc:  # noqa: BLE001 - a CLI failure must not dump a traceback
+        # Missing secrets, unreadable input, an unavailable database and anything else
+        # unexpected all exit 1 so that exit 2 keeps its single meaning: the pipeline ran
+        # and returned something other than REQUIRE_HUMAN.
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    result = report["result"]
+    print(json.dumps({
+        "signal_id": result.get("signal_id"),
+        "status": result.get("status"),
+        "blockers": result.get("blockers", []),
+        "audit_chain_valid": result.get("audit_chain_valid"),
+        "persisted_risk_checked": report.get("persisted_risk_checked"),
+        "decision_id": (report.get("persistence") or {}).get("decision_id"),
+        "output": str(args.output),
+        "execution_enabled": False,
+        "order_created": False,
+    }, indent=2))
+    return 0 if result.get("status") == "REQUIRE_HUMAN" else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,152 @@
+"""Every status and blocker code the agent can journal, in one place.
+
+The codes travel to the journal, the CLI report and the docs, so they must not be
+re-typed as literals in the modules that emit them. ``__all__`` is the contract the
+tests check: a code that exists here must be reachable, and a code an emitter uses
+must exist here.
+"""
+from __future__ import annotations
+
+STATUS_BLOCKED = "BLOCKED"
+STATUS_NO_SIGNAL = "NO_SIGNAL"
+STATUS_OBSERVED = "OBSERVED"
+STATUS_PAPER_OPENED = "PAPER_OPENED"
+
+# Agent gates. Read failures short-circuit, so the run order is not the declaration order:
+# the cycle journals the subset it actually reached, sorted by the agent.
+CLOCK_NOT_UTC_AWARE = "CLOCK_NOT_UTC_AWARE"
+KILL_SWITCH_ACTIVE = "KILL_SWITCH_ACTIVE"
+ACCOUNT_NOT_DEMO = "ACCOUNT_NOT_DEMO"
+ACCOUNT_LOGIN_MISMATCH = "ACCOUNT_LOGIN_MISMATCH"
+ACCOUNT_SERVER_MISMATCH = "ACCOUNT_SERVER_MISMATCH"
+ACCOUNT_EQUITY_INVALID = "ACCOUNT_EQUITY_INVALID"
+ACCOUNT_MARGIN_INVALID = "ACCOUNT_MARGIN_INVALID"
+ACCOUNT_LEVERAGE_INVALID = "ACCOUNT_LEVERAGE_INVALID"
+ACCOUNT_READ_FAILED = "ACCOUNT_READ_FAILED"
+EQUITY_BASELINES_UNAVAILABLE = "EQUITY_BASELINES_UNAVAILABLE"
+DAILY_LOSS_LIMIT_REACHED = "DAILY_LOSS_LIMIT_REACHED"
+REALIZED_DAILY_LOSS_LIMIT_REACHED = "REALIZED_DAILY_LOSS_LIMIT_REACHED"
+DRAWDOWN_LIMIT_REACHED = "DRAWDOWN_LIMIT_REACHED"
+OUTSIDE_TRADING_WINDOW = "OUTSIDE_TRADING_WINDOW"
+POSITION_CAP_COUNT_UNKNOWN = "POSITION_CAP_COUNT_UNKNOWN"
+POSITION_CAP_REACHED = "POSITION_CAP_REACHED"
+POSITION_CAP_EXCEEDED = "POSITION_CAP_EXCEEDED"
+POSITION_READ_FAILED = "POSITION_READ_FAILED"
+POSITION_STOP_UNSET = "POSITION_STOP_UNSET"
+LOSS_FLOOR_BREACHED = "LOSS_FLOOR_BREACHED"
+AGGREGATE_STOP_RISK_LIMIT_REACHED = "AGGREGATE_STOP_RISK_LIMIT_REACHED"
+SYMBOL_ALREADY_OPEN = "SYMBOL_ALREADY_OPEN"
+MARKET_DATA_READ_FAILED = "MARKET_DATA_READ_FAILED"
+# The broker quotes the instrument but has taken away the right to open a position on it
+# (trade mode disabled, close-only or one-sided). The reference EA refuses the same way, so an
+# order queued for such a symbol is a command that can never be filled.
+SYMBOL_TRADING_DISABLED = "SYMBOL_TRADING_DISABLED"
+INSUFFICIENT_BARS = "INSUFFICIENT_BARS"
+QUOTE_FROM_THE_FUTURE = "QUOTE_FROM_THE_FUTURE"
+QUOTE_STALE = "QUOTE_STALE"
+PRICE_MOVED_DURING_CONFIRMATION = "PRICE_MOVED_DURING_CONFIRMATION"
+# The demo runner trades one instrument per executor; a proposal for another symbol is a
+# routing error that must never reach the bridge.
+PROPOSAL_SYMBOL_MISMATCH = "PROPOSAL_SYMBOL_MISMATCH"
+# An external executor passes these gates the proposal its own cycle produced; fields that
+# cannot be turned back into a trade are a broken input, not a missing signal.
+PROPOSAL_UNREADABLE = "PROPOSAL_UNREADABLE"
+RISK_REWARD_BELOW_MINIMUM = "RISK_REWARD_BELOW_MINIMUM"
+MINIMUM_LOT_EXCEEDS_RISK_BUDGET = "MINIMUM_LOT_EXCEEDS_RISK_BUDGET"
+MARGIN_MINIMUM_LOT_UNFUNDED = "MARGIN_MINIMUM_LOT_UNFUNDED"
+# A lot ceiling below the broker's smallest legal lot: the contract cannot be traded at all.
+VOLUME_CEILING_BELOW_BROKER_MIN = "VOLUME_CEILING_BELOW_BROKER_MIN"
+# Our own legs on this symbol keep dying within minutes of opening. On a demo shared with other
+# automated strategies somebody else can flatten this run's book as fast as it is opened, and
+# each round trip pays the spread for a position that was never allowed to work.
+LEG_CHURN_DETECTED = "LEG_CHURN_DETECTED"
+# The terminal would not say how many legs it recorded. It stands the symbol down like churn
+# would, but is named separately so a broken history read is not mistaken for dying legs.
+LEG_HISTORY_UNREADABLE = "LEG_HISTORY_UNREADABLE"
+PAPER_BROKER_REQUIRED_FOR_PAPER_MODE = "PAPER_BROKER_REQUIRED_FOR_PAPER_MODE"
+PAPER_OPEN_REJECTED = "PAPER_OPEN_REJECTED"
+
+# The policy numbers its blackout windows at load time, so this code is built, not typed.
+_BLACKOUT_WINDOW_PREFIX = "BLACKOUT_WINDOW_"
+
+
+def blackout_window_code(index: int) -> str:
+    """Blocker for the policy's ``index``-th blackout window (1-based)."""
+    if isinstance(index, bool) or not isinstance(index, int) or index < 1:
+        raise ValueError("blackout window index must be a positive integer")
+    return f"{_BLACKOUT_WINDOW_PREFIX}{index}"
+
+
+# Execution-mode gate: in confirm mode a proposal is opened only on an explicit operator yes.
+CONFIRMATION_UNAVAILABLE = "CONFIRMATION_UNAVAILABLE"
+OPERATOR_DECLINED = "OPERATOR_DECLINED"
+OPERATOR_CONFIRMATION_FAILED = "OPERATOR_CONFIRMATION_FAILED"
+
+# Strategy-level blockers (evaluate_signal).
+ATR_NOT_MEANINGFUL = "ATR_NOT_MEANINGFUL"
+PRIOR_CLOSE_NON_POSITIVE = "PRIOR_CLOSE_NON_POSITIVE"
+SPREAD_ABOVE_LIMIT = "SPREAD_ABOVE_LIMIT"
+NO_TREND_SIGNAL = "NO_TREND_SIGNAL"
+STOP_DISTANCE_INVALID = "STOP_DISTANCE_INVALID"
+TAKE_PROFIT_PRICE_INVALID = "TAKE_PROFIT_PRICE_INVALID"
+BUY_GEOMETRY_INVALID = "BUY_GEOMETRY_INVALID"
+SELL_GEOMETRY_INVALID = "SELL_GEOMETRY_INVALID"
+STOP_INSIDE_BROKER_STOPS_LEVEL = "STOP_INSIDE_BROKER_STOPS_LEVEL"
+TARGET_INSIDE_BROKER_STOPS_LEVEL = "TARGET_INSIDE_BROKER_STOPS_LEVEL"
+
+BAR_SERIES_INVALID = "BAR_SERIES_INVALID"
+BAR_SYMBOL_MISMATCH = "BAR_SYMBOL_MISMATCH"
+BAR_TIMEFRAME_MISMATCH = "BAR_TIMEFRAME_MISMATCH"
+BAR_TIME_IN_FUTURE = "BAR_TIME_IN_FUTURE"
+BAR_TIME_TOO_OLD = "BAR_TIME_TOO_OLD"
+
+# A broken feed is a reason to stop, never a reason to report "the market offered nothing".
+# A stop or target that cannot be computed from positive prices is the same kind of damage.
+DATA_INTEGRITY_CODES = (
+    BAR_SERIES_INVALID, BAR_SYMBOL_MISMATCH, BAR_TIMEFRAME_MISMATCH, BAR_TIME_IN_FUTURE,
+    BAR_TIME_TOO_OLD, ATR_NOT_MEANINGFUL, PRIOR_CLOSE_NON_POSITIVE, STOP_DISTANCE_INVALID,
+    TAKE_PROFIT_PRICE_INVALID, BUY_GEOMETRY_INVALID, SELL_GEOMETRY_INVALID,
+)
+
+# Why a simulated position stopped being open. These are journaled in the trade payload,
+# so they are labels in the same registry as every blocker rather than free-form prose.
+MANUAL = "MANUAL"
+STOP_LOSS = "STOP_LOSS"
+STOP_LOSS_GAP = "STOP_LOSS_GAP"
+TAKE_PROFIT = "TAKE_PROFIT"
+TAKE_PROFIT_GAP = "TAKE_PROFIT_GAP"
+END_OF_RUN = "END_OF_RUN"
+EXIT_REASON_CODES = (MANUAL, STOP_LOSS, STOP_LOSS_GAP, TAKE_PROFIT, TAKE_PROFIT_GAP,
+                     END_OF_RUN)
+
+# The package has no order-sending surface; the cycle record names that fact as a code.
+NO_BROKER_ORDER_API = "NO_BROKER_ORDER_API"
+POLICY_CODES = (NO_BROKER_ORDER_API,)
+
+CYCLE_CAP_CODES = (
+    CLOCK_NOT_UTC_AWARE, KILL_SWITCH_ACTIVE, ACCOUNT_NOT_DEMO, ACCOUNT_LOGIN_MISMATCH,
+    ACCOUNT_SERVER_MISMATCH, ACCOUNT_EQUITY_INVALID, ACCOUNT_MARGIN_INVALID,
+    ACCOUNT_LEVERAGE_INVALID, ACCOUNT_READ_FAILED, EQUITY_BASELINES_UNAVAILABLE,
+    DAILY_LOSS_LIMIT_REACHED, DRAWDOWN_LIMIT_REACHED, REALIZED_DAILY_LOSS_LIMIT_REACHED,
+    LOSS_FLOOR_BREACHED, AGGREGATE_STOP_RISK_LIMIT_REACHED, OUTSIDE_TRADING_WINDOW,
+    POSITION_CAP_COUNT_UNKNOWN, POSITION_CAP_REACHED, POSITION_CAP_EXCEEDED,
+    POSITION_READ_FAILED, POSITION_STOP_UNSET, MARKET_DATA_READ_FAILED, INSUFFICIENT_BARS,
+    SYMBOL_TRADING_DISABLED,
+    QUOTE_FROM_THE_FUTURE, QUOTE_STALE, PRICE_MOVED_DURING_CONFIRMATION,
+    PROPOSAL_SYMBOL_MISMATCH, PROPOSAL_UNREADABLE,
+    RISK_REWARD_BELOW_MINIMUM, SPREAD_ABOVE_LIMIT,
+    MINIMUM_LOT_EXCEEDS_RISK_BUDGET, MARGIN_MINIMUM_LOT_UNFUNDED, SYMBOL_ALREADY_OPEN,
+    VOLUME_CEILING_BELOW_BROKER_MIN, LEG_CHURN_DETECTED, LEG_HISTORY_UNREADABLE,
+    PAPER_BROKER_REQUIRED_FOR_PAPER_MODE, PAPER_OPEN_REJECTED,
+    CONFIRMATION_UNAVAILABLE, OPERATOR_DECLINED, OPERATOR_CONFIRMATION_FAILED,
+    *DATA_INTEGRITY_CODES,
+)
+
+STRATEGY_CODES = (
+    INSUFFICIENT_BARS, ATR_NOT_MEANINGFUL, PRIOR_CLOSE_NON_POSITIVE, SPREAD_ABOVE_LIMIT,
+    NO_TREND_SIGNAL, STOP_DISTANCE_INVALID, TAKE_PROFIT_PRICE_INVALID, BUY_GEOMETRY_INVALID,
+    SELL_GEOMETRY_INVALID, STOP_INSIDE_BROKER_STOPS_LEVEL, TARGET_INSIDE_BROKER_STOPS_LEVEL,
+    *DATA_INTEGRITY_CODES,
+)
+
+__all__ = [name for name in dir() if name.isupper() and not name.startswith("_")]

@@ -1,0 +1,689 @@
+from datetime import datetime, timezone, timedelta
+from critical_consensus.authorization import InMemoryNonceStore
+from critical_consensus.gates import (
+    certainty_gate, chief_skeptic_pass, permission_gate, revalidate_review_evidence,
+    user_authorization_gate,
+)
+from critical_consensus.audit import canonical_hash
+
+AGENTS = ["PlatformScoutAgent", "TechnicalAnalystAgent", "RiskManagerAgent", "ComplianceAgent"]
+POLICY = {
+    "near_certainty_threshold": 0.98, "consensus_score_threshold": 0.98,
+    "min_reviewers_per_verdict": 2, "brier_threshold": 0.12,
+    "source_credibility_threshold": 0.75, "source_max_age_seconds": 900,
+    "min_calibration_sample_size": 30,
+    "dissent_rate_floor": 0.10, "min_dissent_samples": 30,
+    "false_certainty_rate_max": 0.05, "min_false_certainty_samples": 30,
+    "mandatory_agents": AGENTS, "compliance_agent_id": "ComplianceAgent",
+}
+GOVERNANCE = {"valid": True, "blockers": [], "issuer": "calibration-service",
+              "method_version": "brier-shrink-v1",
+              "dissent_rate": 0.15, "dissent_sample_size": 100,
+              "false_certainty_rate": 0.02, "false_certainty_sample_size": 100}
+
+def good_payload():
+    agents = list(AGENTS)
+    now = datetime.now(timezone.utc)
+    return {
+        "mandatory_agents": agents,
+        "verdicts": [{"agent_id": a, "verdict": "APPROVE", "confidence": 0.99,
+                      "reviewer_count": 2, "calibration_meta": {
+                          "brier_score": 0.08, "sample_size": 100, "calibration_status": "CALIBRATED",
+                          "source": "calibration-service"}}
+                     for a in agents],
+        "consensus_score": 0.99, "open_challenges": [], "challenge_resolution_status": "RESOLVED",
+        "contradictions_last_n_hours": 0, "contradiction_lookback_hours": 6,
+        "news_or_rumor": False,
+        "devil_advocate_report": {"status": "PASS", "counter_hypotheses": [
+            {"hypothesis": "h1", "evidence_refs": ["e1"]},
+            {"hypothesis": "h2", "evidence_refs": ["e2"]},
+            {"hypothesis": "h3", "evidence_refs": ["e3"]}]},
+        "key_sources": [{"source_id": "s1", "credibility": 0.90, "ttl_seconds": 900,
+                         "observed_at": (now - timedelta(seconds=20)).isoformat()},
+                        {"source_id": "s2", "credibility": 0.88, "ttl_seconds": 900,
+                         "observed_at": (now - timedelta(seconds=50)).isoformat()}],
+        "risk_flags": [], "dissent_rate": 0.15, "dissent_sample_size": 100,
+        "false_certainty_rate": 0.02, "false_certainty_sample_size": 100,
+    }
+
+def test_certainty_pass_is_not_trade_authorization():
+    result = certainty_gate(good_payload(), POLICY, governance=GOVERNANCE)
+    assert result["status"] == "PASS"
+    assert result["trade_allowed"] is False
+
+def test_single_reject_blocks_certainty_gate():
+    payload = good_payload()
+    payload["verdicts"][0]["verdict"] = "REJECT"
+    result = certainty_gate(payload, POLICY, governance=GOVERNANCE)
+    assert result["status"] == "GATHER_MORE"
+    assert result["trade_allowed"] is False
+
+def test_open_devil_challenge_blocks_gate():
+    payload = good_payload()
+    payload["open_challenges"] = [{"challenge_id": "da-1", "status": "OPEN", "source": "DevilAdvocateAgent"}]
+    payload["challenge_resolution_status"] = "OPEN"
+    result = certainty_gate(payload, POLICY, governance=GOVERNANCE)
+    assert result["status"] == "GATHER_MORE"
+    assert not result["passed"]
+
+def test_deadlock_escalates_without_trade():
+    payload = good_payload()
+    payload["challenge_resolution_status"] = "DEADLOCK"
+    result = certainty_gate(payload, POLICY, governance=GOVERNANCE)
+    assert result["status"] == "ESCALATE"
+    assert result["trade_allowed"] is False
+
+def test_abstain_without_reason_blocks():
+    payload = good_payload()
+    payload["verdicts"][0]["verdict"] = "ABSTAIN"
+    payload["verdicts"][0]["abstain_reason"] = ""
+    assert certainty_gate(payload, POLICY, governance=GOVERNANCE)["status"] == "GATHER_MORE"
+
+def test_missing_chief_step_cannot_confirm():
+    steps = {k: {"passed": True, "detail": "checked", "evidence_refs": [f"ev-{k}"]} for k in "abcdefgh"}
+    result = chief_skeptic_pass({"verdict": "CONFIRM", "steps": steps, "reasons_against": ["a", "b", "c", "d", "e"], "tail_risk_probability": 0.01, "open_challenges": [], "reasoning_hash": "sha256:0123456789abcdef"})
+    assert result["verdict"] == "HOLD"
+
+def test_chief_confirm_requires_all_a_to_i():
+    reasoning = {"reasoning_id": "chief-r-1", "signal_id": "sig-1", "created_at": datetime.now(timezone.utc).isoformat(),
+                 "verdict": "CONFIRM", "steps": {k: {"passed": True, "detail": "evidence checked", "evidence_refs": [f"ev-{k}"]} for k in "abcdefghi"},
+                 "reasons_against": ["macro", "news", "correlation", "liquidity", "regime"], "tail_risk_probability": 0.01,
+                 "tail_risk_scenarios": [{"scenario": "central bank shock", "probability": 0.01, "impact": "repricing", "evidence_refs": ["risk-1"]}],
+                 "open_challenges": [], "all_challenges_read": True, "challenge_ledger_snapshot": [], "challenge_ledger_hash": canonical_hash([]), "reviewed_challenge_ids": []}
+    reasoning["reasoning_hash"] = canonical_hash(reasoning)
+    result = chief_skeptic_pass(reasoning)
+    assert result["verdict"] == "CONFIRM"
+    assert result["trade_allowed"] is False
+
+def valid_permission_request(now):
+    return {"permission_id": "perm-1", "instrument": "EURUSD", "direction": "BUY", "size": 0.1,
+            "mode": "demo", "chief_verdict": "CONFIRM", "certainty_status": "PASS", "compliance_status": "PASS",
+            "risk_flags": [], "expected_rr": 2.5, "expected_price": 1.0840,
+            "sl_tp": {"sl": 1.0820, "tp": 1.0890}, "expires_at": (now + timedelta(minutes=5)).isoformat(),
+            "within_high_impact_news_window": False,
+            "risk_snapshot": {"risk_fraction": 0.003, "daily_loss_fraction": 0.004,
+                              "drawdown_fraction": 0.02, "open_stop_risk_fraction": 0.0,
+                              "open_positions": 1, "correlated_open_positions": 0}}
+
+def test_permission_gate_requires_human():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    matrix = {"permission_matrix": {"instruments": ["EURUSD"], "max_size_per_trade": 0.2,
+             "allowed_directions": ["BUY", "SELL"], "demo_enabled": True, "live_enabled": False,
+             "blocked_flags": ["MNPI"], "min_expected_rr": 1.5, "require_stop_loss": True,
+             "require_take_profit": True, "max_command_ttl_seconds": 600,
+             "allowed_time_utc": {"start": "07:00", "end": "19:00"},
+             "rollover_block_utc": {"start": "20:55", "end": "21:10"},
+             "blocked_around_news": True, "max_risk_per_trade_fraction": 0.005,
+             "daily_loss_limit_fraction": 0.02, "max_drawdown_fraction": 0.10,
+             "max_positions": 5, "max_correlated_positions": 2}}
+    result = permission_gate(valid_permission_request(now), matrix, now=now)
+    assert result["status"] == "REQUIRE_HUMAN"
+    assert result["allowed"] is False
+
+def test_live_never_passes_when_live_disabled():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    matrix = {"permission_matrix": {"instruments": ["EURUSD"], "max_size_per_trade": 0.2,
+             "allowed_directions": ["BUY", "SELL"], "demo_enabled": True, "live_enabled": False,
+             "blocked_flags": [], "min_expected_rr": 1.5, "require_stop_loss": True,
+             "require_take_profit": True, "max_command_ttl_seconds": 600,
+             "allowed_time_utc": {"start": "07:00", "end": "19:00"},
+             "rollover_block_utc": {"start": "20:55", "end": "21:10"},
+             "blocked_around_news": True, "max_risk_per_trade_fraction": 0.005,
+             "daily_loss_limit_fraction": 0.02, "max_drawdown_fraction": 0.10,
+             "max_positions": 5, "max_correlated_positions": 2}}
+    req = valid_permission_request(now); req["mode"] = "live"
+    assert "LIVE_MODE_DISABLED" in permission_gate(req, matrix, now=now)["blockers"]
+
+def test_live_authorization_requires_2fa_and_signature():
+    now = datetime.now(timezone.utc)
+    perm = {"status": "REQUIRE_HUMAN", "permission_id": "p1", "mode": "live", "expires_at": (now + timedelta(minutes=5)).isoformat()}
+    decision = {"decision": "APPROVE", "user_id": "operator-1", "reason": "reviewed risks",
+                "permission_id": "p1", "timestamp": now.isoformat(), "ttl_seconds": 600,
+                "two_fa_verified": False, "signature_verified": False}
+    result = user_authorization_gate(perm, decision, now=now)
+    assert result["status"] == "DENY"
+    assert "LIVE_2FA_REQUIRED" in result["blockers"]
+    assert "LIVE_SIGNATURE_REQUIRED" in result["blockers"]
+
+def test_expired_authorization_is_denied():
+    now = datetime.now(timezone.utc)
+    perm = {"status": "REQUIRE_HUMAN", "permission_id": "p1", "mode": "demo", "expires_at": (now + timedelta(minutes=5)).isoformat()}
+    decision = {"decision": "APPROVE", "user_id": "u1", "reason": "reviewed",
+                "permission_id": "p1", "timestamp": (now - timedelta(minutes=20)).isoformat(), "ttl_seconds": 600}
+    result = user_authorization_gate(perm, decision, now=now)
+    assert result["status"] == "DENY"
+    assert "DECISION_EXPIRED" in result["blockers"]
+
+
+def test_permission_gate_blocks_news_window():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    matrix = {"permission_matrix": {"instruments": ["EURUSD"], "max_size_per_trade": 0.2,
+             "allowed_directions": ["BUY", "SELL"], "demo_enabled": True, "live_enabled": False,
+             "blocked_flags": [], "min_expected_rr": 1.5, "require_stop_loss": True,
+             "require_take_profit": True, "max_command_ttl_seconds": 600,
+             "allowed_time_utc": {"start": "07:00", "end": "19:00"},
+             "rollover_block_utc": {"start": "20:55", "end": "21:10"},
+             "blocked_around_news": True, "max_risk_per_trade_fraction": 0.005,
+             "daily_loss_limit_fraction": 0.02, "max_drawdown_fraction": 0.10,
+             "max_positions": 5, "max_correlated_positions": 2}}
+    req = valid_permission_request(now); req["within_high_impact_news_window"] = True
+    assert "NEWS_WINDOW_ACTIVE_OR_UNKNOWN" in permission_gate(req, matrix, now=now)["blockers"]
+
+def test_permission_gate_blocks_daily_loss_limit():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    matrix = {"permission_matrix": {"instruments": ["EURUSD"], "max_size_per_trade": 0.2,
+             "allowed_directions": ["BUY", "SELL"], "demo_enabled": True, "live_enabled": False,
+             "blocked_flags": [], "min_expected_rr": 1.5, "require_stop_loss": True,
+             "require_take_profit": True, "max_command_ttl_seconds": 600,
+             "allowed_time_utc": {"start": "07:00", "end": "19:00"},
+             "blocked_around_news": True, "max_risk_per_trade_fraction": 0.005,
+             "daily_loss_limit_fraction": 0.02, "max_drawdown_fraction": 0.10,
+             "max_positions": 5, "max_correlated_positions": 2}}
+    req = valid_permission_request(now); req["risk_snapshot"]["daily_loss_fraction"] = 0.02
+    assert "DAILY_LOSS_LIMIT_REACHED" in permission_gate(req, matrix, now=now)["blockers"]
+
+def test_permission_gate_fails_closed_when_risk_snapshot_missing():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    matrix = {"permission_matrix": {"instruments": ["EURUSD"], "max_size_per_trade": 0.2,
+             "allowed_directions": ["BUY", "SELL"], "demo_enabled": True, "live_enabled": False,
+             "blocked_flags": [], "min_expected_rr": 1.5, "require_stop_loss": True,
+             "require_take_profit": True, "max_command_ttl_seconds": 600,
+             "allowed_time_utc": {"start": "07:00", "end": "19:00"},
+             "blocked_around_news": True, "max_risk_per_trade_fraction": 0.005,
+             "daily_loss_limit_fraction": 0.02, "max_drawdown_fraction": 0.10,
+             "max_positions": 5, "max_correlated_positions": 2}}
+    req = valid_permission_request(now); req.pop("risk_snapshot")
+    assert "RISK_SNAPSHOT_MISSING" in permission_gate(req, matrix, now=now)["blockers"]
+
+
+def test_valid_demo_approval_is_one_time_allow_not_order_execution():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    permission = {"status": "REQUIRE_HUMAN", "permission_id": "p2", "mode": "demo", "expires_at": (now + timedelta(minutes=5)).isoformat()}
+    decision = {"decision": "APPROVE", "user_id": "operator-1", "reason": "reviewed dissent and tail risk",
+                "permission_id": "p2", "decision_id": "decision-2", "nonce": "n" * 24,
+                "timestamp": now.isoformat(), "ttl_seconds": 300}
+    result = user_authorization_gate(permission, decision, now=now,
+                                     nonce_store=InMemoryNonceStore())
+    assert result["status"] == "ALLOW_ONCE"
+    assert result["authorized"] is True
+    assert result["trade_allowed"] is False
+
+
+def test_authorization_nonce_is_one_time_per_operator_across_permissions():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    store = InMemoryNonceStore()
+
+    def permission(permission_id):
+        return {"status": "REQUIRE_HUMAN", "permission_id": permission_id, "mode": "demo",
+                "expires_at": (now + timedelta(minutes=5)).isoformat()}
+
+    def decision(permission_id, user_id):
+        return {"decision": "APPROVE", "user_id": user_id, "reason": "reviewed",
+                "permission_id": permission_id, "decision_id": "d-" + permission_id,
+                "nonce": "n" * 24, "timestamp": now.isoformat(), "ttl_seconds": 300}
+
+    first = user_authorization_gate(permission("p1"), decision("p1", "operator-1"),
+                                    now=now, nonce_store=store)
+    assert first["authorized"] is True
+    # The same nonce cannot be replayed against a second permission, even by the same operator.
+    replayed = user_authorization_gate(permission("p2"), decision("p2", "operator-1"),
+                                       now=now, nonce_store=store)
+    assert replayed["status"] == "DENY"
+    assert "AUTHORIZATION_NONCE_REPLAYED" in replayed["blockers"]
+    # A different operator cannot collide with another operator's nonce namespace.
+    other = user_authorization_gate(permission("p2"), decision("p2", "operator-2"),
+                                    now=now, nonce_store=store)
+    assert other["authorized"] is True
+
+
+def test_authorization_is_once_per_permission_not_just_per_nonce():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    store = InMemoryNonceStore()
+    permission = {"status": "REQUIRE_HUMAN", "permission_id": "perm-once", "mode": "demo",
+                  "expires_at": (now + timedelta(minutes=5)).isoformat()}
+
+    def approval(nonce, user_id, decision_id):
+        return {"decision": "APPROVE", "user_id": user_id, "reason": "reviewed",
+                "permission_id": "perm-once", "decision_id": decision_id,
+                "nonce": nonce, "timestamp": now.isoformat(), "ttl_seconds": 300}
+
+    first = user_authorization_gate(permission, approval("n" * 24, "operator-1", "d-1"),
+                                    now=now, nonce_store=store)
+    assert first["authorized"] is True
+    # A freshly signed approval with a brand-new nonce must not authorize the same order twice.
+    second = user_authorization_gate(permission, approval("m" * 24, "operator-2", "d-2"),
+                                     now=now, nonce_store=store)
+    assert second["status"] == "DENY"
+    assert "AUTHORIZATION_PERMISSION_ALREADY_USED" in second["blockers"]
+
+
+def test_authorization_tombstone_is_keyed_on_the_server_order_scope():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    store = InMemoryNonceStore()
+
+    def permission(permission_id):
+        return {"status": "REQUIRE_HUMAN", "permission_id": permission_id, "mode": "demo",
+                "expires_at": (now + timedelta(minutes=5)).isoformat()}
+
+    def approval(permission_id, nonce, decision_id):
+        return {"decision": "APPROVE", "user_id": "operator-1", "reason": "reviewed",
+                "permission_id": permission_id, "decision_id": decision_id,
+                "nonce": nonce, "timestamp": now.isoformat(), "ttl_seconds": 300}
+
+    scope = "sha256:" + "a" * 64
+    first = user_authorization_gate(permission("p1"), approval("p1", "n" * 24, "d-1"),
+                                    now=now, nonce_store=store, order_scope=scope)
+    assert first["authorized"] is True
+    assert first["order_scope"] == scope
+    # A renamed permission for the identical order cannot reset the tombstone.
+    second = user_authorization_gate(permission("p2"), approval("p2", "m" * 24, "d-2"),
+                                     now=now, nonce_store=store, order_scope=scope)
+    assert second["status"] == "DENY"
+    assert "AUTHORIZATION_PERMISSION_ALREADY_USED" in second["blockers"]
+    invalid = user_authorization_gate(permission("p3"), approval("p3", "k" * 24, "d-3"),
+                                      now=now, nonce_store=store, order_scope="  ")
+    assert "AUTHORIZATION_ORDER_SCOPE_INVALID" in invalid["blockers"]
+
+
+def test_authorization_requires_a_store_with_permission_tombstones():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    permission = {"status": "REQUIRE_HUMAN", "permission_id": "perm-1", "mode": "demo",
+                  "expires_at": (now + timedelta(minutes=5)).isoformat()}
+    decision = {"decision": "APPROVE", "user_id": "operator-1", "reason": "reviewed",
+                "permission_id": "perm-1", "decision_id": "d-1", "nonce": "n" * 24,
+                "timestamp": now.isoformat(), "ttl_seconds": 300}
+
+    class NonceOnlyStore:
+        def consume(self, **kwargs):
+            return True
+
+    result = user_authorization_gate(permission, decision, now=now, nonce_store=NonceOnlyStore())
+    assert result["status"] == "DENY"
+    assert "AUTHORIZATION_PERMISSION_STORE_REQUIRED" in result["blockers"]
+
+
+def test_policy_owned_mandatory_agents_cannot_be_overridden_by_payload():
+    payload = good_payload()
+    payload["mandatory_agents"] = ["PlatformScoutAgent"]
+    policy = dict(POLICY, mandatory_agents=["PlatformScoutAgent", "ComplianceAgent", "ChiefAgent"])
+    result = certainty_gate(payload, policy, governance=GOVERNANCE)
+    assert result["status"] == "GATHER_MORE"
+    assert "MISSING_MANDATORY_AGENTS:ChiefAgent" in result["blockers"]
+
+
+def test_certainty_gate_blocks_groupthink_and_high_false_certainty():
+    result = certainty_gate(good_payload(), POLICY, governance={
+        **GOVERNANCE, "dissent_rate": 0.02, "false_certainty_rate": 0.09})
+    assert result["status"] == "GATHER_MORE"
+    assert "GROUPTHINK_ALARM_OR_DISSENT_METRIC_MISSING" in result["blockers"]
+    assert "FALSE_CERTAINTY_RATE_HIGH_OR_METRIC_UNVERIFIED" in result["blockers"]
+
+
+def test_certainty_gate_requires_verified_health_metric_sample_sizes():
+    result = certainty_gate(good_payload(), POLICY, governance={
+        **GOVERNANCE, "dissent_sample_size": 1, "false_certainty_sample_size": 1})
+    assert result["status"] == "GATHER_MORE"
+    assert "GROUPTHINK_ALARM_OR_DISSENT_METRIC_MISSING" in result["blockers"]
+    assert "FALSE_CERTAINTY_RATE_HIGH_OR_METRIC_UNVERIFIED" in result["blockers"]
+
+
+def test_chief_cannot_confirm_when_open_challenge_is_hidden_in_ledger():
+    ledger = [{"challenge_id": "ch-1", "status": "OPEN"}]
+    reasoning = {"reasoning_id": "chief-r-2", "signal_id": "sig-2", "created_at": datetime.now(timezone.utc).isoformat(),
+                 "verdict": "CONFIRM", "steps": {k: {"passed": True, "detail": "evidence checked", "evidence_refs": [f"ev-{k}"]} for k in "abcdefghi"},
+                 "reasons_against": ["macro", "news", "correlation", "liquidity", "regime"], "tail_risk_probability": 0.01,
+                 "tail_risk_scenarios": [{"scenario": "central bank shock", "probability": 0.01, "impact": "repricing", "evidence_refs": ["risk-1"]}],
+                 "open_challenges": [], "all_challenges_read": True, "challenge_ledger_snapshot": ledger,
+                 "challenge_ledger_hash": canonical_hash(ledger), "reviewed_challenge_ids": ["ch-1"]}
+    reasoning["reasoning_hash"] = canonical_hash(reasoning)
+    result = chief_skeptic_pass(reasoning)
+    assert result["verdict"] == "HOLD"
+    assert "CHIEF_CHALLENGE_LEDGER_CONTAINS_UNRESOLVED_CHALLENGE" in result["blockers"]
+
+
+def test_certainty_gate_rejects_nan_confidence_consensus_and_calibration():
+    payload = good_payload()
+    payload["verdicts"][0]["confidence"] = float("nan")
+    payload["verdicts"][1]["calibration_meta"]["brier_score"] = float("nan")
+    payload["consensus_score"] = float("nan")
+    result = certainty_gate(payload, POLICY, governance=GOVERNANCE)
+    assert result["status"] == "GATHER_MORE"
+    assert "PlatformScoutAgent:INVALID_CONFIDENCE" in result["blockers"]
+    assert "TechnicalAnalystAgent:CALIBRATION_MISSING_UNVERIFIED_OR_OUT_OF_LIMIT" in result["blockers"]
+    assert "CONSENSUS_SCORE_MISSING_INVALID_OR_BELOW_THRESHOLD" in result["blockers"]
+
+
+def test_permission_gate_rejects_nan_size_and_fabricated_reward_risk():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    matrix = {"permission_matrix": {"instruments": ["EURUSD"], "max_size_per_trade": 0.2,
+             "allowed_directions": ["BUY", "SELL"], "demo_enabled": True, "live_enabled": False,
+             "blocked_flags": [], "min_expected_rr": 1.5, "expected_rr_tolerance_fraction": 0.1,
+             "require_stop_loss": True, "require_take_profit": True, "max_command_ttl_seconds": 600,
+             "allowed_time_utc": {"start": "07:00", "end": "19:00"},
+             "blocked_around_news": True, "max_risk_per_trade_fraction": 0.005,
+             "daily_loss_limit_fraction": 0.02, "max_drawdown_fraction": 0.10,
+             "max_positions": 5, "max_correlated_positions": 2}}
+    req = valid_permission_request(now)
+    req["size"] = float("nan")
+    req["expected_rr"] = 99.0
+    result = permission_gate(req, matrix, now=now)
+    assert result["status"] == "DENY"
+    assert "SIZE_INVALID_OR_OUT_OF_POLICY" in result["blockers"]
+    assert "EXPECTED_RR_DOES_NOT_MATCH_SL_TP" in result["blockers"]
+
+
+def test_certainty_gate_malformed_top_level_payload_fails_closed():
+    result = certainty_gate(None, POLICY, governance=GOVERNANCE)
+    assert result["status"] == "GATHER_MORE"
+    assert result["trade_allowed"] is False
+    assert "INVALID_CERTAINTY_PAYLOAD" in result["blockers"]
+
+
+def test_permission_gate_malformed_top_level_request_fails_closed():
+    result = permission_gate(None, {"permission_matrix": {}})
+    assert result["status"] == "DENY"
+    assert result["trade_allowed"] is False
+    assert "INVALID_PERMISSION_REQUEST" in result["blockers"]
+
+
+def test_self_adversarial_pass_does_not_approve_low_confidence():
+    from critical_consensus.gates import self_adversarial_pass
+    now = datetime.now(timezone.utc)
+    sources = [{"source_id": "s1", "credibility": 0.9, "ttl_seconds": 60,
+                "observed_at": (now - timedelta(seconds=5)).isoformat()}]
+    abstain = self_adversarial_pass({"verdict": "APPROVE", "confidence": 0.72, "verdict_id": "v1"},
+                                    counterarguments=["x", "y", "z"], contradictions=[], sources=sources)
+    assert abstain["verdict"] == "ABSTAIN"
+    assert "CONFIDENCE_BELOW_APPROVAL_FLOOR" in abstain["blockers"]
+    reject = self_adversarial_pass({"verdict": "APPROVE", "confidence": 0.2, "verdict_id": "v2"},
+                                   counterarguments=["x", "y", "z"], contradictions=[], sources=sources)
+    assert reject["verdict"] == "REJECT"
+    assert "CONFIDENCE_BELOW_REJECTION_FLOOR" in reject["blockers"]
+
+
+def test_self_adversarial_source_cannot_self_declare_low_floor_or_freshness():
+    from critical_consensus.gates import self_adversarial_pass
+    now = datetime.now(timezone.utc)
+    forged = [{"source_id": "s1", "credibility": 0.01, "min_credibility": 0.0,
+               "age_seconds": 0, "ttl_seconds": 10**9,
+               "observed_at": (now - timedelta(hours=5)).isoformat()}]
+    result = self_adversarial_pass({"verdict": "APPROVE", "confidence": 0.99, "verdict_id": "v1"},
+                                   counterarguments=["x", "y", "z"], contradictions=[], sources=forged)
+    assert result["verdict"] != "APPROVE"
+    assert "SOURCE_STALE_LOW_CREDIBILITY_OR_INVALID" in result["blockers"]
+
+
+def test_certainty_gate_requires_absolute_source_timestamps():
+    payload = good_payload()
+    payload["key_sources"][0].pop("observed_at")
+    payload["key_sources"][0]["age_seconds"] = 1
+    result = certainty_gate(payload, POLICY, governance=GOVERNANCE)
+    assert result["status"] == "GATHER_MORE"
+    assert "KEY_SOURCE_MISSING_STALE_LOW_CREDIBILITY_OR_MNPI_SUSPECT" in result["blockers"]
+
+
+def test_certainty_gate_rejects_unverified_governance_mapping():
+    result = certainty_gate(good_payload(), POLICY, governance={
+        "dissent_rate": 0.15, "dissent_sample_size": 100,
+        "false_certainty_rate": 0.02, "false_certainty_sample_size": 100,
+        "issuer": "calibration-service"})
+    assert result["status"] == "GATHER_MORE"
+    assert "GOVERNANCE_ATTESTATION_MISSING_OR_INVALID" in result["blockers"]
+    assert result["checks"]["governance_attestation_verified"] is False
+
+
+def test_certainty_gate_requires_explicit_news_flag_and_lookback_window():
+    payload = good_payload()
+    payload.pop("news_or_rumor")
+    payload["contradiction_lookback_hours"] = 1
+    result = certainty_gate(payload, POLICY, governance=GOVERNANCE)
+    assert result["status"] == "GATHER_MORE"
+    assert "NEWS_OR_RUMOR_FLAG_MISSING_OR_INVALID" in result["blockers"]
+    assert "RECENT_KNOWLEDGE_GRAPH_CONTRADICTIONS_OR_INVALID_COUNT" in result["blockers"]
+
+
+def test_authorization_requires_nonce_store_and_rejects_expired_permission():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    permission = {"status": "REQUIRE_HUMAN", "permission_id": "p3", "mode": "demo",
+                  "expires_at": (now + timedelta(minutes=5)).isoformat()}
+    decision = {"decision": "APPROVE", "user_id": "u1", "reason": "reviewed",
+                "permission_id": "p3", "decision_id": "d3", "nonce": "n" * 24,
+                "timestamp": now.isoformat(), "ttl_seconds": 300}
+    assert "AUTHORIZATION_NONCE_STORE_REQUIRED" in user_authorization_gate(
+        permission, decision, now=now)["blockers"]
+    expired = {**permission, "expires_at": (now - timedelta(seconds=1)).isoformat()}
+    assert "PERMISSION_EXPIRED" in user_authorization_gate(
+        expired, decision, now=now, nonce_store=InMemoryNonceStore())["blockers"]
+
+
+def test_live_authorization_stays_denied_even_with_self_asserted_verification():
+    now = datetime.now(timezone.utc)
+    permission = {"status": "REQUIRE_HUMAN", "permission_id": "p-live", "mode": "live",
+                  "expires_at": (now + timedelta(minutes=5)).isoformat()}
+    decision = {"decision": "APPROVE", "decision_id": "d-live", "user_id": "operator-1",
+                "reason": "reviewed", "permission_id": "p-live", "nonce": "n" * 24,
+                "timestamp": now.isoformat(), "ttl_seconds": 300,
+                "two_fa_verified": True, "signature_verified": True}
+    result = user_authorization_gate(permission, decision, now=now,
+                                     nonce_store=InMemoryNonceStore())
+    assert result["status"] == "DENY"
+    assert result["authorized"] is False
+    assert "LIVE_AUTHORIZATION_NOT_IMPLEMENTED" in result["blockers"]
+
+
+def test_stale_chief_reasoning_cannot_confirm():
+    base = datetime.now(timezone.utc) - timedelta(seconds=1000)
+    reasoning = {"reasoning_id": "chief-old", "signal_id": "sig-old", "created_at": base.isoformat(),
+                 "verdict": "CONFIRM",
+                 "steps": {k: {"passed": True, "detail": "checked", "evidence_refs": [f"ev-{k}"]} for k in "abcdefghi"},
+                 "reasons_against": ["macro", "news", "correlation", "liquidity", "regime"],
+                 "tail_risk_probability": 0.01,
+                 "tail_risk_scenarios": [{"scenario": "shock", "probability": 0.01,
+                                          "impact": "repricing", "evidence_refs": ["risk-1"]}],
+                 "open_challenges": [], "all_challenges_read": True,
+                 "challenge_ledger_snapshot": [], "challenge_ledger_hash": canonical_hash([]),
+                 "reviewed_challenge_ids": []}
+    reasoning["reasoning_hash"] = canonical_hash(reasoning)
+    result = chief_skeptic_pass(reasoning, now=datetime.now(timezone.utc), max_age_seconds=900)
+    assert result["verdict"] == "HOLD"
+    assert "CHIEF_REASONING_EXPIRED" in result["blockers"]
+
+
+def test_review_counts_and_open_challenges_are_recomputed_from_records():
+    verdicts = [{"verdict_id": "v1", "reviewer_count": 999}]
+    payload = {
+        "peer_reviews": [
+            {"review_id": "r1", "target_verdict_id": "v1", "reviewer_alias": "a1",
+             "stance": "CONFIRM", "argument": "checked", "evidence_refs": ["e1"],
+             "status": "VALIDATED"},
+            {"review_id": "r2", "target_verdict_id": "v1", "reviewer_alias": "a2",
+             "stance": "CONFIRM", "argument": "checked", "evidence_refs": ["e2"],
+             "status": "VALIDATED"},
+        ],
+        "challenge_records": [{"challenge_id": "c1", "target_verdict_id": "v1",
+                               "argument": "still open", "status": "OPEN", "rounds": [],
+                               "evidence_refs": ["e1"]}],
+        "open_challenges": [],
+    }
+    result = revalidate_review_evidence(payload, verdicts, min_reviewers_per_verdict=2)
+    assert result["reviewer_counts"] == {"v1": 2}
+    assert "REVIEWER_COUNT_DOES_NOT_MATCH_RECORDS:v1" in result["blockers"]
+    assert "OPEN_CHALLENGE_STATE_CONTRADICTS_LEDGER" in result["blockers"]
+
+    payload["open_challenges"] = [{"challenge_id": "c1"}]
+    result = revalidate_review_evidence(payload, [{"verdict_id": "v1", "reviewer_count": 2}],
+                                        min_reviewers_per_verdict=2)
+    assert result["blockers"] == []
+    assert result["open_challenges"] == ["c1"]
+
+
+def test_verdict_author_cannot_review_its_own_verdict():
+    verdicts = [{"verdict_id": "v1", "agent_id": "PlatformScoutAgent"}]
+    payload = {"peer_reviews": [
+        {"target_verdict_id": "v1", "reviewer_alias": "PlatformScoutAgent", "stance": "CONFIRM",
+         "argument": "self review", "evidence_refs": ["e1"], "status": "VALIDATED"},
+        {"target_verdict_id": "v1", "reviewer_alias": "a2", "stance": "CONFIRM",
+         "argument": "independent", "evidence_refs": ["e2"], "status": "VALIDATED"},
+    ], "challenge_records": [], "open_challenges": []}
+    result = revalidate_review_evidence(payload, verdicts, min_reviewers_per_verdict=2)
+    assert "PEER_REVIEWER_IS_VERDICT_AUTHOR:v1" in result["blockers"]
+    assert result["reviewer_counts"] == {"v1": 1}
+
+
+def test_challenge_review_must_be_registered_and_resolved_with_new_evidence():
+    verdicts = [{"verdict_id": "v1", "agent_id": "PlatformScoutAgent"}]
+    payload = {"peer_reviews": [
+        {"target_verdict_id": "v1", "reviewer_alias": "a1", "stance": "CONFIRM",
+         "argument": "ok", "evidence_refs": ["e1"], "status": "VALIDATED"},
+        {"target_verdict_id": "v1", "reviewer_alias": "a2", "stance": "CHALLENGE",
+         "challenge_type": "SOURCE_WEAK", "argument": "weak", "evidence_refs": ["e2"],
+         "status": "VALIDATED"},
+    ], "challenge_records": [], "open_challenges": []}
+    result = revalidate_review_evidence(payload, verdicts, min_reviewers_per_verdict=2)
+    assert "PEER_CHALLENGE_NOT_REGISTERED_IN_CHALLENGE_LEDGER" in result["blockers"]
+
+    payload["challenge_records"] = [{
+        "challenge_id": "c1", "target_verdict_id": "v1", "challenge_type": "SOURCE_WEAK",
+        "argument": "weak", "status": "RESOLVED", "rounds": [],
+        "evidence_refs": ["e2"], "resolution_evidence_refs": ["e2"],
+    }]
+    result = revalidate_review_evidence(payload, verdicts, min_reviewers_per_verdict=2)
+    assert "CHALLENGE_RESOLUTION_MISSING_NEW_EVIDENCE" in result["blockers"]
+    assert result["open_challenges"] == ["c1"]
+
+
+def _permission_matrix(**overrides):
+    matrix = {"instruments": ["EURUSD"], "max_size_per_trade": 0.2,
+              "allowed_directions": ["BUY", "SELL"], "demo_enabled": True, "live_enabled": False,
+              "blocked_flags": [], "min_expected_rr": 1.5,
+              "expected_rr_tolerance_fraction": 0.01,
+              "require_stop_loss": True, "require_take_profit": True,
+              "max_command_ttl_seconds": 600,
+              "allowed_time_utc": {"start": "07:00", "end": "19:00"},
+              "blocked_around_news": True, "max_risk_per_trade_fraction": 0.005,
+              "daily_loss_limit_fraction": 0.02, "max_drawdown_fraction": 0.10,
+              "max_positions": 5, "max_correlated_positions": 2}
+    matrix.update(overrides)
+    return {"permission_matrix": matrix}
+
+
+def test_permission_gate_limits_include_the_proposed_trade():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    request = valid_permission_request(now)
+    request["risk_snapshot"] = {"risk_fraction": 0.004, "daily_loss_fraction": 0.018,
+                                "drawdown_fraction": 0.02, "open_stop_risk_fraction": 0.0,
+                                "open_positions": 1, "correlated_open_positions": 0}
+    result = permission_gate(request, _permission_matrix(), now=now)
+    assert "PROJECTED_DAILY_LOSS_EXCEEDS_LIMIT" in result["blockers"]
+
+    request["risk_snapshot"] = {"risk_fraction": 0.004, "daily_loss_fraction": 0.004,
+                                "drawdown_fraction": 0.098, "open_stop_risk_fraction": 0.0,
+                                "open_positions": 1, "correlated_open_positions": 0}
+    result = permission_gate(request, _permission_matrix(), now=now)
+    assert "PROJECTED_DRAWDOWN_EXCEEDS_LIMIT" in result["blockers"]
+
+
+def test_open_stop_risk_adds_to_realised_exposure():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    request = valid_permission_request(now)
+    # realised 0.006 + open 0.0125 = 0.0185; adding the proposed 0.003 breaches 0.02.
+    request["risk_snapshot"] = {"risk_fraction": 0.003, "daily_loss_fraction": 0.006,
+                                "drawdown_fraction": 0.05, "open_stop_risk_fraction": 0.0125,
+                                "open_positions": 1, "correlated_open_positions": 0}
+    result = permission_gate(request, _permission_matrix(), now=now)
+    assert "PROJECTED_DAILY_LOSS_EXCEEDS_LIMIT" in result["blockers"]
+
+    # drawdown 0.08 + 0.0175 + proposed 0.003 = 0.1005 breaches the 0.10 cap.
+    request["risk_snapshot"] = {"risk_fraction": 0.003, "daily_loss_fraction": 0.0,
+                                "drawdown_fraction": 0.08, "open_stop_risk_fraction": 0.0175,
+                                "open_positions": 1, "correlated_open_positions": 0}
+    result = permission_gate(request, _permission_matrix(), now=now)
+    assert "PROJECTED_DRAWDOWN_EXCEEDS_LIMIT" in result["blockers"]
+
+
+def test_open_stop_risk_must_be_a_json_number():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    request = valid_permission_request(now)
+    request["risk_snapshot"]["open_stop_risk_fraction"] = "0.019"
+    result = permission_gate(request, _permission_matrix(), now=now)
+    assert result["status"] == "DENY"
+    assert "INVALID_RISK_VALUE:open_stop_risk_fraction" in result["blockers"]
+
+
+def test_open_stop_risk_field_is_mandatory():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    request = valid_permission_request(now)
+    request["risk_snapshot"].pop("open_stop_risk_fraction")
+    result = permission_gate(request, _permission_matrix(), now=now)
+    assert result["status"] == "DENY"
+    assert "RISK_SNAPSHOT_FIELDS_MISSING:open_stop_risk_fraction" in result["blockers"]
+
+
+def test_permission_gate_recalculates_reward_risk_against_the_floor():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    request = valid_permission_request(now)
+    request.update({"expected_price": 1.1000, "sl_tp": {"sl": 1.0980, "tp": 1.10276},
+                    "expected_rr": 1.5})
+    result = permission_gate(request, _permission_matrix(), now=now)
+    assert result["status"] == "DENY"
+    assert "EXPECTED_RR_BELOW_POLICY_AFTER_RECALCULATION" in result["blockers"]
+
+
+def test_any_mnpi_legal_tag_variant_vetoes():
+    payload = good_payload()
+    payload["key_sources"][0]["legal_tag"] = "MNPI"
+    result = certainty_gate(payload, POLICY, governance=GOVERNANCE)
+    assert result["status"] == "VETO"
+    assert "MNPI_SUSPECT_SOURCE_VETO" in result["blockers"]
+
+
+def test_relabelled_mnpi_legal_tag_still_vetoes():
+    for tag in ("mnpi_suspect", "MNPI-Alleged", " mnpi"):
+        payload = good_payload()
+        payload["key_sources"][0]["legal_tag"] = tag
+        result = certainty_gate(payload, POLICY, governance=GOVERNANCE)
+        assert result["status"] == "VETO", tag
+        assert "MNPI_SUSPECT_SOURCE_VETO" in result["blockers"], tag
+
+
+def test_mnpi_substring_risk_flag_is_vetoed_by_permission_gate():
+    now = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
+    for flag in ("escalate_mnpi_review", "MNPI-SUSPECT", "mnpi_new"):
+        request = valid_permission_request(now)
+        request["risk_flags"] = [flag]
+        result = permission_gate(request, _permission_matrix(), now=now)
+        assert result["status"] == "DENY", flag
+        assert "MNPI_VETO" in result["blockers"], flag
+
+
+def test_non_integer_calibration_sample_floor_is_a_blocker():
+    policy = dict(POLICY, min_calibration_sample_size=29.5)
+    result = certainty_gate(good_payload(), policy, governance=GOVERNANCE)
+    assert result["status"] == "GATHER_MORE"
+    assert "INVALID_POLICY_VALUE:min_calibration_sample_size" in result["blockers"]
+
+
+def test_non_integer_dissent_sample_floor_is_a_blocker():
+    policy = dict(POLICY, min_dissent_samples=29.5)
+    result = certainty_gate(good_payload(), policy, governance=GOVERNANCE)
+    assert result["status"] == "GATHER_MORE"
+    assert "INVALID_POLICY_VALUE:min_dissent_samples" in result["blockers"]
+
+
+def test_chief_tail_risk_cannot_be_lower_than_a_scenario():
+    reasoning = {
+        "reasoning_id": "chief-r-2", "signal_id": "sig-2",
+        "created_at": datetime.now(timezone.utc).isoformat(), "verdict": "CONFIRM",
+        "steps": {k: {"passed": True, "detail": "evidence checked", "evidence_refs": [f"ev-{k}"]}
+                  for k in "abcdefghi"},
+        "reasons_against": ["macro", "news", "correlation", "liquidity", "regime"],
+        "tail_risk_probability": 0.01,
+        "tail_risk_scenarios": [{"scenario": "flash crash", "probability": 0.95,
+                                 "impact": "catastrophic", "evidence_refs": ["risk-1"]}],
+        "open_challenges": [], "all_challenges_read": True, "challenge_ledger_snapshot": [],
+        "challenge_ledger_hash": canonical_hash([]), "reviewed_challenge_ids": [],
+    }
+    reasoning["reasoning_hash"] = canonical_hash(reasoning)
+    result = chief_skeptic_pass(reasoning)
+    assert result["verdict"] == "HOLD"
+    assert "TAIL_RISK_BELOW_SCENARIO_PROBABILITY" in result["blockers"]
