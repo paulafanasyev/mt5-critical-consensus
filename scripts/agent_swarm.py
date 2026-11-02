@@ -74,6 +74,11 @@ AGENTS: list[dict] = [
     agent("trend-jpy", "daily_trend", "USDJPY", 0.02),
     agent("trend-us500", "daily_trend", "US500", 0.1),
     agent("trend-xag-cont", "daily_trend", "XAGUSD", 0.01, experimental=True),
+    agent("ema-xau", "h1_ema", "XAUUSD", 0.02),
+    agent("ema-xag", "h1_ema", "XAGUSD", 0.01),
+    agent("ema-eur", "h1_ema", "EURUSD", 0.02),
+    agent("ema-gbp", "h1_ema", "GBPUSD", 0.02),
+    agent("ema-jpy", "h1_ema", "USDJPY", 0.02),
     agent("trend-aud", "daily_trend", "AUDUSD", 0.02),
     agent("trend-cad", "daily_trend", "USDCAD", 0.02),
     agent("trend-nzd", "daily_trend", "NZDUSD", 0.02),
@@ -157,7 +162,43 @@ def market_retry_blocked(spec: dict) -> bool:
     return SKIP_UNTIL.get(spec["name"], 0) > time.time()
 
 
-def open_trade(mt5, spec: dict, side: str, tick, *, stop: float | None) -> None:
+def h1_ema_state(symbol: str) -> tuple[str, float] | None:
+    """EMA 50/200 on hourly bars, stop 2xATR floored at 3x spread, target 2R."""
+    import statistics as st
+
+    import MetaTrader5 as mt5
+
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 1, 400)
+    if rates is None or len(rates) < 210:
+        return None
+    bars = [{"h": float(r["high"]), "l": float(r["low"]), "c": float(r["close"])}
+            for r in rates]
+    closes = [bar["c"] for bar in bars]
+
+    def ema(values, period):
+        weight = 2 / (period + 1)
+        result = values[0]
+        for value in values[1:]:
+            result = value * weight + result * (1 - weight)
+        return result
+
+    fast = ema(closes, 50)
+    slow = ema(closes, 200)
+    ranges = [max(bars[i]["h"] - bars[i]["l"], abs(bars[i]["h"] - bars[i - 1]["c"]),
+                  abs(bars[i]["l"] - bars[i - 1]["c"])) for i in range(1, len(bars))]
+    atr = st.fmean(ranges[-14:])
+    tick = mt5.symbol_info_tick(symbol)
+    spread = (tick.ask - tick.bid) if tick else 0.0
+    risk = max(2 * atr, spread * 3)
+    if fast > slow and closes[-1] > slow:
+        return "BUY", risk
+    if fast < slow and closes[-1] < slow:
+        return "SELL", risk
+    return None
+
+
+def open_trade(mt5, spec: dict, side: str, tick, *, stop: float | None,
+               take: float | None = None) -> None:
     order_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
     price = tick.ask if side == "BUY" else tick.bid
     request = {"action": mt5.TRADE_ACTION_DEAL, "symbol": spec["symbol"],
@@ -166,6 +207,8 @@ def open_trade(mt5, spec: dict, side: str, tick, *, stop: float | None) -> None:
                "type_filling": mt5.ORDER_FILLING_FOK, "comment": spec["name"][:25]}
     if stop:
         request["sl"] = price * (1 - stop) if side == "BUY" else price * (1 + stop)
+    if take:
+        request["tp"] = price * (1 + take) if side == "BUY" else price * (1 - take)
     result = mt5.order_send(request)
     if result is not None and result.retcode in (10017, 10018, 10014):
         SKIP_UNTIL[spec["name"]] = time.time() + 600
@@ -252,6 +295,21 @@ def main(argv: list[str] | None = None) -> int:
                     elif position is not None and (server.weekday() != 0
                                                    or server.hour >= EXIT_SERVER_HOUR):
                         close_trade(mt5, spec, position)
+
+                elif spec["kind"] == "h1_ema":
+                    state = h1_ema_state(spec["symbol"])
+                    if state is None:
+                        continue
+                    side, risk_distance = state
+                    stop_fraction = risk_distance / tick.ask if tick.ask else None
+                    take_fraction = (2 * risk_distance / tick.ask) if tick.ask else None
+                    if position is None:
+                        open_trade(mt5, spec, side, tick, stop=stop_fraction,
+                                   take=take_fraction)
+                    elif (position.type == 0 and side == "SELL") or                          (position.type == 1 and side == "BUY"):
+                        close_trade(mt5, spec, position)
+                        open_trade(mt5, spec, side, tick, stop=stop_fraction,
+                                   take=take_fraction)
 
                 elif spec["kind"] == "daily_trend":
                     state = daily_trend_state(spec["symbol"])
