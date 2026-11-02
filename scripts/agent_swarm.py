@@ -143,6 +143,14 @@ def daily_trend_state(symbol: str) -> str | None:
     return None
 
 
+SKIP_UNTIL: dict[str, float] = {}
+
+
+def market_retry_blocked(spec: dict) -> bool:
+    """After an 'invalid volume' or 'market closed' answer, wait ten minutes."""
+    return SKIP_UNTIL.get(spec["name"], 0) > time.time()
+
+
 def open_trade(mt5, spec: dict, side: str, tick, *, stop: float | None) -> None:
     order_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
     price = tick.ask if side == "BUY" else tick.bid
@@ -153,6 +161,11 @@ def open_trade(mt5, spec: dict, side: str, tick, *, stop: float | None) -> None:
     if stop:
         request["sl"] = price * (1 - stop) if side == "BUY" else price * (1 + stop)
     result = mt5.order_send(request)
+    if result is not None and result.retcode in (10017, 10018, 10014):
+        SKIP_UNTIL[spec["name"]] = time.time() + 600
+        log({"event": f"{spec['name']} skipped: retcode {result.retcode} "
+                      f"({result.comment}), retry in 10 min"})
+        return
     log({"event": f"{spec['name']} OPEN {side} {spec['lots']} {spec['symbol']} @ {price:.5f} "
                   f"retcode {None if result is None else result.retcode} "
                   f"{'EXPERIMENTAL' if spec['experimental'] else ''}"})
@@ -196,6 +209,8 @@ def main(argv: list[str] | None = None) -> int:
             now = datetime.now(timezone.utc)
             server = now + timedelta(hours=SERVER_OFFSET)
             for spec in AGENTS:
+                if market_retry_blocked(spec):
+                    continue
                 position = open_for(mt5, spec)
                 tick = mt5.symbol_info_tick(spec["symbol"])
                 if tick is None or not tick.bid:
