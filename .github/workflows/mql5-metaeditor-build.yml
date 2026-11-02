@@ -141,6 +141,46 @@ jobs:
           Get-Content -LiteralPath $manifestPath | Add-Content $env:GITHUB_STEP_SUMMARY
           Get-Content -LiteralPath $log -Tail 20
 
+      - name: Compile standalone trading EA and record provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $out = Join-Path $env:GITHUB_WORKSPACE "artifacts\standalone"
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          $source = Join-Path $out "CriticalConsensusStandalone.mq5"
+          $log = Join-Path $out "CriticalConsensusStandalone.log"
+          Copy-Item -LiteralPath "standalone\mql5\CriticalConsensusStandalone.mq5" -Destination $source -Force
+          $binary = [System.IO.Path]::ChangeExtension($source, ".ex5")
+          if (Test-Path $log) { Remove-Item -LiteralPath $log -Force }
+          if (Test-Path $binary) { Remove-Item -LiteralPath $binary -Force }
+          $arguments = @("/compile:$source", "/log:$log", "/include:$env:MT5_INSTALL_DIR\MQL5")
+          $process = Start-Process -FilePath $env:METAEDITOR_PATH -ArgumentList $arguments -Wait -PassThru
+          Write-Host "MetaEditor process exit code: $($process.ExitCode)"
+          $deadline = (Get-Date).AddSeconds(30)
+          while (-not (Test-Path $log) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }
+          if (-not (Test-Path $log)) { throw "MetaEditor did not create the standalone compiler log." }
+          $compileText = [System.IO.File]::ReadAllText($log, [System.Text.Encoding]::Unicode)
+          if ($compileText -notmatch 'Result:\s*0\s+errors,\s*0\s+warnings') {
+            Write-Host $compileText
+            throw "Standalone EA did not compile with zero errors and zero warnings."
+          }
+          if (-not (Test-Path $binary) -or (Get-Item $binary).Length -eq 0) {
+            throw "MetaEditor did not create the standalone .ex5 binary."
+          }
+          $manifest = [ordered]@{
+            schema_version = 1
+            source_commit = $env:GITHUB_SHA
+            workflow_run_id = $env:GITHUB_RUN_ID
+            source_sha256 = (Get-FileHash $source -Algorithm SHA256).Hash
+            ex5_sha256 = (Get-FileHash $binary -Algorithm SHA256).Hash
+            compiler_log_sha256 = (Get-FileHash $log -Algorithm SHA256).Hash
+            ex5_size_bytes = (Get-Item $binary).Length
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $out "build-manifest.json") -Encoding utf8
+          "Standalone EA: 0 errors, 0 warnings" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "Standalone EX5 SHA-256: $($manifest.ex5_sha256)" | Add-Content $env:GITHUB_STEP_SUMMARY
+          Get-Content -LiteralPath $log -Tail 15
+
       - name: Upload compiled demo EA and compiler evidence
         uses: actions/upload-artifact@v4
         with:
@@ -151,5 +191,9 @@ jobs:
             artifacts/demo_ea/CriticalConsensusEA_Demo.log
             artifacts/demo_ea/build-result.json
             artifacts/demo_ea/build-manifest.json
+            artifacts/standalone/CriticalConsensusStandalone.mq5
+            artifacts/standalone/CriticalConsensusStandalone.ex5
+            artifacts/standalone/CriticalConsensusStandalone.log
+            artifacts/standalone/build-manifest.json
           if-no-files-found: error
           retention-days: 14
