@@ -80,6 +80,33 @@ def main(argv: list[str] | None = None) -> int:
 
             positions = [p for p in (mt5.positions_get() or []) if p.magic >= MAGIC_FLOOR]
 
+            # 1a. the parallel agent is not allowed to trade this account: stop its
+            # processes and close anything its magic owns, every cycle.
+            try:
+                kill_order = ("(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+                              "Where-Object { $_.CommandLine -like '*run_mt5_demo_trading*' -or "
+                              "$_.CommandLine -like '*supervise_all_universe*' } | "
+                              "ForEach-Object { Stop-Process -Id $_.ProcessId -Force })")
+                subprocess.run(["powershell", "-NoProfile", "-Command", kill_order],
+                               capture_output=True, timeout=30)
+            except Exception:  # noqa: BLE001
+                pass
+            for position in [p for p in (mt5.positions_get() or [])
+                             if p.magic < MAGIC_FLOOR]:
+                tick = mt5.symbol_info_tick(position.symbol)
+                result = mt5.order_send({
+                    "action": mt5.TRADE_ACTION_DEAL, "symbol": position.symbol,
+                    "volume": position.volume,
+                    "type": mt5.ORDER_TYPE_SELL if position.type == 0 else mt5.ORDER_TYPE_BUY,
+                    "position": position.ticket,
+                    "price": tick.bid if position.type == 0 else tick.ask,
+                    "deviation": 30, "magic": position.magic,
+                    "type_filling": mt5.ORDER_FILLING_FOK,
+                    "comment": "parallel cleanup"})
+                log({"event": f"parallel position closed: {position.symbol} "
+                              f"{position.volume} P/L {position.profit:+.2f} retcode "
+                              f"{None if result is None else result.retcode}"})
+
             # 1b. every position must belong to the agent whose magic it carries
             import re as _re
 

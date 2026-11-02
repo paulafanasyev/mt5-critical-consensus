@@ -199,6 +199,8 @@ SYMBOL_CAP = {"XAUUSD": 0.10, "XAGUSD": 0.06, "EURUSD": 0.07, "GBPUSD": 0.07,
               "NZDUSD": 0.07, "US500": 0.3, "UK100": 0.3, "US30": 0.3, "JPN225": 1.0}
 MAX_DRAWDOWN = 0.01      # close everything if the account loses 1% from the baseline
 PAUSE_SECONDS = 1800
+DOLLAR_STOP = 10.0       # never hold a position that is ten dollars under water
+SCALE_TRIGGER = 15.0     # once a position is fifteen dollars up, add half again
 
 
 def load_state() -> dict:
@@ -240,6 +242,52 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
         state["paused_until"] = time.time() + PAUSE_SECONDS
         save_state(state)
         return
+
+    # 1. cut a loser at the dollar level instead of waiting for the ATR stop
+    survivors = []
+    for position in [p for p in (mt5.positions_get() or []) if p.magic in magics]:
+        if position.profit <= -DOLLAR_STOP:
+            tick = mt5.symbol_info_tick(position.symbol)
+            result = mt5.order_send({
+                "action": mt5.TRADE_ACTION_DEAL, "symbol": position.symbol,
+                "volume": position.volume,
+                "type": mt5.ORDER_TYPE_SELL if position.type == 0 else mt5.ORDER_TYPE_BUY,
+                "position": position.ticket,
+                "price": tick.bid if position.type == 0 else tick.ask,
+                "deviation": 30, "magic": position.magic,
+                "type_filling": mt5.ORDER_FILLING_FOK,
+                "comment": "dollar stop"})
+            log({"event": f"{position.symbol} ticket {position.ticket}: dollar stop at "
+                          f"{position.profit:+.2f}, retcode "
+                          f"{None if result is None else result.retcode}"})
+            continue
+        survivors.append(position)
+
+    # 2. scale into a winner: add half the position once it is up SCALE_TRIGGER
+    scaled = set(state.get("scaled_tickets", []))
+    for position in survivors:
+        if position.profit < SCALE_TRIGGER or position.ticket in scaled:
+            continue
+        add = round(position.volume * 0.5, 2)
+        if add <= 0:
+            continue
+        cap = SYMBOL_CAP.get(position.symbol, 0.04)
+        if swarm_exposure(position.symbol) + add > cap + 1e-9:
+            continue
+        tick = mt5.symbol_info_tick(position.symbol)
+        result = mt5.order_send({
+            "action": mt5.TRADE_ACTION_DEAL, "symbol": position.symbol, "volume": add,
+            "type": mt5.ORDER_TYPE_BUY if position.type == 0 else mt5.ORDER_TYPE_SELL,
+            "price": tick.ask if position.type == 0 else tick.bid,
+            "deviation": 30, "magic": position.magic,
+            "type_filling": mt5.ORDER_FILLING_FOK,
+            "comment": "scale-in"})
+        if result is not None and result.retcode == 10009:
+            scaled.add(position.ticket)
+            state["scaled_tickets"] = sorted(scaled)
+            save_state(state)
+            log({"event": f"{position.symbol} ticket {position.ticket}: up "
+                          f"{position.profit:+.2f}, added {add} lots"})
 
     by_symbol: dict[str, list] = {}
     for position in mt5.positions_get() or []:
