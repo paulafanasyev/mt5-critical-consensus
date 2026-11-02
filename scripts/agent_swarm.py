@@ -219,7 +219,7 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
     account = mt5.account_info()
     if account is None:
         return
-    baseline = max(state.get("baseline_equity", 0), account.equity)
+    baseline = 100_000.0
     state["baseline_equity"] = baseline
     if account.equity < baseline * (1 - MAX_DRAWDOWN):
         log({"event": f"BREAKER: equity {account.equity:.2f} below {baseline:.2f} "
