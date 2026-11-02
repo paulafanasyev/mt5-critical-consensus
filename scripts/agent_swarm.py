@@ -277,8 +277,13 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
                                 "deviation": 30, "magic": position.magic,
                                 "type_filling": mt5.ORDER_FILLING_FOK,
                                 "comment": "breaker"})
-        state["baseline_equity"] = account.equity
+        # the brake is a daily stop: it does not reset the reference capital, it halts the
+        # swarm until the next UTC day begins, so the same day cannot keep re-entering and
+        # tripping the breaker again.
+        midnight = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        state["baseline_equity"] = 100_000.0
         state["paused_until"] = time.time() + PAUSE_SECONDS
+        state["halted_until"] = (midnight + timedelta(days=1)).timestamp()
         save_state(state)
         return
 
@@ -552,7 +557,17 @@ def main(argv: list[str] | None = None) -> int:
             if state.get("paused_until", 0) > time.time():
                 time.sleep(args.interval_sec)
                 continue
+            if state.get("halted_until", 0) > time.time():
+                # the daily stop already fired: the book stays flat until the next UTC day
+                time.sleep(args.interval_sec)
+                continue
             manage_portfolio(mt5, {spec["magic"] for spec in AGENTS}, state)
+            # the brake may have fired inside manage_portfolio in this very cycle: never open
+            # a trade in the same pass that just flattened the book
+            fresh = load_state()
+            if fresh.get("paused_until", 0) > time.time() or fresh.get("halted_until", 0) > time.time():
+                time.sleep(args.interval_sec)
+                continue
             for spec in AGENTS:
                 if market_retry_blocked(spec):
                     continue
