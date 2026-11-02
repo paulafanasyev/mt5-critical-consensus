@@ -205,6 +205,7 @@ DOLLAR_STOP = 10.0       # absolute floor: never hold a position ten dollars und
 STOP_RISK_FRACTION = 0.4 # ...but at least a fraction of the position's own risk
 SCALE_TRIGGER = 15.0     # once a position is fifteen dollars up, add half again
 COOLDOWN_SECONDS = 1800  # after a stop, that symbol rests for half an hour
+MAX_ENTRIES_PER_HOUR = 3 # more than this on one symbol is churn, not trading
 KILL_SWITCH = ROOT / "agent_data" / "demo_bridge" / "kill_switch.json"
 
 
@@ -414,7 +415,16 @@ def swarm_exposure(symbol: str) -> float:
 
 def open_trade(mt5, spec: dict, side: str, tick, *, stop: float | None,
                take: float | None = None) -> None:
-    cooldown_until = load_state().get("cooldowns", {}).get(spec["symbol"], 0)
+    state_now = load_state()
+    entries = state_now.setdefault("entries", {})
+    hour_ago = time.time() - 3600
+    recent = [stamp for stamp in entries.get(spec["symbol"], []) if stamp > hour_ago]
+    entries[spec["symbol"]] = recent
+    if len(recent) >= MAX_ENTRIES_PER_HOUR:
+        log({"event": f"{spec['name']} skipped: {spec['symbol']} churn guard "
+                      f"({len(recent)} entries in the last hour)"})
+        return
+    cooldown_until = state_now.get("cooldowns", {}).get(spec["symbol"], 0)
     if cooldown_until > time.time():
         log({"event": f"{spec['name']} skipped: {spec['symbol']} cooling down "
                       f"({int(cooldown_until - time.time())}s)"})
@@ -433,6 +443,11 @@ def open_trade(mt5, spec: dict, side: str, tick, *, stop: float | None,
         request["sl"] = price * (1 - stop) if side == "BUY" else price * (1 + stop)
     if take:
         request["tp"] = price * (1 + take) if side == "BUY" else price * (1 - take)
+    state_now = load_state()
+    entries = state_now.setdefault("entries", {})
+    entries.setdefault(spec["symbol"], []).append(time.time())
+    save_state(state_now)
+
     result = mt5.order_send(request)
     if result is not None and result.retcode in (10017, 10018, 10014):
         SKIP_UNTIL[spec["name"]] = time.time() + 600
