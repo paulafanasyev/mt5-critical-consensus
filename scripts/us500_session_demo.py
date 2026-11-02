@@ -58,9 +58,11 @@ def main(argv: list[str] | None = None) -> int:
         try:
             now = datetime.now(timezone.utc)
             positions = [p for p in (mt5.positions_get(symbol=SYMBOL) or []) if p.magic == MAGIC]
-            in_session = ENTRY_HOUR <= now.hour < EXIT_HOUR
+            # Monday only: the session drift is +0.23% on Mondays (t=4.2)
+            # against +0.05% on all days (t=2.3).
+            in_session = (now.weekday() == 0 and ENTRY_HOUR <= now.hour < EXIT_HOUR)
 
-            if positions and now.hour >= EXIT_HOUR:
+            if positions and (now.hour >= EXIT_HOUR or now.weekday() != 0):
                 for position in positions:
                     tick = mt5.symbol_info_tick(SYMBOL)
                     result = mt5.order_send({

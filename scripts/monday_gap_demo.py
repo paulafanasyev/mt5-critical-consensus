@@ -23,7 +23,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LOG = ROOT / "agent_data" / "monday_gap.jsonl"
-SYMBOLS = ("GBPUSD", "USDCHF", "AUDUSD")
+SYMBOLS = ("GBPUSD", "USDCHF", "AUDUSD", "USDCAD")
 VOLUME = 0.01
 MIN_GAP = 0.001
 MAGIC = 8172030
