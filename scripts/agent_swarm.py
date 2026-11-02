@@ -78,6 +78,10 @@ AGENTS: list[dict] = [
     # --- weekly momentum on metals (5-day return, hold 5 days) --------------------
     agent("wm-xau", "weekly_momentum", "XAUUSD", 0.02),
     agent("wm-xag", "weekly_momentum", "XAGUSD", 0.01),
+    # --- lab: the same EMA rule on FX, to keep the laboratory generating evidence ---
+    agent("lab-ema-gbp", "h1_ema", "GBPUSD", 0.01, experimental=True),
+    agent("lab-ema-eur", "h1_ema", "EURUSD", 0.01, experimental=True),
+    agent("lab-ema-jpy", "h1_ema", "USDJPY", 0.01, experimental=True),
     # --- experimental, weaker evidence, quarter size ------------------------------
     agent("x-ema-xag", "h1_ema", "XAGUSD", 0.01, experimental=True),
     agent("x-mon-long-uki", "monday_long", "UK100", 0.1, experimental=True),
