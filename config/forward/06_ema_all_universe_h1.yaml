@@ -71,6 +71,14 @@ risk:
   # actually carry. Nothing here raises the ceiling - it is the same 0.20 the executor enforces,
   # so the worst case stays 7 x 0.20 lots.
   max_volume_lots: 0.20
+  # Measured 2026-11-02 on this shared demo: four 0.20 FX legs this run opened and the broker
+  # confirmed were flattened by another process 21 seconds later - EURUSD -1.00, GBPUSD -0.20,
+  # AUDUSD -0.40, NZDUSD -0.80, exactly the spread paid at entry, -2.40 for a round trip that was
+  # never our decision. Re-entering the same symbol every cycle buys that exit again. Four
+  # distinct legs of ours on one instrument inside two hours means the book is not ours to hold,
+  # so the instrument stands down instead of bleeding. The default is the same value; it is
+  # written here because this file describes a contested account.
+  churn_max_legs_per_symbol: 3
 
 strategy:
   family: ema

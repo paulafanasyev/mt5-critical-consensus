@@ -138,6 +138,11 @@ class RiskLimits:
     # ceiling checked only after sizing removes the cheap contracts from the book and leaves
     # the expensive ones exactly where they were.
     max_volume_lots: float | None = None
+    # How many distinct legs this run may open on one symbol inside the churn window before that
+    # symbol is stood down. On a demo shared with other automated strategies a neighbour can
+    # flatten this run's book seconds after a fill, and re-entering every cycle then pays the
+    # spread again for a position that is never allowed to develop. Null disables the guard.
+    churn_max_legs_per_symbol: int | None = 3
 
     def __post_init__(self) -> None:
         _fraction(self.risk_per_trade_fraction, name="risk_per_trade_fraction",
@@ -146,6 +151,9 @@ class RiskLimits:
                   low=0.1, high=1_000.0)
         if self.max_volume_lots is not None:
             _fraction(self.max_volume_lots, name="max_volume_lots", low=0.01, high=100.0)
+        if self.churn_max_legs_per_symbol is not None:
+            _integer(self.churn_max_legs_per_symbol, name="churn_max_legs_per_symbol",
+                     low=1, high=50)
         _integer(self.max_open_positions, name="max_open_positions", low=0, high=50)
         _fraction(self.max_daily_loss_fraction, name="max_daily_loss_fraction",
                   low=0.0001, high=0.25)
@@ -328,7 +336,8 @@ class AgentPolicy:
         risk = _section(raw, "risk", {
             "risk_per_trade_fraction", "max_open_positions", "max_daily_loss_fraction",
             "max_drawdown_fraction", "min_risk_reward", "max_spread_points",
-            "max_quote_age_seconds", "max_notional_fraction", "max_volume_lots"})
+            "max_quote_age_seconds", "max_notional_fraction", "max_volume_lots",
+            "churn_max_legs_per_symbol"})
         strategy = _section(raw, "strategy", {
             "family", "min_bars", "sma_fast", "sma_slow", "ema_fast", "ema_slow",
             "bollinger_period", "bollinger_dev", "donchian_period", "atr_period",

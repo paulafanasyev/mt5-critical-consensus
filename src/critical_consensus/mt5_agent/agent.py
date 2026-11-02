@@ -4,14 +4,14 @@ from __future__ import annotations
 import inspect
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
 
 from ..market_data import MarketBar
 from . import codes
 from .backend import (AccountInfo, MT5Backend, PositionSnapshot, SymbolSpec, Tick,
                        assert_backend_contract)
-from .journal import DecisionJournal
+from .journal import OWN_LEG_EVENT_TYPE, DecisionJournal
 from .policy import AgentPolicy
 from .sizing import SizedOrder, size_position
 from .strategy import Proposal, evaluate_signal
@@ -24,6 +24,14 @@ _MAX_BASELINE_MULTIPLE = 1_000.0
 # approved stop distance. Beyond this the approval was for a different trade: the operator
 # saw one risk/reward and would get another, so the cycle is refused instead of filled.
 _MAX_REQUOTE_SLIP_FRACTION = 0.10
+
+# How long a leg this run opened stays evidence of churn. Two hours is long enough to see a
+# neighbour on a shared demo flatten the same symbol several times in a row, and short enough
+# that ordinary play on an H1 signal - one leg, its stop, tomorrow's entry - never adds up to it.
+_CHURN_WINDOW = timedelta(hours=2)
+# Rows the churn gate reads out of the journal at a time. One row is written per distinct ticket,
+# so this covers days of a seven-symbol book on a 20-second cycle.
+_CHURN_SCAN_ROWS = 4_000
 
 # Called with the journaled proposal and sizing dicts; only a literal True opens the position.
 Approver = Callable[[Mapping[str, Any], Mapping[str, Any]], Any]
@@ -222,6 +230,10 @@ class MT5Agent:
         # silently dropping the row that the run's final drawdown depends on.
         self.closing_equity_recorded = False
         self.closing_equity_error = ""
+        # Tickets seen open on this symbol, with the moment each was first seen. The durable copy
+        # of this lives in the journal; the local one is what the gate still has when a row could
+        # not be written.
+        self._churn_observations: dict[int, datetime] = {}
 
     @property
     def policy(self) -> AgentPolicy:
@@ -290,9 +302,16 @@ class MT5Agent:
         if isinstance(positions, CycleResult):
             return positions
         assert positions is not None
+        # Recorded before the caps can end the cycle: a leg this run holds is exactly what the
+        # cap gate reports back on, and the churn ledger would never see it.
+        self._record_own_legs(positions, moment)
         cap_blockers = self._position_cap_blockers(positions)
         if cap_blockers:
             return self._finish(codes.STATUS_BLOCKED, cap_blockers, None, None, None, moment,
+                                equity=equity, open_positions=len(positions))
+        churn_blockers = self._churn_blockers(moment)
+        if churn_blockers:
+            return self._finish(codes.STATUS_BLOCKED, churn_blockers, None, None, None, moment,
                                 equity=equity, open_positions=len(positions))
 
         market = self._read_market_data(moment)
@@ -569,6 +588,71 @@ class MT5Agent:
         if any(position.symbol == self._policy.symbol for position in ours):
             blockers.append(codes.SYMBOL_ALREADY_OPEN)
         return tuple(blockers)
+
+    def _record_own_legs(self, positions: list[PositionSnapshot], moment: datetime) -> None:
+        """Journal each of this symbol's legs the first time its ticket is seen.
+
+        The ticket is the fact worth keeping: a position that opens and dies in twenty seconds
+        leaves one row, and the rows are what the churn gate counts after the process that wrote
+        them is gone. A row that cannot be written is not retried - the in-memory observation
+        already happened, so the guard only loses its durability, never its current cycle.
+        """
+        if self._policy.risk.churn_max_legs_per_symbol is None or self._journal is None:
+            return
+        for position in positions:
+            if position.ticket in self._churn_observations:
+                continue
+            if position.symbol != self._policy.symbol or not self._owns(position):
+                continue
+            self._churn_observations[position.ticket] = moment
+            try:
+                self._journal.record(OWN_LEG_EVENT_TYPE, {
+                    "symbol": self._policy.symbol, "ticket": int(position.ticket),
+                    "open_time": position.open_time.isoformat(), "seen_at": moment.isoformat(),
+                    "execution_mode": self._policy.execution_mode, "broker_order_sent": False})
+            except Exception:
+                pass
+
+    def _owns(self, position: PositionSnapshot) -> bool:
+        magic = self._policy.position_magic
+        return magic is None or position.magic is None or position.magic == magic
+
+    def _churn_blockers(self, moment: datetime) -> tuple[str, ...]:
+        """Stand this symbol down while its legs keep being reopened and dying.
+
+        Measured on the shared demo: four FX legs opened 20 seconds apart were flattened by
+        another process 21 seconds later, each for exactly the spread it had just paid, and the
+        next cycle would have opened all four again. Reopening into a book somebody else is
+        closing buys their exit forever, so the count of distinct recent tickets - durable rows
+        plus what this process has seen - is what decides whether the signal is worth a lot.
+        """
+        limit = self._policy.risk.churn_max_legs_per_symbol
+        if limit is None:
+            return ()
+        window_start = moment - _CHURN_WINDOW
+        for ticket in [ticket for ticket, seen in self._churn_observations.items()
+                       if seen < window_start]:
+            del self._churn_observations[ticket]
+        tickets = set(self._churn_observations)
+        if self._journal is not None:
+            for event in self._journal.events(limit=_CHURN_SCAN_ROWS,
+                                              event_type=OWN_LEG_EVENT_TYPE):
+                payload = event.get("payload")
+                if not isinstance(payload, Mapping):
+                    continue
+                if payload.get("symbol") != self._policy.symbol:
+                    continue
+                ticket = payload.get("ticket")
+                if isinstance(ticket, bool) or not isinstance(ticket, int) or ticket <= 0:
+                    continue
+                # A row that declares its observation moment wrongly is counted, not skipped: a
+                # ledger this run can no longer read is not evidence that the legs stopped dying.
+                # Only a row that never carried one falls back to the time it was written.
+                seen_at = payload.get("seen_at")
+                seen = _iso_datetime(seen_at if seen_at is not None else event.get("timestamp"))
+                if seen is None or seen >= window_start:
+                    tickets.add(ticket)
+        return (codes.LEG_CHURN_DETECTED,) if len(tickets) > limit else ()
 
     def _read_market_data(self, moment: datetime) -> tuple[SymbolSpec, Tick, list[MarketBar]] \
             | CycleResult:

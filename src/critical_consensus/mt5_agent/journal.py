@@ -16,6 +16,10 @@ from typing import Any, Mapping
 from ..audit import make_audit_event, verify_audit_chain
 
 EQUITY_EVENT_TYPE = "equity_point"
+# One row per leg this run sees open on its own symbol, written the first time the ticket is
+# seen. The churn gate counts distinct tickets inside its window from this event, so the count
+# survives a restart of the process that wrote it.
+OWN_LEG_EVENT_TYPE = "own_leg_observed"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS audit_events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
