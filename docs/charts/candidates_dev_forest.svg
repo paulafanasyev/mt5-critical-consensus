@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1010" height="328" viewBox="0 0 1010 328" role="img" aria-label="Net R per trade with bootstrap interval, development window">
+<rect width="1010" height="328" fill="#ffffff"/>
+<text x="16" y="26" font-family="sans-serif" font-size="15" fill="#111318">Recorded development run &#8212; net R per trade</text>
+<text x="16" y="44" font-family="sans-serif" font-size="11" fill="#5b6470">dev window 2004-06-11 .. 2019-12-31   confidence 0.9833   10000 bootstrap rounds   seed 20261101   cache 73d4359f901e</text>
+<line x1="277.49" y1="74.00" x2="277.49" y2="270.00" stroke="#d7dce2" stroke-width="1"/>
+<text x="277.49" y="286.00" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5b6470">-0.30</text>
+<line x1="319.69" y1="74.00" x2="319.69" y2="270.00" stroke="#d7dce2" stroke-width="1"/>
+<text x="319.69" y="286.00" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5b6470">-0.25</text>
+<line x1="361.89" y1="74.00" x2="361.89" y2="270.00" stroke="#d7dce2" stroke-width="1"/>
+<text x="361.89" y="286.00" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5b6470">-0.20</text>
+<line x1="404.09" y1="74.00" x2="404.09" y2="270.00" stroke="#d7dce2" stroke-width="1"/>
+<text x="404.09" y="286.00" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5b6470">-0.15</text>
+<line x1="446.29" y1="74.00" x2="446.29" y2="270.00" stroke="#d7dce2" stroke-width="1"/>
+<text x="446.29" y="286.00" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5b6470">-0.10</text>
+<line x1="488.49" y1="74.00" x2="488.49" y2="270.00" stroke="#d7dce2" stroke-width="1"/>
+<text x="488.49" y="286.00" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5b6470">-0.05</text>
+<line x1="530.69" y1="74.00" x2="530.69" y2="270.00" stroke="#d7dce2" stroke-width="1"/>
+<text x="530.69" y="286.00" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5b6470">0.00</text>
+<line x1="572.89" y1="74.00" x2="572.89" y2="270.00" stroke="#d7dce2" stroke-width="1"/>
+<text x="572.89" y="286.00" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5b6470">+0.05</text>
+<line x1="615.09" y1="74.00" x2="615.09" y2="270.00" stroke="#d7dce2" stroke-width="1"/>
+<text x="615.09" y="286.00" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5b6470">+0.10</text>
+<line x1="657.29" y1="74.00" x2="657.29" y2="270.00" stroke="#d7dce2" stroke-width="1"/>
+<text x="657.29" y="286.00" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5b6470">+0.15</text>
+<line x1="699.50" y1="74.00" x2="699.50" y2="270.00" stroke="#d7dce2" stroke-width="1"/>
+<text x="699.50" y="286.00" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5b6470">+0.20</text>
+<line x1="530.69" y1="70.00" x2="530.69" y2="274.00" stroke="#111318" stroke-width="1.5"/>
+<text x="530.69" y="64.00" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#111318">no edge</text>
+<text x="16" y="113.00" font-family="monospace" font-size="12" fill="#111318">c1_inside_breakout</text>
+<text x="16" y="129.00" font-family="sans-serif" font-size="10" fill="#5b6470">221 trades / 164 clusters</text>
+<line x1="421.72" y1="115.00" x2="678.28" y2="115.00" stroke="#1f77b4" stroke-width="2.5"/>
+<line x1="421.72" y1="109.00" x2="421.72" y2="121.00" stroke="#1f77b4" stroke-width="2.5"/>
+<line x1="678.28" y1="109.00" x2="678.28" y2="121.00" stroke="#1f77b4" stroke-width="2.5"/>
+<rect x="545.87" y="110.50" width="9" height="9" fill="#d62728"/>
+<text x="724.00" y="105.00" font-family="monospace" font-size="12" fill="#d62728">+0.0233 R net</text>
+<text x="724.00" y="121.00" font-family="sans-serif" font-size="10" fill="#8c564b">FAIL</text>
+<text x="724.00" y="134.00" font-family="sans-serif" font-size="10" fill="#5b6470">at double cost -0.0570 R</text>
+<text x="724.00" y="147.00" font-family="sans-serif" font-size="10" fill="#5b6470">detectable here: 0.186 R</text>
+<text x="16" y="175.00" font-family="monospace" font-size="12" fill="#111318">c2_ratio_reversion</text>
+<text x="16" y="191.00" font-family="sans-serif" font-size="10" fill="#5b6470">157 trades / 100 clusters</text>
+<line x1="281.72" y1="177.00" x2="561.68" y2="177.00" stroke="#1f77b4" stroke-width="2.5"/>
+<line x1="281.72" y1="171.00" x2="281.72" y2="183.00" stroke="#1f77b4" stroke-width="2.5"/>
+<line x1="561.68" y1="171.00" x2="561.68" y2="183.00" stroke="#1f77b4" stroke-width="2.5"/>
+<rect x="413.78" y="172.50" width="9" height="9" fill="#d62728"/>
+<text x="724.00" y="167.00" font-family="monospace" font-size="12" fill="#d62728">-0.1332 R net</text>
+<text x="724.00" y="183.00" font-family="sans-serif" font-size="10" fill="#8c564b">FAIL</text>
+<text x="724.00" y="196.00" font-family="sans-serif" font-size="10" fill="#5b6470">at double cost -0.1994 R</text>
+<text x="724.00" y="209.00" font-family="sans-serif" font-size="10" fill="#5b6470">detectable here: 0.182 R</text>
+<text x="16" y="237.00" font-family="monospace" font-size="12" fill="#111318">c3_fx_tsmom</text>
+<text x="16" y="253.00" font-family="sans-serif" font-size="10" fill="#5b6470">540 trades / 180 clusters</text>
+<line x1="334.85" y1="239.00" x2="563.51" y2="239.00" stroke="#1f77b4" stroke-width="2.5"/>
+<line x1="334.85" y1="233.00" x2="334.85" y2="245.00" stroke="#1f77b4" stroke-width="2.5"/>
+<line x1="563.51" y1="233.00" x2="563.51" y2="245.00" stroke="#1f77b4" stroke-width="2.5"/>
+<rect x="443.24" y="234.50" width="9" height="9" fill="#d62728"/>
+<text x="724.00" y="229.00" font-family="monospace" font-size="12" fill="#d62728">-0.0983 R net</text>
+<text x="724.00" y="245.00" font-family="sans-serif" font-size="10" fill="#8c564b">FAIL</text>
+<text x="724.00" y="258.00" font-family="sans-serif" font-size="10" fill="#5b6470">at double cost -0.1669 R</text>
+<text x="724.00" y="271.00" font-family="sans-serif" font-size="10" fill="#5b6470">detectable here: 0.209 R</text>
+<text x="250.00" y="316.00" font-family="sans-serif" font-size="10" fill="#5b6470">net R per trade, cluster bootstrap interval; an interval that covers zero is not evidence of an edge</text>
+</svg>

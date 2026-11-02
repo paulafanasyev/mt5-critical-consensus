@@ -39,6 +39,11 @@ failures to find an edge, not failures to gather evidence. All three intervals s
 all three go negative at double cost — the second condition of §8.2 would have failed them even
 if an interval had cleared.
 
+The same table as a picture: `docs/charts/candidates_dev_forest.svg`, drawn by
+`scripts/render_candidate_forest.py` straight from `docs/evidence/candidates_dev_2026_11.json`. It
+recomputes nothing — `tests/test_render_candidate_forest.py` fails if a printed number stops
+matching the evidence file or if the committed chart stops matching a fresh render.
+
 ## Cost sweep (§6, four re-pricings of the same trades)
 
 | Candidate | zero cost | transaction only | base | double |
