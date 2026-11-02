@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -30,6 +31,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LOG = ROOT / "agent_data" / "swarm.jsonl"
 MAGIC_BASE = 8180000
+PARALLEL_MAGIC = 8172026
 EXPECTED_LOGIN = 114929502
 SERVER_OFFSET = 2
 ENTRY_SERVER_HOUR = 0      # Monday 00:00 server = Sunday 22:00 UTC
@@ -199,8 +201,24 @@ SYMBOL_CAP = {"XAUUSD": 0.10, "XAGUSD": 0.06, "EURUSD": 0.07, "GBPUSD": 0.07,
               "NZDUSD": 0.07, "US500": 0.3, "UK100": 0.3, "US30": 0.3, "JPN225": 1.0}
 MAX_DRAWDOWN = 0.01      # close everything if the account loses 1% from the baseline
 PAUSE_SECONDS = 1800
-DOLLAR_STOP = 10.0       # never hold a position that is ten dollars under water
+DOLLAR_STOP = 10.0       # absolute floor: never hold a position ten dollars under water
+STOP_RISK_FRACTION = 0.4 # ...but at least a fraction of the position's own risk
 SCALE_TRIGGER = 15.0     # once a position is fifteen dollars up, add half again
+COOLDOWN_SECONDS = 1800  # after a stop, that symbol rests for half an hour
+KILL_SWITCH = ROOT / "agent_data" / "demo_bridge" / "kill_switch.json"
+
+
+def kill_switch_active() -> bool:
+    """The documented brake, read the way the trading runner reads it.
+
+    A switch that is missing or unreadable counts as armed. The swarm used to answer only to its
+    own state file, so the operator's stop reached the runner and left this process trading.
+    """
+    try:
+        raw = json.loads(KILL_SWITCH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    return raw.get("kill_switch_active") is True
 
 
 def load_state() -> dict:
@@ -223,6 +241,17 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
         return
     baseline = 100_000.0
     state["baseline_equity"] = baseline
+
+    # 0. the shared brake. The account belongs to the person trading it in the terminal, so an
+    # armed switch has to reach this process too; it read only its own state file before, which
+    # is why the documented kill switch stopped the runner and not the swarm. A switch we cannot
+    # read is treated as armed, the same way the trading runner treats a missing one.
+    if kill_switch_active():
+        log({"event": "kill switch armed; swarm idle this cycle"})
+        return
+    # Positions whose magic is not ours belong to the owner or to another agent. This process has
+    # no authority over them and never did: flattening them was the churn the account paid for,
+    # and the account's own manual trading is exactly what the observation order reserves.
     if account.equity < baseline * (1 - MAX_DRAWDOWN):
         log({"event": f"BREAKER: equity {account.equity:.2f} below {baseline:.2f} "
                       f"(-{MAX_DRAWDOWN * 100:.0f}%); flattening the swarm"})
@@ -243,10 +272,18 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
         save_state(state)
         return
 
-    # 1. cut a loser at the dollar level instead of waiting for the ATR stop
+    # 1. cut a loser at the dollar level instead of waiting for the ATR stop.
+    # The threshold scales with the position: ten dollars on a 0.05 lot gold trade is
+    # inside the spread, so the floor alone would stop out every entry instantly.
+    cooldowns = state.setdefault("cooldowns", {})
     survivors = []
     for position in [p for p in (mt5.positions_get() or []) if p.magic in magics]:
-        if position.profit <= -DOLLAR_STOP:
+        info = mt5.symbol_info(position.symbol)
+        contract = info.trade_contract_size if info else 100.0
+        stop_distance = abs(position.price_open - position.sl) if position.sl else 0.0
+        risk_dollars = stop_distance * position.volume * contract
+        threshold = max(DOLLAR_STOP, STOP_RISK_FRACTION * risk_dollars)
+        if position.profit <= -threshold:
             tick = mt5.symbol_info_tick(position.symbol)
             result = mt5.order_send({
                 "action": mt5.TRADE_ACTION_DEAL, "symbol": position.symbol,
@@ -258,8 +295,11 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
                 "type_filling": mt5.ORDER_FILLING_FOK,
                 "comment": "dollar stop"})
             log({"event": f"{position.symbol} ticket {position.ticket}: dollar stop at "
-                          f"{position.profit:+.2f}, retcode "
+                          f"{position.profit:+.2f} (threshold {threshold:.2f}), retcode "
                           f"{None if result is None else result.retcode}"})
+            cooldowns[position.symbol] = time.time() + COOLDOWN_SECONDS
+            state["cooldowns"] = cooldowns
+            save_state(state)
             continue
         survivors.append(position)
 
@@ -374,6 +414,11 @@ def swarm_exposure(symbol: str) -> float:
 
 def open_trade(mt5, spec: dict, side: str, tick, *, stop: float | None,
                take: float | None = None) -> None:
+    cooldown_until = load_state().get("cooldowns", {}).get(spec["symbol"], 0)
+    if cooldown_until > time.time():
+        log({"event": f"{spec['name']} skipped: {spec['symbol']} cooling down "
+                      f"({int(cooldown_until - time.time())}s)"})
+        return
     cap = SYMBOL_CAP.get(spec["symbol"], 0.04)
     if swarm_exposure(spec["symbol"]) + spec["lots"] > cap + 1e-9:
         log({"event": f"{spec['name']} skipped: {spec['symbol']} already at cap {cap}"})
