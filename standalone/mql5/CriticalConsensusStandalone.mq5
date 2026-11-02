@@ -279,34 +279,53 @@ string AgentVerdict(const string agent, const bool agree, const string reason,
 }
 
 bool CertaintyGate(const double &fast[], const double &slow[], const double &rsi[],
-                   const double &atr[], const double atr_avg, string &direction, string &log)
+                   const double &atr[], const double atr_baseline, string &direction, string &log)
 {
-   // Agent 1 — Trend: EMA cross direction.
-   bool up = fast[1] > slow[1];
+   // CopyBuffer static arrays are oldest-first. Compare two completed bars.
+   // A bearish EMA alignment is not a SELL signal if the fast EMA is already turning up.
+   bool up = fast[1] > slow[1] && fast[1] > fast[0] && slow[1] >= slow[0];
+   bool down = fast[1] < slow[1] && fast[1] < fast[0] && slow[1] <= slow[0];
+   if(!up && !down)
+   {
+      direction = "";
+      log = "TrendAgent=VETO (EMA direction/slope not aligned)";
+      Print("CERTAINTY GATE: ", log);
+      return false;
+   }
    direction = up ? "BUY" : "SELL";
-   string v1 = AgentVerdict("TrendAgent", true, "", log);
 
-   // Agent 2 — Momentum (RSI zone): no entries into overbought/oversold extremes.
-   bool rsi_ok = (up && rsi[1] > 45.0 && rsi[1] < 70.0) || (!up && rsi[1] > 30.0 && rsi[1] < 55.0);
-   string v2 = AgentVerdict("MomentumAgent", rsi_ok, "RSI " + DoubleToString(rsi[1], 1), log);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double gap = MathAbs(fast[1] - slow[1]);
+   bool trend_ok = gap >= MathMax(atr[1] * 0.10, point * 3.0);
+   string v1 = AgentVerdict("TrendAgent", trend_ok,
+                            "EMA gap below 0.10 ATR / 3 points", log);
 
-   // Agent 3 — Volatility: ATR must be alive but not exploding.
-   bool atr_ok = atr[1] > 0.00005 && atr[1] < atr_avg * 3.0;
-   string v3 = AgentVerdict("VolatilityAgent", atr_ok, "ATR extreme", log);
+   bool rsi_ok = (up && rsi[1] > 45.0 && rsi[1] < 70.0) ||
+                 (down && rsi[1] > 30.0 && rsi[1] < 55.0);
+   string v2 = AgentVerdict("MomentumAgent", rsi_ok,
+                            "RSI " + DoubleToString(rsi[1], 1), log);
 
-   // Agent 4 — Price action: last closed candle agrees with direction.
+   long spread_points = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   double spread_price = spread_points * point;
+   bool atr_ok = atr[1] > MathMax(point * 5.0, spread_price * 2.0) &&
+                 atr_baseline > 0.0 && atr[1] < atr_baseline * 2.5;
+   string v3 = AgentVerdict("VolatilityAgent", atr_ok,
+                            "ATR too low or abnormal", log);
+
    double open_i = iOpen(_Symbol, PERIOD_CURRENT, 1);
    double close_i = iClose(_Symbol, PERIOD_CURRENT, 1);
-   bool candle_ok = (up && close_i > open_i) || (!up && close_i < open_i);
-   string v4 = AgentVerdict("PriceActionAgent", candle_ok, "candle against direction", log);
+   bool candle_ok = (up && close_i > open_i) || (down && close_i < open_i);
+   string v4 = AgentVerdict("PriceActionAgent", candle_ok,
+                            "last completed candle against direction", log);
 
-   // Agent 5 — Session: skip rollover hours (thin liquidity).
-   MqlDateTime tm; TimeToStruct(TimeCurrent(), tm);
+   MqlDateTime tm;
+   TimeToStruct(TimeCurrent(), tm);
    bool session_ok = !(tm.hour >= 23 || tm.hour < 1);
    string v5 = AgentVerdict("SessionAgent", session_ok, "rollover hours", log);
 
    Print("CERTAINTY GATE: ", log);
-   return (v1 == "APPROVE" && v2 == "APPROVE" && v3 == "APPROVE" && v4 == "APPROVE" && v5 == "APPROVE");
+   return (v1 == "APPROVE" && v2 == "APPROVE" && v3 == "APPROVE" &&
+           v4 == "APPROVE" && v5 == "APPROVE");
 }
 
 //+------------------------------------------------------------------+
