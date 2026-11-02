@@ -553,7 +553,10 @@ closed, `kill_switch.active: true` when the section is absent, and a missing
 the policy or in any of its sections is a load error. `strategy.take_profit_risk_multiple` below
 `risk.min_risk_reward` is rejected as an impossible policy. The policy's `symbol_spec` supplies the
 symbol specification for paper execution and sizing on every source; `--source live` supplies bars
-and the account identity, not the symbol specification.
+and the account identity, not the symbol specification. The demo-execution runner
+(`scripts/run_mt5_demo_trading.py`) goes further: it drops the declared `symbol_spec` for every
+instrument and sizes only from what the terminal reports, because a declaration is a record of one
+measurement taken at one broker, and the terminal is the measurement.
 
 ## Checking it on your own Windows VPS
 
@@ -592,9 +595,11 @@ and the account identity, not the symbol specification.
   (`test_risk_baselines_survive_runner_restart_and_are_scoped_to_the_broker_account`).
 - Instruments whose profit is paid in a currency other than the account currency drop out of a
   live run: on a USD account `SymbolSpec.from_terminal` refuses USDJPY, USDCAD, USDCHF and EURGBP,
-  and the running all-universe pass journals them as `demo_symbol_unavailable` - 8 of the 13
-  instruments trade (this terminal serves no BTCUSD or NAS100 at all). The refusal is not paranoia:
-  a cross's lot size is `contract_size` re-expressed through the quote currency's rate, so it moves
+  and the running all-universe pass journals them as `demo_symbol_unavailable` - 7 of the 13
+  instruments reach trading (EURUSD, GBPUSD, AUDUSD, NZDUSD, XAUUSD, XAGUSD, US500, each with its
+  own cycles in the journal; this terminal serves no BTCUSD or NAS100 at all). The refusal is not
+  paranoia: a cross's lot size is `contract_size` re-expressed through the quote currency's rate,
+  so it moves
   with the pair. Measured on MetaQuotes-Demo 2026-11-02, the tick pair gives USDJPY 633.60 $ per
   price unit where `order_calc_profit` over one tick says 0.63 $ (630.00 per unit), USDCAD 71 567.62
   against 72 000 and USDCHF 121 228.29 against 121 000 - for crosses the broker's tick fields really

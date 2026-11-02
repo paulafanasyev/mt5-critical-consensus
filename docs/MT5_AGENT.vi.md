@@ -540,7 +540,9 @@ không phải mặc định UTC ngầm. Khoá lạ trong chính sách hoặc tro
 `strategy.take_profit_risk_multiple` thấp hơn `risk.min_risk_reward` bị từ chối như một chính sách
 bất khả thi. `symbol_spec` trong chính sách cung cấp đặc tả symbol cho việc mô phỏng và tính khối
 lượng ở mọi nguồn; `--source live` cung cấp nến và danh tính tài khoản, không cung cấp đặc tả
-symbol.
+symbol. Vòng chạy demo-execution (`scripts/run_mt5_demo_trading.py`) đi xa hơn: nó bỏ luôn
+`symbol_spec` đã khai cho mọi công cụ và chỉ tính khối lượng theo dữ liệu terminal báo về, vì một
+khai báo chỉ là bản ghi của một phép đo tại một broker, còn terminal mới là phép đo.
 
 ## Cách kiểm tra trên Windows VPS của bạn
 
@@ -579,9 +581,10 @@ symbol.
   (`test_risk_baselines_survive_runner_restart_and_are_scoped_to_the_broker_account`).
 - Các công cụ trả lợi nhuận bằng tiền tệ khác tiền tệ tài khoản bị loại khỏi phiên live: trên tài
   khoản USD, `SymbolSpec.from_terminal` từ chối USDJPY, USDCAD, USDCHF và EURGBP, và vòng
-  all-universe đang chạy ghi nhật ký chúng là `demo_symbol_unavailable` — nghĩa là chỉ 8 trong 13
-  công cụ được giao dịch (terminal này không cung cấp BTCUSD và NAS100). Lời từ chối không phải là
-  sự thận dư: kích thước lot của một cặp cross là `contract_size` quy đổi qua tỷ giá của tiền tệ
+  all-universe đang chạy ghi nhật ký chúng là `demo_symbol_unavailable` — nghĩa là chỉ 7 trong 13
+  công cụ đi tới được phiên giao dịch (EURUSD, GBPUSD, AUDUSD, NZDUSD, XAUUSD, XAGUSD, US500, mỗi
+  mã có vòng riêng trong nhật ký; terminal này không cung cấp BTCUSD và NAS100). Lời từ chối không
+  phải là thái quá: kích thước lot của một cặp cross là `contract_size` quy đổi qua tỷ giá của tiền tệ
   yết giá, nên nó thay đổi theo cặp. Đo trên MetaQuotes-Demo ngày 2026-11-02: cặp tick cho USDJPY
   633,60 $ mỗi bước giá, còn `order_calc_profit` trên một tick cho 0,63 $ (630,00 mỗi bước giá),
   USDCAD 71.567,62 so với 72.000 và USDCHF 121.228,29 so với 121.000 — với cặp cross, các trường

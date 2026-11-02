@@ -38,7 +38,15 @@ risk:
   # 0.0002 fraction this run started with sizes a ~20 $ budget, which no legal lot fits, so
   # metals would be refused outright; 0.0005 is the smallest fraction the contract allows.
   risk_per_trade_fraction: 0.0005
-  max_open_positions: 1
+  # One position per instrument, so the universe can actually be in trades at the same time.
+  # With 1, the single gold position taken at the open froze the whole run: every other symbol
+  # came back POSITION_CAP_REACHED for the rest of the day, which makes "all-universe" a name
+  # and not a state. 7 is what this account reaches (the journal gives a cycle to EURUSD,
+  # GBPUSD, AUDUSD, NZDUSD, XAUUSD, XAGUSD, US500 and nothing else). Worst-case stop risk is
+  # 7 x 0.0005 = 0.0035 of equity, still well inside max_daily_loss_fraction, which is the
+  # relation policy validation refuses to let a policy break. SYMBOL_ALREADY_OPEN is unchanged,
+  # so this raises how many instruments are in, never how many times the same one is.
+  max_open_positions: 7
   max_daily_loss_fraction: 0.02
   max_drawdown_fraction: 0.06
   min_risk_reward: 1.5
