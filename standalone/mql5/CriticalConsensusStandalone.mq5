@@ -586,9 +586,14 @@ int OnInit()
       Print("WARNING: this is NOT a demo account. The EA will refuse to trade.");
    if(StringLen(TelegramToken) == 0)
       Print("WARNING: TelegramToken is empty — confirmation mode cannot ask; autonomous will only log.");
-   if(WorkMode == MODE_CONFIRMATION && LotSize > MaxAutonomousLot)
-      Print("NOTE: LotSize ", DoubleToString(LotSize, 2), " > autonomous cap ",
-            DoubleToString(MaxAutonomousLot, 2), " — autonomous mode would block this size.");
+   if(SlPips <= 0 || TakeProfitPips < 0 || BreakEvenAfterPips <= 0 ||
+      TrailStartPips < BreakEvenAfterPips || TrailDistancePips <= 0 ||
+      (UseRiskBasedSizing && (RiskPercentPerTrade <= 0.0 || RiskPercentPerTrade > 1.0)) ||
+      (!UseRiskBasedSizing && LotSize <= 0.0))
+   {
+      Print("BLOCKED: invalid stop, trailing or risk-sizing inputs.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
 
    hFastMa = iMA(_Symbol, PERIOD_CURRENT, FastMaPeriod, 0, MODE_EMA, PRICE_CLOSE);
    hSlowMa = iMA(_Symbol, PERIOD_CURRENT, SlowMaPeriod, 0, MODE_EMA, PRICE_CLOSE);
@@ -615,12 +620,15 @@ void OnDeinit(const int reason)
 
 void OnTick()
 {
+   // Exit protection must run on every tick, including while the bar is forming.
+   ManageOpenPositions();
+
    datetime bar_time = iTime(_Symbol, PERIOD_CURRENT, 0);
-   if(bar_time == last_bar_time) return;   // evaluate once per bar
+   if(bar_time == last_bar_time) return;
    last_bar_time = bar_time;
 
-   if(pending_active) return;              // one pending confirmation at a time
-   if(PositionsTotal() > 0) return;        // one position at a time
+   if(pending_active) return;
+   if(PositionsTotal() > 0) return;
 
    double fast[3], slow[3], rsi[3], atr[3];
    if(CopyBuffer(hFastMa, 0, 0, 3, fast) < 3) return;
@@ -628,9 +636,8 @@ void OnTick()
    if(CopyBuffer(hRsi, 0, 0, 3, rsi) < 3) return;
    if(CopyBuffer(hAtr, 0, 0, 3, atr) < 3) return;
 
-   double atr_sum = 0.0;
-   for(int i = 1; i <= 2; i++) atr_sum += atr[i];
-   HandleSignal(fast, slow, rsi, atr, atr_sum / 2.0);
+   // Index 0 is the older completed candle; index 1 is the latest completed candle.
+   HandleSignal(fast, slow, rsi, atr, atr[0]);
 }
 
 void OnTimer()
