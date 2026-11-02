@@ -12,3 +12,5 @@ htmlcov/
 .env.*.local
 *.log
 agent_data/
+# Terminal screenshots show the account holder's name and every login in the Navigator.
+docs/evidence/mt5_*.png
