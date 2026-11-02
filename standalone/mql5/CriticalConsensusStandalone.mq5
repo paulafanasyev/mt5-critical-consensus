@@ -22,22 +22,79 @@ enum WorkModeEnum { MODE_CONFIRMATION = 0, MODE_AUTONOMOUS = 1 };
 input WorkModeEnum WorkMode          = MODE_CONFIRMATION; // Work mode: confirmation or autonomous
 input string TelegramToken         = "";            // Telegram bot token from @BotFather
 input string TelegramChatID        = "";            // Chat ID (leave empty: auto-detected after you /start the bot)
-input double LotSize               = 0.01;          // Lot size (demo)
+input double LotSize               = 0.01;          // Fixed lot only when risk sizing is disabled
+input bool   UseRiskBasedSizing    = true;          // Size from equity and stop distance
+input double RiskPercentPerTrade   = 0.50;          // Planned stop loss as % of equity; hard cap 1%
 input double MaxAutonomousLot      = 0.05;          // Autonomous mode lot cap
-input int    SlPips                = 50;            // Stop loss, pips
-input int    TpPips                = 100;           // Take profit, pips
+input int    SlPips                = 20;            // Initial stop loss, true pips (not points)
+input int    TakeProfitPips        = 0;             // 0 = no fixed TP; trailing stop manages exit
+input int    BreakEvenAfterPips    = 10;            // Move SL beyond entry after favourable move
+input int    TrailStartPips        = 20;            // Start trailing after favourable move
+input int    TrailDistancePips     = 10;            // Keep SL this far behind market
 input int    MaxTradesPerDay       = 3;             // Max trades per day (demo safety)
 input int    MaxSpreadPoints       = 30;            // Max spread, points
 input int    FastMaPeriod          = 12;            // Trend agent: fast EMA
 input int    SlowMaPeriod          = 26;            // Trend agent: slow EMA
 input int    RsiPeriod             = 14;            // Momentum agent: RSI period
 input int    AtrPeriod             = 14;            // Volatility agent: ATR period
-input double ConfidenceThreshold   = 0.98;          // Certainty threshold (conjunction of agents)
 input long   MagicNumber           = 8172027;       // Magic number
 input int    ApprovalTimeoutMin    = 5;             // Confirmation mode: approval timeout, minutes
 
 //--- indicator handles
 int hFastMa = INVALID_HANDLE, hSlowMa = INVALID_HANDLE, hRsi = INVALID_HANDLE, hAtr = INVALID_HANDLE;
+
+// MT5 quotes use points; on 5/3-digit FX symbols one pip is 10 points.
+double PipSize()
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   if(point <= 0.0) return 0.0;
+   return point * ((digits == 3 || digits == 5) ? 10.0 : 1.0);
+}
+
+int VolumeDigits(const double step)
+{
+   for(int digits = 0; digits <= 8; digits++)
+      if(MathAbs(NormalizeDouble(step, digits) - step) < 0.00000001)
+         return digits;
+   return 8;
+}
+
+double CalculateOrderVolume(const double stop_distance, string &reason)
+{
+   if(!UseRiskBasedSizing) return LotSize;
+   if(RiskPercentPerTrade <= 0.0 || RiskPercentPerTrade > 1.0)
+   { reason = "risk percent must be > 0 and <= 1.0"; return 0.0; }
+
+   double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE_LOSS);
+   if(tick_value <= 0.0) tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double minvol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxvol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+
+   if(stop_distance <= 0.0 || tick_size <= 0.0 || tick_value <= 0.0 ||
+      step <= 0.0 || minvol <= 0.0 || maxvol < minvol || equity <= 0.0)
+   { reason = "invalid broker tick/volume specification or equity"; return 0.0; }
+
+   double loss_per_lot = (stop_distance / tick_size) * tick_value;
+   double risk_budget = equity * RiskPercentPerTrade / 100.0;
+   if(loss_per_lot <= 0.0 || risk_budget <= 0.0)
+   { reason = "invalid calculated risk budget"; return 0.0; }
+
+   double raw_volume = risk_budget / loss_per_lot;
+   double volume = MathFloor(raw_volume / step + 0.000000001) * step;
+   if(volume < minvol - step * 0.000001)
+   { reason = "risk budget is below broker minimum lot; trade refused"; return 0.0; }
+   if(volume > maxvol) volume = maxvol;
+   volume = NormalizeDouble(volume, VolumeDigits(step));
+
+   if(volume < minvol || volume > maxvol ||
+      MathAbs(volume / step - MathRound(volume / step)) > 0.000001)
+   { reason = "risk-sized volume violates broker constraints"; return 0.0; }
+   return volume;
+}
 
 //--- telegram state
 string bot_username = "";
