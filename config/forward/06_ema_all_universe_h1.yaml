@@ -44,10 +44,17 @@ symbol_spec:
   stops_level_points: 0
 
 risk:
-  # The smallest sendable gold lot (0.01) at a 2x-ATR stop costs 44.8 $ on this broker. The
-  # 0.0002 fraction this run started with sizes a ~20 $ budget, which no legal lot fits, so
-  # metals would be refused outright; 0.0005 is the smallest fraction the contract allows.
-  risk_per_trade_fraction: 0.0005
+  # The smallest sendable gold lot (0.01) at a 2x-ATR stop costs 44.8 $ on this broker, so no
+  # fraction below ~0.0005 can size a metal at all. That is why this run started at the floor and
+  # not at a risk budget. Measured at the floor, the six legs the account actually filled carried
+  # 195 $ of stop risk between them - 0.195% of equity, and a 2R wave worth ~390 $ - because the
+  # four FX pairs are clipped to the 0.20-lot ceiling the executor enforces and cannot be grown
+  # from here. 0.002 keeps the same per-leg discipline at a number the contract allows: the FX
+  # legs stay where the ceiling puts them (44, 45, 32, 31 $) and the metals go from 34 $ and 38 $
+  # to ~171 $ and ~191 $ at 0.05 lots, which is still under the ceiling. Worst-case aggregate
+  # stop risk is 7 x 0.002 = 1.4% of equity, inside max_daily_loss_fraction, the relation policy
+  # validation refuses to let a policy break.
+  risk_per_trade_fraction: 0.002
   # One position per instrument, so the universe can actually be in trades at the same time.
   # With 1, the single gold position taken at the open froze the whole run: every other symbol
   # came back POSITION_CAP_REACHED for the rest of the day, which makes "all-universe" a name
