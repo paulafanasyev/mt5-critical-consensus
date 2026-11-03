@@ -26,7 +26,7 @@ LOG = ROOT / "agent_data" / "real_mirror.jsonl"
 STATE = ROOT / "agent_data" / "real_mirror_state.json"
 DEMO_MAGIC_FLOOR = 8180000
 REAL_MAGIC = 8272026
-DEMO_TERMINAL = r"C:\Program Files\MetaTrader 5\terminal64.exe"
+DEMO_TERMINAL = r"C:\mt5-exness\terminal64.exe"
 
 
 def log(event: dict) -> None:

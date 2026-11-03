@@ -31,7 +31,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LOG = ROOT / "agent_data" / "swarm.jsonl"
 MAGIC_BASE = 8180000
-DEMO_TERMINAL = r"C:\Program Files\MetaTrader 5\terminal64.exe"
+DEMO_TERMINAL = r"C:\mt5-exness\terminal64.exe"
 DESK_MAGIC = 8189999   # the lead's own hand-placed trades: watched, never re-entered by an agent
 PARALLEL_MAGIC = 8172026
 EXPECTED_LOGIN = 114929502
