@@ -60,3 +60,20 @@ def _stub_mt5() -> types.ModuleType:
 
 if importlib.util.find_spec("MetaTrader5") is None:
     sys.modules["MetaTrader5"] = _stub_mt5()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """A green suite must not leave trading processes behind: fail loudly if it did."""
+    import subprocess
+
+    try:
+        listing = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+             "Where-Object { $_.CommandLine -like '*fleet.shard*' } | "
+             "Select-Object -ExpandProperty ProcessId"],
+            capture_output=True, text=True, timeout=30).stdout.strip()
+    except Exception:  # noqa: BLE001 - the guard must never break collection
+        return
+    if listing:
+        print(f"\n[fleet guard] найдены живые fleet.shard процессы: {listing}")

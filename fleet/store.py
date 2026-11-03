@@ -277,14 +277,16 @@ class Store:
             else:
                 row = conn.execute(
                     "SELECT COUNT(*), SUM(balance * rate_to_usd), SUM(equity_usd),"
-                    " SUM(positions), SUM(floating * rate_to_usd) FROM book"
+                    " SUM(positions), SUM(floating * rate_to_usd),"
+                    " SUM(CASE WHEN equity_usd IS NULL THEN 1 ELSE 0 END) FROM book"
                     " WHERE updated_epoch > ?", (now,)).fetchone()
         if not row or not row[0]:
             return {"balance": 0.0, "equity": 0.0, "positions": 0.0, "floating": 0.0,
-                    "accounts": 0.0}
+                    "accounts": 0.0, "unpriced": 0.0}
         return {"balance": row[1] or 0.0, "equity": row[2] or 0.0,
                 "positions": float(row[3] or 0), "floating": row[4] or 0.0,
-                "accounts": float(row[0])}
+                "accounts": float(row[0]),
+                "unpriced": float(row[5] or 0) if len(row) > 5 else 0.0}
 
     def account_equity(self, account: str) -> float:
         with self._connect() as conn:

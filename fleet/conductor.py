@@ -136,6 +136,9 @@ class Conductor:
         book_stop = self.store.portfolio([a.name for a in self.config.enabled()],
                                          fresh_only=False)
         self._remember_baseline(book)
+        if book_stop.get("unpriced", 0) > 0:
+            self.store.event("conductor", "unpriced_accounts",
+                             count=book_stop["unpriced"])
         reason = self._portfolio_stop(book_stop)
         if reason and not PAUSE_FILE.exists():
             PAUSE_FILE.write_text(reason, encoding="utf-8")

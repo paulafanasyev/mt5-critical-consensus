@@ -135,9 +135,30 @@ def _check_keys(where: str, data: dict[str, Any], allowed: set[str]) -> None:
                           f"допустимые: {sorted(allowed)}")
 
 
+def _coerce(value: Any, kind: type, where: str) -> Any:
+    if isinstance(value, bool) and kind in (int, float):
+        raise ConfigError(f"{where}: ожидалось число, получено {value!r}")
+    try:
+        return kind(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{where}: ожидалось {kind.__name__}, получено {value!r}") from exc
+
+
+def _typed(data: dict[str, Any], where: str, fields: dict[str, type]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in data.items():
+        out[key] = _coerce(value, fields[key], f"{where}.{key}")
+    return out
+
+
 def _risk(data: dict[str, Any], where: str) -> RiskProfile:
     _check_keys(where, data, _RISK_KEYS)
-    return RiskProfile(**data)
+    kinds = {f.name: (int if f.type in ("int", "bool") else float)
+             for f in dataclasses.fields(RiskProfile)}
+    kinds["max_hold_minutes"] = int
+    kinds["max_open_positions"] = int
+    kinds["max_spread_points"] = int
+    return RiskProfile(**_typed(data, where, kinds))
 
 
 def _strategy(data: dict[str, Any], where: str) -> StrategyProfile:
@@ -146,6 +167,12 @@ def _strategy(data: dict[str, Any], where: str) -> StrategyProfile:
     for key in ("kinds", "timeframes"):
         if key in cleaned:
             cleaned[key] = tuple(cleaned[key])
+    for key in ("min_atr_pct",):
+        if key in cleaned:
+            cleaned[key] = _coerce(cleaned[key], float, f"{where}.{key}")
+    for key in ("max_positions_per_symbol", "cooldown_minutes"):
+        if key in cleaned:
+            cleaned[key] = _coerce(cleaned[key], int, f"{where}.{key}")
     return StrategyProfile(**cleaned)
 
 
@@ -204,7 +231,10 @@ def load(path: pathlib.Path | None = None) -> FleetConfig:
     accounts = [account_from_dict(item) for item in items]
     portfolio_data = data.get("portfolio", {})
     _check_keys("portfolio", portfolio_data, _PORTFOLIO_KEYS)
-    portfolio = PortfolioLimits(**portfolio_data)
+    portfolio = PortfolioLimits(**_typed(
+        portfolio_data, "portfolio",
+        {f.name: (int if f.type in ("int", "bool") else float)
+         for f in dataclasses.fields(PortfolioLimits)}))
     config = FleetConfig(accounts=accounts, portfolio=portfolio)
     _validate_uniqueness(config)
     return config

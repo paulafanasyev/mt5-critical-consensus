@@ -346,6 +346,8 @@ def test_portfolio_stop_alarms_on_an_incomplete_book(tmp_path, monkeypatch) -> N
     monkeypatch.setattr(conductor, "PAUSE_FILE", tmp_path / "PAUSE")
     monkeypatch.setattr(conductor, "STATE_FILE", tmp_path / "state.json")
     monkeypatch.setattr(conductor.terminals, "stop_other_fleet", lambda *a, **k: None)
+    monkeypatch.setattr(conductor.subprocess, "Popen",
+                        lambda command, **kwargs: _record([], command))
     store = Store(tmp_path / "book.sqlite")
     accounts = [Account(name="a", login=1, server="S", mode="demo"),
                 Account(name="b", login=2, server="S", mode="demo")]
