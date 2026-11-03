@@ -1,5 +1,7 @@
 # Keep the trading stack alive without anyone watching: if a piece is missing, start it.
-# Registered as a Windows scheduled task, it runs every five minutes around the clock.
+# Registered as a Windows scheduled task, it runs every minute around the clock.
+# The demo account lives in the portable copy C:\mt5-exness; the real account lives in
+# C:\mt5-real and is never started by this script — a human logs it in deliberately.
 $ErrorActionPreference = "SilentlyContinue"
 $root = "C:\Users\Administrator\Documents\Qoder\2026-10-30\c3d543b8\repo"
 $python = Join-Path $root ".venv\Scripts\python.exe"
@@ -10,10 +12,11 @@ function Write-Log([string]$message) {
     Add-Content -Path $log -Value "[$time] $message" -Encoding utf8
 }
 
-$terminal = Get-Process terminal64 -ErrorAction SilentlyContinue
-if (-not $terminal) {
-    Start-Process -FilePath "C:\Program Files\MetaTrader 5\terminal64.exe" -ArgumentList "/config:C:\mt5-start-demo.ini"
-    Write-Log "terminal was down, started (WebRequest may need re-ticking)"
+$demoTerminal = Get-CimInstance Win32_Process -Filter "Name='terminal64.exe'" |
+    Where-Object { $_.CommandLine -like "*mt5-exness*" }
+if (-not $demoTerminal) {
+    Start-Process -FilePath "C:\mt5-exness\terminal64.exe" -ArgumentList "/portable"
+    Write-Log "demo terminal was down, started C:\mt5-exness"
 }
 
 $swarm = Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
@@ -38,4 +41,4 @@ if (-not $supervisor) {
     Write-Log "supervisor was down, started"
 }
 
-Write-Log ("alive: terminal=" + [bool]$terminal + " swarm=" + [bool]$swarm + " supervisor=" + [bool]$supervisor)
+Write-Log ("alive: demo_terminal=" + [bool]$demoTerminal + " swarm=" + [bool]$swarm + " supervisor=" + [bool]$supervisor)
