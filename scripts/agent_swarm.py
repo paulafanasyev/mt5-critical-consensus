@@ -456,27 +456,6 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
         # gives back the larger of five dollars and two fifths of its peak, instead of waiting
         # for it to turn into a loss. The breakeven stop is the last line, this is the first.
         giveback_floor = peak - max(5.0, 0.40 * peak)
-        # bank half at the peak and let the rest work: a 0.02 lot or larger position is split,
-        # anything smaller has to choose one exit and keeps the giveback rule below
-        partial = state.setdefault("partial_done", {})
-        if position.volume >= 0.02 and key not in partial:
-            half = round(position.volume / 2, 2)
-            tick = mt5.symbol_info_tick(position.symbol)
-            result = mt5.order_send({
-                "action": mt5.TRADE_ACTION_DEAL, "symbol": position.symbol,
-                "volume": half,
-                "type": mt5.ORDER_TYPE_SELL if position.type == 0 else mt5.ORDER_TYPE_BUY,
-                "position": position.ticket,
-                "price": tick.bid if position.type == 0 else tick.ask,
-                "deviation": 30, "magic": position.magic,
-                "type_filling": mt5.ORDER_FILLING_FOK,
-                "comment": "partial at peak"})
-            if result is not None and result.retcode == 10009:
-                partial[key] = True
-                state["partial_done"] = partial
-                save_state(state)
-                log({"event": f"{position.symbol} ticket {position.ticket}: peak {peak:+.2f}, "
-                              f"banked {half} of {position.volume + half}"})
         if position.profit <= max(1.0, giveback_floor):
             tick = mt5.symbol_info_tick(position.symbol)
             result = mt5.order_send({
