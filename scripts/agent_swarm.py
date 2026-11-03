@@ -533,16 +533,25 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
         if ticket in current:
             continue
         comment = ""
+        last_price = 0.0
+        last_side = "BUY"
         try:
             deals = mt5.history_deals_get(position=int(ticket)) or []
             if deals:
                 comment = (deals[-1].comment or "").strip()
+                last_price = float(deals[-1].price)
+                # a closing deal is a sell when the position was long
+                last_side = "BUY" if deals[-1].type == 1 else "SELL"
         except Exception:  # noqa: BLE001 - history is a nicety, never a reason to crash
             pass
         if comment not in our_comments:
             cooldowns = state.setdefault("cooldowns", {})
             cooldowns[symbol] = max(cooldowns.get(symbol, 0.0), time.time() + 300)
             state["cooldowns"] = cooldowns
+            barriers = state.setdefault("operator_barrier", {})
+            barriers[symbol] = {"price": last_price, "side": last_side,
+                                "time": time.time()}
+            state["operator_barrier"] = barriers
             log({"event": f"{symbol} ticket {ticket}: closed by the operator "
                           f"(deal comment '{comment}'); symbol rests 5 minutes"})
     state["open_tickets"] = current
@@ -646,8 +655,41 @@ def peak_rejection(mt5, position) -> bool:
     return made_low and last["c"] > last["o"] and last["c"] > bars[-2]["c"]
 
 
+def blocked_by_operator_barrier(mt5, spec: dict, side: str, tick) -> bool:
+    """After a manual close, wait until the move proves itself past the exit price."""
+    state_now = load_state()
+    barrier = (state_now.get("operator_barrier") or {}).get(spec["symbol"])
+    if not barrier:
+        return False
+    if time.time() - barrier.get("time", 0) > 4 * 3600:
+        return False
+    rates = mt5.copy_rates_from_pos(spec["symbol"], mt5.TIMEFRAME_H1, 1, 40)
+    if rates is None or len(rates) < 20:
+        return False
+    closes = [float(r["close"]) for r in rates]
+    highs = [float(r["high"]) for r in rates]
+    lows = [float(r["low"]) for r in rates]
+    ranges = [max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]),
+                  abs(lows[i] - closes[i - 1])) for i in range(1, len(closes))]
+    atr = sum(ranges[-14:]) / 14
+    buffer = 0.25 * atr
+    price = tick.ask if side == "BUY" else tick.bid
+    exit_price = float(barrier.get("price") or 0.0)
+    if side == "BUY" and price < exit_price + buffer:
+        log({"event": f"{spec['name']} skipped: {spec['symbol']} has not cleared the "
+                      f"manual exit {exit_price:.5f} (needs {exit_price + buffer:.5f})"})
+        return True
+    if side == "SELL" and price > exit_price - buffer:
+        log({"event": f"{spec['name']} skipped: {spec['symbol']} has not cleared the "
+                      f"manual exit {exit_price:.5f} (needs {exit_price - buffer:.5f})"})
+        return True
+    return False
+
+
 def open_trade(mt5, spec: dict, side: str, tick, *, stop: float | None,
                take: float | None = None) -> None:
+    if blocked_by_operator_barrier(mt5, spec, side, tick):
+        return
     # a signal at the average itself is a coin flip: require the price to stand clear of the
     # fast average by a quarter of an ATR before the trade is taken
     if not trend_clear_of_fast_average(mt5, spec["symbol"], side):
