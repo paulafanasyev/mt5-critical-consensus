@@ -26,6 +26,7 @@ SWARM = ROOT / "scripts" / "agent_swarm.py"
 PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 MAGIC_FLOOR = 8180000
 MAGIC_BASE = 8180000
+DEMO_TERMINAL = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 DESK_MAGIC = 8189999  # hand-placed by the lead, not an orphan
 MAX_DRAWDOWN = 0.01
 KILL_SWITCH = ROOT / "agent_data" / "demo_bridge" / "kill_switch.json"
@@ -71,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--interval-sec", type=int, default=300)
     args = parser.parse_args(argv)
-    if not mt5.initialize():
+    if not mt5.initialize(path=DEMO_TERMINAL):
         raise SystemExit("MetaTrader5.initialize failed")
 
     while True:

@@ -26,6 +26,7 @@ LOG = ROOT / "agent_data" / "real_mirror.jsonl"
 STATE = ROOT / "agent_data" / "real_mirror_state.json"
 DEMO_MAGIC_FLOOR = 8180000
 REAL_MAGIC = 8272026
+DEMO_TERMINAL = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 
 
 def log(event: dict) -> None:
@@ -100,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
     while True:
         try:
             # --- 1. the demo laboratory ---
-            if not mt5.initialize():
+            if not mt5.initialize(path=DEMO_TERMINAL):
                 log({"event": "demo terminal unavailable, retry"})
                 time.sleep(args.interval_sec)
                 continue

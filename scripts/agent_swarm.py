@@ -31,6 +31,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LOG = ROOT / "agent_data" / "swarm.jsonl"
 MAGIC_BASE = 8180000
+DEMO_TERMINAL = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 DESK_MAGIC = 8189999   # the lead's own hand-placed trades: watched, never re-entered by an agent
 PARALLEL_MAGIC = 8172026
 EXPECTED_LOGIN = 114929502
@@ -716,7 +717,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--interval-sec", type=int, default=30)
     args = parser.parse_args(argv)
-    if not mt5.initialize():
+    if not mt5.initialize(path=DEMO_TERMINAL):
         raise SystemExit("MetaTrader5.initialize failed")
     account = mt5.account_info()
     if account is None or account.login != EXPECTED_LOGIN:
