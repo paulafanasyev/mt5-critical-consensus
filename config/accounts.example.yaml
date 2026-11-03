@@ -1,0 +1,77 @@
+# Реестр торговых счетов парка. Копируется в config/accounts.yaml и правится под себя.
+# Пароли НЕ хранятся здесь: только имя переменной окружения (password_env).
+#
+# Поля счёта:
+#   name          уникальное имя (используется в логах и статусе)
+#   login/server  номер счёта и сервер ровно как в MT5
+#   mode          demo | real
+#   enabled       false — счёт игнорируется
+#   network       direct | vpn   (vpn — брокер блокируется в текущей сети)
+#   symbols       список базовых имён; брокерские суффиксы подставляются автоматически
+#   shard         номер шарда (группы процессов дирижёра)
+#   magic         метка сделок этого счёта
+#   password_env  имя переменной окружения с паролем (для авто-входа)
+
+accounts:
+  - name: demo-metaquotes
+    login: 114929502
+    server: MetaQuotes-Demo
+    mode: demo
+    enabled: true
+    network: direct
+    shard: 0
+    magic: 7000001
+    seed_config: C:\mt5-team\config
+    symbols: [EURUSD, GBPUSD, USDJPY, XAUUSD]
+    strategy:
+      kinds: [trend]
+      timeframes: [H1, H4]
+    risk:
+      risk_per_trade_pct: 0.25
+      daily_stop_pct: 1.0
+      max_open_positions: 3
+      max_lots: 0.10
+
+  - name: exness-real
+    login: 276261159
+    server: Exness-MT5Real26
+    mode: real
+    enabled: false
+    network: vpn
+    shard: 1
+    magic: 7000002
+    password_env: EXNESS_REAL_PASSWORD
+    seed_config: C:\mt5-exness\config
+    symbols: [GBPUSD, EURUSD, XAUUSD]
+    strategy:
+      kinds: [trend]
+      timeframes: [H1, H4]
+    risk:
+      risk_per_trade_pct: 0.20
+      daily_stop_pct: 0.50
+      max_open_positions: 2
+      max_lots: 0.01
+      stop_atr: 1.8
+      take_atr: 2.2
+
+  - name: gtc-real
+    login: 52183174
+    server: GTCGlobalSA-Server 2
+    mode: real
+    enabled: false
+    network: direct
+    shard: 2
+    magic: 7000003
+    symbols: [EURUSD, GBPUSD]
+    risk:
+      risk_per_trade_pct: 0.20
+      daily_stop_pct: 0.50
+      max_lots: 0.01
+
+portfolio:
+  max_total_risk_pct: 2.0
+  max_gold_lots: 0.30
+  max_usd_lots: 1.00
+  max_open_positions: 60
+  daily_stop_pct: 2.0
+  max_worker_processes: 4
