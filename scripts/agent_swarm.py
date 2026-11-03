@@ -31,6 +31,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LOG = ROOT / "agent_data" / "swarm.jsonl"
 MAGIC_BASE = 8180000
+DESK_MAGIC = 8189999   # the lead's own hand-placed trades: watched, never re-entered by an agent
 PARALLEL_MAGIC = 8172026
 EXPECTED_LOGIN = 114929502
 SERVER_OFFSET = 2
@@ -108,7 +109,7 @@ for index, item in enumerate(AGENTS):
 _duplicates = len(AGENTS) - len({item["magic"] for item in AGENTS})
 if _duplicates:
     raise SystemExit(f"magic collision between agents: {_duplicates} duplicates")
-MAGIC_SET = {item["magic"] for item in AGENTS}
+MAGIC_SET = {item["magic"] for item in AGENTS} | {DESK_MAGIC}
 AGENT_BY_MAGIC = {item["magic"]: item for item in AGENTS}
 
 

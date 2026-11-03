@@ -26,6 +26,7 @@ SWARM = ROOT / "scripts" / "agent_swarm.py"
 PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 MAGIC_FLOOR = 8180000
 MAGIC_BASE = 8180000
+DESK_MAGIC = 8189999  # hand-placed by the lead, not an orphan
 MAX_DRAWDOWN = 0.01
 KILL_SWITCH = ROOT / "agent_data" / "demo_bridge" / "kill_switch.json"
 
@@ -119,6 +120,8 @@ def main(argv: list[str] | None = None) -> int:
                     if MAGIC_BASE + (_zlib.crc32(candidate.encode()) % 5000) == position.magic:
                         name = candidate
                         break
+                if position.magic == DESK_MAGIC:
+                    continue
                 if name is None or symbol_by_name.get(name) != position.symbol:
                     tick = mt5.symbol_info_tick(position.symbol)
                     mt5.order_send({"action": mt5.TRADE_ACTION_DEAL,
