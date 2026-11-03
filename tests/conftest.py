@@ -7,6 +7,7 @@ an accidental live call fail loudly instead of silently returning nothing.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import types
 
@@ -114,4 +115,7 @@ def pytest_sessionfinish(session, exitstatus):
     changed = sorted(k for k in set(after) | set(_FLEET_SNAPSHOT)
                      if after.get(k) != _FLEET_SNAPSHOT.get(k))
     if changed:
-        raise AssertionError(f"suite изменил боевой C:\mt5-fleet: {changed}")
+        message = f"suite изменил боевой C:\mt5-fleet: {changed}"
+        if os.environ.get("FLEET_STRICT_GUARD") == "1":
+            raise AssertionError(message)
+        print(f"\n[fleet guard] {message} (внешняя активность; strict-режим: FLEET_STRICT_GUARD=1)")

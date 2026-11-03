@@ -703,6 +703,11 @@ def test_interleaving_between_publish_and_equity_never_fakes_a_stop(tmp_path, mo
     # equity catches up: the flow is applied and the result is still flat
     store.equity("a", 1, 900.0, 900.0, 0, 0.0, "USD", 1.0, "2026-11-03")
     assert engine._portfolio_stop(store.portfolio(["a"], fresh_only=False)) == ""
+    # deposit direction: published +100 before the equity row, then equity 1100
+    store.set_meta("dayflows:a:2026-11-03", "100.00|0.00|1100.00000000|0")
+    assert engine._portfolio_stop(store.portfolio(["a"], fresh_only=False)) == ""
+    store.equity("a", 1, 1100.0, 1100.0, 0, 0.0, "USD", 1.0, "2026-11-03")
+    assert engine._portfolio_stop(store.portfolio(["a"], fresh_only=False)) == ""
 
 
 def test_cycle_runs_the_real_entry_path(tmp_path, monkeypatch) -> None:
