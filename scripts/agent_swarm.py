@@ -823,11 +823,17 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(args.interval_sec)
                 continue
             # never trade a real account: rebind to the demo terminal or wait
-            check = mt5.account_info()
+            try:
+                check = mt5.account_info()
+            except Exception:  # noqa: BLE001 - a dropped channel is not an exit
+                check = None
             if (check is None or check.login != EXPECTED_LOGIN
                     or check.trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO):
                 log({"event": "bound terminal is not the demo account; rebinding"})
-                mt5.shutdown()
+                try:
+                    mt5.shutdown()
+                except Exception:  # noqa: BLE001
+                    pass
                 if not connect_demo(mt5):
                     time.sleep(args.interval_sec)
                     continue

@@ -98,7 +98,12 @@ def main(argv: list[str] | None = None) -> int:
             now = datetime.now(timezone.utc)
             account = mt5.account_info()
             if account is None:
-                log({"event": "no account info, retry"})
+                log({"event": "no account info; rebinding to the demo terminal"})
+                try:
+                    mt5.shutdown()
+                except Exception:  # noqa: BLE001
+                    pass
+                connect_demo(mt5)
                 time.sleep(args.interval_sec)
                 continue
             state = json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {}
