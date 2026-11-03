@@ -4,6 +4,7 @@
 #
 # Обязательные поля: name, login, server, mode (demo|real).
 # network: vpn требует vpn_profile — путь к .ovpn.
+# currency_scale: 0.01 для центовых счетов (100000 «центов» = $1000), иначе не задавать.
 
 accounts:
   - name: demo-metaquotes

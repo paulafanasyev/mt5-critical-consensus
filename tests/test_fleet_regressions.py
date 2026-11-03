@@ -407,13 +407,11 @@ def test_try_entries_places_one_order(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(worker.strategy, "signals", lambda acc: [signal])
     monkeypatch.setattr(worker.broker, "symbol", lambda base: spec)
     monkeypatch.setattr(worker.broker, "symbol_exact", lambda name: spec)
-    monkeypatch.setattr(worker.risk, "size_for", lambda *a, **k: 0.01)
     monkeypatch.setattr(worker.broker, "market_order",
                         lambda *a, **k: sent.append(1) or types.SimpleNamespace(
                             volume=0.01, price=1.10, retcode=10009, token="t"))
     monkeypatch.setattr(worker.broker, "open_positions", lambda *a, **k: [])
     monkeypatch.setattr(worker.risk, "can_open", lambda *a, **k: (True, ""))
-    monkeypatch.setattr(worker.risk, "can_open_portfolio", lambda *a, **k: (True, ""))
     snapshot = risk_mod.AccountSnapshot(login=1, server="S", currency="USD", balance=1000.0,
                                        equity=1000.0, margin_free=1000.0, leverage=100,
                                        positions=0, floating=0.0, server_day="2026-11-03")
@@ -449,3 +447,28 @@ def test_naked_position_still_counts_in_book_risk() -> None:
                                   type=0)
     total = risk_mod.book_risk_money([naked], {"XAUUSD": spec}, {"XAUUSD": 5.0})
     assert total > 0
+
+
+def test_day_flow_cache_invalidates_after_a_deposit(tmp_path, monkeypatch) -> None:
+    """A deposit after the first cycle must not be masked by the cached flow."""
+    from fleet import risk as risk_mod
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    calls = {"flow": 0}
+
+    def fake_flow(day):
+        calls["flow"] += 1
+        return 100.0 if calls["flow"] > 1 else 0.0
+
+    monkeypatch.setattr(risk_mod, "daily_net_flow", fake_flow)
+    monkeypatch.setattr(risk_mod, "daily_realized", lambda day: 0.0)
+    account = Account(name="a", login=1, server="S", mode="demo")
+    store = StoreCls(tmp_path / "book.sqlite")
+    runner = worker.Worker(FleetConfig(accounts=[account]), store)
+    state = runner._day_state(account, types.SimpleNamespace(balance=1000.0), "2026-11-03")
+    assert state.net_flow == 0.0
+    # a deposit lands: the balance moves, so the cached flows must be recomputed
+    state = runner._day_state(account, types.SimpleNamespace(balance=1100.0), "2026-11-03")
+    assert state.net_flow == 100.0
+    assert state.daily_pct(1080.0) == -2.0

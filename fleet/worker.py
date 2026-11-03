@@ -277,7 +277,7 @@ class Worker:
         book = self.store.portfolio([a.name for a in self.config.enabled()])
         book_stop = self.store.portfolio([a.name for a in self.config.enabled()],
                                          fresh_only=False)
-        mirror = self.store.all_positions()
+        mirror = self.store.all_positions(max_age=10 ** 9)  # caps: last known, not only fresh
         book_positions = [types.SimpleNamespace(
             symbol=symbol, volume=volume, sl=sl, price_open=price_open,
             type=int(mt5.POSITION_TYPE_BUY) if side == "buy" else int(mt5.POSITION_TYPE_SELL))
@@ -388,23 +388,9 @@ class Worker:
     def _day_state(self, account: Account, snapshot: risk.AccountSnapshot,
                    server_day: str) -> risk.DayState:
         stored = self.store.day(account.name)
-        cache_key = f"netflow:{account.name}:{server_day}"
-        cached_flow = self.store.get_meta(cache_key)
-        if cached_flow is not None:
-            try:
-                net_flow = float(cached_flow)
-            except ValueError:
-                net_flow = 0.0
-        else:
-            try:
-                net_flow = risk.daily_net_flow(risk.day_start_datetime(server_day))
-                self.store.set_meta(cache_key, f"{net_flow:.2f}")
-            except Exception:  # noqa: BLE001 - history may lag right after midnight
-                net_flow = 0.0
-        try:
-            realized_today = risk.daily_realized(risk.day_start_datetime(server_day))
-        except Exception:  # noqa: BLE001
-            realized_today = 0.0
+        day_start = risk.day_start_datetime(server_day)
+        net_flow, realized_today = self._cached_day_flows(account, server_day,
+                                                          snapshot.balance, day_start)
         opened_with = snapshot.balance - net_flow - realized_today
         if opened_with <= 0:
             # The whole balance arrived today: there is no opening base, so no loss to measure.
@@ -418,6 +404,37 @@ class Worker:
             state.net_flow = net_flow
         state.rollover(opened_with, server_day)
         return state
+
+    def _cached_day_flows(self, account: Account, server_day: str, balance: float,
+                          day_start: dt.datetime) -> tuple[float, float]:
+        """Cache the day's flows, but invalidate the moment the balance moves under them.
+
+        A cache that never expires is worse than no cache: a deposit after the first cycle would
+        silently mask the day's loss. The balance is the witness that the flows changed.
+        """
+        key = f"dayflows:{account.name}:{server_day}"
+        cached = self.store.get_meta(key)
+        if cached:
+            parts = cached.split("|")
+            if len(parts) == 3:
+                try:
+                    cached_flow, cached_realized, cached_balance = (float(parts[0]),
+                                                                    float(parts[1]),
+                                                                    float(parts[2]))
+                except ValueError:
+                    cached_flow = cached_realized = cached_balance = None
+                if cached_balance is not None and abs(cached_balance - balance) < 1e-9:
+                    return cached_flow, cached_realized
+        try:
+            net_flow = risk.daily_net_flow(day_start)
+        except Exception:  # noqa: BLE001 - history may lag right after midnight
+            net_flow = 0.0
+        try:
+            realized = risk.daily_realized(day_start)
+        except Exception:  # noqa: BLE001
+            realized = 0.0
+        self.store.set_meta(key, f"{net_flow:.2f}|{realized:.2f}|{balance:.2f}")
+        return net_flow, realized
 
     def _save_day(self, account: Account, state: risk.DayState) -> None:
         self.store.save_day(account.name, state.day, state.start_balance, state.realized,

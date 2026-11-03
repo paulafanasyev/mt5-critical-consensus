@@ -163,7 +163,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if real and not args.live:
         print(f"реальные счета {real}: ордера выключены, нужен --live")
     print(f"парк: {len(config.enabled())} счетов, шарды {engine.shards}")
-    engine.run_forever()
+    engine.run_forever(force_lock=args.force_lock)
     return 0
 
 
@@ -231,6 +231,8 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--live", action="store_true")
     run.add_argument("--shards", default="", help="например 0 или 0,2")
     run.add_argument("--allow-multi-shard", action="store_true")
+    run.add_argument("--force-lock", action="store_true",
+                     help="снять залипший lock дирижёра")
     run.set_defaults(func=cmd_run)
 
     pause = sub.add_parser("pause", help="включить паузу")
