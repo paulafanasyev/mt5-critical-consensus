@@ -347,8 +347,12 @@ class Store:
                          " (SELECT account, ticket FROM positions)")
             conn.execute("DELETE FROM risk_slots WHERE created_epoch < ?",
                          (time.time() - 600,))
-            conn.execute("DELETE FROM meta WHERE key LIKE 'dayflows:%' AND key NOT LIKE ?",
-                         (f"dayflows:%:{dt.datetime.now(dt.timezone.utc).date().isoformat()}",))
+            keep = {row[0] for row in conn.execute(
+                "SELECT DISTINCT server_day FROM book WHERE server_day <> ''").fetchall()}
+            stale = [key for (key,) in conn.execute(
+                "SELECT key FROM meta WHERE key LIKE 'dayflows:%'").fetchall()
+                if key.rsplit(":", 1)[-1] not in keep]
+            conn.executemany("DELETE FROM meta WHERE key=?", [(k,) for k in stale])
             conn.execute("DELETE FROM meta WHERE key LIKE 'netflow:%'")
             conn.execute("DELETE FROM meta WHERE (key LIKE 'atr:%' OR key LIKE 'entry:%')"
                          " AND key NOT IN (SELECT 'atr:' || account || ':' || ticket"

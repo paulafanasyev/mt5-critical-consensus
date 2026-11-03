@@ -474,3 +474,43 @@ def test_day_flow_cache_invalidates_after_a_deposit(tmp_path, monkeypatch) -> No
     state = runner._day_state(account, types.SimpleNamespace(balance=1100.0), "2026-11-03")
     assert state.net_flow == 100.0
     assert state.daily_pct(1080.0) == -2.0
+
+
+def test_book_flows_use_each_accounts_broker_day(tmp_path, monkeypatch) -> None:
+    from fleet import risk as risk_mod
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    store = StoreCls(tmp_path / "book.sqlite")
+    # Broker A is already on the next day, broker B is still on the old one.
+    store.equity("a", 1, 1000.0, 1000.0, 0, 0.0, "USD", 1.0, "2026-11-04")
+    store.equity("b", 2, 1000.0, 800.0, 0, 0.0, "USD", 1.0, "2026-11-03")
+    store.set_meta("dayflows:b:2026-11-03", "-200.00|0.00|800.00|0")
+    engine = conductor.Conductor(FleetConfig(accounts=[
+        Account(name="a", login=1, server="S", mode="demo"),
+        Account(name="b", login=2, server="S", mode="demo")]), store, shards=[0])
+    flow, realized = engine._book_flows()
+    assert flow == -200.0 and realized == 0.0
+
+
+def test_prune_keeps_dayflows_of_reported_broker_days(tmp_path) -> None:
+    store = Store(tmp_path / "book.sqlite")
+    store.equity("a", 1, 1000.0, 1000.0, 0, 0.0, "USD", 1.0, "2026-11-04")
+    store.set_meta("dayflows:a:2026-11-04", "0|0|1000|0")
+    store.set_meta("dayflows:a:2026-01-01", "0|0|1000|0")
+    store.prune(["a"])
+    assert store.get_meta("dayflows:a:2026-11-04") is not None
+    assert store.get_meta("dayflows:a:2026-01-01") is None
+
+
+def test_unpriced_account_flow_is_not_counted(tmp_path) -> None:
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    store = StoreCls(tmp_path / "book.sqlite")
+    store.equity("u", 1, 1000.0, 1000.0, 0, 0.0, "USD", 0.0, "2026-11-03")  # unpriced
+    store.set_meta("dayflows:u:2026-11-03", "500.00|0.00|1000.00|0")
+    engine = conductor.Conductor(FleetConfig(accounts=[
+        Account(name="u", login=1, server="S", mode="demo")]), store, shards=[0])
+    flow, _ = engine._book_flows()
+    assert flow == 0.0

@@ -137,8 +137,13 @@ class Conductor:
                                          fresh_only=False)
         self._remember_baseline(book)
         if book_stop.get("unpriced", 0) > 0:
-            self.store.event("conductor", "unpriced_accounts",
-                             count=book_stop["unpriced"])
+            if self.store.get_meta("unpriced_warned") != "1":
+                self.store.set_meta("unpriced_warned", "1")
+                self.store.event("conductor", "unpriced_accounts",
+                                 count=book_stop["unpriced"])
+        elif self.store.get_meta("unpriced_warned") == "1":
+            self.store.set_meta("unpriced_warned", "0")
+            self.store.event("conductor", "unpriced_resolved")
         reason = self._portfolio_stop(book_stop)
         if reason and not PAUSE_FILE.exists():
             PAUSE_FILE.write_text(reason, encoding="utf-8")
@@ -232,21 +237,29 @@ class Conductor:
 
     def _book_flows(self) -> tuple[float, float]:
         """Sum today's deposits/withdrawals and realized P&L across the enabled accounts."""
-        with self.store._connect() as conn:  # noqa: SLF001 - same package boundary
-            row = conn.execute("SELECT MAX(server_day) FROM book").fetchone()
-        day = (row[0] if row and row[0] else "") or ""
         flow = realized = 0.0
-        for account in self.config.enabled():
-            raw = self.store.get_meta(f"dayflows:{account.name}:{day}")
-            if not raw:
-                continue
-            parts = raw.split("|")
-            if len(parts) >= 2:
-                try:
-                    flow += float(parts[0])
-                    realized += float(parts[1])
-                except ValueError:
+        with self.store._connect() as conn:  # noqa: SLF001 - same package boundary
+            rows = conn.execute(
+                "SELECT account, server_day FROM book").fetchall()
+            priced = {account for account, equity_usd in conn.execute(
+                "SELECT account, equity_usd FROM book").fetchall() if equity_usd is not None}
+            for account, day in rows:
+                if account not in priced:
+                    continue  # an unpriced account is not in equity, so its flow is not either
+                raw = None
+                row = conn.execute("SELECT value FROM meta WHERE key=?",
+                                   (f"dayflows:{account}:{day}",)).fetchone()
+                if row:
+                    raw = row[0]
+                if not raw:
                     continue
+                parts = raw.split("|")
+                if len(parts) >= 2:
+                    try:
+                        flow += float(parts[0])
+                        realized += float(parts[1])
+                    except ValueError:
+                        continue
         return flow, realized
 
     def _registry_hash(self) -> str:
