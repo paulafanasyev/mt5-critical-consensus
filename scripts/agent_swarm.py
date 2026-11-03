@@ -276,8 +276,19 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
     account = mt5.account_info()
     if account is None:
         return
-    baseline = 100_000.0
-    state["baseline_equity"] = baseline
+    # A daily stop measured from the day's own starting equity, plus a total stop measured from
+    # the initial capital. Measuring only from 100 000 made the brake permanent once the account
+    # sat below -1%: every cycle flattened a flat book and refused to trade again.
+    today = datetime.now(timezone.utc).date().isoformat()
+    if state.get("day") != today or not state.get("day_start_equity"):
+        state["day"] = today
+        state["day_start_equity"] = account.equity
+        state["halted_until"] = 0
+        state["paused_until"] = 0
+        save_state(state)
+    day_start = float(state["day_start_equity"])
+    total_floor = 100_000.0 * (1 - 0.03)
+    daily_floor = day_start * (1 - MAX_DRAWDOWN)
 
     # 0. the shared brake. The account belongs to the person trading it in the terminal, so an
     # armed switch has to reach this process too; it read only its own state file before, which
@@ -289,9 +300,11 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
     # Positions whose magic is not ours belong to the owner or to another agent. This process has
     # no authority over them and never did: flattening them was the churn the account paid for,
     # and the account's own manual trading is exactly what the observation order reserves.
-    if account.equity < baseline * (1 - MAX_DRAWDOWN):
-        log({"event": f"BREAKER: equity {account.equity:.2f} below {baseline:.2f} "
-                      f"(-{MAX_DRAWDOWN * 100:.0f}%); flattening the swarm"})
+    if account.equity < total_floor or account.equity < daily_floor:
+        daily = account.equity < daily_floor
+        log({"event": f"BREAKER: equity {account.equity:.2f} below "
+                      f"{'the daily floor ' + format(daily_floor, '.2f') if daily else 'the total floor ' + format(total_floor, '.2f')}; "
+                      f"flattening the swarm"})
         for position in mt5.positions_get() or []:
             if position.magic in magics:
                 tick = mt5.symbol_info_tick(position.symbol)
@@ -304,13 +317,11 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
                                 "deviation": 30, "magic": position.magic,
                                 "type_filling": mt5.ORDER_FILLING_FOK,
                                 "comment": "breaker"})
-        # the brake is a daily stop: it does not reset the reference capital, it halts the
-        # swarm until the next UTC day begins, so the same day cannot keep re-entering and
-        # tripping the breaker again.
         midnight = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        state["baseline_equity"] = 100_000.0
         state["paused_until"] = time.time() + PAUSE_SECONDS
-        state["halted_until"] = (midnight + timedelta(days=1)).timestamp()
+        # a daily stop halts until tomorrow; the total stop halts until a person lifts it
+        state["halted_until"] = ((midnight + timedelta(days=1)).timestamp()
+                                 if daily else time.time() + 365 * 86400)
         save_state(state)
         return
 
