@@ -76,4 +76,4 @@ def pytest_sessionfinish(session, exitstatus):
     except Exception:  # noqa: BLE001 - the guard must never break collection
         return
     if listing:
-        print(f"\n[fleet guard] найдены живые fleet.shard процессы: {listing}")
+        raise AssertionError(f"живые fleet.shard процессы после suite: {listing}")

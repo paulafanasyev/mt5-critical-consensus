@@ -350,6 +350,9 @@ class Store:
             conn.execute("DELETE FROM meta WHERE key LIKE 'dayflows:%' AND key NOT LIKE ?",
                          (f"dayflows:%:{dt.datetime.now(dt.timezone.utc).date().isoformat()}",))
             conn.execute("DELETE FROM meta WHERE key LIKE 'netflow:%'")
+            conn.execute("DELETE FROM meta WHERE (key LIKE 'atr:%' OR key LIKE 'entry:%')"
+                         " AND key NOT IN (SELECT 'atr:' || account || ':' || ticket"
+                         " FROM positions)")
         return removed
 
 

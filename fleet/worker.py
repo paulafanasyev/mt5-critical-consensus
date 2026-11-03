@@ -294,8 +294,13 @@ class Worker:
                 spec_for_atr = specs.get(position.symbol)
                 if spec_for_atr is not None:
                     atrs[position.symbol] = broker.atr(spec_for_atr.name, mt5.TIMEFRAME_H1)
-        current_risk = risk.book_risk_money(book_positions, specs, atrs,
-                                            account.risk.stop_atr)
+        atr_by_symbol = dict(atrs)
+        current_risk = 0.0
+        for position in book_positions:
+            spec = specs.get(position.symbol)
+            stop_atr = account.risk.stop_atr
+            current_risk += risk.position_risk_money(
+                position, spec, atr_by_symbol.get(position.symbol, 0.0), stop_atr)
         if book_stop.get("unpriced", 0) > 0:
             self.store.event(account.name, "unpriced_accounts_book",
                              count=book_stop["unpriced"])
