@@ -34,14 +34,23 @@ class WorkerResult:
     closed: int = 0
 
 
-def port_owner() -> int | None:
-    """Pid listening on the MT5 API port, if anything is listening at all."""
+_PORT_OWNER_CACHE: dict[str, float | int] = {"ts": 0.0, "pid": 0}
+
+
+def port_owner(max_age: float = 20.0) -> int | None:
+    """Pid listening on the MT5 API port, cached briefly: the lookup costs ~2 s."""
+    cached_pid = int(_PORT_OWNER_CACHE.get("pid", 0) or 0)
+    if cached_pid and time.time() - float(_PORT_OWNER_CACHE.get("ts", 0)) < max_age:
+        return cached_pid
     script = ("Get-NetTCPConnection -LocalPort 22346 -State Listen -ErrorAction SilentlyContinue"
               " | Select-Object -First 1 -ExpandProperty OwningProcess")
     result = subprocess.run(["powershell", "-NoProfile", "-Command", script],
                             capture_output=True, text=True)
     text = result.stdout.strip()
-    return int(text) if text.isdigit() else None
+    pid = int(text) if text.isdigit() else 0
+    _PORT_OWNER_CACHE["ts"] = time.time()
+    _PORT_OWNER_CACHE["pid"] = pid
+    return pid or None
 
 
 def port_is_free_or_ours(account: Account) -> tuple[bool, str]:
@@ -277,7 +286,13 @@ class Worker:
         specs: dict[str, broker.BrokerSymbol | None] = {}
         for position in book_positions:
             specs[position.symbol] = broker.symbol_exact(position.symbol)
-        current_risk = risk.book_risk_money(book_positions, specs)
+        atrs: dict[str, float] = {}
+        for position in book_positions:
+            if float(getattr(position, "sl", 0.0) or 0.0) <= 0:
+                spec_for_atr = specs.get(position.symbol)
+                if spec_for_atr is not None:
+                    atrs[position.symbol] = broker.atr(spec_for_atr.name, mt5.TIMEFRAME_H1)
+        current_risk = risk.book_risk_money(book_positions, specs, atrs)
         day_pct = self._portfolio_day_pct(book["equity"])
         for signal in strategy.signals(account):
             spec = broker.symbol(signal.base_symbol)
@@ -288,19 +303,17 @@ class Worker:
                 continue
             if self._in_cooldown(account, spec.name):
                 continue
-            new_risk = spec.distance_money(signal.stop_distance,
-                                           max(spec.volume_min, account.risk.min_lots))
-            ok, why = risk.can_open_portfolio(
-                self.config.portfolio, book["equity"], current_risk, new_risk,
-                book_positions, specs, day_pct, new_symbol=spec.name, new_volume=volume)
-            if not ok:
-                self.store.event(account.name, "portfolio_hold", reason=why)
-                return 0
             volume = risk.size_for(account, spec, signal.stop_distance, snapshot.balance)
             if volume <= 0:
                 self.store.event(account.name, "skip", symbol=spec.name, reason="объём 0")
                 continue
             risk_money = spec.distance_money(signal.stop_distance, volume)
+            ok, why = risk.can_open_portfolio(
+                self.config.portfolio, book_stop["equity"], current_risk, risk_money,
+                book_positions, specs, day_pct, new_symbol=spec.name, new_volume=volume)
+            if not ok:
+                self.store.event(account.name, "portfolio_hold", reason=why)
+                return 0
             reserved, why, slot = self.store.reserve(account.name, spec.name, volume,
                                                      self.config.portfolio, book["equity"])
             if not reserved:
@@ -377,14 +390,18 @@ class Worker:
             net_flow = risk.daily_net_flow(risk.day_start_datetime(server_day))
         except Exception:  # noqa: BLE001 - history may lag right after midnight
             net_flow = 0.0
+        opened_with = snapshot.balance - net_flow
+        if opened_with <= 0:
+            # The whole balance arrived today: there is no opening base, so no loss to measure.
+            opened_with = snapshot.balance
+            net_flow = 0.0
         if stored and stored[0] == server_day:
             state = risk.DayState(day=server_day, start_balance=stored[1],
                                   net_flow=net_flow, realized=stored[2], stopped=stored[3])
         else:
-            # The balance already contains today's deposits, so the day opened at balance-flow.
-            state = risk.DayState.fresh(snapshot.balance - net_flow, server_day)
+            state = risk.DayState.fresh(opened_with, server_day)
             state.net_flow = net_flow
-        state.rollover(snapshot.balance - net_flow, server_day)
+        state.rollover(opened_with, server_day)
         return state
 
     def _save_day(self, account: Account, state: risk.DayState) -> None:

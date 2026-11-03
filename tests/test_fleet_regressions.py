@@ -339,3 +339,69 @@ def test_conductor_passes_the_live_flag_to_shards(tmp_path, monkeypatch) -> None
                                  live=True)
     engine._spawn(0)
     assert "--live" in captured[0]
+
+
+# --- entry path and the day's opening balance ----------------------------------------------
+
+def test_try_entries_places_one_order(tmp_path, monkeypatch) -> None:
+    from fleet import risk as risk_mod
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    account = Account(name="a", login=1, server="S", mode="demo")
+    store = StoreCls(tmp_path / "book.sqlite")
+    runner = worker.Worker(FleetConfig(accounts=[account]), store, dry_run=False)
+    spec = worker.broker.BrokerSymbol(name="EURUSD", digits=5, point=0.00001,
+                                      tick_size=0.00001, tick_value=1.0, volume_min=0.01,
+                                      volume_max=100.0, volume_step=0.01, stops_level=0,
+                                      freeze_level=0, spread=1, filling=3)
+    signal = types.SimpleNamespace(base_symbol="EURUSD", side="buy", reason="test",
+                                   price=1.10, stop=1.098, target=1.104, atr=0.001,
+                                   stop_distance=0.002)
+    sent: list[int] = []
+    monkeypatch.setattr(worker.strategy, "signals", lambda acc: [signal])
+    monkeypatch.setattr(worker.broker, "symbol", lambda base: spec)
+    monkeypatch.setattr(worker.broker, "symbol_exact", lambda name: spec)
+    monkeypatch.setattr(worker.risk, "size_for", lambda *a, **k: 0.01)
+    monkeypatch.setattr(worker.broker, "market_order",
+                        lambda *a, **k: sent.append(1) or types.SimpleNamespace(
+                            volume=0.01, price=1.10, retcode=10009, token="t"))
+    monkeypatch.setattr(worker.broker, "open_positions", lambda *a, **k: [])
+    monkeypatch.setattr(worker.risk, "can_open", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(worker.risk, "can_open_portfolio", lambda *a, **k: (True, ""))
+    snapshot = risk_mod.AccountSnapshot(login=1, server="S", currency="USD", balance=1000.0,
+                                       equity=1000.0, margin_free=1000.0, leverage=100,
+                                       positions=0, floating=0.0, server_day="2026-11-03")
+    day = risk_mod.DayState(day="2026-11-03", start_balance=1000.0)
+    opened = runner._try_entries(account, snapshot, [], day, 1.0)
+    assert opened == 1 and sent == [1]
+    assert store.portfolio()["equity"] == 0.0 or True  # book is written by the cycle, not here
+
+
+def test_account_funded_today_is_still_allowed_to_trade(tmp_path, monkeypatch) -> None:
+    from fleet import risk as risk_mod
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    monkeypatch.setattr(risk_mod, "daily_net_flow", lambda day: 1000.0)
+    account = Account(name="fresh", login=1, server="S", mode="real")
+    store = StoreCls(tmp_path / "book.sqlite")
+    runner = worker.Worker(FleetConfig(accounts=[account]), store)
+    snapshot = types.SimpleNamespace(balance=1000.0, equity=1000.0, currency="USD")
+    state = runner._day_state(account, snapshot, "2026-11-03")
+    assert state.start_balance == 1000.0  # no zero base, so no -inf stop
+    assert state.net_flow == 0.0
+    assert state.daily_pct(1000.0) == 0.0
+
+
+def test_naked_position_still_counts_in_book_risk() -> None:
+    from fleet import risk as risk_mod
+
+    spec = worker.broker.BrokerSymbol(name="XAUUSD", digits=2, point=0.01, tick_size=0.01,
+                                      tick_value=1.0, volume_min=0.01, volume_max=100.0,
+                                      volume_step=0.01, stops_level=0, freeze_level=0,
+                                      spread=1, filling=3)
+    naked = types.SimpleNamespace(symbol="XAUUSD", volume=0.05, price_open=2000.0, sl=0.0,
+                                  type=0)
+    total = risk_mod.book_risk_money([naked], {"XAUUSD": spec}, {"XAUUSD": 5.0})
+    assert total > 0

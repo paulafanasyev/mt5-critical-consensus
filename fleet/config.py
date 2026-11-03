@@ -170,6 +170,8 @@ def account_from_dict(data: dict[str, Any]) -> Account:
         raise ConfigError(f"{where}: {exc}") from exc
     if account.mode not in ("demo", "real"):
         raise ConfigError(f"{where}: mode={account.mode!r}, допустимо demo|real")
+    if not 0 < account.currency_scale <= 100:
+        raise ConfigError(f"{where}: currency_scale={account.currency_scale!r} вне (0, 100]")
     if account.network not in ("direct", "vpn"):
         raise ConfigError(f"{where}: network={account.network!r}, допустимо direct|vpn")
     if account.network == "vpn":

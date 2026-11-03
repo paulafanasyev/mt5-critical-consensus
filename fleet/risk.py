@@ -145,14 +145,14 @@ def can_open(account: Account, snapshot: AccountSnapshot, day: DayState,
 
 
 def position_risk_money(position, spec: broker.BrokerSymbol | None,
-                        atr_fallback: float = 0.0) -> float:
+                        atr_fallback: float = 0.0, stop_atr: float = 1.6) -> float:
     """Money at risk if this position hits its own stop; unknown stop counts as the full risk."""
     if spec is None:
         return 0.0
     stop = float(getattr(position, "sl", 0.0) or 0.0)
     entry = float(position.price_open)
     if stop <= 0:
-        return spec.distance_money(atr_fallback * 1.6, float(position.volume))
+        return spec.distance_money(atr_fallback * stop_atr, float(position.volume))
     return spec.distance_money(abs(entry - stop), float(position.volume))
 
 

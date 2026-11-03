@@ -182,8 +182,14 @@ class Conductor:
         stored_day = self.store.get_meta("portfolio_day")
         stored_value = self.store.get_meta("portfolio_day_start_equity")
         expected = sum(len(self.config.by_shard(shard)) for shard in self.shards)
+        if stored_day == today and stored_value:
+            try:
+                self.day_start_equity = float(stored_value)
+            except ValueError:
+                self.day_start_equity = None
+            return  # an existing baseline is authoritative even on a partial book
         if expected and book["accounts"] < expected:
-            return  # never fix the day's baseline from a partial book
+            return  # never fix a new baseline from a partial book
         if stored_day != today or not stored_value:
             if book["equity"] > 0:
                 self.store.set_meta("portfolio_day", today)
