@@ -185,6 +185,18 @@ def stop(account: Account) -> None:
     if pid:
         subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
         _PID_CACHE[str(account.data_dir).lower()] = (time.time(), None)
+        _invalidate_port_cache()
+
+
+def _invalidate_port_cache() -> None:
+    """A killed terminal must not leave a stale port owner behind for the next account."""
+    try:
+        from . import worker
+
+        worker._PORT_OWNER_CACHE["ts"] = 0.0
+        worker._PORT_OWNER_CACHE["pid"] = 0
+    except Exception:  # noqa: BLE001 - cache invalidation is best effort
+        pass
 
 
 def stop_all() -> None:
@@ -208,6 +220,7 @@ def stop_other_fleet(keep_dir: pathlib.Path | None = None) -> int:
         stopped += 1
     if stopped:
         _PID_CACHE.clear()
+        _invalidate_port_cache()
     return stopped
 
 

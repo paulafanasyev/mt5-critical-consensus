@@ -293,7 +293,7 @@ class Worker:
                 if spec_for_atr is not None:
                     atrs[position.symbol] = broker.atr(spec_for_atr.name, mt5.TIMEFRAME_H1)
         current_risk = risk.book_risk_money(book_positions, specs, atrs)
-        day_pct = self._portfolio_day_pct(book["equity"])
+        day_pct = self._portfolio_day_pct(book_stop["equity"])
         for signal in strategy.signals(account):
             spec = broker.symbol(signal.base_symbol)
             if spec is None:

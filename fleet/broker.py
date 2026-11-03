@@ -362,7 +362,8 @@ def ema(name: str, timeframe: int, period: int = 50, bars: int = 400) -> float:
 
 def server_timestamp() -> float:
     """The broker's clock from one liquid symbol: scanning every symbol would cost seconds."""
-    for name in ("EURUSD", "XAUUSD", "GBPUSD", "USDJPY"):
+    for base in ("EURUSD", "XAUUSD", "GBPUSD", "USDJPY"):
+        name = resolve(base) or base
         tick = mt5.symbol_info_tick(name)
         if tick is not None and getattr(tick, "time", 0):
             return float(tick.time)
