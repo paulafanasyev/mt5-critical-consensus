@@ -131,6 +131,33 @@ def open_for(mt5, spec: dict) -> dict | None:
     return None
 
 
+def trend_clear_of_fast_average(mt5, symbol: str, side: str) -> bool:
+    """The price must sit a quarter ATR away from the hourly EMA50 in the trade's direction.
+
+    Without this the swarm kept shorting a rally at the average line: the signal said "below
+    the 200 average" while the price was bouncing on the 50 average, and every such entry was
+    a coin flip that paid the spread.
+    """
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 1, 60)
+    if rates is None or len(rates) < 30:
+        return True
+    closes = [float(rate["close"]) for rate in rates]
+    highs = [float(rate["high"]) for rate in rates]
+    lows = [float(rate["low"]) for rate in rates]
+    weight = 2 / 51
+    fast = closes[0]
+    for value in closes[1:]:
+        fast = value * weight + fast * (1 - weight)
+    ranges = [max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]),
+                  abs(lows[i] - closes[i - 1])) for i in range(1, len(closes))]
+    atr = sum(ranges[-14:]) / 14
+    buffer = 0.25 * atr
+    price = closes[-1]
+    if side == "SELL":
+        return price < fast - buffer
+    return price > fast + buffer
+
+
 def daily_trend_state(symbol: str) -> str | None:
     """Return BUY if the last daily close is above its 200-day average, SELL if below."""
     import MetaTrader5 as mt5
@@ -472,6 +499,12 @@ def swarm_exposure(symbol: str) -> float:
 
 def open_trade(mt5, spec: dict, side: str, tick, *, stop: float | None,
                take: float | None = None) -> None:
+    # a signal at the average itself is a coin flip: require the price to stand clear of the
+    # fast average by a quarter of an ATR before the trade is taken
+    if not trend_clear_of_fast_average(mt5, spec["symbol"], side):
+        log({"event": f"{spec['name']} skipped: {spec['symbol']} price hugs EMA50 "
+                      f"(no trend confirmation)"})
+        return
     state_now = load_state()
     entries = state_now.setdefault("entries", {})
     hour_ago = time.time() - 3600
