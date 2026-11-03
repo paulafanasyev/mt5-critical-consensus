@@ -182,11 +182,8 @@ class Worker:
         # Re-read after management so the gates judge the account as it is now, not as it was.
         snapshot = risk.AccountSnapshot.read(server_day) or snapshot
         positions = risk.positions_for(account)
-        self.store.equity(account.name, snapshot.login, snapshot.balance, snapshot.equity,
-                          len(positions), snapshot.floating, snapshot.currency, rate,
-                          server_day)
         if flows_payload:
-            # Publish the flows only after the equity they belong to, and with the FINAL balance
+            # Publish the flows before the equity row, with the FINAL balance
             # as witness: managing positions can change the balance between the two snapshots.
             parts = flows_payload.split("|")
             if len(parts) >= 4:
@@ -195,6 +192,9 @@ class Worker:
             self.store.set_meta(f"dayflows:{account.name}:{server_day}", flows_payload)
         self.store.save_positions(account.name, positions)
 
+        self.store.equity(account.name, snapshot.login, snapshot.balance, snapshot.equity,
+                          len(positions), snapshot.floating, snapshot.currency, rate,
+                          server_day)
         opened = 0
         if allow_entries and rate > 0:
             opened = self._try_entries(account, snapshot, positions, day, rate)

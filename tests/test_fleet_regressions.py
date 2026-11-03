@@ -642,3 +642,39 @@ def test_witness_tolerates_a_fractional_balance(tmp_path) -> None:
         Account(name="a", login=1, server="S", mode="demo")]), store, shards=[0])
     flow, _ = engine._book_flows()
     assert flow == -200.0
+
+
+def test_flows_are_published_before_equity_so_a_withdrawal_cannot_fake_a_stop(tmp_path, monkeypatch) -> None:
+    from fleet import risk as risk_mod
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    account = Account(name="a", login=1, server="S", mode="demo")
+    store = StoreCls(tmp_path / "book.sqlite")
+    runner = worker.Worker(FleetConfig(accounts=[account]), store)
+    snapshots = [
+        risk_mod.AccountSnapshot(login=1, server="S", currency="USD", balance=1000.0,
+                                 equity=1000.0, margin_free=1000.0, leverage=100,
+                                 positions=0, floating=0.0, server_day="2026-11-03"),
+        risk_mod.AccountSnapshot(login=1, server="S", currency="USD", balance=900.0,
+                                 equity=900.0, margin_free=900.0, leverage=100,
+                                 positions=0, floating=0.0, server_day="2026-11-03"),
+    ]
+    calls = {"n": 0}
+
+    def read(*a, **k):
+        value = snapshots[min(calls["n"], len(snapshots) - 1)]
+        calls["n"] += 1
+        return value
+
+    monkeypatch.setattr(risk_mod, "AccountSnapshot", types.SimpleNamespace(read=read))
+    monkeypatch.setattr(risk_mod, "positions_for", lambda acc: [])
+    monkeypatch.setattr(risk_mod, "daily_net_flow", lambda day: -100.0)
+    monkeypatch.setattr(risk_mod, "daily_realized", lambda day: 0.0)
+    monkeypatch.setattr(worker.Worker, "_manage_positions", lambda self, *a, **k: 0)
+    monkeypatch.setattr(worker.Worker, "_try_entries", lambda self, *a, **k: 0)
+    runner._cycle(account, allow_entries=True)
+    payload = store.get_meta("dayflows:a:2026-11-03")
+    assert payload is not None
+    assert payload.startswith("-100.00")
+    assert abs(float(payload.split("|")[2]) - 900.0) < 0.01
