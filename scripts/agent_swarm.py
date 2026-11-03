@@ -433,6 +433,35 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
                           f"{position.profit:+.2f} at tier "
                           f"{SCALE_TIERS[level]:.0f}, added {add} lots"})
 
+    # 3. the operator closes positions by hand sometimes. Notice it, thank them, and give the
+    # symbol ten minutes before the agents try to re-enter it: otherwise a manual take-profit
+    # is instantly re-opened by the same scheme at the same price.
+    known = state.get("open_tickets", {})
+    current = {}
+    for position in mt5.positions_get() or []:
+        if position.magic in magics:
+            current[str(position.ticket)] = position.symbol
+    our_comments = {"dollar stop", "trail exit", "breaker", "parallel cleanup", "cap trim",
+                    "scale-in", "flatten", "orphan", "supervisor"}
+    for ticket, symbol in known.items():
+        if ticket in current:
+            continue
+        comment = ""
+        try:
+            deals = mt5.history_deals_get(position=int(ticket)) or []
+            if deals:
+                comment = (deals[-1].comment or "").strip()
+        except Exception:  # noqa: BLE001 - history is a nicety, never a reason to crash
+            pass
+        if comment not in our_comments:
+            cooldowns = state.setdefault("cooldowns", {})
+            cooldowns[symbol] = max(cooldowns.get(symbol, 0.0), time.time() + 600)
+            state["cooldowns"] = cooldowns
+            log({"event": f"{symbol} ticket {ticket}: closed by the operator "
+                          f"(deal comment '{comment}'); symbol rests 10 minutes"})
+    state["open_tickets"] = current
+    save_state(state)
+
     by_symbol: dict[str, list] = {}
     for position in mt5.positions_get() or []:
         if position.magic in magics:
