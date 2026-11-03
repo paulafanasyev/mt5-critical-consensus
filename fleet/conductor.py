@@ -201,13 +201,12 @@ class Conductor:
         limits = self.config.portfolio
         expected = sum(len(self.config.by_shard(shard)) for shard in self.shards)
         if expected and book["accounts"] < expected:
-            # A partial book cannot prove a loss, but it must block entries and say so.
+            # Alarm, then judge on the equity we do see: silence here would disable the last line.
             if self.store.get_meta("book_incomplete") != "1":
                 self.store.set_meta("book_incomplete", "1")
                 self.store.event("conductor", "book_incomplete",
                                  accounts=book["accounts"], expected=expected)
-            return ""
-        if self.store.get_meta("book_incomplete") == "1":
+        elif self.store.get_meta("book_incomplete") == "1":
             self.store.set_meta("book_incomplete", "0")
             self.store.event("conductor", "book_complete", accounts=book["accounts"])
         if self.day_start_equity and self.day_start_equity > 0 and book["equity"] > 0:

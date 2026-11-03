@@ -18,6 +18,17 @@ if str(ROOT) not in sys.path:
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import fleet_cli  # noqa: E402
+from fleet import config as fleet_config  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def isolated_fleet_root(tmp_path, monkeypatch):
+    """Provision into a temporary fleet root: tests must never touch the real fleet folder."""
+    root = tmp_path / "fleet"
+    monkeypatch.setattr(fleet_config, "FLEET_ROOT", root)
+    monkeypatch.setattr(terminals, "FLEET_ROOT", root)
+    monkeypatch.setattr(fleet_cli.worker, "Worker", fleet_cli.worker.Worker)
+    return root
 from fleet import terminals, worker  # noqa: E402
 from fleet.config import Account, FleetConfig, load  # noqa: E402
 from fleet.store import Store  # noqa: E402
@@ -57,7 +68,7 @@ accounts:
     assert "terminal down" in capsys.readouterr().out
 
 
-def test_real_account_without_live_is_dry_run(tmp_path: pathlib.Path, capsys) -> None:
+def test_real_account_without_live_is_dry_run(tmp_path: pathlib.Path, capsys, monkeypatch) -> None:
     config_path = tmp_path / "accounts.yaml"
     config_path.write_text("""
 accounts:
@@ -66,6 +77,8 @@ accounts:
     server: Broker-Live
     mode: real
 """, encoding="utf-8")
+    monkeypatch.setattr(worker.Worker, "attach", lambda self, account: "тест: без терминала")
+    monkeypatch.setattr(worker.Worker, "detach", lambda self: None)
     code = fleet_cli.main(["--config", str(config_path),
                            "--store", str(tmp_path / "fleet.sqlite"), "once",
                            "--account", "real"])

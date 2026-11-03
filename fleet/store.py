@@ -349,4 +349,4 @@ def _is_gold(symbol: str) -> bool:
 
 def _is_usd_pair(symbol: str) -> bool:
     upper = symbol.upper()
-    return upper.endswith("USD") and not _is_gold(upper)
+    return (upper.startswith("USD") or upper.endswith("USD")) and not _is_gold(upper)
