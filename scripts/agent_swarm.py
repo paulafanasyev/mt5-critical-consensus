@@ -312,11 +312,11 @@ MAX_DRAWDOWN = 0.01      # close everything if the account loses 1% from the bas
 PAUSE_SECONDS = 1800
 DOLLAR_STOP = 10.0       # absolute floor: never hold a position ten dollars under water
 STOP_RISK_FRACTION = 0.4 # ...but at least a fraction of the position's own risk
-SCALE_TRIGGER = 15.0     # once a position is fifteen dollars up, add half again
+SCALE_TRIGGER = 15.0     # one position is fifteen dollars up, add half again
 COOLDOWN_SECONDS = 1800  # after a stop, that symbol rests for half an hour
 MAX_ENTRIES_PER_HOUR = 3 # more than this on one symbol is churn, not trading
-TRAIL_ARM = 12.0         # once a position is twelve dollars up, protect it
-GIVEBACK_FRACTION = 0.35 # close once a third of the peak profit is given back
+TRAIL_ARM = 5.0          # once a position is five dollars up, protect it
+GIVEBACK_FRACTION = 0.15 # close once a sixth of the peak profit is given back
 SCALE_TIERS = (15.0, 30.0, 50.0, 75.0)  # add half again at each of these
 KILL_SWITCH = ROOT / "agent_data" / "demo_bridge" / "kill_switch.json"
 
@@ -467,8 +467,8 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
         # take the profit while it is still there: once a trade has been up, close it when it
         # gives back the larger of five dollars and two fifths of its peak, instead of waiting
         # for it to turn into a loss. The breakeven stop is the last line, this is the first.
-        giveback_floor = peak - max(5.0, 0.40 * peak)
-        if position.profit <= max(1.0, giveback_floor):
+        giveback_floor = peak - max(1.5, 0.15 * peak)
+        if position.profit <= max(0.5, giveback_floor):
             tick = mt5.symbol_info_tick(position.symbol)
             result = mt5.order_send({
                 "action": mt5.TRADE_ACTION_DEAL, "symbol": position.symbol,
