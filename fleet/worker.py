@@ -40,8 +40,11 @@ _PORT_OWNER_CACHE: dict[str, float | int] = {"ts": 0.0, "pid": 0}
 def port_owner(max_age: float = 20.0) -> int | None:
     """Pid listening on the MT5 API port, cached briefly: the lookup costs ~2 s."""
     cached_pid = int(_PORT_OWNER_CACHE.get("pid", 0) or 0)
-    if cached_pid and time.time() - float(_PORT_OWNER_CACHE.get("ts", 0)) < max_age:
-        return cached_pid
+    cached_age = time.time() - float(_PORT_OWNER_CACHE.get("ts", 0))
+    # A free port is a fact worth caching for a couple of seconds: the lookup costs seconds.
+    ttl = max_age if cached_pid else min(max_age, 4.0)
+    if _PORT_OWNER_CACHE.get("ts") and cached_age < ttl:
+        return cached_pid or None
     script = ("Get-NetTCPConnection -LocalPort 22346 -State Listen -ErrorAction SilentlyContinue"
               " | Select-Object -First 1 -ExpandProperty OwningProcess")
     result = subprocess.run(["powershell", "-NoProfile", "-Command", script],
@@ -172,7 +175,7 @@ class Worker:
             return WorkerResult(account.name, "flat",
                                 f"нет курса {snapshot.currency}→USD: книга счёт не видит")
         rate = snapshot.rate_to_usd(account.currency_scale)
-        day = self._day_state(account, snapshot, server_day)
+        day, flows_payload = self._day_state(account, snapshot, server_day)
         positions = risk.positions_for(account)  # includes manual positions: they move equity
 
         closed = self._manage_positions(account, day, positions)
@@ -311,6 +314,9 @@ class Worker:
                 self.store.event(account.name, "unpriced_accounts_book",
                                  count=book_stop["unpriced"])
             return 0
+        if self.store.get_meta(f"unpriced_warned:{account.name}") == "1":
+            self.store.set_meta(f"unpriced_warned:{account.name}", "0")
+            self.store.event(account.name, "unpriced_book_resolved")
         day_pct = self._portfolio_day_pct(book_stop["equity"])
         for signal in strategy.signals(account):
             spec = broker.symbol(signal.base_symbol)
@@ -403,7 +409,7 @@ class Worker:
 
     # --- day state ----------------------------------------------------------------------
     def _day_state(self, account: Account, snapshot: risk.AccountSnapshot,
-                   server_day: str) -> risk.DayState:
+                   server_day: str) -> tuple[risk.DayState, str]:
         stored = self.store.day(account.name)
         day_start = risk.day_start_datetime(server_day)
         net_flow, realized_today, flows_payload = self._cached_day_flows(
@@ -420,7 +426,7 @@ class Worker:
             state = risk.DayState.fresh(opened_with, server_day)
             state.net_flow = net_flow
         state.rollover(opened_with, server_day)
-        return state
+        return state, flows_payload
 
     def _cached_day_flows(self, account: Account, server_day: str, balance: float,
                           day_start: dt.datetime) -> tuple[float, float, str]:

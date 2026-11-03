@@ -432,7 +432,7 @@ def test_account_funded_today_is_still_allowed_to_trade(tmp_path, monkeypatch) -
     store = StoreCls(tmp_path / "book.sqlite")
     runner = worker.Worker(FleetConfig(accounts=[account]), store)
     snapshot = types.SimpleNamespace(balance=1000.0, equity=1000.0, currency="USD")
-    state = runner._day_state(account, snapshot, "2026-11-03")
+    state, _payload = runner._day_state(account, snapshot, "2026-11-03")
     assert state.start_balance == 1000.0  # no zero base, so no -inf stop
     assert state.net_flow == 0.0
     assert state.daily_pct(1000.0) == 0.0
@@ -468,10 +468,12 @@ def test_day_flow_cache_invalidates_after_a_deposit(tmp_path, monkeypatch) -> No
     account = Account(name="a", login=1, server="S", mode="demo")
     store = StoreCls(tmp_path / "book.sqlite")
     runner = worker.Worker(FleetConfig(accounts=[account]), store)
-    state = runner._day_state(account, types.SimpleNamespace(balance=1000.0), "2026-11-03")
+    state, _payload = runner._day_state(account, types.SimpleNamespace(balance=1000.0),
+                                        "2026-11-03")
     assert state.net_flow == 0.0
     # a deposit lands: the balance moves, so the cached flows must be recomputed
-    state = runner._day_state(account, types.SimpleNamespace(balance=1100.0), "2026-11-03")
+    state, _payload = runner._day_state(account, types.SimpleNamespace(balance=1100.0),
+                                        "2026-11-03")
     assert state.net_flow == 100.0
     assert state.daily_pct(1080.0) == -2.0
 
@@ -485,7 +487,7 @@ def test_book_flows_use_each_accounts_broker_day(tmp_path, monkeypatch) -> None:
     # Broker A is already on the next day, broker B is still on the old one.
     store.equity("a", 1, 1000.0, 1000.0, 0, 0.0, "USD", 1.0, "2026-11-04")
     store.equity("b", 2, 1000.0, 800.0, 0, 0.0, "USD", 1.0, "2026-11-03")
-    store.set_meta("dayflows:b:2026-11-03", "-200.00|0.00|800.00|0")
+    store.set_meta("dayflows:b:2026-11-03", "-200.00|0.00|1000.00|0")
     engine = conductor.Conductor(FleetConfig(accounts=[
         Account(name="a", login=1, server="S", mode="demo"),
         Account(name="b", login=2, server="S", mode="demo")]), store, shards=[0])
@@ -530,6 +532,63 @@ def test_day_flows_are_published_only_after_equity(tmp_path, monkeypatch) -> Non
     snapshot = types.SimpleNamespace(balance=1100.0, equity=1100.0, currency="USD",
                                      login=1, server="S", margin_free=1000.0,
                                      leverage=100, positions=0, floating=0.0)
-    day = runner._day_state(account, snapshot, "2026-11-03")
+    day, _payload = runner._day_state(account, snapshot, "2026-11-03")
     assert store.get_meta("dayflows:a:2026-11-03") is None  # not yet: equity comes first
     assert day.net_flow == 100.0
+
+
+def test_port_owner_caches_a_free_port(tmp_path, monkeypatch) -> None:
+    calls = {"n": 0}
+
+    class FakeRun:
+        def __init__(self, *a, **k):
+            calls["n"] += 1
+            self.stdout = ""
+            self.stderr = ""
+
+    monkeypatch.setattr(worker.subprocess, "run", FakeRun, raising=False)
+    monkeypatch.setattr(worker, "_PORT_OWNER_CACHE", {"ts": 0.0, "pid": 0}, raising=False)
+    worker.port_owner()
+    worker.port_owner()
+    assert calls["n"] == 1  # the second lookup is served from the cache
+
+
+def test_book_flows_ignore_a_payload_with_a_different_balance(tmp_path) -> None:
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    store = StoreCls(tmp_path / "book.sqlite")
+    store.equity("a", 1, 1000.0, 1000.0, 0, 0.0, "USD", 1.0, "2026-11-03")
+    # payload says balance 1100 (new deposit) while the book row still says 1000
+    store.set_meta("dayflows:a:2026-11-03", "100.00|0.00|1100.00|0")
+    engine = conductor.Conductor(FleetConfig(accounts=[
+        Account(name="a", login=1, server="S", mode="demo")]), store, shards=[0])
+    flow, _ = engine._book_flows()
+    assert flow == 0.0
+    store.equity("a", 1, 1100.0, 1100.0, 0, 0.0, "USD", 1.0, "2026-11-03")
+    flow, _ = engine._book_flows()
+    assert flow == 100.0
+
+
+def test_cycle_completes_and_publishes_flows(tmp_path, monkeypatch) -> None:
+    """The whole per-account cycle must run, not just the pieces around it."""
+    from fleet import risk as risk_mod
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    account = Account(name="a", login=1, server="S", mode="demo")
+    store = StoreCls(tmp_path / "book.sqlite")
+    runner = worker.Worker(FleetConfig(accounts=[account]), store)
+    snapshot = risk_mod.AccountSnapshot(login=1, server="S", currency="USD",
+                                       balance=1100.0, equity=1100.0, margin_free=1000.0,
+                                       leverage=100, positions=0, floating=0.0,
+                                       server_day="2026-11-03")
+    monkeypatch.setattr(risk_mod, "AccountSnapshot", types.SimpleNamespace(read=lambda *a, **k: snapshot))
+    monkeypatch.setattr(risk_mod, "positions_for", lambda acc: [])
+    monkeypatch.setattr(risk_mod, "daily_net_flow", lambda day: 100.0)
+    monkeypatch.setattr(risk_mod, "daily_realized", lambda day: 0.0)
+    monkeypatch.setattr(worker.Worker, "_manage_positions", lambda self, *a, **k: 0)
+    monkeypatch.setattr(worker.Worker, "_try_entries", lambda self, *a, **k: 0)
+    result = runner._cycle(account, allow_entries=True)
+    assert result.status == "ok"
+    assert store.get_meta("dayflows:a:2026-11-03") is not None  # published after equity

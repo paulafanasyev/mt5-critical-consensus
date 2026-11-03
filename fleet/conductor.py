@@ -240,26 +240,30 @@ class Conductor:
         flow = realized = 0.0
         with self.store._connect() as conn:  # noqa: SLF001 - same package boundary
             rows = conn.execute(
-                "SELECT account, server_day FROM book").fetchall()
-            priced = {account for account, equity_usd in conn.execute(
-                "SELECT account, equity_usd FROM book").fetchall() if equity_usd is not None}
-            for account, day in rows:
-                if account not in priced:
-                    continue  # an unpriced account is not in equity, so its flow is not either
-                raw = None
+                "SELECT account, server_day, balance, equity_usd FROM book").fetchall()
+            for account, day, balance, equity_usd in rows:
+                if account not in {a.name for a in self.config.enabled()}:
+                    continue
+                if equity_usd is None:
+                    continue  # unpriced: not in equity, so its flow must not move adjusted
                 row = conn.execute("SELECT value FROM meta WHERE key=?",
                                    (f"dayflows:{account}:{day}",)).fetchone()
-                if row:
-                    raw = row[0]
-                if not raw:
+                if not row:
                     continue
-                parts = raw.split("|")
-                if len(parts) >= 2:
-                    try:
-                        flow += float(parts[0])
-                        realized += float(parts[1])
-                    except ValueError:
-                        continue
+                parts = row[0].split("|")
+                if len(parts) < 4:
+                    continue
+                try:
+                    flow += float(parts[0])
+                    realized += float(parts[1])
+                    witness = float(parts[2])
+                except ValueError:
+                    continue
+                if abs(witness - float(balance or 0.0)) > 1e-9:
+                    # The payload belongs to a different balance than this book row: skip it,
+                    # the next cycle will see both settled.
+                    flow -= float(parts[0])
+                    realized -= float(parts[1])
         return flow, realized
 
     def _registry_hash(self) -> str:
