@@ -13,6 +13,7 @@ import pathlib
 import subprocess
 import time
 import traceback
+import types
 
 import MetaTrader5 as mt5
 
@@ -72,12 +73,12 @@ class Worker:
             ok, detail = network.ensure_tunnel(account.vpn_profile)
             if not ok:
                 return f"нужен туннель: {detail}"
-        ok, detail = port_is_free_or_ours(account)
-        if not ok:
-            return detail
         if not account.terminal_exe.exists():
             terminals.provision(account)
         terminals.stop_other_fleet(keep_dir=account.data_dir)
+        ok, detail = port_is_free_or_ours(account)
+        if not ok:
+            return detail
         if terminals.running_pid(account) is None:
             terminals.launch(account)
         password = terminals.password_for(account)
@@ -122,9 +123,6 @@ class Worker:
     # --- one account --------------------------------------------------------------------
     def run_account(self, account: Account, allow_entries: bool = True) -> WorkerResult:
         failures, next_attempt, last_error = self.store.health(account.name)
-        if failures >= MAX_FAILURES:
-            return WorkerResult(account.name, "blocked",
-                                f"счёт заблокирован после {failures} сбоев: {last_error}")
         if time.time() < next_attempt:
             return WorkerResult(account.name, "cooldown",
                                 f"до следующей попытки {int(next_attempt - time.time())} с")
@@ -134,7 +132,8 @@ class Worker:
             error = f"attach: {type(exc).__name__}: {exc}"
             self.store.event(account.name, "attach_exception", error=str(exc))
         if error:
-            backoff = min(900.0, 5.0 * (2 ** min(failures, 6)))
+            # Escalating but always finite: a broker outage must not brick an account forever.
+            backoff = 60.0 if failures >= MAX_FAILURES else min(900.0, 5.0 * (2 ** failures))
             self.store.record_failure(account.name, error, backoff)
             if not account.keep_running:
                 terminals.stop(account)
@@ -160,6 +159,9 @@ class Worker:
             return WorkerResult(account.name, "flat", "нулевой баланс")
         if account.is_real and snapshot.balance <= 0:
             return WorkerResult(account.name, "flat", "реальный счёт без денег")
+        if snapshot.rate_to_usd() <= 0 and not account.is_real:
+            return WorkerResult(account.name, "flat",
+                                f"нет курса {snapshot.currency}→USD: книга счёт не видит")
         rate = snapshot.rate_to_usd()
         day = self._day_state(account, snapshot, server_day)
         positions = risk.positions_for(account)  # includes manual positions: they move equity
@@ -174,7 +176,7 @@ class Worker:
         self.store.save_positions(account.name, positions)
 
         opened = 0
-        if allow_entries:
+        if allow_entries and rate > 0:
             opened = self._try_entries(account, snapshot, positions, day, rate)
         self._save_day(account, day)
         return WorkerResult(account.name, "ok", f"equity {snapshot.equity:.2f}",
@@ -206,7 +208,8 @@ class Worker:
                 self.store.set_peak(account.name, position.ticket, peak)
 
             be_level = strategy.break_even_level(account, position, spec, atr_entry)
-            if be_level is not None and not self.dry_run:
+            if (be_level is not None and not self.dry_run
+                    and not (account.is_real and not self.allow_live)):
                 try:
                     broker.modify_position(int(position.ticket), name, be_level,
                                            float(position.tp), spec.digits)
@@ -254,16 +257,20 @@ class Worker:
     # --- entries ------------------------------------------------------------------------
     def _try_entries(self, account: Account, snapshot: risk.AccountSnapshot, positions: list,
                      day: risk.DayState, rate: float) -> int:
-        owned = [p for p in positions if p.magic == account.magic]
         allowed, reason = risk.can_open(account, snapshot, day, positions)
         if not allowed:
             self.store.event(account.name, "hold", reason=reason)
             return 0
         book = self.store.portfolio([a.name for a in self.config.enabled()])
+        mirror = self.store.all_positions()
+        book_positions = [types.SimpleNamespace(symbol=symbol, volume=volume, sl=sl,
+                                                price_open=price_open, type=side)
+                          for _acc, _ticket, symbol, side, volume, price_open, _profit,
+                          sl, _tp, _magic in mirror]
         specs: dict[str, broker.BrokerSymbol | None] = {}
-        for position in positions:
+        for position in book_positions:
             specs[position.symbol] = broker.symbol_exact(position.symbol)
-        current_risk = risk.book_risk_money(positions, specs)
+        current_risk = risk.book_risk_money(book_positions, specs)
         day_pct = self._portfolio_day_pct(book["equity"])
         for signal in strategy.signals(account):
             spec = broker.symbol(signal.base_symbol)
@@ -278,7 +285,7 @@ class Worker:
                                            max(spec.volume_min, account.risk.min_lots))
             ok, why = risk.can_open_portfolio(
                 self.config.portfolio, book["equity"], current_risk, new_risk,
-                positions, specs, day_pct)
+                book_positions, specs, day_pct)
             if not ok:
                 self.store.event(account.name, "portfolio_hold", reason=why)
                 return 0
@@ -294,6 +301,7 @@ class Worker:
                 return 0
             try:
                 if self.dry_run or (account.is_real and not self.allow_live):
+                    self.store.release(slot)
                     self.store.event(account.name, "entry(gated)", symbol=spec.name,
                                      side=signal.side, volume=volume, reason=signal.reason,
                                      risk_usd=round(risk_money * (rate or 1.0), 2))

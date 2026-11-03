@@ -153,7 +153,14 @@ def account_from_dict(data: dict[str, Any]) -> Account:
     _check_keys(where, data, _ACCOUNT_KEYS | {"risk", "strategy"})
     payload = {k: v for k, v in data.items() if k in _ACCOUNT_KEYS}
     if "symbols" in payload:
-        payload["symbols"] = tuple(payload["symbols"])
+        symbols = payload["symbols"]
+        if isinstance(symbols, str) or not all(isinstance(s, str) for s in symbols):
+            raise ConfigError(f"{where}: symbols должен быть списком строк")
+        payload["symbols"] = tuple(symbols)
+    if "login" in payload and not isinstance(payload["login"], int):
+        raise ConfigError(f"{where}: login должен быть числом")
+    if "enabled" in payload and not isinstance(payload["enabled"], bool):
+        raise ConfigError(f"{where}: enabled должен быть true/false")
     if "terminal_source" in payload:
         payload["terminal_source"] = pathlib.Path(str(payload["terminal_source"]))
     try:
@@ -164,10 +171,19 @@ def account_from_dict(data: dict[str, Any]) -> Account:
         raise ConfigError(f"{where}: mode={account.mode!r}, допустимо demo|real")
     if account.network not in ("direct", "vpn"):
         raise ConfigError(f"{where}: network={account.network!r}, допустимо direct|vpn")
-    if account.network == "vpn" and not account.vpn_profile:
-        raise ConfigError(f"{where}: network=vpn требует vpn_profile (путь к .ovpn)")
+    if account.network == "vpn":
+        if not account.vpn_profile:
+            raise ConfigError(f"{where}: network=vpn требует vpn_profile (путь к .ovpn)")
+        # An enabled account must have a real profile; a disabled placeholder may not exist yet.
+        if account.enabled and not pathlib.Path(account.vpn_profile).exists():
+            raise ConfigError(f"{where}: нет файла профиля {account.vpn_profile}")
     account.risk = _risk(data.get("risk", {}), f"{where}.risk")
     account.strategy = _strategy(data.get("strategy", {}), f"{where}.strategy")
+    from .risk import validate_risk_profile
+
+    problems = validate_risk_profile(account)
+    if problems:
+        raise ConfigError("; ".join(problems))
     return account
 
 
@@ -175,10 +191,14 @@ def load(path: pathlib.Path | None = None) -> FleetConfig:
     """Read and validate the registry; raise ConfigError instead of trading bad numbers."""
     target = pathlib.Path(path) if path else CONFIG_PATH
     if not target.exists():
-        return FleetConfig()
+        raise ConfigError(f"нет реестра счетов: {target}")
     raw = target.read_text(encoding="utf-8")
     data = _parse_yaml(raw) if target.suffix.lower() in {".yaml", ".yml"} else json.loads(raw)
-    accounts = [account_from_dict(item) for item in data.get("accounts", [])]
+    _check_keys("реестр", data, {"accounts", "portfolio"})
+    items = data.get("accounts", [])
+    if not isinstance(items, list):
+        raise ConfigError("accounts должен быть списком")
+    accounts = [account_from_dict(item) for item in items]
     portfolio_data = data.get("portfolio", {})
     _check_keys("portfolio", portfolio_data, _PORTFOLIO_KEYS)
     portfolio = PortfolioLimits(**portfolio_data)

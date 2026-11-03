@@ -52,17 +52,17 @@ def rate_to_usd(currency: str) -> float:
     code = (currency or "USD").upper()
     if code in ("USD", "USDT", "USDC"):
         return 1.0
-    direct = f"{code}USD"
-    if mt5.symbol_info(direct) is not None:
+    direct = broker.resolve(f"{code}USD")
+    if direct:
         tick = mt5.symbol_info_tick(direct)
         if tick is not None and tick.bid > 0:
             return float(tick.bid)
-    inverse = f"USD{code}"
-    if mt5.symbol_info(inverse) is not None:
+    inverse = broker.resolve(f"USD{code}")
+    if inverse:
         tick = mt5.symbol_info_tick(inverse)
         if tick is not None and tick.bid > 0:
             return 1.0 / float(tick.bid)
-    return 0.0  # unknown conversion: the caller excludes the account from the book
+    return 0.0  # unpriced: the account cannot be judged, so it may not open trades
 
 
 def server_day_now() -> str:
@@ -196,7 +196,7 @@ def broker_is_gold(symbol_name: str) -> bool:
 
 def broker_is_usd_pair(symbol_name: str) -> bool:
     upper = symbol_name.upper()
-    return upper.endswith("USD") and not broker_is_gold(upper)
+    return (upper.startswith("USD") or upper.endswith("USD")) and not broker_is_gold(upper)
 
 
 def size_for(account: Account, spec: broker.BrokerSymbol, stop_distance: float,

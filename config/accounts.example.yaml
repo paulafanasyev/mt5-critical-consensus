@@ -14,7 +14,7 @@ accounts:
     network: direct
     shard: 0
     magic: 7000001
-    seed_config: C:\mt5-team\config
+    seed_config: C:\path\to\demo\config
     symbols: [EURUSD, GBPUSD, USDJPY, XAUUSD]
     strategy:
       kinds: [trend]
@@ -29,16 +29,16 @@ accounts:
       min_lots: 0.01
 
   - name: exness-real
-    login: 276261159
-    server: Exness-MT5Real26
+    login: 12345678
+    server: BrokerX-Live
     mode: real
     enabled: false
     network: vpn
-    vpn_profile: C:\openvpn\vgate.ovpn
+    vpn_profile: C:\path\to\profile.ovpn
     shard: 1
     magic: 7000002
     password_env: EXNESS_REAL_PASSWORD
-    seed_config: C:\mt5-exness\config
+    seed_config: C:\path\to\broker-x\config
     symbols: [GBPUSD, EURUSD, XAUUSD]
     strategy:
       kinds: [trend]
@@ -55,8 +55,8 @@ accounts:
       break_even_atr: 0.4
 
   - name: gtc-real
-    login: 52183174
-    server: GTCGlobalSA-Server 2
+    login: 12345679
+    server: BrokerY-Live
     mode: real
     enabled: false
     network: direct
@@ -66,6 +66,7 @@ accounts:
     risk:
       risk_per_trade_pct: 0.20
       daily_stop_pct: 0.50
+      max_open_positions: 2
       max_lots: 0.01
 
 portfolio:

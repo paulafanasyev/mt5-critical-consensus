@@ -23,8 +23,8 @@ def test_registry_parses_accounts(tmp_path: pathlib.Path) -> None:
     assert len(fleet.accounts) == 3
     exness = fleet.by_name("exness-real")
     assert exness is not None
-    assert exness.login == 276261159
-    assert exness.server == "Exness-MT5Real26"
+    assert exness.login == 12345678
+    assert exness.server == "BrokerX-Live"
     assert exness.is_real
     assert exness.risk.max_lots == 0.01
     assert exness.risk.daily_stop_pct == 0.5

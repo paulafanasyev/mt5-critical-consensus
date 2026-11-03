@@ -158,7 +158,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     shards = [int(part) for part in args.shards.replace(" ", "").split(",") if part] or None
     engine = conductor.Conductor(config, Store(args.store), interval=args.interval,
                                  dry_run=args.dry_run, config_path=config_path, shards=shards,
-                                 allow_multi_shard=args.allow_multi_shard)
+                                 allow_multi_shard=args.allow_multi_shard, live=args.live)
     real = _real_names(config.enabled())
     if real and not args.live:
         print(f"реальные счета {real}: ордера выключены, нужен --live")
@@ -175,6 +175,17 @@ def cmd_pause(args: argparse.Namespace) -> int:
     else:
         conductor.PAUSE_FILE.unlink(missing_ok=True)
         print("пауза снята")
+    return 0
+
+
+def cmd_reset_health(args: argparse.Namespace) -> int:
+    store = Store(args.store)
+    config = _config(args)
+    names = [args.account] if args.account else [a.name for a in config.enabled()]
+    for name in names:
+        store.clear_failure(name)
+        store.event(name, "health_reset")
+    print(f"circuit breaker сброшен: {', '.join(names) or 'нет счетов'}")
     return 0
 
 
@@ -228,6 +239,9 @@ def main(argv: list[str] | None = None) -> int:
     resume.set_defaults(func=cmd_pause, action="resume")
     reset = sub.add_parser("reset-day", help="сбросить дневную базу портфеля")
     reset.set_defaults(func=cmd_reset_day)
+    health = sub.add_parser("reset-health", help="разблокировать счёт после circuit breaker")
+    health.add_argument("--account", default="")
+    health.set_defaults(func=cmd_reset_health)
 
     args = parser.parse_args(argv)
     try:
@@ -240,6 +254,9 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     except OSError as exc:
         print(f"ошибка ввода-вывода: {exc}")
+        return 2
+    except RuntimeError as exc:
+        print(f"ошибка запуска: {exc}")
         return 2
 
 

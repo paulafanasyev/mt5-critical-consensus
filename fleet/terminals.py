@@ -144,6 +144,7 @@ def write_startup_config(account: Account) -> None:
 def launch(account: Account, extra_args: tuple[str, ...] = ()) -> subprocess.Popen:
     if not account.terminal_exe.exists():
         raise FileNotFoundError(f"терминал не подготовлен: {account.terminal_exe}")
+    _PID_CACHE.pop(str(account.data_dir).lower(), None)
     creation = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     return subprocess.Popen([str(account.terminal_exe), "/portable", *extra_args],
                             cwd=str(account.data_dir), creationflags=creation, close_fds=True,
@@ -172,7 +173,10 @@ def running_pid(account: Account) -> int | None:
     expected = str(account.terminal_exe).lower()
     pid = next((candidate for candidate, path in _terminal_processes()
                 if path.lower() == expected), None)
-    _PID_CACHE[key] = (now, pid)
+    if pid is not None:
+        _PID_CACHE[key] = (now, pid)
+    else:
+        _PID_CACHE.pop(key, None)
     return pid
 
 

@@ -215,14 +215,15 @@ def test_pause_stops_the_park_and_resume_brings_it_back(tmp_path, monkeypatch) -
     conductor.PAUSE_FILE.write_text("стоп", encoding="utf-8")
     state = engine.tick()
     assert state["paused"] is True
-    assert engine.children == {} and stopped  # terminals released too
+    # A pause blocks entries; shards keep running so stops and targets still fire.
+    assert engine.children and not stopped
     before = len(spawned)
     engine.tick()
-    engine.tick()
     assert len(spawned) == before  # no respawn storm while paused
+    assert not engine.children[0].terminated
     conductor.PAUSE_FILE.unlink()
     engine.tick()
-    assert engine.children and len(spawned) == before + 1  # resume restarts the shard
+    assert len(spawned) == before  # existing shard is reused, not duplicated
 
 
 def _record(sink: list, command: list) -> FakePopen:

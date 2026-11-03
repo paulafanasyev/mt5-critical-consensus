@@ -30,7 +30,7 @@ class Conductor:
                  dry_run: bool = False, python: str | None = None,
                  config_path: pathlib.Path | None = None,
                  shards: list[int] | None = None,
-                 allow_multi_shard: bool = False) -> None:
+                 allow_multi_shard: bool = False, live: bool = False) -> None:
         self.config = config
         self.store = store
         self.interval = interval
@@ -45,6 +45,7 @@ class Conductor:
                 "или --allow-multi-shard, если счета не пересекаются по порту.")
         self.shards = wanted
         self.allow_multi_shard = allow_multi_shard
+        self.live = live
         self.children: dict[int, subprocess.Popen] = {}
         self.day_start_equity: float | None = None
         self._paused = False
@@ -96,6 +97,8 @@ class Conductor:
             command.extend(["--config", str(self.config_path)])
         if self.dry_run:
             command.append("--dry-run")
+        if self.live:
+            command.append("--live")
         child = subprocess.Popen(command, cwd=str(pathlib.Path(__file__).resolve().parents[1]),
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.children[shard] = child
@@ -111,7 +114,7 @@ class Conductor:
                     child.kill()
                 self.store.event("conductor", "stopped_shard", shard=shard)
         self.children.clear()
-        terminals.stop_all()  # detached terminals would keep holding the API port
+        terminals.stop_other_fleet()  # fleet terminals only: never someone else's terminal
         from . import network
 
         if any(a.network == "vpn" for a in self.config.enabled()):
@@ -156,23 +159,23 @@ class Conductor:
                 self.next_restart[shard] = now + delay
                 if count > len(BACKOFF):
                     self.store.event("conductor", "alarm", shard=shard,
-                                     reason="шард падает слишком часто; нужен человек",
-                                     restarts=count)
-                    continue
-            self._spawn(shard)
+                                     reason="шард падает слишком часто", restarts=count)
+                self._spawn(shard)
+            else:
+                self._spawn(shard)
 
     def _hold_on_pause(self) -> None:
+        """Pause blocks new entries only: shards keep running so stops and targets still fire."""
         if self._paused:
             return
         self._paused = True
-        self.stop()
         self.store.event("conductor", "paused",
                          reason=PAUSE_FILE.read_text(encoding="utf-8")[:200])
 
     def _remember_baseline(self, book: dict) -> None:
-        from . import risk
-
-        today = risk.server_day_now()
+        with self.store._connect() as conn:  # noqa: SLF001 - same package boundary
+            row = conn.execute("SELECT MAX(server_day) FROM book").fetchone()
+        today = (row[0] if row and row[0] else "") or ""
         stored_day = self.store.get_meta("portfolio_day")
         stored_value = self.store.get_meta("portfolio_day_start_equity")
         if stored_day != today or not stored_value:
@@ -190,6 +193,9 @@ class Conductor:
 
     def _portfolio_stop(self, book: dict) -> str:
         limits = self.config.portfolio
+        expected = len(self.config.enabled())
+        if expected and book["accounts"] < expected:
+            return ""  # a partial book (paused shard, backoff, restart) must not fake a loss
         if self.day_start_equity and self.day_start_equity > 0 and book["equity"] > 0:
             change_pct = (book["equity"] - self.day_start_equity) / self.day_start_equity * 100
             if change_pct <= -limits.daily_stop_pct:

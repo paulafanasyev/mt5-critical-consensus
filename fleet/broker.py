@@ -360,14 +360,12 @@ def ema(name: str, timeframe: int, period: int = 50, bars: int = 400) -> float:
 
 
 def server_timestamp() -> float:
-    """The broker's clock, taken from the newest tick the terminal knows about."""
-    best = 0.0
-    for item in mt5.symbols_get() or []:
-        tick = mt5.symbol_info_tick(item.name)
+    """The broker's clock from one liquid symbol: scanning every symbol would cost seconds."""
+    for name in ("EURUSD", "XAUUSD", "GBPUSD", "USDJPY"):
+        tick = mt5.symbol_info_tick(name)
         if tick is not None and getattr(tick, "time", 0):
-            best = max(best, float(tick.time))
-    if best <= 0:
-        rates = mt5.copy_rates_from_pos("EURUSD", mt5.TIMEFRAME_D1, 0, 1)
+            return float(tick.time)
+        rates = mt5.copy_rates_from_pos(name, mt5.TIMEFRAME_D1, 0, 1)
         if rates is not None and len(rates):
-            best = float(rates[-1]["time"])
-    return best
+            return float(rates[-1]["time"])
+    return 0.0
