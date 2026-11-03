@@ -26,7 +26,8 @@ SWARM = ROOT / "scripts" / "agent_swarm.py"
 PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 MAGIC_FLOOR = 8180000
 MAGIC_BASE = 8180000
-DEMO_TERMINALS = (r"C:\mt5-exness\terminal64.exe",
+DEMO_TERMINALS = (r"C:\mt5-team\terminal64.exe",
+                  r"C:\mt5-exness\terminal64.exe",
                   r"C:\Program Files\MetaTrader 5\terminal64.exe",
                   r"C:\mt5-real\terminal64.exe")
 DESK_MAGIC = 8189999  # hand-placed by the lead, not an orphan
