@@ -4,7 +4,11 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $terminalDir = "C:\Program Files\MetaTrader 5"
 $policy = Join-Path $root "agent_data\live_gold_ema_policy.yaml"
-$db = Join-Path $root "agent_data\demo_live_20261101.db"
+# The journal is named for the UTC day it belongs to, and that day is measured here rather than
+# frozen in a literal: with `demo_live_20261101.db` hardcoded, every later run appended to the
+# previous day's audit trail and re-read that day's risk baseline and served ids as if they were
+# today's.
+$db = Join-Path $root ("agent_data\demo_live_{0}.db" -f (Get-Date).ToUniversalTime().ToString('yyyyMMdd'))
 
 # The bridge secret is never stored in a tracked file: this script is pushed, and a literal
 # here would hand every reader the credential that authorizes order commands. It comes from

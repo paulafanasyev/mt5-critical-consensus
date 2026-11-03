@@ -71,26 +71,67 @@ def equity_series(events: Sequence[dict[str, Any]]) -> list[tuple[datetime, floa
     return points
 
 
-def planned_risk_currency(trade: dict[str, Any], *, tick_size: float, tick_value: float) -> float | None:
-    """Account-currency risk the trade was sized for: stop distance in ticks times tick value."""
+def policy_cash_per_price_unit(tick_size: float, tick_value: float,
+                               contract_size: float | None) -> float:
+    """The cash per price unit a policy YAML declares, using the sizer's own source priority.
+
+    ``SymbolSpec.cash_per_price_unit`` prefers the declared contract size because the broker's
+    tick field is not reliable - MetaQuotes-Demo publishes XAUUSD at 10 $ per price unit per lot
+    there while the contract and its own profit math say 100. Only a journal with no sizing rows
+    of its own falls back to this.
+    """
+    if contract_size is not None:
+        return contract_size
+    return tick_value / tick_size
+
+
+def recorded_cash_per_price_unit(events: Sequence[dict[str, Any]]) -> float | None:
+    """The cash per price unit a run actually sized at, read back out of its own cycles.
+
+    ``sizing.risk_per_lot`` is ``proposal.risk_distance`` times that number, so the pair divides
+    it out without trusting any policy file. This is the basis a report has to use: a journal
+    written before the contract-priced fix earned its P/L at the broker's tick field and was
+    sized at the same field, so re-reading it against today's declared contract would divide an
+    unchanged numerator by a tenfold larger denominator and redraw the same trades as
+    one-tenth of the R they were booked at.
+    """
+    for event in events:
+        if event.get("event_type") != "agent_cycle":
+            continue
+        sizing, proposal = event.get("sizing"), event.get("proposal")
+        if not isinstance(sizing, dict) or not isinstance(proposal, dict):
+            continue
+        per_lot, distance = sizing.get("risk_per_lot"), proposal.get("risk_distance")
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               for value in (per_lot, distance)):
+            continue
+        if per_lot > 0 and distance > 0:
+            ratio = float(per_lot) / float(distance)
+            if math.isfinite(ratio) and ratio > 0:
+                return ratio
+    return None
+
+
+def planned_risk_currency(trade: dict[str, Any], *, cash_per_price_unit: float) -> float | None:
+    """Account-currency risk the trade was sized for: stop distance times cash per price unit."""
     entry, stop = trade.get("entry_price"), trade.get("stop_loss")
     volume = trade.get("volume")
     if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in (entry, stop, volume)):
         return None
-    if not tick_size or tick_size <= 0 or tick_value <= 0:
+    if not cash_per_price_unit or cash_per_price_unit <= 0:
         return None
-    risk = abs(float(entry) - float(stop)) / tick_size * tick_value * float(volume)
+    risk = abs(float(entry) - float(stop)) * cash_per_price_unit * float(volume)
     return risk if math.isfinite(risk) and risk > 0 else None
 
 
-def r_multiples(events: Sequence[dict[str, Any]], *, tick_size: float,
-                tick_value: float) -> list[tuple[str, float]]:
+def r_multiples(events: Sequence[dict[str, Any]], *,
+                cash_per_price_unit: float) -> list[tuple[str, float]]:
     """Realised P/L per closed paper trade divided by the risk that trade was sized for."""
     out = []
     for event in events:
         if event.get("event_type") != "paper_trade_closed":
             continue
-        risk = planned_risk_currency(event, tick_size=tick_size, tick_value=tick_value)
+        risk = planned_risk_currency(event, cash_per_price_unit=cash_per_price_unit)
         pnl = event.get("pnl")
         if risk is None or isinstance(pnl, bool) or not isinstance(pnl, (int, float)):
             continue
@@ -344,12 +385,23 @@ def fetch_real_bars(symbol: str, *, days: int) -> list[dict[str, Any]]:
              "low": float(row["low"]), "close": float(row["close"])} for row in rates]
 
 
-def read_symbol_spec(policy_path: Path) -> tuple[float, float]:
+def read_symbol_spec(policy_path: Path) -> tuple[float, float, float | None]:
+    """Return (tick_size, tick_value, contract_size) from a policy YAML.
+
+    contract_size is None when the policy predates the field or leaves it non-positive, which is
+    the same "unknown" reading ``SymbolSpec.from_terminal`` uses; the tick ratio is then the only
+    estimate available.
+    """
     import yaml
 
     raw = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
     spec = raw["symbol_spec"]
-    return float(spec["tick_size"]), float(spec["tick_value"])
+    contract_size = None
+    if isinstance(spec, dict):
+        value = spec.get("contract_size")
+        if not isinstance(value, bool) and isinstance(value, (int, float)) and value > 0:
+            contract_size = float(value)
+    return float(spec["tick_size"]), float(spec["tick_value"]), contract_size
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -381,15 +433,24 @@ def render_demo_journals(specs: Sequence[tuple[str, Path, Path]], out_dir: Path,
     r_bars: list[tuple[str, list[tuple[str, float]]]] = []
     r_labels: list[str] = []
     for label, policy_path, db_path in specs:
-        tick_size, tick_value = read_symbol_spec(policy_path)
+        tick_size, tick_value, contract_size = read_symbol_spec(policy_path)
         events = load_journal_events(db_path)
+        # The basis the run itself booked at, when its cycles carried a proposal and a sizing;
+        # a policy file is a description of the contract, not a record of this journal.
+        declared = policy_cash_per_price_unit(tick_size, tick_value, contract_size)
+        recorded = recorded_cash_per_price_unit(events)
+        if recorded is None:
+            cash, risk_basis = declared, ("policy_contract_size" if contract_size is not None
+                                          else "policy_tick_ratio")
+        else:
+            cash, risk_basis = recorded, "journal_sizing"
         equity = equity_series(events)
         if not equity:
             raise ValueError(f"{db_path}: journal has no equity_point events, so nothing to plot")
         origin = equity[0][0].timestamp()
         curves.append((label, [((at.timestamp() - origin) / 86_400.0, value)
                                for at, value in equity]))
-        multiples = r_multiples(events, tick_size=tick_size, tick_value=tick_value)
+        multiples = r_multiples(events, cash_per_price_unit=cash)
         keys = [f"{i + 1}" for i in range(len(multiples))]
         r_bars.append((label, list(zip(keys, [value for _, value in multiples]))))
         r_labels = keys if len(keys) > len(r_labels) else r_labels
@@ -401,6 +462,9 @@ def render_demo_journals(specs: Sequence[tuple[str, Path, Path]], out_dir: Path,
             "policy": str(policy_path),
             "tick_size": tick_size,
             "tick_value": tick_value,
+            "contract_size": contract_size,
+            "risk_cash_per_price_unit": round(cash, 6),
+            "risk_basis": risk_basis,
             "cycles": sum(1 for event in events if event.get("event_type") == "agent_cycle"),
             "closed_trades": len(closed),
             "winning_trades": wins,
@@ -413,7 +477,7 @@ def render_demo_journals(specs: Sequence[tuple[str, Path, Path]], out_dir: Path,
             "r_multiples": [round(value, 4) for _, value in multiples],
             "planned_risk_currency_per_trade": [
                 round(risk, 4) for risk in (
-                    planned_risk_currency(event, tick_size=tick_size, tick_value=tick_value)
+                    planned_risk_currency(event, cash_per_price_unit=cash)
                     for event in closed if event.get("pnl") is not None) if risk is not None],
             "broker_order_sent_anywhere": any(bool(event.get("broker_order_sent"))
                                               for event in events),

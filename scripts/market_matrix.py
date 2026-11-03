@@ -52,6 +52,11 @@ def terminal_specs(symbols: list[str]) -> dict[str, dict]:
                 "spread_points": min(max(int(info.spread), 10), 60),
                 "stops_level_points": max(int(info.trade_stops_level), 0),
             }
+            # Only a broker that publishes it: SymbolSpec rejects a declared non-positive
+            # contract_size, and an unset field reads as 0.0 rather than as "unknown".
+            contract_size = getattr(info, "trade_contract_size", 0.0)
+            if contract_size > 0:
+                specs[symbol]["contract_size"] = float(contract_size)
     finally:
         mt5.shutdown()
     return specs

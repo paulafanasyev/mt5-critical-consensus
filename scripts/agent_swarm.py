@@ -789,8 +789,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--interval-sec", type=int, default=30)
     args = parser.parse_args(argv)
-    if not connect_demo(mt5):
-        raise SystemExit("no terminal with the demo account")
+    while not connect_demo(mt5):
+        log({"event": "demo terminal unavailable; retrying in 10 s"})
+        time.sleep(10)
     account = mt5.account_info()
     if account is None or account.login != EXPECTED_LOGIN:
         raise SystemExit("unexpected account")

@@ -14,3 +14,6 @@ htmlcov/
 agent_data/
 # Terminal screenshots show the account holder's name and every login in the Navigator.
 docs/evidence/mt5_*.png
+
+# рабочий реестр счетов: у каждого свой
+config/accounts.yaml

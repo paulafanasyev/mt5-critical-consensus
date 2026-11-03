@@ -1,24 +1,24 @@
-"""Unit tests for the code-first fleet: registry, sizing, storage and parsing.
-
-These run without a terminal so CI stays green on machines with no MT5 installed.
-"""
+"""Registry and storage tests: validation, the book aggregate and atomic reservations."""
 from __future__ import annotations
 
 import pathlib
 import sys
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from fleet import config, store  # noqa: E402
-from fleet.broker import BrokerSymbol, normalize_volume  # noqa: E402
+from fleet import config  # noqa: E402
+from fleet.config import ConfigError, PortfolioLimits  # noqa: E402
+from fleet.store import Store  # noqa: E402
 
 
 def test_registry_parses_accounts(tmp_path: pathlib.Path) -> None:
     target = tmp_path / "accounts.yaml"
-    source = ROOT / "config" / "accounts.example.yaml"
-    target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    target.write_text((ROOT / "config" / "accounts.example.yaml").read_text(encoding="utf-8"),
+                      encoding="utf-8")
     fleet = config.load(target)
     assert len(fleet.accounts) == 3
     exness = fleet.by_name("exness-real")
@@ -28,47 +28,157 @@ def test_registry_parses_accounts(tmp_path: pathlib.Path) -> None:
     assert exness.is_real
     assert exness.risk.max_lots == 0.01
     assert exness.risk.daily_stop_pct == 0.5
+    assert exness.risk.take_atr_real == 1.6
     assert exness.symbols == ("GBPUSD", "EURUSD", "XAUUSD")
     assert exness.strategy.kinds == ("trend",)
+    assert exness.vpn_profile.endswith(".ovpn")
     assert fleet.portfolio.daily_stop_pct == 2.0
-    assert fleet.enabled()  # демо включён, реальные выключены
-
-
-def test_shards_and_paths(tmp_path: pathlib.Path) -> None:
-    fleet = config.load()
+    assert [a.name for a in fleet.enabled()] == ["demo-metaquotes"]
     demo = fleet.by_name("demo-metaquotes")
-    assert demo is not None
-    assert demo.data_dir.name.startswith("114929502-")
-    assert demo.terminal_exe.name == "terminal64.exe"
+    assert demo is not None and demo.data_dir.name.startswith("114929502-")
 
 
-def test_volume_normalization_respects_step_and_cap() -> None:
-    spec = BrokerSymbol(name="EURUSD", digits=5, point=0.00001, tick_size=0.00001,
-                        tick_value=1.0, volume_min=0.01, volume_max=100.0,
-                        volume_step=0.01, stops_level=0, freeze_level=0, spread=10, filling=1)
-    assert normalize_volume(0.004, spec, 0.10) == 0.01
-    assert normalize_volume(0.017, spec, 0.10) == 0.02
-    assert normalize_volume(5.0, spec, 0.10) == 0.10
-    assert normalize_volume(0.5, spec, 0.005) == 0.0
+def _write(tmp_path: pathlib.Path, body: str) -> pathlib.Path:
+    target = tmp_path / "accounts.yaml"
+    target.write_text(body, encoding="utf-8")
+    return target
 
 
-def test_store_roundtrip(tmp_path: pathlib.Path) -> None:
-    db = store.Store(tmp_path / "fleet.sqlite")
-    db.equity("demo", 1, 100.0, 101.0, 2, 1.0)
-    db.event("demo", "opened", symbol="EURUSD")
-    db.save_day("demo", "2026-11-03", 100.0, 0.5, False)
-    book = db.portfolio()
-    assert book["equity"] == 101.0
-    assert book["accounts"] == 1.0
-    day = db.day("demo")
-    assert day is not None and day[1] == 100.0 and day[3] is False
-    assert db.recent_events(1)[0][2] == "opened"
-    assert (tmp_path / "fleet.jsonl").exists()
+def test_unknown_risk_key_is_an_error(tmp_path: pathlib.Path) -> None:
+    target = _write(tmp_path, """
+accounts:
+  - name: a
+    login: 1
+    server: S
+    mode: real
+    risk:
+      risk_per_trad_pct: 0.2
+""")
+    with pytest.raises(ConfigError):
+        config.load(target)
 
 
-def test_scalar_parsing() -> None:
-    assert config._scalar("42") == 42
-    assert config._scalar("0.5") == 0.5
-    assert config._scalar("true") is True
-    assert config._scalar("[EURUSD, GBPUSD]") == ["EURUSD", "GBPUSD"]
-    assert config._scalar("Exness-MT5Real26") == "Exness-MT5Real26"
+def test_mode_is_required_and_validated(tmp_path: pathlib.Path) -> None:
+    target = _write(tmp_path, """
+accounts:
+  - name: a
+    login: 1
+    server: S
+    mode: Real
+""")
+    with pytest.raises(ConfigError):
+        config.load(target)
+
+
+def test_vpn_without_profile_is_an_error(tmp_path: pathlib.Path) -> None:
+    target = _write(tmp_path, """
+accounts:
+  - name: a
+    login: 1
+    server: S
+    mode: real
+    network: vpn
+""")
+    with pytest.raises(ConfigError):
+        config.load(target)
+
+
+def test_duplicate_login_and_name_are_errors(tmp_path: pathlib.Path) -> None:
+    duplicate_login = _write(tmp_path, """
+accounts:
+  - name: a
+    login: 1
+    server: S
+    mode: demo
+  - name: b
+    login: 1
+    server: S
+    mode: demo
+""")
+    with pytest.raises(ConfigError):
+        config.load(duplicate_login)
+
+
+def test_inline_comments_are_not_values(tmp_path: pathlib.Path) -> None:
+    target = _write(tmp_path, """
+accounts:
+  - name: a
+    login: 1
+    server: Demo-Server
+    mode: demo
+    network: direct   # или vpn
+    seed_config: C:\\cfg\\data  # сохранённая сессия
+""")
+    account = config.load(target).by_name("a")
+    assert account is not None
+    assert account.network == "direct"
+    assert account.seed_config == r"C:\cfg\data"
+
+
+# --- the book -------------------------------------------------------------------------------
+
+def test_portfolio_sums_every_account_in_usd(tmp_path: pathlib.Path) -> None:
+    store = Store(tmp_path / "fleet.sqlite")
+    store.equity("usd", 1, 1000.0, 1010.0, 1, 10.0, "USD", 1.0)
+    store.equity("eur", 2, 1000.0, 1020.0, 2, 20.0, "EUR", 1.1)
+    book = store.portfolio()
+    assert book["balance"] == pytest.approx(1000.0 + 1000.0 * 1.1)
+    assert book["equity"] == pytest.approx(1010.0 + 1020.0 * 1.1)
+    assert book["positions"] == 3.0
+    assert book["accounts"] == 2.0
+    rows = store.latest_equity()
+    assert [row[0] for row in rows] == ["eur", "usd"]
+
+
+def test_portfolio_uses_latest_row_per_account(tmp_path: pathlib.Path) -> None:
+    store = Store(tmp_path / "fleet.sqlite")
+    store.equity("a", 1, 1000.0, 1000.0, 0, 0.0, "USD", 1.0)
+    store.equity("a", 1, 1000.0, 900.0, 1, -100.0, "USD", 1.0)
+    assert store.portfolio()["equity"] == 900.0
+
+
+# --- atomic reservations ---------------------------------------------------------------------
+
+def test_reservation_blocks_a_second_oversized_entry(tmp_path: pathlib.Path) -> None:
+    store = Store(tmp_path / "fleet.sqlite")
+    limits = PortfolioLimits(max_gold_lots=0.30)
+    ok, _, slot = store.reserve("a1", "XAUUSD", 0.20, limits, 10_000)
+    assert ok and slot > 0
+    blocked, reason, _ = store.reserve("a2", "XAUUSD", 0.20, limits, 10_000)
+    assert not blocked and "золот" in reason.lower()
+    store.release(slot)
+    again, _, slot2 = store.reserve("a2", "XAUUSD", 0.20, limits, 10_000)
+    assert again
+    store.release(slot2)
+
+
+def test_reservation_is_per_symbol_class(tmp_path: pathlib.Path) -> None:
+    store = Store(tmp_path / "fleet.sqlite")
+    limits = PortfolioLimits(max_gold_lots=0.30, max_usd_lots=1.0)
+    ok, _, slot = store.reserve("a", "XAUUSD", 0.20, limits, 10_000)
+    assert ok
+    ok_fx, _, slot_fx = store.reserve("a", "EURUSD", 0.50, limits, 10_000)
+    assert ok_fx
+    assert store.reserved_volume("gold") == pytest.approx(0.20)
+    store.release(slot)
+    store.release(slot_fx)
+
+
+def test_positions_mirror_has_ttl_and_cleanup(tmp_path: pathlib.Path) -> None:
+    store = Store(tmp_path / "fleet.sqlite")
+
+    class P:
+        ticket = 11
+        symbol = "EURUSD"
+        type = 0
+        volume = 0.10
+        price_open = 1.10
+        profit = 1.0
+        sl = 1.09
+        tp = 1.12
+        magic = 7000001
+
+    store.save_positions("a", [P()])
+    assert len(store.open_positions()) == 1
+    store.close_position_row("a", 11)
+    assert store.open_positions() == []

@@ -1,24 +1,36 @@
-"""Terminal provisioning: one disposable MT5 copy per account, launched and verified in code.
+"""Terminal provisioning and channel handoff.
 
-A fleet of hundreds of accounts cannot be driven by clicking in MT5. Each account gets its own
-portable directory: binaries are hard-linked from a clean installation (so hundreds of accounts
-cost seconds and megabytes, not gigabytes), while config, logs and MQL5 stay private. The
-terminal is then started, waited for, verified and killed — all from here.
+One portable directory per account: binaries hard-linked from a clean install (so hundreds of
+accounts cost megabytes), private config/logs, a startup file that points the terminal at exactly
+one account, and no secrets written to disk. Because MT5 serves the Python API on a single port per
+Windows session, the fleet stops every other fleet terminal before it hands the channel over.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import pathlib
 import shutil
 import subprocess
 import time
-from typing import Iterable
 
 from .config import FLEET_ROOT, Account
 
-SKIP_DIRS = {"config", "logs", "MQL5", "profiles", "sounds", "Tester", "bases", "MQL5"}
-WRITABLE_DIRS = ("config", "logs", "MQL5", "MQL5/Experts", "MQL5/Scripts", "profiles", "sounds", "Tester")
+SKIP_DIRS = {"config", "logs", "MQL5", "profiles", "sounds", "Tester", "bases"}
+WRITABLE_DIRS = ("config", "logs", "MQL5", "MQL5/Experts", "MQL5/Scripts", "profiles", "sounds",
+                 "Tester")
 
+_PID_CACHE: dict[str, tuple[float, int | None]] = {}
+_CACHE_TTL = 15.0
+
+
+def _ps(script: str) -> str:
+    result = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                            capture_output=True, text=True)
+    return result.stdout or ""
+
+
+# --- provisioning ---------------------------------------------------------------------------
 
 def _hardlink_tree(source: pathlib.Path, target: pathlib.Path) -> None:
     for item in source.iterdir():
@@ -37,13 +49,27 @@ def _hardlink_tree(source: pathlib.Path, target: pathlib.Path) -> None:
             shutil.copy2(item, destination)
 
 
-def provision(account: Account, source: pathlib.Path | None = None, force: bool = False) -> pathlib.Path:
+def _binary_fingerprint(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()[:16]
+
+
+def provision(account: Account, source: pathlib.Path | None = None,
+              force: bool = False) -> pathlib.Path:
     """Create (or refresh) the portable directory for one account."""
     base = pathlib.Path(source or account.terminal_source)
     if not base.exists():
         raise FileNotFoundError(f"нет установленного терминала: {base}")
     target = account.data_dir
-    if target.exists() and force:
+    binary = base / "terminal64.exe"
+    fingerprint_file = target / ".fleet-source.sha"
+    current = _binary_fingerprint(binary) if binary.exists() else ""
+    stale = (target.exists() and fingerprint_file.exists()
+             and fingerprint_file.read_text(encoding="utf-8").strip() != current)
+    if target.exists() and (force or stale):
         shutil.rmtree(target, ignore_errors=True)
     target.mkdir(parents=True, exist_ok=True)
     _hardlink_tree(base, target)
@@ -52,16 +78,25 @@ def provision(account: Account, source: pathlib.Path | None = None, force: bool 
     _seed_saved_session(account)
     if not (target / "config" / "common.ini").exists():
         write_startup_config(account)
+    if current:
+        fingerprint_file.write_text(current, encoding="utf-8")
     return target
 
 
-def _seed_saved_session(account: Account) -> None:
-    """Copy a broker session saved by an earlier manual login.
+def seed_status(account: Account) -> tuple[bool, str]:
+    """Whether this account has a saved session to start from, and why not when it has none."""
+    if not account.seed_config:
+        return False, "seed_config не задан: терминал не сможет авторизоваться сам"
+    seed_dir = pathlib.Path(account.seed_config)
+    if not seed_dir.exists():
+        return False, f"нет папки seed_config: {seed_dir}"
+    if not (seed_dir / "accounts.dat").exists():
+        return False, f"в {seed_dir} нет accounts.dat с сохранённой сессией"
+    return True, ""
 
-    MT5 keeps the account list and server addresses in encrypted data files. Copying them lets a
-    provisioned terminal start already authorized, which is the difference between a fleet that
-    works unattended and one that needs a human per account.
-    """
+
+def _seed_saved_session(account: Account) -> None:
+    """Copy a session saved by an earlier manual login (accounts/servers data)."""
     if not account.seed_config:
         return
     seed_dir = pathlib.Path(account.seed_config)
@@ -75,15 +110,10 @@ def _seed_saved_session(account: Account) -> None:
             shutil.copy2(candidate, config_dir / pattern)
 
 
-def write_startup_config(account: Account, password: str | None = None) -> None:
-    """Point the terminal at exactly one account.
-
-    MT5 also accepts a Password key in common.ini for unattended start-up; when the fleet has
-    one from the environment it is written here so the terminal authorizes without any GUI.
-    """
+def write_startup_config(account: Account) -> None:
+    """Start-up file for exactly one account. Secrets never go to disk: the worker logs in."""
     config_dir = account.data_dir / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
-    common = config_dir / "common.ini"
     lines = [
         "[Common]",
         f"Login={account.login}",
@@ -94,118 +124,114 @@ def write_startup_config(account: Account, password: str | None = None) -> None:
         "",
         "[Charts]",
         "MaxBars=20000",
-        "SaveDeleted=0",
         "",
         "[Experts]",
         "Enabled=1",
-        "AllowLiveTrading=1",
+        f"AllowLiveTrading={1 if account.is_real else 0}",
         "AllowDllImport=0",
-        "Account=0",
-        "Profile=0",
         "",
         "[StartUp]",
         "Symbol=EURUSD",
         "Period=H1",
         "",
     ]
-    if password:
-        lines.insert(3, f"Password={password}")
-    common.write_text("\r\n".join(lines), encoding="utf-8")
-    (config_dir / "portable.txt").write_text("", encoding="utf-8")
+    with (config_dir / "common.ini").open("w", encoding="utf-8", newline="\r\n") as handle:
+        handle.write("\n".join(lines))
 
 
-def launch(account: Account, extra_args: Iterable[str] = ()) -> subprocess.Popen:
-    """Start the account's terminal detached in portable mode."""
+# --- process control ------------------------------------------------------------------------
+
+def launch(account: Account, extra_args: tuple[str, ...] = ()) -> subprocess.Popen:
     if not account.terminal_exe.exists():
         raise FileNotFoundError(f"терминал не подготовлен: {account.terminal_exe}")
     creation = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-    return subprocess.Popen(
-        [str(account.terminal_exe), "/portable", *extra_args],
-        cwd=str(account.data_dir),
-        creationflags=creation,
-        close_fds=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    return subprocess.Popen([str(account.terminal_exe), "/portable", *extra_args],
+                            cwd=str(account.data_dir), creationflags=creation, close_fds=True,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _terminal_processes() -> list[tuple[int, str]]:
+    output = _ps("Get-CimInstance Win32_Process -Filter \"Name='terminal64.exe'\" | "
+                 "ForEach-Object { \"$($_.ProcessId)|$($_.ExecutablePath)\" }")
+    rows: list[tuple[int, str]] = []
+    for line in output.splitlines():
+        if "|" not in line:
+            continue
+        pid_text, path = line.split("|", 1)
+        if pid_text.strip().isdigit():
+            rows.append((int(pid_text.strip()), path.strip()))
+    return rows
 
 
 def running_pid(account: Account) -> int | None:
-    """Return the pid whose command line belongs to this account's directory."""
-    script = (
-        "Get-CimInstance Win32_Process -Filter \"Name='terminal64.exe'\" | "
-        "Where-Object { $_.CommandLine -like '*" + str(account.data_dir) + "*' } | "
-        "Select-Object -ExpandProperty ProcessId"
-    )
-    result = subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                            capture_output=True, text=True)
-    text = result.stdout.strip().splitlines()
-    return int(text[0]) if text and text[0].strip().isdigit() else None
+    key = str(account.data_dir).lower()
+    cached = _PID_CACHE.get(key)
+    now = time.time()
+    if cached and now - cached[0] < _CACHE_TTL:
+        return cached[1]
+    expected = str(account.terminal_exe).lower()
+    pid = next((candidate for candidate, path in _terminal_processes()
+                if path.lower() == expected), None)
+    _PID_CACHE[key] = (now, pid)
+    return pid
 
 
 def stop(account: Account) -> None:
     pid = running_pid(account)
     if pid:
         subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+        _PID_CACHE[str(account.data_dir).lower()] = (time.time(), None)
 
 
 def stop_all() -> None:
-    """Kill every MT5 terminal on the machine (use when the API port must be free)."""
+    """Kill every MT5 terminal: the API port must be free before another terminal starts."""
     subprocess.run(["taskkill", "/IM", "terminal64.exe", "/F"], capture_output=True)
+    _PID_CACHE.clear()
 
 
 def stop_other_fleet(keep_dir: pathlib.Path | None = None) -> int:
-    """Stop fleet terminals except the one about to be used.
-
-    MT5 binds its Python API port (22346) once per Windows session, so two terminals cannot both
-    answer the API. The fleet therefore hands the channel from account to account by killing the
-    previous terminal first.
-    """
-    script = (
-        "Get-CimInstance Win32_Process -Filter \"Name='terminal64.exe'\" | "
-        "ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }"
-    )
-    result = subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                            capture_output=True, text=True)
+    """Stop fleet terminals except the one whose exact executable path is ``keep_dir``."""
+    keep_exe = (str(pathlib.Path(keep_dir) / "terminal64.exe").lower()
+                if keep_dir is not None else "")
     stopped = 0
-    root = str(FLEET_ROOT).lower()
-    keep = str(keep_dir).lower() if keep_dir else ""
-    for line in result.stdout.splitlines():
-        if "|" not in line:
+    for pid, path in _terminal_processes():
+        normalized = path.lower()
+        if str(FLEET_ROOT).lower() not in normalized:
             continue
-        pid_text, command = line.split("|", 1)
-        if not pid_text.strip().isdigit():
+        if keep_exe and normalized == keep_exe:
             continue
-        command_lower = command.lower()
-        if root not in command_lower:
-            continue
-        if keep and keep in command_lower:
-            continue
-        subprocess.run(["taskkill", "/PID", pid_text.strip(), "/F"], capture_output=True)
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
         stopped += 1
+    if stopped:
+        _PID_CACHE.clear()
     return stopped
 
 
+# --- logs and authorization -----------------------------------------------------------------
+
 def last_log_lines(account: Account, count: int = 40) -> list[str]:
-    """Read the newest terminal log, coping with MT5's UTF-16 and UTF-8 log variants."""
+    """Tail of the newest terminal log, decoding UTF-16 (MT5) or UTF-8 by evidence."""
     log_dir = account.data_dir / "logs"
     if not log_dir.exists():
         return []
     logs = sorted(log_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not logs:
         return []
+    path = logs[0]
     try:
-        raw = logs[0].read_bytes()
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            handle.seek(max(0, size - 128 * 1024))
+            raw = handle.read()
     except OSError:
         return []
-    for encoding in ("utf-8", "utf-16-le", "utf-16"):
-        try:
-            text = raw.decode(encoding)
-            if "\x00" in text[:200]:
-                continue
-            return text.splitlines()[-count:]
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace").splitlines()[-count:]
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = raw.decode("utf-16", errors="replace")
+    elif b"\x00" in raw[:400]:
+        text = raw.decode("utf-16-le", errors="replace")
+    else:
+        text = raw.decode("utf-8", errors="replace")
+    return text.splitlines()[-count:]
 
 
 def authorized(account: Account) -> bool:
@@ -213,7 +239,7 @@ def authorized(account: Account) -> bool:
     return any(marker in line for line in last_log_lines(account, 200))
 
 
-def wait_authorized(account: Account, timeout: float = 90.0, poll: float = 3.0) -> bool:
+def wait_authorized(account: Account, timeout: float = 30.0, poll: float = 1.5) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if authorized(account):
@@ -223,15 +249,6 @@ def wait_authorized(account: Account, timeout: float = 90.0, poll: float = 3.0) 
 
 
 def password_for(account: Account) -> str | None:
-    """Secrets stay out of the registry: they are read from the environment."""
     if not account.password_env:
         return None
     return os.environ.get(account.password_env) or None
-
-
-def ensure(account: Account, timeout: float = 90.0) -> bool:
-    """Provision, launch and wait until the account is authorized."""
-    provision(account, force=False)
-    if running_pid(account) is None:
-        launch(account)
-    return wait_authorized(account, timeout)

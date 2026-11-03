@@ -75,6 +75,9 @@ def build_spec(symbol: str, price: float) -> dict:
         "tick_size": tick, "tick_value": tick, "volume_min": 0.001, "volume_max": 1000.0,
         "volume_step": 0.001, "spread_points": max(1, round(price * 0.001 / tick)),
         "stops_level_points": 0,
+        # One lot is one unit of the base asset; stated so the sizer uses the definition instead
+        # of inferring it from the tick pair, which is the field a broker can get wrong.
+        "contract_size": 1.0,
     }
 
 

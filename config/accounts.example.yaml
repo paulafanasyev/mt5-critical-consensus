@@ -1,16 +1,9 @@
 # Реестр торговых счетов парка. Копируется в config/accounts.yaml и правится под себя.
 # Пароли НЕ хранятся здесь: только имя переменной окружения (password_env).
+# Неизвестный ключ — ошибка запуска: опечатка в риске не должна тихо менять риск.
 #
-# Поля счёта:
-#   name          уникальное имя (используется в логах и статусе)
-#   login/server  номер счёта и сервер ровно как в MT5
-#   mode          demo | real
-#   enabled       false — счёт игнорируется
-#   network       direct | vpn   (vpn — брокер блокируется в текущей сети)
-#   symbols       список базовых имён; брокерские суффиксы подставляются автоматически
-#   shard         номер шарда (группы процессов дирижёра)
-#   magic         метка сделок этого счёта
-#   password_env  имя переменной окружения с паролем (для авто-входа)
+# Обязательные поля: name, login, server, mode (demo|real).
+# network: vpn требует vpn_profile — путь к .ovpn.
 
 accounts:
   - name: demo-metaquotes
@@ -26,11 +19,14 @@ accounts:
     strategy:
       kinds: [trend]
       timeframes: [H1, H4]
+      min_atr_pct: 0.0004
+      cooldown_minutes: 45
     risk:
       risk_per_trade_pct: 0.25
       daily_stop_pct: 1.0
       max_open_positions: 3
       max_lots: 0.10
+      min_lots: 0.01
 
   - name: exness-real
     login: 276261159
@@ -38,6 +34,7 @@ accounts:
     mode: real
     enabled: false
     network: vpn
+    vpn_profile: C:\openvpn\vgate.ovpn
     shard: 1
     magic: 7000002
     password_env: EXNESS_REAL_PASSWORD
@@ -46,6 +43,7 @@ accounts:
     strategy:
       kinds: [trend]
       timeframes: [H1, H4]
+      cooldown_minutes: 60
     risk:
       risk_per_trade_pct: 0.20
       daily_stop_pct: 0.50
@@ -53,6 +51,8 @@ accounts:
       max_lots: 0.01
       stop_atr: 1.8
       take_atr: 2.2
+      take_atr_real: 1.6
+      break_even_atr: 0.4
 
   - name: gtc-real
     login: 52183174
@@ -74,4 +74,4 @@ portfolio:
   max_usd_lots: 1.00
   max_open_positions: 60
   daily_stop_pct: 2.0
-  max_worker_processes: 4
+  max_worker_processes: 1

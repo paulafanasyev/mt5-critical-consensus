@@ -1,8 +1,8 @@
-"""Strategies: plain functions that read bars and return a signal, never touch orders.
+"""Strategies: read bars, return a signal; judge exits from the position's own levels.
 
-Because the fleet trades hundreds of accounts, a strategy must be cheap, deterministic and
-broker-agnostic: it works with the broker's resolved symbol name and returns target levels in
-price terms. The worker turns that into volume and an order.
+Exits are measured from the ATR that was on the chart when the trade was opened — the stop and
+target the broker actually holds — not from the live ATR, which would silently move the target and
+the stop every hour. Real accounts take profit earlier and give back less than demo ones.
 """
 from __future__ import annotations
 
@@ -30,7 +30,6 @@ class Signal:
 
 
 def _trend(name: str) -> str:
-    """Return 'up', 'down' or '' from the H4 and H1 averages on one symbol."""
     h4_fast = broker.ema(name, mt5.TIMEFRAME_H4, 21)
     h4_slow = broker.ema(name, mt5.TIMEFRAME_H4, 55)
     h1_fast = broker.ema(name, mt5.TIMEFRAME_H1, 21)
@@ -49,83 +48,85 @@ def _price(name: str) -> float:
     return float(tick.ask) if tick else 0.0
 
 
+def _passes_filters(account: Account, spec: broker.BrokerSymbol, atr: float,
+                    price: float) -> bool:
+    if not broker.spread_within_stop(spec, atr * account.risk.stop_atr,
+                                     max_fraction=0.15):
+        return False
+    if price <= 0:
+        return False
+    if atr / price < account.strategy.min_atr_pct:
+        return False
+    return True
+
+
 def trend_signal(account: Account, base_symbol: str) -> Signal | None:
-    """Buy with the H4+H1 trend after a pullback close back above the fast H1 average."""
     spec = broker.symbol(base_symbol)
     if spec is None:
         return None
-    if not broker.spread_ok(spec, account.risk.max_spread_points):
+    atr = broker.atr(spec.name, mt5.TIMEFRAME_H1)
+    if atr <= 0:
+        return None
+    price = _price(spec.name)
+    if not _passes_filters(account, spec, atr, price):
         return None
     direction = _trend(spec.name)
     if not direction:
-        return None
-    atr = broker.atr(spec.name, mt5.TIMEFRAME_H1)
-    if atr <= 0:
         return None
     bars = mt5.copy_rates_from_pos(spec.name, mt5.TIMEFRAME_H1, 0, 3)
     if bars is None or len(bars) < 3:
         return None
     last_close = float(bars[-1]["close"])
     fast = broker.ema(spec.name, mt5.TIMEFRAME_H1, 21)
-    price = _price(spec.name)
-    if price <= 0:
-        return None
     stop_distance = atr * account.risk.stop_atr
+    take_distance = atr * _take_atr(account)
     if direction == "up":
-        if last_close < fast:  # only enter when momentum agrees with the trend
+        if last_close < fast:
             return None
-        stop = price - stop_distance
-        target = price + atr * account.risk.take_atr
         return Signal(base_symbol, "buy", "H4+H1 тренд вверх, цена над EMA21",
-                      price, stop, target, atr)
+                      price, price - stop_distance, price + take_distance, atr)
     if last_close > fast:
         return None
-    stop = price + stop_distance
-    target = price - atr * account.risk.take_atr
     return Signal(base_symbol, "sell", "H4+H1 тренд вниз, цена под EMA21",
-                  price, stop, target, atr)
+                  price, price + stop_distance, price - take_distance, atr)
 
 
 def breakout_signal(account: Account, base_symbol: str, lookback: int = 24) -> Signal | None:
-    """Trade an H1 close outside the last N bars, but only with the higher-timeframe trend."""
     spec = broker.symbol(base_symbol)
-    if spec is None or not broker.spread_ok(spec, account.risk.max_spread_points):
+    if spec is None:
         return None
     bars = mt5.copy_rates_from_pos(spec.name, mt5.TIMEFRAME_H1, 0, lookback + 2)
     if bars is None or len(bars) < lookback + 2:
+        return None
+    atr = broker.atr(spec.name, mt5.TIMEFRAME_H1)
+    price = _price(spec.name)
+    if not _passes_filters(account, spec, atr, price):
         return None
     window = bars[-(lookback + 1):-1]
     high = max(float(row["high"]) for row in window)
     low = min(float(row["low"]) for row in window)
     close = float(bars[-1]["close"])
-    atr = broker.atr(spec.name, mt5.TIMEFRAME_H1)
-    if atr <= 0:
-        return None
     direction = _trend(spec.name)
-    price = _price(spec.name)
-    if price <= 0:
-        return None
     stop_distance = atr * account.risk.stop_atr
+    take_distance = atr * _take_atr(account)
     if close > high and direction == "up":
         return Signal(base_symbol, "buy", f"пробой {lookback}-часового максимума",
-                      price, price - stop_distance, price + atr * account.risk.take_atr, atr)
+                      price, price - stop_distance, price + take_distance, atr)
     if close < low and direction == "down":
         return Signal(base_symbol, "sell", f"пробой {lookback}-часового минимума",
-                      price, price + stop_distance, price - atr * account.risk.take_atr, atr)
+                      price, price + stop_distance, price - take_distance, atr)
     return None
 
 
-KINDS = {
-    "trend": trend_signal,
-    "breakout": breakout_signal,
-}
+KINDS = {"trend": trend_signal, "breakout": breakout_signal}
 
 
 def signals(account: Account) -> list[Signal]:
-    """All actionable signals for one account, best first."""
     found: list[Signal] = []
     for base_symbol in account.symbols:
         for kind in account.strategy.kinds:
+            if kind == "trend" and "H4" not in account.strategy.timeframes:
+                continue
             builder = KINDS.get(kind)
             if builder is None:
                 continue
@@ -135,42 +136,82 @@ def signals(account: Account) -> list[Signal]:
                 result = None
             if result is not None:
                 found.append(result)
-                break  # one signal per instrument
-    found.sort(key=lambda s: s.atr and (s.stop_distance / s.atr) or 99)
+                break
+    found.sort(key=lambda s: s.stop_distance / s.atr if s.atr else 99)
     return found
 
 
-def exit_reason(account: Account, position, spec: broker.BrokerSymbol,
-                peak: float) -> str:
-    """Decide whether an open position should be closed now.
+def _take_atr(account: Account) -> float:
+    return (account.risk.take_atr_real if account.is_real else account.risk.take_atr)
 
-    This is the single place that decides exits — the worker only executes what comes back. The
-    operator's standing rules: take profit earlier on real money, never let a winner turn into a
-    loser, and never hold past the planned horizon.
-    """
-    atr = broker.atr(spec.name, mt5.TIMEFRAME_H1)
-    if atr <= 0:
-        return ""
+
+def _giveback_fraction(account: Account) -> float:
+    return (account.risk.giveback_fraction_real if account.is_real
+            else account.risk.giveback_fraction)
+
+
+def entry_distances(position, spec: broker.BrokerSymbol,
+                    atr_entry: float, account: Account) -> tuple[float, float]:
+    """Stop and target distances the trade was actually opened with."""
+    entry = float(position.price_open)
+    sl = float(getattr(position, "sl", 0.0) or 0.0)
+    tp = float(getattr(position, "tp", 0.0) or 0.0)
+    fallback_stop = atr_entry * account.risk.stop_atr if atr_entry > 0 else 0.0
+    fallback_take = atr_entry * _take_atr(account) if atr_entry > 0 else 0.0
+    stop_distance = abs(entry - sl) if sl > 0 else fallback_stop
+    take_distance = abs(tp - entry) if tp > 0 else fallback_take
+    if account.is_real and fallback_take > 0:
+        take_distance = min(take_distance, fallback_take)
+    return stop_distance, take_distance
+
+
+def break_even_level(account: Account, position, spec: broker.BrokerSymbol,
+                     atr_entry: float) -> float | None:
+    """A stop at the entry price once the trade is far enough in profit to deserve protection."""
+    if atr_entry <= 0:
+        return None
+    entry = float(position.price_open)
+    is_buy = int(position.type) == int(mt5.POSITION_TYPE_BUY)
+    tick = mt5.symbol_info_tick(spec.name)
+    if tick is None:
+        return None
+    price = float(tick.bid if is_buy else tick.ask)
+    gain = (price - entry) if is_buy else (entry - price)
+    if gain < atr_entry * account.risk.break_even_atr:
+        return None
+    current = float(getattr(position, "sl", 0.0) or 0.0)
+    spread = abs(float(tick.ask) - float(tick.bid))
+    target = entry + spread if is_buy else entry - spread
+    if is_buy and (current <= 0 or target > current):
+        return target
+    if not is_buy and (current <= 0 or target < current):
+        return target
+    return None
+
+
+def exit_reason(account: Account, position, spec: broker.BrokerSymbol, peak: float,
+                atr_entry: float) -> str:
+    """The single exit decision: target, stop, protected giveback, or nothing."""
     tick = mt5.symbol_info_tick(spec.name)
     if tick is None:
         return ""
-    is_buy = position.type == mt5.POSITION_TYPE_BUY
-    price = float(tick.bid if is_buy else tick.ask)
+    is_buy = int(position.type) == int(mt5.POSITION_TYPE_BUY)
     entry = float(position.price_open)
+    price = float(tick.bid if is_buy else tick.ask)
     gain = (price - entry) if is_buy else (entry - price)
-
-    if gain >= atr * account.risk.take_atr:
-        return "тейк по ATR"
-    if gain <= -atr * account.risk.stop_atr * 1.05:
-        return "жёсткий стоп по ATR"
-    if gain >= atr * account.risk.trail_arm_atr and peak > 0:
-        giveback_floor = max(atr * 0.35, account.risk.giveback_fraction * peak)
-        if gain <= peak - giveback_floor:
+    stop_distance, take_distance = entry_distances(position, spec, atr_entry, account)
+    if take_distance > 0 and gain >= take_distance:
+        return f"тейк {take_distance / max(atr_entry, 1e-9):.2f} ATR"
+    if stop_distance > 0 and gain <= -stop_distance * 1.02:
+        return f"стоп {stop_distance / max(atr_entry, 1e-9):.2f} ATR"
+    if peak > 0 and gain > 0:
+        floor = max(atr_entry * 0.25, _giveback_fraction(account) * peak)
+        if gain <= peak - floor:
             return "фиксация после отката от пика"
     if account.risk.max_hold_minutes > 0:
         import time as _time
 
-        held_minutes = (_time.time() - float(position.time)) / 60
-        if held_minutes >= account.risk.max_hold_minutes:
-            return f"время вышло ({held_minutes:.0f} мин)"
+        held = (_time.time() - float(getattr(position, "time", 0))) / 60
+        if held >= account.risk.max_hold_minutes:
+            return f"время вышло ({held:.0f} мин)"
     return ""

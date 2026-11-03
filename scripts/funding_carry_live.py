@@ -61,24 +61,30 @@ def main(argv: list[str] | None = None) -> int:
     while True:
         total = 0.0
         report = {"ts": datetime.now(timezone.utc).isoformat(), "assets": {}}
-        for symbol in SYMBOLS:
-            asset = state["assets"][symbol]
-            history = funding(symbol)
-            fresh = [rate for ts, rate in history if ts > asset["last_ts"]]
-            if fresh:
-                asset["accrued"] += sum(NOTIONAL * rate for rate in fresh)
-                asset["last_ts"] = max(ts for ts, _ in history)
-                asset["periods"] += len(fresh)
-            spot, perp = prices(symbol)
-            basis_bps = (perp / spot - 1) * 10_000
-            net = asset["accrued"] - FEE_PER_ASSET
-            total += net
-            report["assets"][symbol] = {"accrued": round(asset["accrued"], 4),
-                                        "periods": asset["periods"],
-                                        "net": round(net, 4),
-                                        "basis_bps": round(basis_bps, 2)}
+        try:
+            for symbol in SYMBOLS:
+                asset = state["assets"][symbol]
+                history = funding(symbol)
+                fresh = [rate for ts, rate in history if ts > asset["last_ts"]]
+                if fresh:
+                    asset["accrued"] += sum(NOTIONAL * rate for rate in fresh)
+                    asset["last_ts"] = max(ts for ts, _ in history)
+                    asset["periods"] += len(fresh)
+                spot, perp = prices(symbol)
+                basis_bps = (perp / spot - 1) * 10_000
+                net = asset["accrued"] - FEE_PER_ASSET
+                total += net
+                report["assets"][symbol] = {"accrued": round(asset["accrued"], 4),
+                                            "periods": asset["periods"],
+                                            "net": round(net, 4),
+                                            "basis_bps": round(basis_bps, 2)}
+        except Exception as exc:  # noqa: BLE001 - a venue refusing a call must not stop the loop
+            print(f"[{report['ts'][11:19]}] cycle error {type(exc).__name__}: {exc}", flush=True)
+            time.sleep(args.interval_sec)
+            continue
         report["total_net"] = round(total, 4)
         report["capital"] = state["capital"]
+        STATE.write_text(json.dumps(state), encoding="utf-8")
         with LOG.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(report) + "\n")
         print(f"[{report['ts'][11:19]}] net ${total:+.2f} "

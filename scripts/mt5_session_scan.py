@@ -20,12 +20,26 @@ SYMBOLS = ("EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD",
            "XAUUSD", "XAGUSD", "US500", "UK100")
 
 
+def server_offset_seconds(tick_time: int, now: float) -> int:
+    """How far ahead of UTC this server stamps its bars, measured rather than assumed.
+
+    `rate["time"]` is server time, not UTC: on `MetaQuotes-Demo` a live tick whose real UTC
+    moment was 07:52:48 came back as 09:52:46 (+7200 s), so the hour of a bar read straight off
+    the epoch is the server's hour and the top window this scan prints as 00:00-01:00 is 22:00
+    UTC. It also moves with the server's DST rule, so a schedule anchored to a UTC minute would
+    silently drift three hours twice a year. Returned as whole hours because the sub-hour part
+    is the age of the current tick, not a clock difference.
+    """
+    return int(round((tick_time - now) / 3600.0)) * 3600
+
+
 def main() -> int:
     import MetaTrader5 as mt5
 
     if not mt5.initialize():
         raise SystemExit("MetaTrader5.initialize failed")
     results = []
+    offsets = []
     try:
         for symbol in SYMBOLS:
             if not mt5.symbol_select(symbol, True):
@@ -36,10 +50,14 @@ def main() -> int:
             tick = mt5.symbol_info_tick(symbol)
             spread = ((tick.ask - tick.bid) / ((tick.ask + tick.bid) / 2)
                       if tick and tick.bid else 0.0)
-            # daily series of hourly closes, keyed by date and UTC hour
+            if tick and tick.time:
+                offsets.append(server_offset_seconds(int(tick.time),
+                                                     datetime.now(timezone.utc).timestamp()))
+            # daily series of hourly closes, keyed by date and true UTC hour
+            shift = offsets[-1] if offsets else 0
             by_day: dict[str, dict[int, float]] = {}
             for rate in rates:
-                stamp = datetime.fromtimestamp(int(rate["time"]), tz=timezone.utc)
+                stamp = datetime.fromtimestamp(int(rate["time"]) - shift, tz=timezone.utc)
                 by_day.setdefault(stamp.date().isoformat(), {})[stamp.hour] = float(rate["close"])
             days = sorted(by_day)
             for entry in range(0, 23):
@@ -66,7 +84,9 @@ def main() -> int:
         mt5.shutdown()
 
     results.sort(key=lambda row: row["t"], reverse=True)
+    shift = max(set(offsets), key=offsets.count) if offsets else 0
     print("top 15 intraday windows by t-statistic (costs included, one round trip per day)")
+    print(f"hours are true UTC; this server was {shift // 3600} h ahead of UTC at the read")
     print(f"{'symbol':8} {'window':>11} {'n':>6} {'mean%':>9} {'t':>6} {'annual%':>9}")
     for row in results[:15]:
         print(f"{row['symbol']:8} {row['entry']:02d}:00-{row['exit']:02d}:00 {row['n']:6} "

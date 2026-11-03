@@ -5,15 +5,27 @@ $terminalDir = "C:\Program Files\MetaTrader 5"
 
 $terminal = Get-Process terminal64 -ErrorAction SilentlyContinue
 "terminal      : " + $(if ($terminal) { "running (pid $($terminal.Id), since $($terminal.StartTime.ToString('HH:mm')))" } else { "STOPPED" })
-$bridge = netstat -ano | Select-String ":8000.*LISTENING"
-"bridge :8000  : " + $(if ($bridge) { "listening" } else { "DOWN" })
+$listen = @(Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue)
+"bridge :8000  : " + $(if ($listen) { "listening (pid $((($listen.OwningProcess | Sort-Object -Unique) -join ',')))" } else { "DOWN" })
 $runner = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -like "*run_mt5_demo_trading*" })
-"runner        : " + $(if ($runner.Count -gt 0) { "$($runner.Count) process(es)" } else { "STOPPED" })
+# `.venv\Scripts\python.exe` is a stub that re-spawns the identical command line in the base
+# interpreter, so one run is two processes here. A raw count calls that "2 process(es)" — which
+# reads like a double launch against one account — and would call a genuine double launch 4.
+# Dropping the child of another runner keeps one entry per decision loop.
+$stubOfRunner = @($runner | ForEach-Object { $_.ParentProcessId })
+$loops = @($runner | Where-Object { $stubOfRunner -notcontains $_.ProcessId })
+"runner        : " + $(if ($loops.Count -gt 0) { "$($loops.Count) loop (pid $((($loops.ProcessId | Sort-Object -Unique) -join ',')))" } else { "STOPPED" })
 
-$log = "$terminalDir\MQL5\logs\20261101.log"
-if (Test-Path $log) {
-    "EA log tail   :"
-    Get-Content $log -Encoding Unicode | Select-Object -Last 3 | ForEach-Object { "  " + $_ }
+$log = Get-ChildItem "$terminalDir\MQL5\logs\*.log" -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if ($log) {
+    # The date must come from the directory, not from a literal: on 2026-11-02 this script read
+    # 20261101.log, so it printed a clean tail while today's polls were all error=4014.
+    "EA log (" + $log.Name + ") :"
+    & "$root\.venv\Scripts\python.exe" "$root\scripts\check_ea_transport.py" `
+        --log-dir "$terminalDir\MQL5\logs"
+    if ($LASTEXITCODE -eq 1) { "  -> a command queued now expires at the bridge without reaching the broker." }
+    if ($LASTEXITCODE -eq 2) { "  -> the check could not decide: read the meaning line above, and do not treat this as a dead transport." }
 }
 
 & "$root\.venv\Scripts\python.exe" -c @"

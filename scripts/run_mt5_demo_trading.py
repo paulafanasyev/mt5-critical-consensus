@@ -555,14 +555,19 @@ class DemoTerminal(LiveMT5Backend):
         return total
 
     def entry_deals(self, since: datetime) -> list[dict[str, Any]]:
-        """Deals since ``since``, widened by an hour on each side of the server clock skew."""
+        """Deals since ``since``, read through a deliberately oversized terminal window."""
         if since.tzinfo is None:
             raise ValueError("since must be timezone-aware")
-        # The terminal's history filters are interpreted on the broker server clock; a wide
-        # window makes the exact boundary convention irrelevant because every candidate is
-        # re-filtered by magic and comment in ``match_entry_deal``.
-        start = (since - timedelta(hours=1)).astimezone(UTC).replace(tzinfo=None)
-        end = (datetime.now(UTC) + timedelta(hours=1)).replace(tzinfo=None)
+        # Measured on MetaQuotes-Demo (2026-11-02 04:58 UTC, against the two fills this session
+        # actually placed): the same seven-day left edge returns 1 row and neither CC deal for a
+        # right edge of now+4h, and 5 rows including both deals for now+8h — so the *right* edge is
+        # what clips, because the terminal reads these naive values on the server clock and the
+        # server runs 7200 s ahead of UTC. A clipped range reads as an empty book, so a fill the EA
+        # really placed is journalled as NO_FILL_OBSERVED, the run stops, and the restart is refused
+        # as well. The window is therefore oversized on both sides; every candidate is still
+        # re-filtered by magic, comment and ``not_before`` in ``match_entry_deal``.
+        start = (since - timedelta(days=7)).astimezone(UTC).replace(tzinfo=None)
+        end = (datetime.now(UTC) + timedelta(days=3)).replace(tzinfo=None)
         rows = self._mt5.history_deals_get(start, end)
         if rows is None:
             raise RuntimeError("MT5 history_deals_get() returned no result set")

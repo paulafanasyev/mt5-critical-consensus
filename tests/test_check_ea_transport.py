@@ -182,11 +182,14 @@ def test_command_line_exit_codes_separate_dead_from_absent(tmp_path: Path, capsy
     assert CHECKER.main(["--log-dir", str(tmp_path / "absent")]) == 2
     assert "no_log" in capsys.readouterr().out
 
-    _write_log(log_dir, "20261102.log", BLOCKED_4014)
+    # The file name carries the log's date and this test uses the real clock, so the name must be
+    # today's: a hardcoded date makes a fresh refusal read as stale the day after it was written.
+    today_log = f"{dt.date.today():%Y%m%d}.log"
+    _write_log(log_dir, today_log, BLOCKED_4014)
     assert CHECKER.main(["--log-dir", str(log_dir), "--stale-seconds", "86400"]) == 1
     assert "request_not_allowed" in capsys.readouterr().out
 
-    _write_log(log_dir, "20261102.log", ARMED)
+    _write_log(log_dir, today_log, ARMED)
     assert CHECKER.main(["--log-dir", str(log_dir), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["state"] == "kill_switch_armed"
 

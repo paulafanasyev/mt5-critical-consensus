@@ -4,5 +4,6 @@ The terminal is treated as disposable infrastructure; the trading logic, risk an
 live here so a new broker is a config record rather than a manual session.
 """
 
-__all__ = ["config", "terminals", "broker", "risk", "strategy", "store", "worker", "conductor"]
+__all__ = ["config", "terminals", "network", "broker", "risk", "strategy", "store",
+           "worker", "shard", "conductor"]
 __version__ = "1.0.0"

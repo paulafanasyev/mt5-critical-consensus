@@ -10,6 +10,10 @@ switch state that cannot be read, or was never written at all, is served as arme
 It never binds a non-loopback address, never accepts a write on the command path, and
 never logs the token or the command body.
 
+A third GET, ``/v1/health``, is for the operator's transport check only. It answers with the
+counters below — including the last moment an authenticated request reached an endpoint the
+advisor polls — and it is not on any path the advisor reads or the runner orders through.
+
 The bridge is part of the demo execution path in ``scripts/``; the order-free
 ``critical_consensus.mt5_agent`` package stays untouched.
 """
@@ -21,6 +25,7 @@ import ipaddress
 import json
 import os
 import re
+import sys
 import tempfile
 import threading
 from dataclasses import dataclass, field
@@ -43,6 +48,9 @@ MAX_TTL_SECONDS = 600
 MIN_TTL_SECONDS = 5
 KILL_SWITCH_PATH = "/v1/risk/kill-switch"
 NEXT_COMMAND_PATH = "/v1/execution/next"
+# An operator-facing read of the counters below. It is not polled by the EA and cannot change
+# anything: a health check that could reorder would be a second execution path.
+HEALTH_PATH = "/v1/health"
 KILL_SWITCH_STATE_FILENAME = "kill_switch.json"
 # Served when no switch record exists yet. It is a blocker, not a label: the reason text
 # is what an operator sees first when the state file was deleted or never seeded.
@@ -56,6 +64,12 @@ MAX_NOTE_CHARS = 180
 # The most a refused request is drained out of. Refusals are answered only after the body is
 # consumed, because an answer written over unread bytes is a reset, not an answer.
 MAX_BODY_DRAIN_BYTES = 1 << 20
+# A loopback client that disappears mid-request is expected here: the terminal aborts its own
+# WebRequest as soon as it refuses the poll, and the socket dies while the handler is still reading
+# the request or still writing the answer. socketserver answers each one with a full traceback, which
+# reads as a crash in the runner log and buries the failures that are real. Anything outside
+# this tuple still gets the standard report.
+CLIENT_ABORT_ERRORS = (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)
 # A handler socket that stops talking would otherwise hold its thread forever. The body is
 # read before any answer, so a stalled or slow client can pin every handler on a busy bridge.
 REQUEST_TIMEOUT_SECONDS = 10.0
@@ -399,10 +413,21 @@ class BridgeState:
     expired: int = 0
     refused: int = 0
     reasons: dict[str, int] = field(default_factory=dict)
+    # The advisor writes a log line only when it is refused or something happens, so a quiet
+    # log cannot tell a healthy poll loop from a detached EA. These two fields are the positive
+    # record: the last time an authenticated request actually arrived on an EA path.
+    ea_polls: int = 0
+    last_ea_poll_at: str = ""
+    last_ea_poll_path: str = ""
 
     def refuse(self, code: str) -> None:
         self.refused += 1
         self.reasons[code] = self.reasons.get(code, 0) + 1
+
+    def record_ea_poll(self, at: datetime, path: str) -> None:
+        self.ea_polls += 1
+        self.last_ea_poll_at = at.astimezone(UTC).isoformat()
+        self.last_ea_poll_path = path
 
 
 class DemoBridge:
@@ -514,6 +539,11 @@ class DemoBridge:
                 if self.command != "GET":
                     self._reject_method()
                     return
+                # Recorded before the answer, not after: what this proves is that the advisor
+                # reached the bridge, and a bridge whose kill-switch read failed still had a
+                # live advisor on the other end of the socket.
+                if path in (KILL_SWITCH_PATH, NEXT_COMMAND_PATH):
+                    bridge._note_ea_poll(path)
                 if path == KILL_SWITCH_PATH:
                     payload = bridge._kill_switch_payload()
                     if payload is None:
@@ -541,6 +571,9 @@ class DemoBridge:
                         return
                     self._status_code = 200
                     self._send_json(200, command)
+                elif path == HEALTH_PATH:
+                    self._status_code = 200
+                    self._send_json(200, bridge._health_payload())
                 else:
                     self._status_code = 404
                     self._send_json(404, {"error": "not_found"})
@@ -689,7 +722,19 @@ class DemoBridge:
                 self.end_headers()
                 self.wfile.write(body)
 
-        server = ThreadingHTTPServer((self._host, self._port), Handler)
+        class Server(ThreadingHTTPServer):
+            """Reports an expected client abort in one line instead of a traceback."""
+
+            def handle_error(self, request: Any, client_address: Any) -> None:  # noqa: N802 - stdlib API
+                exc = sys.exc_info()[1]
+                if isinstance(exc, CLIENT_ABORT_ERRORS):
+                    host, port = client_address[0], client_address[1]
+                    print(f"bridge: client {host}:{port} closed the socket mid-request "
+                          f"({type(exc).__name__})", file=sys.stderr)
+                    return
+                super().handle_error(request, client_address)
+
+        server = Server((self._host, self._port), Handler)
         server.daemon_threads = True
         self._server = server
         self._thread = threading.Thread(target=server.serve_forever,
@@ -791,6 +836,49 @@ class DemoBridge:
                 or moment.utcoffset() is None:
             raise BridgeError("BRIDGE_CLOCK_NOT_AWARE")
         return moment.astimezone(UTC)
+
+    def _note_ea_poll(self, path: str) -> None:
+        """Record that an authenticated request arrived on an endpoint only the advisor polls."""
+        try:
+            moment = self._now()
+        except BridgeError:
+            return
+        with self._lock:
+            self.state.record_ea_poll(moment, path)
+
+    def _health_payload(self) -> dict[str, Any]:
+        """Counters for the operator's health check: no token, no command body, no writes.
+
+        The poll age is measured on the bridge's own clock so a checker in another process
+        does not have to trust that the two machines agree.
+        """
+        with self._lock:
+            state = self.state
+            try:
+                moment: datetime | None = self._now()
+            except BridgeError:
+                moment = None
+            age = None
+            if moment is not None and state.last_ea_poll_at:
+                try:
+                    seen = datetime.fromisoformat(state.last_ea_poll_at)
+                except ValueError:
+                    seen = None
+                if seen is not None:
+                    age = round((moment - seen).total_seconds(), 1)
+            return {
+                "ok": True,
+                "pid": os.getpid(),
+                "queued": state.queued,
+                "served": state.served,
+                "expired": state.expired,
+                "refused": state.refused,
+                "ea_polls": state.ea_polls,
+                "last_ea_poll_at": state.last_ea_poll_at,
+                "last_ea_poll_path": state.last_ea_poll_path,
+                "ea_poll_age_seconds": age,
+                "bridge_time": moment.isoformat() if moment is not None else "",
+            }
 
     def _kill_switch_payload(self) -> dict[str, Any] | None:
         try:

@@ -1,8 +1,8 @@
 """Fleet configuration: hundreds of MT5 accounts across many brokers, described in code.
 
-The terminal is disposable — one dedicated portable copy per account, provisioned and thrown
-away by the fleet. Everything that decides what to trade lives here and in the sibling modules,
-so adding a broker means adding a record, not clicking through MT5.
+Every account gets its own records; nothing about trading is configured by clicking in a terminal.
+Unknown keys are an error, not a silent default: a typo in a risk limit must stop the fleet, not
+quietly trade with a different one.
 """
 from __future__ import annotations
 
@@ -13,7 +13,12 @@ from typing import Any
 
 DEFAULT_TERMINAL_SOURCE = pathlib.Path(r"C:\Program Files\MetaTrader 5")
 FLEET_ROOT = pathlib.Path(r"C:\mt5-fleet")
+DEFAULT_STORE = FLEET_ROOT / "fleet.sqlite"
 CONFIG_PATH = pathlib.Path(__file__).resolve().parents[1] / "config" / "accounts.yaml"
+
+
+class ConfigError(ValueError):
+    """The registry cannot be trusted: refuse to trade rather than trade the wrong numbers."""
 
 
 @dataclasses.dataclass(slots=True)
@@ -30,13 +35,16 @@ class RiskProfile:
     take_atr: float = 2.6
     trail_arm_atr: float = 0.8
     giveback_fraction: float = 0.35
-    max_hold_minutes: int = 0  # 0 — без ограничения по времени
+    max_hold_minutes: int = 0
+    # real money takes profit earlier and protects a winner harder than the laboratory
+    take_atr_real: float = 1.8
+    trail_arm_atr_real: float = 0.5
+    giveback_fraction_real: float = 0.25
+    break_even_atr: float = 0.4
 
 
 @dataclasses.dataclass(slots=True)
 class StrategyProfile:
-    """Which signals the account may act on."""
-
     kinds: tuple[str, ...] = ("trend",)
     timeframes: tuple[str, ...] = ("H1", "H4")
     min_atr_pct: float = 0.0004
@@ -52,7 +60,7 @@ class Account:
     login: int
     server: str
     terminal_source: pathlib.Path = DEFAULT_TERMINAL_SOURCE
-    mode: str = "demo"  # demo | real
+    mode: str = "real"  # demo | real; fail-closed: an unlabelled account is treated as real
     enabled: bool = True
     network: str = "direct"  # direct | vpn
     vpn_profile: str = ""
@@ -61,9 +69,10 @@ class Account:
     strategy: StrategyProfile = dataclasses.field(default_factory=StrategyProfile)
     magic: int = 7000000
     shard: int = 0
+    host: str = ""  # empty: this account may run on any worker; set to pin it to one machine
     password_env: str = ""
-    seed_config: str = ""  # data dir whose config/*.dat carry a saved session for this account
-    keep_running: bool = False  # leave the terminal up between cycles (still frees the API port)
+    seed_config: str = ""
+    keep_running: bool = False
 
     @property
     def data_dir(self) -> pathlib.Path:
@@ -80,14 +89,12 @@ class Account:
 
 @dataclasses.dataclass(slots=True)
 class PortfolioLimits:
-    """Rules that treat the whole fleet as one book."""
-
     max_total_risk_pct: float = 2.0
     max_gold_lots: float = 0.30
     max_usd_lots: float = 1.00
     max_open_positions: int = 60
     daily_stop_pct: float = 2.0
-    max_worker_processes: int = 4
+    max_worker_processes: int = 1  # one terminal owns the API port per Windows session
 
 
 @dataclasses.dataclass(slots=True)
@@ -109,19 +116,32 @@ class FleetConfig:
 
 
 def _slug(text: str) -> str:
-    return "".join(c if c.isalnum() else "-" for c in text).strip("-").lower()
+    return "".join(c if c.isalnum() else "-" for c in str(text)).strip("-").lower()
 
 
-# --- loading --------------------------------------------------------------------------------
+# --- loading and validation -----------------------------------------------------------------
 
-def _risk(data: dict[str, Any]) -> RiskProfile:
-    allowed = {f.name for f in dataclasses.fields(RiskProfile)}
-    return RiskProfile(**{k: v for k, v in data.items() if k in allowed})
+_ACCOUNT_KEYS = {f.name for f in dataclasses.fields(Account)} - {"risk", "strategy"}
+_RISK_KEYS = {f.name for f in dataclasses.fields(RiskProfile)}
+_STRATEGY_KEYS = {f.name for f in dataclasses.fields(StrategyProfile)}
+_PORTFOLIO_KEYS = {f.name for f in dataclasses.fields(PortfolioLimits)}
 
 
-def _strategy(data: dict[str, Any]) -> StrategyProfile:
-    allowed = {f.name for f in dataclasses.fields(StrategyProfile)}
-    cleaned = {k: v for k, v in data.items() if k in allowed}
+def _check_keys(where: str, data: dict[str, Any], allowed: set[str]) -> None:
+    unknown = sorted(set(data) - allowed)
+    if unknown:
+        raise ConfigError(f"{where}: неизвестные ключи {unknown}; "
+                          f"допустимые: {sorted(allowed)}")
+
+
+def _risk(data: dict[str, Any], where: str) -> RiskProfile:
+    _check_keys(where, data, _RISK_KEYS)
+    return RiskProfile(**data)
+
+
+def _strategy(data: dict[str, Any], where: str) -> StrategyProfile:
+    _check_keys(where, data, _STRATEGY_KEYS)
+    cleaned = dict(data)
     for key in ("kinds", "timeframes"):
         if key in cleaned:
             cleaned[key] = tuple(cleaned[key])
@@ -129,46 +149,73 @@ def _strategy(data: dict[str, Any]) -> StrategyProfile:
 
 
 def account_from_dict(data: dict[str, Any]) -> Account:
-    known = {f.name for f in dataclasses.fields(Account)}
-    payload = {k: v for k, v in data.items() if k in known and k not in {"risk", "strategy"}}
+    where = f"accounts[{data.get('name', '?')}]"
+    _check_keys(where, data, _ACCOUNT_KEYS | {"risk", "strategy"})
+    payload = {k: v for k, v in data.items() if k in _ACCOUNT_KEYS}
     if "symbols" in payload:
         payload["symbols"] = tuple(payload["symbols"])
-    account = Account(**payload)
-    account.risk = _risk(data.get("risk", {}))
-    account.strategy = _strategy(data.get("strategy", {}))
+    if "terminal_source" in payload:
+        payload["terminal_source"] = pathlib.Path(str(payload["terminal_source"]))
+    try:
+        account = Account(**payload)
+    except TypeError as exc:
+        raise ConfigError(f"{where}: {exc}") from exc
+    if account.mode not in ("demo", "real"):
+        raise ConfigError(f"{where}: mode={account.mode!r}, допустимо demo|real")
+    if account.network not in ("direct", "vpn"):
+        raise ConfigError(f"{where}: network={account.network!r}, допустимо direct|vpn")
+    if account.network == "vpn" and not account.vpn_profile:
+        raise ConfigError(f"{where}: network=vpn требует vpn_profile (путь к .ovpn)")
+    account.risk = _risk(data.get("risk", {}), f"{where}.risk")
+    account.strategy = _strategy(data.get("strategy", {}), f"{where}.strategy")
     return account
 
 
 def load(path: pathlib.Path | None = None) -> FleetConfig:
-    """Read the YAML registry; JSON is accepted too so the file stays dependency-free."""
+    """Read and validate the registry; raise ConfigError instead of trading bad numbers."""
     target = pathlib.Path(path) if path else CONFIG_PATH
     if not target.exists():
         return FleetConfig()
     raw = target.read_text(encoding="utf-8")
-    if target.suffix.lower() in {".yaml", ".yml"}:
-        data = _parse_yaml(raw)
-    else:
-        data = json.loads(raw)
+    data = _parse_yaml(raw) if target.suffix.lower() in {".yaml", ".yml"} else json.loads(raw)
     accounts = [account_from_dict(item) for item in data.get("accounts", [])]
     portfolio_data = data.get("portfolio", {})
-    allowed = {f.name for f in dataclasses.fields(PortfolioLimits)}
-    portfolio = PortfolioLimits(**{k: v for k, v in portfolio_data.items() if k in allowed})
-    return FleetConfig(accounts=accounts, portfolio=portfolio)
+    _check_keys("portfolio", portfolio_data, _PORTFOLIO_KEYS)
+    portfolio = PortfolioLimits(**portfolio_data)
+    config = FleetConfig(accounts=accounts, portfolio=portfolio)
+    _validate_uniqueness(config)
+    return config
+
+
+def _validate_uniqueness(config: FleetConfig) -> None:
+    names: dict[str, int] = {}
+    logins: dict[tuple[int, str], str] = {}
+    dirs: dict[pathlib.Path, str] = {}
+    for account in config.accounts:
+        if account.name in names:
+            raise ConfigError(f"дубликат имени счёта: {account.name}")
+        names[account.name] = 1
+        key = (account.login, account.server)
+        if key in logins:
+            raise ConfigError(f"дубликат счёта {account.login}/{account.server}: "
+                              f"{logins[key]} и {account.name}")
+        logins[key] = account.name
+        directory = account.data_dir
+        if directory in dirs:
+            raise ConfigError(f"счета {dirs[directory]} и {account.name} делят папку {directory}")
+        dirs[directory] = account.name
 
 
 def _parse_yaml(text: str) -> dict[str, Any]:
-    """Parse the small, predictable subset of YAML the registry uses.
-
-    Pulling PyYAML into the fleet is avoidable: the file is a list of flat records with nested
-    risk/strategy blocks, so a two-level indentation parser covers it without a dependency.
-    """
-    try:  # a real parser is better when the environment happens to have one
+    """Parse the registry with PyYAML. A hand-rolled fallback silently misread valid YAML."""
+    try:
         import yaml  # type: ignore
-
-        return yaml.safe_load(text) or {}
-    except Exception:  # noqa: BLE001 - fall back to the built-in reader
-        pass
-
+    except ImportError as exc:  # pragma: no cover - the dependency is declared
+        raise ConfigError("нужен PyYAML: pip install PyYAML") from exc
+    data = yaml.safe_load(text)
+    if not isinstance(data, dict):
+        raise ConfigError("реестр должен быть отображением верхнего уровня")
+    return data
     root: dict[str, Any] = {}
     current: dict[str, Any] | None = None
     nested: dict[str, Any] | None = None
@@ -214,7 +261,6 @@ def _parse_yaml(text: str) -> dict[str, Any]:
 
 def _scalar(value: str) -> Any:
     text = value.strip()
-    # A trailing "# ..." is an inline comment, not part of the value (docs encourage them).
     if " #" in text and not text.startswith(("'", '"')):
         text = text.split(" #", 1)[0].rstrip()
     if text.startswith("[") and text.endswith("]"):
