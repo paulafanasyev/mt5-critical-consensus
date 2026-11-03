@@ -137,7 +137,12 @@ def trend_clear_of_fast_average(mt5, symbol: str, side: str) -> bool:
     Without this the swarm kept shorting a rally at the average line: the signal said "below
     the 200 average" while the price was bouncing on the 50 average, and every such entry was
     a coin flip that paid the spread.
+
+    The metals are exempt on the demo: the operator asked to see them traded and observed
+    rather than filtered, so there only the EMA50/200 signal decides the direction.
     """
+    if symbol in ("XAUUSD", "XAGUSD"):
+        return True
     rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 1, 60)
     if rates is None or len(rates) < 30:
         return True
