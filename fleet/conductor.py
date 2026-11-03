@@ -191,7 +191,17 @@ class Conductor:
                 self.day_start_equity = None
             return  # an existing baseline is authoritative even on a partial book
         if expected and book["accounts"] < expected:
-            return  # never fix a new baseline from a partial book
+            last_known = self.store.portfolio([a.name for a in self.config.enabled()],
+                                              fresh_only=False)
+            if last_known["equity"] > 0:
+                self.store.set_meta("portfolio_day", today)
+                self.store.set_meta("portfolio_day_start_equity",
+                                    f"{last_known['equity']:.2f}")
+                self.day_start_equity = last_known["equity"]
+                self.store.event("conductor", "baseline_rebased", day=today,
+                                 equity=round(last_known["equity"], 2),
+                                 accounts=last_known["accounts"], expected=expected)
+            return  # never invent a base from three fresh rows out of a hundred
         if stored_day != today or not stored_value:
             if book["equity"] > 0:
                 self.store.set_meta("portfolio_day", today)

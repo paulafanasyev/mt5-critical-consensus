@@ -292,7 +292,8 @@ class Worker:
                 spec_for_atr = specs.get(position.symbol)
                 if spec_for_atr is not None:
                     atrs[position.symbol] = broker.atr(spec_for_atr.name, mt5.TIMEFRAME_H1)
-        current_risk = risk.book_risk_money(book_positions, specs, atrs)
+        current_risk = risk.book_risk_money(book_positions, specs, atrs,
+                                            account.risk.stop_atr)
         day_pct = self._portfolio_day_pct(book_stop["equity"])
         for signal in strategy.signals(account):
             spec = broker.symbol(signal.base_symbol)
@@ -387,11 +388,24 @@ class Worker:
     def _day_state(self, account: Account, snapshot: risk.AccountSnapshot,
                    server_day: str) -> risk.DayState:
         stored = self.store.day(account.name)
+        cache_key = f"netflow:{account.name}:{server_day}"
+        cached_flow = self.store.get_meta(cache_key)
+        if cached_flow is not None:
+            try:
+                net_flow = float(cached_flow)
+            except ValueError:
+                net_flow = 0.0
+        else:
+            try:
+                net_flow = risk.daily_net_flow(risk.day_start_datetime(server_day))
+                self.store.set_meta(cache_key, f"{net_flow:.2f}")
+            except Exception:  # noqa: BLE001 - history may lag right after midnight
+                net_flow = 0.0
         try:
-            net_flow = risk.daily_net_flow(risk.day_start_datetime(server_day))
-        except Exception:  # noqa: BLE001 - history may lag right after midnight
-            net_flow = 0.0
-        opened_with = snapshot.balance - net_flow
+            realized_today = risk.daily_realized(risk.day_start_datetime(server_day))
+        except Exception:  # noqa: BLE001
+            realized_today = 0.0
+        opened_with = snapshot.balance - net_flow - realized_today
         if opened_with <= 0:
             # The whole balance arrived today: there is no opening base, so no loss to measure.
             opened_with = snapshot.balance

@@ -111,6 +111,16 @@ def daily_net_flow(day_start: dt.datetime) -> float:
     return total
 
 
+def daily_realized(day_start: dt.datetime) -> float:
+    """Trading result already booked today, so a fresh day base is not inflated by it."""
+    deals = mt5.history_deals_get(day_start, dt.datetime.now() + dt.timedelta(days=1)) or []
+    total = 0.0
+    for deal in deals:
+        if int(getattr(deal, "entry", -1)) == 1:  # a closing deal carries the P/L
+            total += float(getattr(deal, "profit", 0.0))
+    return total
+
+
 def day_start_datetime(day: str) -> dt.datetime:
     try:
         parsed = dt.date.fromisoformat(day)
@@ -157,9 +167,10 @@ def position_risk_money(position, spec: broker.BrokerSymbol | None,
 
 
 def book_risk_money(positions: list, specs: dict[str, broker.BrokerSymbol | None],
-                    atr_by_symbol: dict[str, float] | None = None) -> float:
+                    atr_by_symbol: dict[str, float] | None = None,
+                    stop_atr: float = 1.6) -> float:
     atrs = atr_by_symbol or {}
-    return sum(position_risk_money(p, specs.get(p.symbol), atrs.get(p.symbol, 0.0))
+    return sum(position_risk_money(p, specs.get(p.symbol), atrs.get(p.symbol, 0.0), stop_atr)
                for p in positions)
 
 

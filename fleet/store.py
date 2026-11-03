@@ -307,11 +307,13 @@ class Store:
         return [(a, s, v, m, now - (u or 0)) for a, s, v, m, u in rows
                 if now - (u or 0) <= POSITIONS_TTL_SECONDS]
 
-    def all_positions(self) -> list[tuple]:
+    def all_positions(self, max_age: float = POSITIONS_TTL_SECONDS) -> list[tuple]:
+        """Mirror rows fresh enough to trust; a long-silent account's ghosts stop counting."""
+        cutoff = time.time() - max_age
         with self._connect() as conn:
             return conn.execute(
                 "SELECT account, ticket, symbol, side, volume, price_open, profit, sl, tp, magic"
-                " FROM positions").fetchall()
+                " FROM positions WHERE updated_epoch >= ?", (cutoff,)).fetchall()
 
     def recent_events(self, limit: int = 20) -> list[tuple]:
         with self._connect() as conn:
