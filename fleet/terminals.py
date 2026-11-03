@@ -145,6 +145,7 @@ def launch(account: Account, extra_args: tuple[str, ...] = ()) -> subprocess.Pop
     if not account.terminal_exe.exists():
         raise FileNotFoundError(f"терминал не подготовлен: {account.terminal_exe}")
     _PID_CACHE.pop(str(account.data_dir).lower(), None)
+    _invalidate_port_cache()
     creation = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     return subprocess.Popen([str(account.terminal_exe), "/portable", *extra_args],
                             cwd=str(account.data_dir), creationflags=creation, close_fds=True,

@@ -187,6 +187,18 @@ class Conductor:
         stored_day = self.store.get_meta("portfolio_day")
         stored_value = self.store.get_meta("portfolio_day_start_equity")
         expected = sum(len(self.config.by_shard(shard)) for shard in self.shards)
+        registry = self._registry_hash()
+        if self.store.get_meta("portfolio_registry_hash") != registry:
+            flow, realized = self._book_flows()
+            base = (book["equity"] - flow - realized) if book["equity"] > 0 else 0.0
+            if base > 0:
+                self.store.set_meta("portfolio_registry_hash", registry)
+                self.store.set_meta("portfolio_day", today)
+                self.store.set_meta("portfolio_day_start_equity", f"{base:.2f}")
+                self.day_start_equity = base
+                self.store.event("conductor", "baseline_rebased", day=today,
+                                 equity=round(base, 2), registry=registry)
+            return
         if stored_day == today and stored_value:
             try:
                 self.day_start_equity = float(stored_value)
@@ -218,6 +230,31 @@ class Conductor:
         except ValueError:
             self.day_start_equity = None
 
+    def _book_flows(self) -> tuple[float, float]:
+        """Sum today's deposits/withdrawals and realized P&L across the enabled accounts."""
+        from . import risk
+
+        day = risk.server_day_now()
+        flow = realized = 0.0
+        for account in self.config.enabled():
+            raw = self.store.get_meta(f"dayflows:{account.name}:{day}")
+            if not raw:
+                continue
+            parts = raw.split("|")
+            if len(parts) >= 2:
+                try:
+                    flow += float(parts[0])
+                    realized += float(parts[1])
+                except ValueError:
+                    continue
+        return flow, realized
+
+    def _registry_hash(self) -> str:
+        import hashlib
+
+        names = sorted(a.name for a in self.config.enabled())
+        return hashlib.sha1(",".join(names).encode()).hexdigest()[:12]
+
     def _portfolio_stop(self, book: dict) -> str:
         limits = self.config.portfolio
         expected = sum(len(self.config.by_shard(shard)) for shard in self.shards)
@@ -231,7 +268,9 @@ class Conductor:
             self.store.set_meta("book_incomplete", "0")
             self.store.event("conductor", "book_complete", accounts=book["accounts"])
         if self.day_start_equity and self.day_start_equity > 0 and book["equity"] > 0:
-            change_pct = (book["equity"] - self.day_start_equity) / self.day_start_equity * 100
+            flow, realized = self._book_flows()
+            adjusted = book["equity"] - flow - realized
+            change_pct = (adjusted - self.day_start_equity) / self.day_start_equity * 100
             if change_pct <= -limits.daily_stop_pct:
                 return f"дневной стоп портфеля: {change_pct:.2f}% ({book['equity']:.2f} USD)"
         return ""

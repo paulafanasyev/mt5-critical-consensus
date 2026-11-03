@@ -187,6 +187,8 @@ class Worker:
         opened = 0
         if allow_entries and rate > 0:
             opened = self._try_entries(account, snapshot, positions, day, rate)
+        elif allow_entries and rate <= 0:
+            self.store.event(account.name, "unpriced_account", currency=snapshot.currency)
         self._save_day(account, day)
         return WorkerResult(account.name, "ok", f"equity {snapshot.equity:.2f}",
                             opened=opened, closed=closed)
@@ -294,6 +296,10 @@ class Worker:
                     atrs[position.symbol] = broker.atr(spec_for_atr.name, mt5.TIMEFRAME_H1)
         current_risk = risk.book_risk_money(book_positions, specs, atrs,
                                             account.risk.stop_atr)
+        if book_stop.get("unpriced", 0) > 0:
+            self.store.event(account.name, "unpriced_accounts_book",
+                             count=book_stop["unpriced"])
+            return 0
         day_pct = self._portfolio_day_pct(book_stop["equity"])
         for signal in strategy.signals(account):
             spec = broker.symbol(signal.base_symbol)

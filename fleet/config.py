@@ -191,6 +191,10 @@ def account_from_dict(data: dict[str, Any]) -> Account:
         raise ConfigError(f"{where}: enabled должен быть true/false")
     if "terminal_source" in payload:
         payload["terminal_source"] = pathlib.Path(str(payload["terminal_source"]))
+    for key, kind in (("login", int), ("magic", int), ("shard", int),
+                      ("currency_scale", float)):
+        if key in payload:
+            payload[key] = _coerce(payload[key], kind, f"{where}.{key}")
     try:
         account = Account(**payload)
     except TypeError as exc:
