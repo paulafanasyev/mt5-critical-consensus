@@ -59,6 +59,8 @@ def ensure_tunnel(profile: str, timeout: float = 60.0) -> tuple[bool, str]:
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text("", encoding="utf-8")  # a new session must not inherit an old success line
     config = pathlib.Path(profile)
+    if not config.exists():
+        return False, f"нет файла VPN-профиля {config}: отказ вместо публичного релея"
     if config.exists() and OPENVPN.exists():
         creation = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
         subprocess.Popen([str(OPENVPN), "--config", str(config), "--log", str(log), "--verb", "3"],

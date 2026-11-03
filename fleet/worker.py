@@ -124,6 +124,12 @@ class Worker:
         if info.login != account.login or info.server != account.server:
             mt5.shutdown()
             return f"привязан чужой счёт {info.login}/{info.server}"
+        # The YAML label is not evidence: the broker's own trade_mode decides demo vs real.
+        broker_real = int(info.trade_mode) == int(mt5.ACCOUNT_TRADE_MODE_REAL)
+        if broker_real != account.is_real:
+            mt5.shutdown()
+            return (f"несовпадение режима: в реестре {'real' if account.is_real else 'demo'}, "
+                    f"у брокера {'real' if broker_real else 'demo'} — торговля запрещена")
         return ""
 
     def detach(self) -> None:
@@ -138,6 +144,9 @@ class Worker:
         if time.time() < next_attempt:
             return WorkerResult(account.name, "cooldown",
                                 f"до следующей попытки {int(next_attempt - time.time())} с")
+        if account.password_env and not terminals.password_for(account):
+            return WorkerResult(account.name, "error",
+                                f"секрет не найден: переменная {account.password_env} пуста")
         try:
             error = self.attach(account)
         except Exception as exc:  # noqa: BLE001 - a bad terminal must not kill the shard

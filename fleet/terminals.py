@@ -16,7 +16,7 @@ import time
 
 from .config import FLEET_ROOT, Account
 
-SKIP_DIRS = {"config", "logs", "MQL5", "profiles", "sounds", "Tester", "bases"}
+SKIP_DIRS = {"config", "bases", "logs", "profiles", "sounds", "tester", "mql5"}
 WRITABLE_DIRS = ("config", "logs", "MQL5", "MQL5/Experts", "MQL5/Scripts", "profiles", "sounds",
                  "Tester")
 
@@ -36,7 +36,9 @@ def _hardlink_tree(source: pathlib.Path, target: pathlib.Path) -> None:
     for item in source.iterdir():
         destination = target / item.name
         if item.is_dir():
-            if item.name in SKIP_DIRS:
+            # MT5 ships Config/Bases/Profiles with capital letters: a case-sensitive skip would
+            # hardlink saved sessions and shared databases into every account folder.
+            if item.name.casefold() in SKIP_DIRS:
                 continue
             destination.mkdir(exist_ok=True)
             _hardlink_tree(item, destination)
@@ -76,8 +78,7 @@ def provision(account: Account, source: pathlib.Path | None = None,
     for relative in WRITABLE_DIRS:
         (target / relative).mkdir(parents=True, exist_ok=True)
     _seed_saved_session(account)
-    if not (target / "config" / "common.ini").exists():
-        write_startup_config(account)
+    write_startup_config(account)  # always ours: never a hardlinked copy of another account
     if current:
         fingerprint_file.write_text(current, encoding="utf-8")
     return target

@@ -73,6 +73,7 @@ class Account:
     password_env: str = ""
     seed_config: str = ""
     currency_scale: float = 1.0  # 0.01 for cent accounts: 100 "cents" are one dollar
+    allow_public_relay: bool = False  # real money over VPN Gate is refused by default
     keep_running: bool = False
 
     @property
@@ -218,6 +219,10 @@ def account_from_dict(data: dict[str, Any]) -> Account:
         # An enabled account must have a real profile; a disabled placeholder may not exist yet.
         if account.enabled and not pathlib.Path(account.vpn_profile).exists():
             raise ConfigError(f"{where}: нет файла профиля {account.vpn_profile}")
+        if account.is_real and not account.allow_public_relay and "vgate" in account.vpn_profile:
+            raise ConfigError(
+                f"{where}: реальный счёт через публичный VPN Gate запрещён; "
+                "нужен выделенный VPN или allow_public_relay: true с пониманием риска")
     account.risk = _risk(data.get("risk", {}), f"{where}.risk")
     account.strategy = _strategy(data.get("strategy", {}), f"{where}.strategy")
     from .risk import validate_risk_profile
