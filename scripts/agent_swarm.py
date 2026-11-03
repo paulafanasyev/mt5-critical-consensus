@@ -399,12 +399,19 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
         save_state(state)
         return
 
+    # positions the operator was told to leave alone until a date: keep only the hard stop
+    holds = {str(ticket): float(until) for ticket, until in (state.get("holds") or {}).items()
+             if float(until) > time.time()}
+
     # 1. cut a loser at the dollar level instead of waiting for the ATR stop.
     # The threshold scales with the position: ten dollars on a 0.05 lot gold trade is
     # inside the spread, so the floor alone would stop out every entry instantly.
     cooldowns = state.setdefault("cooldowns", {})
     survivors = []
     for position in [p for p in (mt5.positions_get() or []) if p.magic in magics]:
+        if str(position.ticket) in holds:
+            survivors.append(position)
+            continue
         info = mt5.symbol_info(position.symbol)
         contract = info.trade_contract_size if info else 100.0
         stop_distance = abs(position.price_open - position.sl) if position.sl else 0.0
@@ -436,6 +443,8 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
     peaks = state.setdefault("peaks", {})
     for position in survivors:
         key = str(position.ticket)
+        if key in holds:
+            continue
         peak = max(peaks.get(key, 0.0), position.profit)
         peaks[key] = peak
         if peak < TRAIL_ARM:
@@ -493,6 +502,8 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
     levels = state.setdefault("scale_levels", {})
     for position in survivors:
         key = str(position.ticket)
+        if key in holds:
+            continue
         level = levels.get(key, 0)
         if level >= len(SCALE_TIERS) or position.profit < SCALE_TIERS[level]:
             continue
