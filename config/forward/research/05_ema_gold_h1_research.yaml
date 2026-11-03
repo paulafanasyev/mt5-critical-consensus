@@ -14,12 +14,16 @@ account:
   require_demo: true
 
 # Read from the terminal (MetaQuotes-Demo, 2026-11-01): point 0.01, tick_value 0.10 per lot.
+# That tick field is wrong by 10x for this broker - the same terminal's order_calc_profit pays
+# 100 $ per price unit per lot - so risk comes from contract_size and the tick pair is kept only
+# as the cross-check behind SymbolSpec.cash_estimate_divergence.
 symbol_spec:
   symbol: XAUUSD
   point: 0.01
   digits: 2
   tick_size: 0.01
   tick_value: 0.1
+  contract_size: 100.0
   volume_min: 0.01
   volume_max: 100.0
   volume_step: 0.01

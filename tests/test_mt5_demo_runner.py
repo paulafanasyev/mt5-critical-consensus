@@ -1180,7 +1180,11 @@ def test_acknowledging_the_uncertain_startup_is_journaled_and_the_run_continues(
 
 
 # ------------------------------------------------------------------- symbol universe
-GOLD = SymbolSpec(symbol="XAUUSD", point=0.01, digits=2, tick_size=0.01, tick_value=1.0,
+# Gold as MetaQuotes-Demo actually publishes it: a tick field describing a tenth of a lot and a
+# contract size that says 100 ounces. The runner reads specs from the terminal, so its sizing
+# tests must be fed the contradictory pair, not a hand-corrected one.
+GOLD = SymbolSpec(symbol="XAUUSD", point=0.01, digits=2, tick_size=0.01, tick_value=0.1,
+                  contract_size=100.0,
                   volume_min=0.01, volume_max=50.0, volume_step=0.01, spread_points=30,
                   stops_level_points=0)
 
@@ -1777,6 +1781,29 @@ def test_entry_deals_normalizes_terminal_rows():
     assert row["time_epoch"] == pytest.approx(stamp)
     assert abs(datetime.fromisoformat(row["time"])
                - datetime.fromtimestamp(stamp, tz=UTC)) < timedelta(seconds=1)
+
+
+def test_entry_deals_asks_for_a_window_wide_enough_to_see_a_server_clock_fill():
+    # The terminal returns nothing for a window ending close to UTC even when the deal exists,
+    # so a fill the EA really placed read as an empty book and stopped the run. Measured live on
+    # this host at 2026-11-02 04:58 UTC: one and the same seven-day left edge gave 1 row and no
+    # magic-8172026 deal at now+4h, and 5 rows with both fills at now+8h — the right edge is what
+    # clips, because these naive bounds are read on the server clock (UTC+7200 s).
+    seen: list[tuple[datetime, datetime]] = []
+
+    class Module:
+        @staticmethod
+        def history_deals_get(start, end):
+            seen.append((start, end))
+            return []
+
+    terminal = bare_terminal()
+    terminal._mt5 = Module()
+    commanded = datetime.now(UTC) - timedelta(seconds=90)
+    terminal.entry_deals(commanded)
+    start, end = seen[0]
+    assert start <= (commanded - timedelta(days=1)).replace(tzinfo=None)
+    assert end >= (datetime.now(UTC) + timedelta(hours=12)).replace(tzinfo=None)
 
 
 def test_an_empty_history_result_set_is_an_error_not_an_empty_book():

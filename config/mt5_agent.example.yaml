@@ -26,6 +26,11 @@ symbol_spec:                  # спецификация для симуляци
   digits: 5
   tick_size: 0.00001
   tick_value: 1.0             # стоимость тика для 1 лота в валюте счёта
+  # Размер контракта в базовых единицах на 1 лот. Риск и маржа считаются от него; брокерский
+  # tick_value для металлов на MetaQuotes-Demo занижен в 10 раз, поэтому поле, а не соотношение
+  # tick_value/tick_size, должно быть названо явно. Совпадение двух оценок проверяется
+  # SymbolSpec.cash_estimate_divergence.
+  contract_size: 100000.0
   volume_min: 0.01
   volume_max: 100.0
   volume_step: 0.01

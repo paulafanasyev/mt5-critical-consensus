@@ -4,7 +4,9 @@ from __future__ import annotations
 from critical_consensus.mt5_agent import SymbolSpec
 from critical_consensus.mt5_agent.sizing import size_position
 
-# Silver as MetaQuotes-Demo quotes it: 500 ounces per lot, so one lot is worth ~$36k at $71.
+# Silver priced from its tick pair - the fallback path, for a broker that publishes no contract.
+# MetaQuotes-Demo's own trade_contract_size for XAGUSD is 5000 ounces, ten times what this ratio
+# claims; test_mt5_contract_sizing.py covers the contract-based number.
 SPEC = SymbolSpec(symbol="XAGUSD", point=0.001, digits=3, tick_size=0.001, tick_value=0.5,
                   volume_min=0.01, volume_max=100.0, volume_step=0.01, spread_points=22,
                   stops_level_points=0)
@@ -38,7 +40,8 @@ def test_a_notional_cap_below_one_lot_is_a_denial():
 
 
 def test_the_notional_cap_uses_the_contract_size_not_the_raw_price():
-    """One lot of silver is 500 ounces: a raw-price cap would allow ~500x the position."""
+    """One lot here is 500 $ per price unit, so ~$35.7k of notional at $71.5: a raw-price cap
+    would allow ~500x the position."""
     capped = size(max_notional=30_000.0, stop_distance=0.066)
     uncapped = size(stop_distance=0.066)
     assert capped.order.volume < uncapped.order.volume

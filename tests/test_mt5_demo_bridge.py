@@ -952,3 +952,88 @@ def test_sha256_text_is_stable():
     assert module.sha256_text("abc") == module.sha256_text("abc")
     assert len(module.sha256_text("abc")) == 64
     assert module.sha256_text("abc") != module.sha256_text("abd")
+
+
+@pytest.mark.parametrize("kind", [ConnectionAbortedError, ConnectionResetError, BrokenPipeError])
+def test_a_client_that_disconnects_mid_answer_costs_one_line_not_a_traceback(
+        make_bridge, capsys, kind):
+    # The terminal aborts its own WebRequest the moment it refuses the poll, so the bridge
+    # regularly loses the socket with the response body still in flight. On 2026-11-02 six of
+    # those came through socketserver as full tracebacks in the runner log, where they read as
+    # the bridge crashing while the queue kept serving.
+    bridge = make_bridge().start()
+    try:
+        raise kind(10053, "aborted by host software")
+    except kind:
+        bridge._server.handle_error(None, ("127.0.0.1", 50757))
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "closed the socket mid-request" in err
+    assert "127.0.0.1:50757" in err
+
+
+def test_an_unexpected_handler_error_still_gets_the_full_report(make_bridge, capsys):
+    # Filtering by exception type is the whole point: a genuine bug on the bridge must not be
+    # reduced to the same one line a client disconnect gets.
+    bridge = make_bridge().start()
+    try:
+        raise ValueError("not a disconnect")
+    except ValueError:
+        bridge._server.handle_error(None, ("127.0.0.1", 50758))
+    err = capsys.readouterr().err
+    assert "Traceback (most recent call last)" in err
+    assert "ValueError: not a disconnect" in err
+
+
+def test_an_authenticated_poll_on_an_ea_path_is_counted(make_bridge, clock):
+    # The advisor logs only refusals and events, so a quiet log cannot tell a live poll loop from
+    # a detached EA. The counter here is the positive record the transport check reads.
+    bridge = make_bridge().start()
+    assert bridge.state.ea_polls == 0
+    _request(bridge, "GET", "/v1/risk/kill-switch")
+    _request(bridge, "GET", "/v1/execution/next")
+    status, body, _ = _request(bridge, "GET", "/v1/health")
+    assert status == 200
+    payload = _json(body)
+    assert payload["ea_polls"] == 2
+    assert payload["last_ea_poll_path"] == "/v1/execution/next"
+    assert payload["ea_poll_age_seconds"] == 0.0
+    clock.advance(45)
+    assert _json(_request(bridge, "GET", "/v1/health")[1])["ea_poll_age_seconds"] == 45.0
+
+
+def test_the_health_read_itself_is_not_an_advisor_poll_and_needs_the_token(make_bridge):
+    bridge = make_bridge().start()
+    _request(bridge, "GET", "/v1/risk/kill-switch")
+    polls = bridge.state.ea_polls
+    _request(bridge, "GET", "/v1/health")
+    assert bridge.state.ea_polls == polls
+    status, body, _ = _request(bridge, "GET", "/v1/health", key=None)
+    assert status == 401
+    status, _, _ = _request(bridge, "GET", "/v1/health", key="b" * 43)
+    assert status == 401
+    # A command that expires unserved still proves the advisor was polling for it, and the
+    # health answer must not carry what it would have been handed.
+    bridge.enqueue(_command(clock_now(bridge)))
+    served = _json(_request(bridge, "GET", "/v1/execution/next")[1])
+    health = json.dumps(_json(_request(bridge, "GET", "/v1/health")[1]))
+    assert served["command_id"] not in health
+    assert TOKEN not in health
+    assert "payload_hash" not in health
+
+
+def test_a_refused_poll_is_not_counted(make_bridge):
+    bridge = make_bridge().start()
+    _request(bridge, "GET", "/v1/risk/kill-switch", key="b" * 43)
+    _post(bridge, "/v1/risk/kill-switch", {"action": "arm", "reason": "x", "actor_id": "y"},
+          key="b" * 43)
+    assert bridge.state.ea_polls == 0
+    # An unauthenticated read of the health endpoint is not an advisor poll either, and the
+    # queue path a browser could reach with an Origin header is refused before any counting.
+    _request(bridge, "GET", "/v1/health", key=None)
+    _request(bridge, "GET", "/v1/risk/kill-switch", headers={"Origin": "http://evil.example"})
+    assert bridge.state.ea_polls == 0
+
+
+def clock_now(bridge) -> datetime:
+    return bridge._now()

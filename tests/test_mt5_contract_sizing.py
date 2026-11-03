@@ -134,6 +134,20 @@ def test_a_negative_contract_size_is_rejected_rather_than_silently_dropped():
         SymbolSpec(**{**GOLD.__dict__, "contract_size": -100.0})
 
 
+def test_from_terminal_falls_back_when_the_loss_tick_value_is_zero():
+    """A broker that leaves trade_tick_value_loss at 0.0 has not published a zero-cost tick."""
+    spec = SymbolSpec.from_terminal(terminal_info(trade_tick_value_loss=0.0,
+                                                 trade_tick_value=0.1), "USD")
+    assert spec.tick_value == 0.1
+
+
+def test_from_terminal_names_the_tick_field_that_is_missing():
+    """Both tick values at 0.0 used to reach the dataclass and raise a generic geometry error."""
+    with pytest.raises(RuntimeError, match="has no trade_tick_value"):
+        SymbolSpec.from_terminal(terminal_info(trade_tick_value_loss=0.0, trade_tick_value=0.0),
+                                 "USD")
+
+
 # --- the rest of the risk stack has to price the lot the same way -------------------------
 #
 # The collector and the independent verifier run in a different process from the sizing code.

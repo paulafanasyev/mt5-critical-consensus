@@ -144,8 +144,9 @@ def exit_reason(account: Account, position, spec: broker.BrokerSymbol,
                 peak: float) -> str:
     """Decide whether an open position should be closed now.
 
-    The operator's standing rule: take profit earlier on real money, never let a winner turn
-    into a loser, and never hold a losing position longer than the plan allows.
+    This is the single place that decides exits — the worker only executes what comes back. The
+    operator's standing rules: take profit earlier on real money, never let a winner turn into a
+    loser, and never hold past the planned horizon.
     """
     atr = broker.atr(spec.name, mt5.TIMEFRAME_H1)
     if atr <= 0:
@@ -157,10 +158,19 @@ def exit_reason(account: Account, position, spec: broker.BrokerSymbol,
     price = float(tick.bid if is_buy else tick.ask)
     entry = float(position.price_open)
     gain = (price - entry) if is_buy else (entry - price)
-    arm = atr * account.risk.trail_arm_atr
-    giveback_floor = max(atr * 0.35, account.risk.giveback_fraction * peak) if peak > 0 else 0.0
-    if gain >= arm and peak > 0 and gain <= peak - giveback_floor:
-        return "фиксация после отката от пика"
+
+    if gain >= atr * account.risk.take_atr:
+        return "тейк по ATR"
     if gain <= -atr * account.risk.stop_atr * 1.05:
         return "жёсткий стоп по ATR"
+    if gain >= atr * account.risk.trail_arm_atr and peak > 0:
+        giveback_floor = max(atr * 0.35, account.risk.giveback_fraction * peak)
+        if gain <= peak - giveback_floor:
+            return "фиксация после отката от пика"
+    if account.risk.max_hold_minutes > 0:
+        import time as _time
+
+        held_minutes = (_time.time() - float(position.time)) / 60
+        if held_minutes >= account.risk.max_hold_minutes:
+            return f"время вышло ({held_minutes:.0f} мин)"
     return ""

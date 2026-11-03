@@ -30,6 +30,7 @@ class RiskProfile:
     take_atr: float = 2.6
     trail_arm_atr: float = 0.8
     giveback_fraction: float = 0.35
+    max_hold_minutes: int = 0  # 0 — без ограничения по времени
 
 
 @dataclasses.dataclass(slots=True)
@@ -213,6 +214,9 @@ def _parse_yaml(text: str) -> dict[str, Any]:
 
 def _scalar(value: str) -> Any:
     text = value.strip()
+    # A trailing "# ..." is an inline comment, not part of the value (docs encourage them).
+    if " #" in text and not text.startswith(("'", '"')):
+        text = text.split(" #", 1)[0].rstrip()
     if text.startswith("[") and text.endswith("]"):
         return [_scalar(part) for part in text[1:-1].split(",") if part.strip()]
     if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):

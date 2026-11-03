@@ -66,9 +66,9 @@ def test_equity_series_skips_broken_points_and_sorts(tmp_path: Path) -> None:
 def test_r_multiple_divides_profit_by_the_sized_risk() -> None:
     trade = {"event_type": "paper_trade_closed", "opened_at": "2026-10-01T00:00:00+00:00",
              "entry_price": 100.0, "stop_loss": 98.0, "volume": 1.0, "pnl": 4.0}
-    # stop distance 2.0 / tick 1.0 = 2 ticks x 1.0 per tick x 1.0 lot = 2.0 of risk
-    assert render.planned_risk_currency(trade, tick_size=1.0, tick_value=1.0) == 2.0
-    assert render.r_multiples([trade], tick_size=1.0, tick_value=1.0) == [("2026-10-01T00:00", 2.0)]
+    # stop distance 2.0 x 1.0 of cash per price unit x 1.0 lot = 2.0 of risk
+    assert render.planned_risk_currency(trade, cash_per_price_unit=1.0) == 2.0
+    assert render.r_multiples([trade], cash_per_price_unit=1.0) == [("2026-10-01T00:00", 2.0)]
 
 
 @pytest.mark.parametrize("field,value", [("volume", None), ("pnl", "1"), ("entry_price", float("nan"))])
@@ -76,7 +76,7 @@ def test_an_unusable_trade_produces_no_bar(field: str, value: object) -> None:
     trade = {"event_type": "paper_trade_closed", "opened_at": "2026-10-01T00:00:00+00:00",
              "entry_price": 100.0, "stop_loss": 98.0, "volume": 1.0, "pnl": 4.0}
     trade[field] = value
-    assert render.r_multiples([trade], tick_size=1.0, tick_value=1.0) == []
+    assert render.r_multiples([trade], cash_per_price_unit=1.0) == []
 
 
 def test_autocorrelation_distinguishes_reversion_from_trend() -> None:
@@ -173,6 +173,85 @@ def test_rendering_two_journals_writes_svg_and_records_the_numbers(tmp_path: Pat
     # -10 over a 20-point stop = 2000 ticks x 0.1 x 0.05 = 10 of risk, so exactly -1R
     assert summary["planned_risk_currency_per_trade"] == [10.0]
     assert summary["r_multiples"] == [-1.0]
+
+
+def test_the_report_divides_by_the_basis_the_journal_itself_booked(tmp_path: Path) -> None:
+    """A pre-fix journal priced its P/L and its risk at the broker tick field; both must move
+    together, or re-rendering last week's evidence redraws -1R trades as -0.1R ones.
+
+    The numbers are the real XAUUSD paper journal: one lot at a 40.784-point stop booked
+    407.84 $ of risk per lot, i.e. the 10 $ per price unit MetaQuotes-Demo's tick pair claims,
+    while the contract the policy now declares says 100 $.
+    """
+    policy = tmp_path / "policy.yaml"
+    policy.write_text("symbol_spec:\n  tick_size: 0.01\n  tick_value: 0.1\n"
+                      "  contract_size: 100.0\n", encoding="utf-8")
+    db = tmp_path / "journal.db"
+    _write_journal(db, [
+        ("agent_cycle", {"status": "PAPER_OPENED",
+                         "proposal": {"risk_distance": 40.7842857142853},
+                         "sizing": {"risk_per_lot": 407.842857142853, "volume": 0.04},
+                         "broker_order_sent": False}),
+        ("equity_point", {"at": "2026-10-01T00:00:00+00:00", "equity": 100_000.0,
+                          "broker_order_sent": False}),
+        ("equity_point", {"at": "2026-10-02T00:00:00+00:00", "equity": 99_983.69,
+                          "broker_order_sent": False}),
+        ("paper_trade_closed", {"opened_at": "2026-10-01T01:00:00+00:00", "entry_price": 4024.68,
+                                "stop_loss": 4065.4642857142853, "volume": 0.04,
+                                "pnl": -16.313714285714195, "broker_order_sent": False}),
+    ])
+    evidence: dict = {}
+    render.render_demo_journals([("XAUUSD", policy, db)], tmp_path / "charts", evidence)
+    summary = evidence["demos"]["XAUUSD"]
+    assert summary["risk_basis"] == "journal_sizing"
+    assert summary["risk_cash_per_price_unit"] == pytest.approx(10.0)
+    assert summary["planned_risk_currency_per_trade"] == [16.3137]
+    assert summary["r_multiples"] == [-1.0]
+
+
+def test_a_journal_without_sizing_rows_uses_the_contract_the_policy_declares(tmp_path: Path) -> None:
+    """No booked basis to read: fall back to the declared contract, not to a tick field that is
+    ten times too small for these metals."""
+    policy = tmp_path / "policy.yaml"
+    policy.write_text("symbol_spec:\n  tick_size: 0.01\n  tick_value: 0.1\n"
+                      "  contract_size: 100.0\n", encoding="utf-8")
+    db = tmp_path / "journal.db"
+    _write_journal(db, [
+        ("equity_point", {"at": "2026-10-01T00:00:00+00:00", "equity": 100_000.0,
+                          "broker_order_sent": False}),
+        ("equity_point", {"at": "2026-10-02T00:00:00+00:00", "equity": 99_990.0,
+                          "broker_order_sent": False}),
+        ("paper_trade_closed", {"opened_at": "2026-10-01T01:00:00+00:00", "entry_price": 4000.0,
+                                "stop_loss": 3980.0, "volume": 0.05, "pnl": -10.0,
+                                "broker_order_sent": False}),
+    ])
+    evidence: dict = {}
+    render.render_demo_journals([("XAUUSD", policy, db)], tmp_path / "charts", evidence)
+    summary = evidence["demos"]["XAUUSD"]
+    # 20 points x 100 $ per price unit per lot x 0.05 lots = 100 of risk.
+    assert summary["risk_basis"] == "policy_contract_size"
+    assert summary["planned_risk_currency_per_trade"] == [100.0]
+    assert summary["r_multiples"] == [-0.1]
+    assert summary["contract_size"] == 100.0
+
+
+def test_a_policy_without_a_contract_size_falls_back_to_the_tick_ratio(tmp_path: Path) -> None:
+    policy = tmp_path / "policy.yaml"
+    policy.write_text("symbol_spec:\n  tick_size: 0.01\n  tick_value: 0.1\n", encoding="utf-8")
+    assert render.read_symbol_spec(policy) == (0.01, 0.1, None)
+    assert render.policy_cash_per_price_unit(0.01, 0.1, None) == 10.0
+    assert render.policy_cash_per_price_unit(0.01, 0.1, 100.0) == 100.0
+    trade = {"event_type": "paper_trade_closed", "entry_price": 4000.0,
+             "stop_loss": 3980.0, "volume": 0.05, "pnl": -10.0}
+    assert render.planned_risk_currency(trade, cash_per_price_unit=10.0) == 10.0
+    assert render.planned_risk_currency(trade, cash_per_price_unit=100.0) == 100.0
+
+
+def test_a_cycle_without_a_usable_sizing_pair_provides_no_basis() -> None:
+    assert render.recorded_cash_per_price_unit([
+        {"event_type": "agent_cycle", "sizing": {"risk_per_lot": 407.84},
+         "proposal": {"risk_distance": 0}}]) is None
+    assert render.recorded_cash_per_price_unit([{"event_type": "agent_cycle"}]) is None
 
 
 def test_a_journal_with_no_equity_is_refused_before_anything_is_written(tmp_path: Path) -> None:

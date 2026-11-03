@@ -112,15 +112,25 @@ def can_open_portfolio(limits: PortfolioLimits, snapshots: list[AccountSnapshot]
 
 def size_for(account: Account, spec: broker.BrokerSymbol, stop_distance: float,
              balance: float) -> float:
-    """Lots that lose roughly risk_per_trade_pct of balance when the stop is hit."""
+    """Lots that lose roughly risk_per_trade_pct of balance when the stop is hit.
+
+    When even the broker's minimum lot would risk materially more than the allowance, the trade
+    is skipped (0.0) rather than quietly oversized — on a real account an oversized minimum lot
+    is exactly how a small balance dies.
+    """
     if stop_distance <= 0 or spec.tick_size <= 0 or spec.tick_value <= 0:
         return 0.0
     risk_money = balance * account.risk.risk_per_trade_pct / 100
+    if risk_money <= 0:
+        return 0.0
     ticks = stop_distance / spec.tick_size
     loss_per_lot = ticks * spec.tick_value
     if loss_per_lot <= 0:
         return 0.0
     raw = risk_money / loss_per_lot
+    min_risk = spec.volume_min * loss_per_lot
+    if min_risk > risk_money * 1.5:
+        return 0.0
     volume = broker.normalize_volume(raw, spec, account.risk.max_lots)
     return max(0.0, volume)
 
