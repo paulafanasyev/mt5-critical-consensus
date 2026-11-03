@@ -259,7 +259,7 @@ class Conductor:
                     witness = float(parts[2])
                 except ValueError:
                     continue
-                if abs(witness - float(balance or 0.0)) > 1e-9:
+                if abs(witness - float(balance or 0.0)) > 0.01:  # sub-cent balances exist
                     # The payload belongs to a different balance than this book row: skip it,
                     # the next cycle will see both settled.
                     flow -= float(parts[0])

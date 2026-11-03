@@ -186,8 +186,12 @@ class Worker:
                           len(positions), snapshot.floating, snapshot.currency, rate,
                           server_day)
         if flows_payload:
-            # Publish the flows only after the equity they belong to: a conductor reading
-            # between the two writes would otherwise see new flows against old equity.
+            # Publish the flows only after the equity they belong to, and with the FINAL balance
+            # as witness: managing positions can change the balance between the two snapshots.
+            parts = flows_payload.split("|")
+            if len(parts) >= 4:
+                parts[2] = f"{snapshot.balance:.8f}"
+                flows_payload = "|".join(parts)
             self.store.set_meta(f"dayflows:{account.name}:{server_day}", flows_payload)
         self.store.save_positions(account.name, positions)
 
