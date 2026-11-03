@@ -518,7 +518,7 @@ def test_unpriced_account_flow_is_not_counted(tmp_path) -> None:
     assert flow == 0.0
 
 
-def test_day_flows_are_published_only_after_equity(tmp_path, monkeypatch) -> None:
+def test_day_state_does_not_publish_flows(tmp_path, monkeypatch) -> None:
     """A conductor must never see new flows against the previous equity row."""
     from fleet import risk as risk_mod
     from fleet.config import Account, FleetConfig
@@ -678,3 +678,64 @@ def test_flows_are_published_before_equity_so_a_withdrawal_cannot_fake_a_stop(tm
     assert payload is not None
     assert payload.startswith("-100.00")
     assert abs(float(payload.split("|")[2]) - 900.0) < 0.01
+
+
+def test_interleaving_between_publish_and_equity_never_fakes_a_stop(tmp_path, monkeypatch) -> None:
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    monkeypatch.setattr(conductor, "PAUSE_FILE", tmp_path / "PAUSE")
+    monkeypatch.setattr(conductor, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(conductor.terminals, "stop_other_fleet", lambda *a, **k: None)
+    monkeypatch.setattr(conductor.subprocess, "Popen", lambda c, **k: _record([], c))
+    store = StoreCls(tmp_path / "book.sqlite")
+    account = Account(name="a", login=1, server="S", mode="demo")
+    engine = conductor.Conductor(FleetConfig(accounts=[account]), store, shards=[0])
+    store.equity("a", 1, 1000.0, 1000.0, 0, 0.0, "USD", 1.0, "2026-11-03")
+    store.set_meta("portfolio_day", conductor.risk.server_day_now() if hasattr(conductor, "risk") else "")
+    store.set_meta("portfolio_day_start_equity", "1000")
+    store.set_meta("portfolio_registry_hash", engine._registry_hash())
+    # withdrawal published, equity row not yet updated: the witness does not match -> flow skipped
+    store.set_meta("dayflows:a:" + (store._connect().execute(
+        "SELECT server_day FROM book WHERE account='a'").fetchone()[0]),
+        "-100.00|0.00|900.00000000|0")
+    assert engine._portfolio_stop(store.portfolio(["a"], fresh_only=False)) == ""
+    # equity catches up: the flow is applied and the result is still flat
+    store.equity("a", 1, 900.0, 900.0, 0, 0.0, "USD", 1.0, "2026-11-03")
+    assert engine._portfolio_stop(store.portfolio(["a"], fresh_only=False)) == ""
+
+
+def test_cycle_runs_the_real_entry_path(tmp_path, monkeypatch) -> None:
+    from fleet import risk as risk_mod
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    account = Account(name="a", login=1, server="S", mode="demo")
+    store = StoreCls(tmp_path / "book.sqlite")
+    runner = worker.Worker(FleetConfig(accounts=[account]), store)
+    spec = worker.broker.BrokerSymbol(name="EURUSD", digits=5, point=0.00001,
+                                      tick_size=0.00001, tick_value=1.0, volume_min=0.01,
+                                      volume_max=100.0, volume_step=0.01, stops_level=0,
+                                      freeze_level=0, spread=1, filling=3)
+    signal = types.SimpleNamespace(base_symbol="EURUSD", side="buy", reason="test",
+                                   price=1.10, stop=1.098, target=1.104, atr=0.001,
+                                   stop_distance=0.002)
+    snapshot = risk_mod.AccountSnapshot(login=1, server="S", currency="USD", balance=1000.0,
+                                       equity=1000.0, margin_free=1000.0, leverage=100,
+                                       positions=0, floating=0.0, server_day="2026-11-03")
+    sent = []
+    monkeypatch.setattr(risk_mod, "AccountSnapshot", types.SimpleNamespace(read=lambda *a, **k: snapshot))
+    monkeypatch.setattr(risk_mod, "positions_for", lambda acc: [])
+    monkeypatch.setattr(risk_mod, "daily_net_flow", lambda day: 0.0)
+    monkeypatch.setattr(risk_mod, "daily_realized", lambda day: 0.0)
+    monkeypatch.setattr(worker.Worker, "_manage_positions", lambda self, *a, **k: 0)
+    monkeypatch.setattr(worker.strategy, "signals", lambda acc: [signal])
+    monkeypatch.setattr(worker.broker, "symbol", lambda base: spec)
+    monkeypatch.setattr(worker.broker, "symbol_exact", lambda name: spec)
+    monkeypatch.setattr(worker.broker, "open_positions", lambda *a, **k: [])
+    monkeypatch.setattr(worker.broker, "market_order",
+                        lambda *a, **k: sent.append(1) or types.SimpleNamespace(
+                            volume=0.02, price=1.10, retcode=10009, token="t"))
+    result = runner._cycle(account, allow_entries=True)
+    assert result.status == "ok"
+    assert sent == [1]  # the real _try_entries reached the broker call

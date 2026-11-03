@@ -62,6 +62,37 @@ if importlib.util.find_spec("MetaTrader5") is None:
     sys.modules["MetaTrader5"] = _stub_mt5()
 
 
+_FLEET_SNAPSHOT: dict[str, float] = {}
+_FLEET_OWNED = ("fleet.sqlite", "fleet.jsonl", "conductor.json", "conductor.lock", "PAUSE")
+
+
+def _fleet_state(root) -> dict[str, float]:
+    import pathlib as _pathlib
+
+    state: dict[str, float] = {}
+    base = _pathlib.Path(root)
+    if not base.exists():
+        return state
+    for name in _FLEET_OWNED:
+        target = base / name
+        if target.exists():
+            state[name] = target.stat().st_mtime
+    terminals = base / "terminals"
+    if terminals.exists():
+        for item in terminals.iterdir():
+            try:
+                state[f"terminals/{item.name}"] = item.stat().st_mtime
+            except OSError:
+                continue
+    return state
+
+
+def pytest_configure(config):
+    import pathlib as _pathlib
+
+    _FLEET_SNAPSHOT.update(_fleet_state(_pathlib.Path(r"C:\mt5-fleet")))
+
+
 def pytest_sessionfinish(session, exitstatus):
     """A green suite must not leave trading processes behind: fail loudly if it did."""
     import subprocess
@@ -77,3 +108,10 @@ def pytest_sessionfinish(session, exitstatus):
         return
     if listing:
         raise AssertionError(f"живые fleet.shard процессы после suite: {listing}")
+    import pathlib as _pathlib
+
+    after = _fleet_state(_pathlib.Path(r"C:\mt5-fleet"))
+    changed = sorted(k for k in set(after) | set(_FLEET_SNAPSHOT)
+                     if after.get(k) != _FLEET_SNAPSHOT.get(k))
+    if changed:
+        raise AssertionError(f"suite изменил боевой C:\mt5-fleet: {changed}")
