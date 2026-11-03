@@ -204,6 +204,7 @@ def stop_all() -> None:
     """Kill every MT5 terminal: the API port must be free before another terminal starts."""
     subprocess.run(["taskkill", "/IM", "terminal64.exe", "/F"], capture_output=True)
     _PID_CACHE.clear()
+    _invalidate_port_cache()
 
 
 def stop_other_fleet(keep_dir: pathlib.Path | None = None) -> int:

@@ -193,6 +193,7 @@ def cmd_reset_day(args: argparse.Namespace) -> int:
     store = Store(args.store)
     store.set_meta("portfolio_day", "")
     store.set_meta("portfolio_day_start_equity", "0")
+    store.set_meta("portfolio_registry_hash", "")
     conductor.PAUSE_FILE.unlink(missing_ok=True)
     store.event("cli", "reset_day")
     print("дневная база портфеля сброшена, пауза снята")

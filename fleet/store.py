@@ -271,7 +271,8 @@ class Store:
                 marks = ",".join("?" for _ in active)
                 row = conn.execute(
                     "SELECT COUNT(*), SUM(balance * rate_to_usd), SUM(equity_usd),"
-                    " SUM(positions), SUM(floating * rate_to_usd) FROM book"
+                    " SUM(positions), SUM(floating * rate_to_usd),"
+                    " SUM(CASE WHEN equity_usd IS NULL THEN 1 ELSE 0 END) FROM book"
                     f" WHERE updated_epoch > ? AND account IN ({marks})",
                     (now, *active)).fetchone()
             else:

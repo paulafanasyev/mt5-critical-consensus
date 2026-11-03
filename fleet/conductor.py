@@ -189,8 +189,7 @@ class Conductor:
         expected = sum(len(self.config.by_shard(shard)) for shard in self.shards)
         registry = self._registry_hash()
         if self.store.get_meta("portfolio_registry_hash") != registry:
-            flow, realized = self._book_flows()
-            base = (book["equity"] - flow - realized) if book["equity"] > 0 else 0.0
+            base = self._adjusted_equity(book) if book["equity"] > 0 else 0.0
             if base > 0:
                 self.store.set_meta("portfolio_registry_hash", registry)
                 self.store.set_meta("portfolio_day", today)
@@ -208,22 +207,23 @@ class Conductor:
         if expected and book["accounts"] < expected:
             last_known = self.store.portfolio([a.name for a in self.config.enabled()],
                                               fresh_only=False)
-            if last_known["equity"] > 0:
+            adjusted = self._adjusted_equity(last_known)
+            if adjusted > 0:
                 self.store.set_meta("portfolio_day", today)
-                self.store.set_meta("portfolio_day_start_equity",
-                                    f"{last_known['equity']:.2f}")
-                self.day_start_equity = last_known["equity"]
+                self.store.set_meta("portfolio_day_start_equity", f"{adjusted:.2f}")
+                self.day_start_equity = adjusted
                 self.store.event("conductor", "baseline_rebased", day=today,
                                  equity=round(last_known["equity"], 2),
                                  accounts=last_known["accounts"], expected=expected)
             return  # never invent a base from three fresh rows out of a hundred
         if stored_day != today or not stored_value:
-            if book["equity"] > 0:
+            adjusted = self._adjusted_equity(book)
+            if adjusted > 0:
                 self.store.set_meta("portfolio_day", today)
-                self.store.set_meta("portfolio_day_start_equity", f"{book['equity']:.2f}")
-                self.day_start_equity = book["equity"]
+                self.store.set_meta("portfolio_day_start_equity", f"{adjusted:.2f}")
+                self.day_start_equity = adjusted
                 self.store.event("conductor", "new_day", day=today,
-                                 equity=round(book["equity"], 2))
+                                 equity=round(adjusted, 2))
             return
         try:
             self.day_start_equity = float(stored_value)
@@ -232,9 +232,9 @@ class Conductor:
 
     def _book_flows(self) -> tuple[float, float]:
         """Sum today's deposits/withdrawals and realized P&L across the enabled accounts."""
-        from . import risk
-
-        day = risk.server_day_now()
+        with self.store._connect() as conn:  # noqa: SLF001 - same package boundary
+            row = conn.execute("SELECT MAX(server_day) FROM book").fetchone()
+        day = (row[0] if row and row[0] else "") or ""
         flow = realized = 0.0
         for account in self.config.enabled():
             raw = self.store.get_meta(f"dayflows:{account.name}:{day}")
@@ -255,6 +255,11 @@ class Conductor:
         names = sorted(a.name for a in self.config.enabled())
         return hashlib.sha1(",".join(names).encode()).hexdigest()[:12]
 
+    def _adjusted_equity(self, book: dict) -> float:
+        """Equity with today's deposits and realized P&L removed: the number the stop judges."""
+        flow, realized = self._book_flows()
+        return book["equity"] - flow - realized
+
     def _portfolio_stop(self, book: dict) -> str:
         limits = self.config.portfolio
         expected = sum(len(self.config.by_shard(shard)) for shard in self.shards)
@@ -268,8 +273,7 @@ class Conductor:
             self.store.set_meta("book_incomplete", "0")
             self.store.event("conductor", "book_complete", accounts=book["accounts"])
         if self.day_start_equity and self.day_start_equity > 0 and book["equity"] > 0:
-            flow, realized = self._book_flows()
-            adjusted = book["equity"] - flow - realized
+            adjusted = self._adjusted_equity(book)
             change_pct = (adjusted - self.day_start_equity) / self.day_start_equity * 100
             if change_pct <= -limits.daily_stop_pct:
                 return f"дневной стоп портфеля: {change_pct:.2f}% ({book['equity']:.2f} USD)"
