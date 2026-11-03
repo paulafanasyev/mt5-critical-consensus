@@ -79,6 +79,11 @@ AGENTS: list[dict] = [
     # --- weekly momentum on metals (5-day return, hold 5 days) --------------------
     agent("wm-xau", "weekly_momentum", "XAUUSD", 0.01),
     agent("wm-xag", "weekly_momentum", "XAGUSD", 0.01),
+    # --- silver experiment: the same three rules measured on one metal -----------------
+    agent("sil-ema", "h1_ema", "XAGUSD", 0.02, experimental=True),
+    agent("sil-mom", "momentum_buy", "XAGUSD", 0.02, experimental=True),
+    agent("sil-dip", "dip_buy", "XAGUSD", 0.02, experimental=True),
+    agent("sil-week", "weekly_momentum", "XAGUSD", 0.01, experimental=True),
     # --- the operator's own two rules: buy growth, buy the extreme dip ------------
     agent("mom-xau", "momentum_buy", "XAUUSD", 0.01, experimental=True),
     agent("mom-xag", "momentum_buy", "XAGUSD", 0.01, experimental=True),
