@@ -514,3 +514,22 @@ def test_unpriced_account_flow_is_not_counted(tmp_path) -> None:
         Account(name="u", login=1, server="S", mode="demo")]), store, shards=[0])
     flow, _ = engine._book_flows()
     assert flow == 0.0
+
+
+def test_day_flows_are_published_only_after_equity(tmp_path, monkeypatch) -> None:
+    """A conductor must never see new flows against the previous equity row."""
+    from fleet import risk as risk_mod
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    account = Account(name="a", login=1, server="S", mode="demo")
+    store = StoreCls(tmp_path / "book.sqlite")
+    runner = worker.Worker(FleetConfig(accounts=[account]), store)
+    monkeypatch.setattr(risk_mod, "daily_net_flow", lambda day: 100.0)
+    monkeypatch.setattr(risk_mod, "daily_realized", lambda day: 0.0)
+    snapshot = types.SimpleNamespace(balance=1100.0, equity=1100.0, currency="USD",
+                                     login=1, server="S", margin_free=1000.0,
+                                     leverage=100, positions=0, floating=0.0)
+    day = runner._day_state(account, snapshot, "2026-11-03")
+    assert store.get_meta("dayflows:a:2026-11-03") is None  # not yet: equity comes first
+    assert day.net_flow == 100.0

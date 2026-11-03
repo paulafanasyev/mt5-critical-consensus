@@ -182,6 +182,10 @@ class Worker:
         self.store.equity(account.name, snapshot.login, snapshot.balance, snapshot.equity,
                           len(positions), snapshot.floating, snapshot.currency, rate,
                           server_day)
+        if flows_payload:
+            # Publish the flows only after the equity they belong to: a conductor reading
+            # between the two writes would otherwise see new flows against old equity.
+            self.store.set_meta(f"dayflows:{account.name}:{server_day}", flows_payload)
         self.store.save_positions(account.name, positions)
 
         opened = 0
@@ -302,8 +306,10 @@ class Worker:
             current_risk += risk.position_risk_money(
                 position, spec, atr_by_symbol.get(position.symbol, 0.0), stop_atr)
         if book_stop.get("unpriced", 0) > 0:
-            self.store.event(account.name, "unpriced_accounts_book",
-                             count=book_stop["unpriced"])
+            if self.store.get_meta(f"unpriced_warned:{account.name}") != "1":
+                self.store.set_meta(f"unpriced_warned:{account.name}", "1")
+                self.store.event(account.name, "unpriced_accounts_book",
+                                 count=book_stop["unpriced"])
             return 0
         day_pct = self._portfolio_day_pct(book_stop["equity"])
         for signal in strategy.signals(account):
@@ -400,8 +406,8 @@ class Worker:
                    server_day: str) -> risk.DayState:
         stored = self.store.day(account.name)
         day_start = risk.day_start_datetime(server_day)
-        net_flow, realized_today = self._cached_day_flows(account, server_day,
-                                                          snapshot.balance, day_start)
+        net_flow, realized_today, flows_payload = self._cached_day_flows(
+            account, server_day, snapshot.balance, day_start)
         opened_with = snapshot.balance - net_flow - realized_today
         if opened_with <= 0:
             # The whole balance arrived today: there is no opening base, so no loss to measure.
@@ -417,7 +423,7 @@ class Worker:
         return state
 
     def _cached_day_flows(self, account: Account, server_day: str, balance: float,
-                          day_start: dt.datetime) -> tuple[float, float]:
+                          day_start: dt.datetime) -> tuple[float, float, str]:
         """Cache the day's flows, but invalidate the moment the balance moves under them.
 
         A cache that never expires is worse than no cache: a deposit after the first cycle would
@@ -436,7 +442,7 @@ class Worker:
                 fresh = cached_at is not None and (time.time() - cached_at) < 120
                 if (cached_balance is not None and abs(cached_balance - balance) < 1e-9
                         and fresh):
-                    return cached_flow, cached_realized
+                    return cached_flow, cached_realized, ""
         try:
             net_flow = risk.daily_net_flow(day_start)
         except Exception:  # noqa: BLE001 - history may lag right after midnight
@@ -445,8 +451,8 @@ class Worker:
             realized = risk.daily_realized(day_start)
         except Exception:  # noqa: BLE001
             realized = 0.0
-        self.store.set_meta(key, f"{net_flow:.2f}|{realized:.2f}|{balance:.2f}|{time.time():.0f}")
-        return net_flow, realized
+        payload = f"{net_flow:.2f}|{realized:.2f}|{balance:.2f}|{time.time():.0f}"
+        return net_flow, realized, payload
 
     def _save_day(self, account: Account, state: risk.DayState) -> None:
         self.store.save_day(account.name, state.day, state.start_balance, state.realized,
