@@ -256,9 +256,13 @@ class Conductor:
         return hashlib.sha1(",".join(names).encode()).hexdigest()[:12]
 
     def _adjusted_equity(self, book: dict) -> float:
-        """Equity with today's deposits and realized P&L removed: the number the stop judges."""
-        flow, realized = self._book_flows()
-        return book["equity"] - flow - realized
+        """Equity net of deposits/withdrawals only.
+
+        Realized P&L is already inside equity, so subtracting it again would hide every closed
+        loss from the portfolio stop — the exact failure the stop exists to prevent.
+        """
+        flow, _realized = self._book_flows()
+        return book["equity"] - flow
 
     def _portfolio_stop(self, book: dict) -> str:
         limits = self.config.portfolio
