@@ -247,6 +247,51 @@ def test_restart_backoff_prevents_a_crash_loop(tmp_path, monkeypatch) -> None:
     assert len(spawned) == 1  # not restarted during the backoff window
 
 
+def test_partial_close_keeps_the_peak_and_the_row(tmp_path, monkeypatch) -> None:
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    account = Account(name="a", login=1, server="S", mode="demo")
+    store = StoreCls(tmp_path / "book.sqlite")
+    runner = worker.Worker(FleetConfig(accounts=[account]), store, allow_live=True)
+    position = types.SimpleNamespace(ticket=7, symbol="EURUSD", type=0, volume=0.10,
+                                     price_open=1.10, profit=5.0, sl=1.09, tp=0.0,
+                                     magic=account.magic, time=0)
+    spec = worker.broker.BrokerSymbol(name="EURUSD", digits=5, point=0.00001,
+                                      tick_size=0.00001, tick_value=1.0, volume_min=0.01,
+                                      volume_max=100.0, volume_step=0.01, stops_level=0,
+                                      freeze_level=0, spread=1, filling=3)
+    monkeypatch.setattr(worker.broker, "symbol_exact", lambda name: spec)
+    monkeypatch.setattr(worker.mt5, "symbol_info_tick",
+                        lambda name: types.SimpleNamespace(bid=1.101, ask=1.101))
+    monkeypatch.setattr(worker.strategy, "break_even_level", lambda *a, **k: None)
+    monkeypatch.setattr(worker.strategy, "exit_reason", lambda *a, **k: "тейк")
+    monkeypatch.setattr(worker.broker, "close_position", lambda *a, **k: 0.04)  # partial fill
+    store.save_positions(account.name, [position])
+    store.set_peak(account.name, 7, 0.0010)
+    day = worker.risk.DayState(day="2026-11-03", start_balance=1000.0)
+    closed = runner._manage_positions(account, day, [position])
+    assert closed == 0  # not a full close
+    assert store.peak(account.name, 7) == 0.0010  # peak preserved
+    assert store.open_positions()[0][1] == "EURUSD"  # mirror row kept
+
+
+def test_reset_health_clears_the_breaker(tmp_path) -> None:
+    import sys
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import fleet_cli
+
+    store = Store(tmp_path / "book.sqlite")
+    store.record_failure("a", "down", 600)
+    assert store.health("a")[0] == 1
+    config_path = tmp_path / "accounts.yaml"
+    config_path.write_text("accounts:\n  - name: a\n    login: 1\n    server: S\n    mode: demo\n",
+                           encoding="utf-8")
+    assert fleet_cli.main(["--config", str(config_path), "--store", str(store.path),
+                           "reset-health"]) == 0
+    assert store.health("a")[0] == 0
+
+
 def test_conductor_lock_is_exclusive(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(conductor, "LOCK_FILE", tmp_path / "conductor.lock")
     monkeypatch.setattr(conductor, "FLEET_ROOT", tmp_path)
@@ -375,7 +420,6 @@ def test_try_entries_places_one_order(tmp_path, monkeypatch) -> None:
     day = risk_mod.DayState(day="2026-11-03", start_balance=1000.0)
     opened = runner._try_entries(account, snapshot, [], day, 1.0)
     assert opened == 1 and sent == [1]
-    assert store.portfolio()["equity"] == 0.0 or True  # book is written by the cycle, not here
 
 
 def test_account_funded_today_is_still_allowed_to_trade(tmp_path, monkeypatch) -> None:

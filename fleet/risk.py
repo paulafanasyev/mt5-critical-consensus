@@ -177,7 +177,7 @@ def can_open_portfolio(limits: PortfolioLimits, equity_usd: float, risk_money: f
                        new_risk_money: float, positions: list,
                        specs: dict[str, broker.BrokerSymbol | None],
                        day_pct: float, new_symbol: str = "",
-                       new_volume: float = 0.0) -> tuple[bool, str]:
+                       new_volume: float = 0.0, new_side: str = "") -> tuple[bool, str]:
     """Book-wide gates, all in money and signed exposure, including the incoming order."""
     if day_pct <= -limits.daily_stop_pct:
         return False, f"дневной стоп портфеля {limits.daily_stop_pct:.2f}%"
@@ -185,12 +185,15 @@ def can_open_portfolio(limits: PortfolioLimits, equity_usd: float, risk_money: f
         return False, "достигнут лимит позиций портфеля"
     if equity_usd > 0 and (risk_money + new_risk_money) > equity_usd * limits.max_total_risk_pct / 100:
         return False, "лимит суммарного риска портфеля"
-    gold = abs(signed_exposure(positions, broker_is_gold))
-    usd = abs(signed_exposure(positions, broker_is_usd_pair))
+    sign = -1.0 if str(new_side).lower() == "sell" else 1.0
+    gold_signed = signed_exposure(positions, broker_is_gold)
+    usd_signed = signed_exposure(positions, broker_is_usd_pair)
     if new_symbol and broker_is_gold(new_symbol):
-        gold += abs(new_volume)
+        gold_signed += sign * abs(new_volume)
     elif new_symbol and broker_is_usd_pair(new_symbol):
-        usd += abs(new_volume)
+        usd_signed += sign * abs(new_volume)
+    gold = abs(gold_signed)
+    usd = abs(usd_signed)
     if gold > limits.max_gold_lots:
         return False, "лимит по золоту"
     if usd > limits.max_usd_lots:

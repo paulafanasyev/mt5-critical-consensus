@@ -53,26 +53,28 @@ class Conductor:
         self.next_restart: dict[int, float] = {}
 
     # --- lifecycle ----------------------------------------------------------------------
-    def acquire_lock(self) -> bool:
+    def acquire_lock(self, force: bool = False) -> bool:
+        """Publish the lock atomically: a reader can never see an empty half-written file."""
         FLEET_ROOT.mkdir(parents=True, exist_ok=True)
-        try:
-            handle = LOCK_FILE.open("x", encoding="utf-8")
-        except FileExistsError:
+        for _ in range(2):
+            payload = json.dumps({"pid": os.getpid(), "host": socket.gethostname()})
+            tmp = LOCK_FILE.with_suffix(".lock.tmp")
+            tmp.write_text(payload, encoding="utf-8")
             try:
-                payload = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                payload = {}
-            pid = int(payload.get("pid", 0) or 0)
-            if pid and _pid_alive(pid):
-                return False
-            LOCK_FILE.unlink(missing_ok=True)
-            try:
-                handle = LOCK_FILE.open("x", encoding="utf-8")
+                os.link(tmp, LOCK_FILE)
+                tmp.unlink(missing_ok=True)
+                return True
             except FileExistsError:
-                return False
-        handle.write(json.dumps({"pid": os.getpid(), "host": socket.gethostname()}))
-        handle.close()
-        return True
+                tmp.unlink(missing_ok=True)
+                try:
+                    current = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    current = {}
+                pid = int(current.get("pid", 0) or 0)
+                if pid and _pid_alive(pid) and not force:
+                    return False
+                LOCK_FILE.unlink(missing_ok=True)
+        return False
 
     def release_lock(self) -> None:
         try:
@@ -221,8 +223,8 @@ class Conductor:
                 return f"дневной стоп портфеля: {change_pct:.2f}% ({book['equity']:.2f} USD)"
         return ""
 
-    def run_forever(self) -> None:
-        if not self.acquire_lock():
+    def run_forever(self, force_lock: bool = False) -> None:
+        if not self.acquire_lock(force=force_lock):
             raise RuntimeError(f"дирижёр уже работает: {LOCK_FILE}")
         self.start()
         self.store.event("conductor", "running", interval=self.interval)
@@ -262,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--shards", default="", help="например 0 или 0,2")
     parser.add_argument("--allow-multi-shard", action="store_true")
+    parser.add_argument("--force-lock", action="store_true", help="снять чужой/устаревший lock")
     args = parser.parse_args(argv)
     config_path = pathlib.Path(args.config).resolve() if args.config else None
     config = load(config_path)
@@ -276,7 +279,7 @@ def main(argv: list[str] | None = None) -> int:
                        dry_run=args.dry_run, config_path=config_path, shards=shards,
                        allow_multi_shard=args.allow_multi_shard)
     print(f"парк: {len(config.enabled())} счетов, шарды {engine.shards}")
-    engine.run_forever()
+    engine.run_forever(force_lock=args.force_lock)
     return 0
 
 

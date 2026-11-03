@@ -310,7 +310,8 @@ class Worker:
             risk_money = spec.distance_money(signal.stop_distance, volume)
             ok, why = risk.can_open_portfolio(
                 self.config.portfolio, book_stop["equity"], current_risk, risk_money,
-                book_positions, specs, day_pct, new_symbol=spec.name, new_volume=volume)
+                book_positions, specs, day_pct, new_symbol=spec.name, new_volume=volume,
+                new_side=signal.side)
             if not ok:
                 self.store.event(account.name, "portfolio_hold", reason=why)
                 return 0

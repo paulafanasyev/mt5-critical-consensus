@@ -333,6 +333,9 @@ class Store:
                 conn.execute(
                     f"DELETE FROM positions WHERE updated_epoch < ? AND account NOT IN ({marks})",
                     (epoch_cutoff, *active))
+                conn.execute(f"DELETE FROM book WHERE account NOT IN ({marks})", (*active,))
+                conn.execute(f"DELETE FROM peaks WHERE account NOT IN ({marks})", (*active,))
+                conn.execute(f"DELETE FROM health WHERE account NOT IN ({marks})", (*active,))
             else:
                 conn.execute("DELETE FROM positions WHERE updated_epoch < ?", (epoch_cutoff,))
             conn.execute("DELETE FROM peaks WHERE (account, ticket) NOT IN"
