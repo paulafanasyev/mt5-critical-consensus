@@ -151,7 +151,10 @@ def trend_clear_of_fast_average(mt5, symbol: str, side: str) -> bool:
     ranges = [max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]),
                   abs(lows[i] - closes[i - 1])) for i in range(1, len(closes))]
     atr = sum(ranges[-14:]) / 14
-    buffer = 0.25 * atr
+    # On the demo the operator explicitly wants the metals traded so the schemes can be
+    # observed; there the price only has to be on the correct side of the average. FX keeps
+    # the quarter-ATR clearance, which is what stopped the boundary whipsaw.
+    buffer = 0.0 if symbol in ("XAUUSD", "XAGUSD") else 0.25 * atr
     price = closes[-1]
     if side == "SELL":
         return price < fast - buffer
