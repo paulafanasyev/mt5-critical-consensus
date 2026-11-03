@@ -78,6 +78,15 @@ AGENTS: list[dict] = [
     # --- weekly momentum on metals (5-day return, hold 5 days) --------------------
     agent("wm-xau", "weekly_momentum", "XAUUSD", 0.01),
     agent("wm-xag", "weekly_momentum", "XAGUSD", 0.01),
+    # --- the operator's own two rules: buy growth, buy the extreme dip ------------
+    agent("mom-xau", "momentum_buy", "XAUUSD", 0.01, experimental=True),
+    agent("mom-xag", "momentum_buy", "XAGUSD", 0.01, experimental=True),
+    agent("mom-eur", "momentum_buy", "EURUSD", 0.01, experimental=True),
+    agent("mom-gbp", "momentum_buy", "GBPUSD", 0.01, experimental=True),
+    agent("dip-xau", "dip_buy", "XAUUSD", 0.01, experimental=True),
+    agent("dip-xag", "dip_buy", "XAGUSD", 0.01, experimental=True),
+    agent("dip-eur", "dip_buy", "EURUSD", 0.01, experimental=True),
+    agent("dip-gbp", "dip_buy", "GBPUSD", 0.01, experimental=True),
     # --- lab: the same EMA rule on FX, to keep the laboratory generating evidence ---
     agent("lab-ema-gbp", "h1_ema", "GBPUSD", 0.01, experimental=True),
     agent("lab-ema-eur", "h1_ema", "EURUSD", 0.01, experimental=True),
@@ -120,6 +129,56 @@ def friday_close(symbol: str) -> float | None:
         stamp = datetime.fromtimestamp(int(rate["time"]), tz=timezone.utc)
         if (stamp + timedelta(hours=SERVER_OFFSET)).weekday() == 4:
             return float(rate["close"])
+    return None
+
+
+def momentum_buy_state(symbol: str):
+    """Buy in an uptrend while the last hourly bar is rising."""
+    import MetaTrader5 as mt5
+
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 1, 260)
+    if rates is None or len(rates) < 220:
+        return None
+    closes = [float(rate["close"]) for rate in rates]
+    highs = [float(rate["high"]) for rate in rates]
+    lows = [float(rate["low"]) for rate in rates]
+
+    def ema(values, period):
+        weight = 2 / (period + 1)
+        result = values[0]
+        for value in values[1:]:
+            result = value * weight + result * (1 - weight)
+        return result
+
+    fast, slow = ema(closes, 50), ema(closes, 200)
+    ranges = [max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]),
+                  abs(lows[i] - closes[i - 1])) for i in range(1, len(closes))]
+    atr = sum(ranges[-14:]) / 14
+    if fast > slow and closes[-1] > fast and closes[-1] > closes[-2]:
+        return "BUY", max(2 * atr, 0.0)
+    return None
+
+
+def dip_buy_state(symbol: str):
+    """Buy after a fall of more than three ATRs in six hours once the low stops extending."""
+    import MetaTrader5 as mt5
+
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 1, 120)
+    if rates is None or len(rates) < 40:
+        return None
+    closes = [float(rate["close"]) for rate in rates]
+    highs = [float(rate["high"]) for rate in rates]
+    lows = [float(rate["low"]) for rate in rates]
+    ranges = [max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]),
+                  abs(lows[i] - closes[i - 1])) for i in range(1, len(closes))]
+    atr = sum(ranges[-14:]) / 14
+    if atr <= 0:
+        return None
+    recent_high = max(closes[-7:-1])
+    drop = closes[-1] - recent_high
+    reversed_up = closes[-1] > closes[-2] and lows[-1] >= min(lows[-3:])
+    if drop < -3 * atr and reversed_up:
+        return "BUY", max(2 * atr, 0.0)
     return None
 
 
@@ -687,6 +746,18 @@ def main(argv: list[str] | None = None) -> int:
                     elif position is not None and (server.weekday() != 0
                                                    or server.hour >= EXIT_SERVER_HOUR):
                         close_trade(mt5, spec, position)
+
+                elif spec["kind"] in ("momentum_buy", "dip_buy"):
+                    state = (momentum_buy_state(spec["symbol"]) if spec["kind"] == "momentum_buy"
+                             else dip_buy_state(spec["symbol"]))
+                    if state is None:
+                        continue
+                    side, risk_distance = state
+                    stop_fraction = risk_distance / tick.ask if tick.ask else None
+                    take_fraction = (2 * risk_distance / tick.ask) if tick.ask else None
+                    if position is None:
+                        open_trade(mt5, spec, side, tick, stop=stop_fraction,
+                                   take=take_fraction)
 
                 elif spec["kind"] == "h1_ema":
                     state = h1_ema_state(spec["symbol"])
