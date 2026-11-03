@@ -346,6 +346,9 @@ class Store:
                          " (SELECT account, ticket FROM positions)")
             conn.execute("DELETE FROM risk_slots WHERE created_epoch < ?",
                          (time.time() - 600,))
+            conn.execute("DELETE FROM meta WHERE key LIKE 'dayflows:%' AND key NOT LIKE ?",
+                         (f"dayflows:%:{dt.datetime.now(dt.timezone.utc).date().isoformat()}",))
+            conn.execute("DELETE FROM meta WHERE key LIKE 'netflow:%'")
         return removed
 
 

@@ -138,6 +138,10 @@ def _check_keys(where: str, data: dict[str, Any], allowed: set[str]) -> None:
 def _coerce(value: Any, kind: type, where: str) -> Any:
     if isinstance(value, bool) and kind in (int, float):
         raise ConfigError(f"{where}: ожидалось число, получено {value!r}")
+    if kind is int and isinstance(value, float) and not value.is_integer():
+        raise ConfigError(f"{where}: ожидалось целое, получено {value!r}")
+    if kind is int and isinstance(value, str) and not value.strip().lstrip("+-").isdigit():
+        raise ConfigError(f"{where}: ожидалось целое, получено {value!r}")
     try:
         return kind(value)
     except (TypeError, ValueError) as exc:
@@ -166,7 +170,10 @@ def _strategy(data: dict[str, Any], where: str) -> StrategyProfile:
     cleaned = dict(data)
     for key in ("kinds", "timeframes"):
         if key in cleaned:
-            cleaned[key] = tuple(cleaned[key])
+            value = cleaned[key]
+            if isinstance(value, str) or not all(isinstance(item, str) for item in value):
+                raise ConfigError(f"{where}.{key}: ожидался список строк")
+            cleaned[key] = tuple(value)
     for key in ("min_atr_pct",):
         if key in cleaned:
             cleaned[key] = _coerce(cleaned[key], float, f"{where}.{key}")

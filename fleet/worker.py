@@ -422,14 +422,15 @@ class Worker:
         cached = self.store.get_meta(key)
         if cached:
             parts = cached.split("|")
-            if len(parts) == 3:
+            if len(parts) >= 4:
                 try:
-                    cached_flow, cached_realized, cached_balance = (float(parts[0]),
-                                                                    float(parts[1]),
-                                                                    float(parts[2]))
+                    cached_flow, cached_realized, cached_balance, cached_at = (
+                        float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]))
                 except ValueError:
-                    cached_flow = cached_realized = cached_balance = None
-                if cached_balance is not None and abs(cached_balance - balance) < 1e-9:
+                    cached_flow = cached_realized = cached_balance = cached_at = None
+                fresh = cached_at is not None and (time.time() - cached_at) < 120
+                if (cached_balance is not None and abs(cached_balance - balance) < 1e-9
+                        and fresh):
                     return cached_flow, cached_realized
         try:
             net_flow = risk.daily_net_flow(day_start)
@@ -439,7 +440,7 @@ class Worker:
             realized = risk.daily_realized(day_start)
         except Exception:  # noqa: BLE001
             realized = 0.0
-        self.store.set_meta(key, f"{net_flow:.2f}|{realized:.2f}|{balance:.2f}")
+        self.store.set_meta(key, f"{net_flow:.2f}|{realized:.2f}|{balance:.2f}|{time.time():.0f}")
         return net_flow, realized
 
     def _save_day(self, account: Account, state: risk.DayState) -> None:
