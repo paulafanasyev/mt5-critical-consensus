@@ -31,7 +31,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LOG = ROOT / "agent_data" / "swarm.jsonl"
 MAGIC_BASE = 8180000
-DEMO_TERMINAL = r"C:\mt5-exness\terminal64.exe"
+DEMO_TERMINALS = (r"C:\mt5-exness\terminal64.exe",
+                  r"C:\Program Files\MetaTrader 5\terminal64.exe",
+                  r"C:\mt5-real\terminal64.exe")
 DESK_MAGIC = 8189999   # the lead's own hand-placed trades: watched, never re-entered by an agent
 PARALLEL_MAGIC = 8172026
 EXPECTED_LOGIN = 114929502
@@ -764,14 +766,30 @@ def close_trade(mt5, spec: dict, position) -> None:
                   f"retcode {None if result is None else result.retcode}"})
 
 
+def connect_demo(mt5) -> bool:
+    """Bind to whichever known terminal currently holds the demo login."""
+    for path in DEMO_TERMINALS:
+        try:
+            if not mt5.initialize(path=path, timeout=3000):
+                continue
+            account = mt5.account_info()
+            if (account is not None
+                    and account.login == EXPECTED_LOGIN
+                    and account.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO):
+                return True
+            mt5.shutdown()
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
 def main(argv: list[str] | None = None) -> int:
     import MetaTrader5 as mt5
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--interval-sec", type=int, default=30)
     args = parser.parse_args(argv)
-    if not mt5.initialize(path=DEMO_TERMINAL):
-        raise SystemExit("MetaTrader5.initialize failed")
+    if not connect_demo(mt5):
+        raise SystemExit("no terminal with the demo account")
     account = mt5.account_info()
     if account is None or account.login != EXPECTED_LOGIN:
         raise SystemExit("unexpected account")
@@ -803,6 +821,15 @@ def main(argv: list[str] | None = None) -> int:
             if fresh.get("paused_until", 0) > time.time() or fresh.get("halted_until", 0) > time.time():
                 time.sleep(args.interval_sec)
                 continue
+            # never trade a real account: rebind to the demo terminal or wait
+            check = mt5.account_info()
+            if (check is None or check.login != EXPECTED_LOGIN
+                    or check.trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO):
+                log({"event": "bound terminal is not the demo account; rebinding"})
+                mt5.shutdown()
+                if not connect_demo(mt5):
+                    time.sleep(args.interval_sec)
+                    continue
             for spec in AGENTS:
                 if market_retry_blocked(spec):
                     continue

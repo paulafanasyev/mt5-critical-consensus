@@ -26,7 +26,9 @@ SWARM = ROOT / "scripts" / "agent_swarm.py"
 PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 MAGIC_FLOOR = 8180000
 MAGIC_BASE = 8180000
-DEMO_TERMINAL = r"C:\mt5-exness\terminal64.exe"
+DEMO_TERMINALS = (r"C:\mt5-exness\terminal64.exe",
+                  r"C:\Program Files\MetaTrader 5\terminal64.exe",
+                  r"C:\mt5-real\terminal64.exe")
 DESK_MAGIC = 8189999  # hand-placed by the lead, not an orphan
 MAX_DRAWDOWN = 0.01
 KILL_SWITCH = ROOT / "agent_data" / "demo_bridge" / "kill_switch.json"
@@ -64,6 +66,21 @@ def swarm_running() -> bool:
         return False
 
 
+def connect_demo(mt5) -> bool:
+    """Bind to whichever known terminal currently holds the demo login."""
+    for path in DEMO_TERMINALS:
+        try:
+            if not mt5.initialize(path=path, timeout=3000):
+                continue
+            account = mt5.account_info()
+            if (account is not None and account.login == 114929502
+                    and account.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO):
+                return True
+            mt5.shutdown()
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
@@ -72,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--interval-sec", type=int, default=300)
     args = parser.parse_args(argv)
-    if not mt5.initialize(path=DEMO_TERMINAL):
+    if not connect_demo(mt5):
         raise SystemExit("MetaTrader5.initialize failed")
 
     while True:
