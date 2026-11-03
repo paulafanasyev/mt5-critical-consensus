@@ -302,7 +302,7 @@ def h1_ema_state(symbol: str) -> tuple[str, float] | None:
 
 
 STATE = ROOT / "agent_data" / "swarm_state.json"
-SYMBOL_CAP = {"XAUUSD": 0.10, "XAGUSD": 0.06, "EURUSD": 0.07, "GBPUSD": 0.07,
+SYMBOL_CAP = {"XAUUSD": 0.10, "XAGUSD": 0.10, "EURUSD": 0.07, "GBPUSD": 0.07,
               "USDJPY": 0.07, "AUDUSD": 0.07, "USDCHF": 0.07, "USDCAD": 0.07,
               "NZDUSD": 0.07, "US500": 0.3, "UK100": 0.3, "US30": 0.3, "JPN225": 1.0}
 MAX_DRAWDOWN = 0.01      # close everything if the account loses 1% from the baseline
