@@ -260,13 +260,82 @@ def test_conductor_lock_is_exclusive(tmp_path, monkeypatch) -> None:
 
 # --- worker gating --------------------------------------------------------------------------
 
-def test_real_account_never_trades_without_live_flag(tmp_path, monkeypatch) -> None:
-    from fleet.config import Account
+
+
+
+# --- regressions found in the third review -------------------------------------------------
+
+def test_book_gate_accepts_the_numeric_side_from_the_mirror(tmp_path) -> None:
+    """The mirror stores "buy"/"sell"; the gate needs a numeric side or it raises."""
+    from fleet import risk
+    from fleet.config import PortfolioLimits
 
     store = Store(tmp_path / "book.sqlite")
-    account = Account(name="real", login=1, server="Srv", mode="real")
-    runner = worker.Worker(FleetConfig(accounts=[account]), store, dry_run=False,
-                           allow_live=False)
-    events: list[tuple] = []
-    monkeypatch.setattr(store, "event", lambda *a, **k: events.append((a, k)))
-    assert (account.is_real and not runner.allow_live) is True
+
+    class P:
+        ticket = 1
+        symbol = "XAUUSD"
+        type = 0
+        volume = 0.28
+        price_open = 2000.0
+        profit = 0.0
+        sl = 1990.0
+        tp = 0.0
+        magic = 1
+
+    store.save_positions("a", [P()])
+    side, volume = store.all_positions()[0][3], store.all_positions()[0][4]
+    book_positions = [types.SimpleNamespace(
+        symbol="XAUUSD", volume=volume, sl=1990.0, price_open=2000.0,
+        type=0 if side == "buy" else 1)]
+    allowed, reason = risk.can_open_portfolio(
+        PortfolioLimits(max_gold_lots=0.30), 10_000, 0.0, 0.05,
+        book_positions, {"XAUUSD": None}, day_pct=0.0,
+        new_symbol="XAUUSD", new_volume=0.05)
+    assert not allowed and "золот" in reason.lower()
+
+
+def test_portfolio_stop_alarms_on_an_incomplete_book(tmp_path, monkeypatch) -> None:
+    from fleet.config import Account
+
+    monkeypatch.setattr(conductor, "PAUSE_FILE", tmp_path / "PAUSE")
+    monkeypatch.setattr(conductor, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(conductor.terminals, "stop_other_fleet", lambda *a, **k: None)
+    store = Store(tmp_path / "book.sqlite")
+    accounts = [Account(name="a", login=1, server="S", mode="demo"),
+                Account(name="b", login=2, server="S", mode="demo")]
+    engine = conductor.Conductor(FleetConfig(accounts=accounts), store, shards=[0])
+    store.equity("a", 1, 1000.0, 500.0, 0, 0.0)  # "b" has not reported yet
+    store.set_meta("portfolio_day_start_equity", "1000")
+    store.set_meta("portfolio_day", "2026-11-03")
+    state = engine.tick()
+    assert not conductor.PAUSE_FILE.exists()  # a partial book must not fake a stop
+    assert store.get_meta("book_incomplete") == "1"
+
+
+def test_pause_mid_cycle_blocks_the_next_accounts(tmp_path, monkeypatch) -> None:
+    from fleet.config import Account
+
+    pause = tmp_path / "PAUSE"
+    accounts = [Account(name=f"a{i}", login=i + 1, server="S", mode="demo") for i in range(3)]
+    config = FleetConfig(accounts=accounts)
+    flags: list[bool] = []
+
+    def fake_run(self, account, allow_entries=True):
+        flags.append(allow_entries)
+        pause.write_text("стоп", encoding="utf-8")  # the pause appears during the first account
+        return worker.WorkerResult(account.name, "ok")
+
+    monkeypatch.setattr(worker.Worker, "run_account", fake_run)
+    worker.run_shard(config, Store(tmp_path / "book.sqlite"), 0, pause_file=pause)
+    assert flags == [True, False, False]
+
+
+def test_conductor_passes_the_live_flag_to_shards(tmp_path, monkeypatch) -> None:
+    captured: list[list[str]] = []
+    monkeypatch.setattr(conductor.subprocess, "Popen",
+                        lambda command, **kwargs: _record(captured, command))
+    engine = conductor.Conductor(FleetConfig(), Store(tmp_path / "b.sqlite"), shards=[0],
+                                 live=True)
+    engine._spawn(0)
+    assert "--live" in captured[0]

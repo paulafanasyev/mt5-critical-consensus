@@ -72,6 +72,7 @@ class Account:
     host: str = ""  # empty: this account may run on any worker; set to pin it to one machine
     password_env: str = ""
     seed_config: str = ""
+    currency_scale: float = 1.0  # 0.01 for cent accounts: 100 "cents" are one dollar
     keep_running: bool = False
 
     @property

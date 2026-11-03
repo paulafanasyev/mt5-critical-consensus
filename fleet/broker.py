@@ -8,6 +8,7 @@ of the money at risk.
 from __future__ import annotations
 
 import dataclasses
+import math
 import time
 import uuid
 from typing import Any
@@ -143,7 +144,7 @@ def normalize_volume(volume: float, spec: BrokerSymbol, lot_cap: float) -> float
     """Clamp DOWN to the broker's step so rounding never increases risk."""
     if spec.volume_step <= 0:
         return 0.0
-    cap = min(spec.volume_max, lot_cap)
+    cap = math.floor(min(spec.volume_max, lot_cap) / spec.volume_step + 1e-9) * spec.volume_step
     if cap < spec.volume_min:
         return 0.0
     steps = int(volume / spec.volume_step)  # floor: rounding up would enlarge the risk

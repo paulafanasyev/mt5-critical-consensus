@@ -211,7 +211,8 @@ def exit_reason(account: Account, position, spec: broker.BrokerSymbol, peak: flo
     if account.risk.max_hold_minutes > 0:
         import time as _time
 
-        held = (_time.time() - float(getattr(position, "time", 0))) / 60
+        server_now = broker.server_timestamp() or _time.time()
+        held = (server_now - float(getattr(position, "time", 0))) / 60
         if held >= account.risk.max_hold_minutes:
             return f"время вышло ({held:.0f} мин)"
     return ""

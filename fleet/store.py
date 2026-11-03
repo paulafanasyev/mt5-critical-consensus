@@ -106,7 +106,7 @@ class Store:
                 "INSERT INTO equity (ts, account, login, balance, equity, positions, floating,"
                 " currency, rate_to_usd) VALUES (?,?,?,?,?,?,?,?,?)",
                 (stamp, account, login, balance, equity, positions, floating, currency,
-                 rate_to_usd))
+                 rate_to_usd or None))
             conn.execute(
                 "INSERT INTO book (account, ts, login, balance, equity, equity_usd, positions,"
                 " floating, currency, rate_to_usd, server_day, updated_epoch)"
@@ -116,7 +116,8 @@ class Store:
                 " positions=excluded.positions, floating=excluded.floating,"
                 " currency=excluded.currency, rate_to_usd=excluded.rate_to_usd,"
                 " server_day=excluded.server_day, updated_epoch=excluded.updated_epoch",
-                (account, stamp, login, balance, equity, equity * rate_to_usd, positions,
+                (account, stamp, login, balance, equity,
+                 equity * rate_to_usd if rate_to_usd > 0 else None, positions,
                  floating, currency, rate_to_usd, server_day, epoch))
 
     def trade(self, account: str, login: int, symbol: str, side: str, volume: float,
@@ -261,9 +262,10 @@ class Store:
                 (account,)).fetchone()
         return (row[0], row[1], row[2], bool(row[3])) if row else None
 
-    def portfolio(self, active: list[str] | None = None) -> dict[str, float]:
-        """The book in USD, optionally restricted to accounts the registry still trades."""
-        now = time.time() - 3600
+    def portfolio(self, active: list[str] | None = None,
+                  fresh_only: bool = True) -> dict[str, float]:
+        """The book in USD; the stop uses fresh_only=False so a stale account is not forgotten."""
+        now = time.time() - 3600 if fresh_only else 0.0
         with self._connect() as conn:
             if active:
                 marks = ",".join("?" for _ in active)
@@ -317,15 +319,22 @@ class Store:
                 "SELECT ts, account, kind, payload FROM events ORDER BY rowid DESC LIMIT ?",
                 (limit,)).fetchall()
 
-    def prune(self, retention_days: int = RETENTION_DAYS) -> int:
-        """Drop old history and stale mirrors so the database stays small on a long run."""
+    def prune(self, active: list[str] | None = None,
+              retention_days: int = RETENTION_DAYS) -> int:
+        """Drop old history and orphaned mirrors; registered accounts keep their rows."""
         cutoff = (dt.datetime.now(dt.timezone.utc)
                   - dt.timedelta(days=retention_days)).isoformat(timespec="seconds")
         epoch_cutoff = time.time() - POSITIONS_TTL_SECONDS
         with self._connect() as conn:
             removed = conn.execute("DELETE FROM equity WHERE ts < ?", (cutoff,)).rowcount
             conn.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
-            conn.execute("DELETE FROM positions WHERE updated_epoch < ?", (epoch_cutoff,))
+            if active:
+                marks = ",".join("?" for _ in active)
+                conn.execute(
+                    f"DELETE FROM positions WHERE updated_epoch < ? AND account NOT IN ({marks})",
+                    (epoch_cutoff, *active))
+            else:
+                conn.execute("DELETE FROM positions WHERE updated_epoch < ?", (epoch_cutoff,))
             conn.execute("DELETE FROM peaks WHERE (account, ticket) NOT IN"
                          " (SELECT account, ticket FROM positions)")
             conn.execute("DELETE FROM risk_slots WHERE created_epoch < ?",

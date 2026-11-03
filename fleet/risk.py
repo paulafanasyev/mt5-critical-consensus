@@ -43,8 +43,8 @@ class AccountSnapshot:
             floating=sum(p.profit for p in positions),
             server_day=server_day or server_day_now())
 
-    def rate_to_usd(self) -> float:
-        return rate_to_usd(self.currency)
+    def rate_to_usd(self, scale: float = 1.0) -> float:
+        return rate_to_usd(self.currency) * scale
 
 
 def rate_to_usd(currency: str) -> float:
@@ -144,19 +144,23 @@ def can_open(account: Account, snapshot: AccountSnapshot, day: DayState,
     return True, ""
 
 
-def position_risk_money(position, spec: broker.BrokerSymbol | None) -> float:
+def position_risk_money(position, spec: broker.BrokerSymbol | None,
+                        atr_fallback: float = 0.0) -> float:
     """Money at risk if this position hits its own stop; unknown stop counts as the full risk."""
     if spec is None:
         return 0.0
     stop = float(getattr(position, "sl", 0.0) or 0.0)
     entry = float(position.price_open)
     if stop <= 0:
-        return 0.0
+        return spec.distance_money(atr_fallback * 1.6, float(position.volume))
     return spec.distance_money(abs(entry - stop), float(position.volume))
 
 
-def book_risk_money(positions: list, specs: dict[str, broker.BrokerSymbol | None]) -> float:
-    return sum(position_risk_money(p, specs.get(p.symbol)) for p in positions)
+def book_risk_money(positions: list, specs: dict[str, broker.BrokerSymbol | None],
+                    atr_by_symbol: dict[str, float] | None = None) -> float:
+    atrs = atr_by_symbol or {}
+    return sum(position_risk_money(p, specs.get(p.symbol), atrs.get(p.symbol, 0.0))
+               for p in positions)
 
 
 def signed_exposure(positions: list, predicate) -> float:
@@ -172,8 +176,9 @@ def signed_exposure(positions: list, predicate) -> float:
 def can_open_portfolio(limits: PortfolioLimits, equity_usd: float, risk_money: float,
                        new_risk_money: float, positions: list,
                        specs: dict[str, broker.BrokerSymbol | None],
-                       day_pct: float) -> tuple[bool, str]:
-    """Book-wide gates, all in money and signed exposure."""
+                       day_pct: float, new_symbol: str = "",
+                       new_volume: float = 0.0) -> tuple[bool, str]:
+    """Book-wide gates, all in money and signed exposure, including the incoming order."""
     if day_pct <= -limits.daily_stop_pct:
         return False, f"дневной стоп портфеля {limits.daily_stop_pct:.2f}%"
     if len(positions) >= limits.max_open_positions:
@@ -182,9 +187,13 @@ def can_open_portfolio(limits: PortfolioLimits, equity_usd: float, risk_money: f
         return False, "лимит суммарного риска портфеля"
     gold = abs(signed_exposure(positions, broker_is_gold))
     usd = abs(signed_exposure(positions, broker_is_usd_pair))
-    if gold >= limits.max_gold_lots:
+    if new_symbol and broker_is_gold(new_symbol):
+        gold += abs(new_volume)
+    elif new_symbol and broker_is_usd_pair(new_symbol):
+        usd += abs(new_volume)
+    if gold > limits.max_gold_lots:
         return False, "лимит по золоту"
-    if usd >= limits.max_usd_lots:
+    if usd > limits.max_usd_lots:
         return False, "лимит по долларовым парам"
     return True, ""
 

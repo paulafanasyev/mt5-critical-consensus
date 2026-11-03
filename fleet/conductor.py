@@ -124,14 +124,17 @@ class Conductor:
     def tick(self) -> dict:
         if PAUSE_FILE.exists():
             self._hold_on_pause()
+            self._reap_and_restart()  # a shard must be restarted even while entries are paused
         else:
             if self._paused:
                 self._paused = False
                 self.store.event("conductor", "resumed")
             self._reap_and_restart()
         book = self.store.portfolio([a.name for a in self.config.enabled()])
+        book_stop = self.store.portfolio([a.name for a in self.config.enabled()],
+                                         fresh_only=False)
         self._remember_baseline(book)
-        reason = self._portfolio_stop(book)
+        reason = self._portfolio_stop(book_stop)
         if reason and not PAUSE_FILE.exists():
             PAUSE_FILE.write_text(reason, encoding="utf-8")
             self.store.event("conductor", "portfolio_stop", reason=reason, **book)
@@ -178,6 +181,9 @@ class Conductor:
         today = (row[0] if row and row[0] else "") or ""
         stored_day = self.store.get_meta("portfolio_day")
         stored_value = self.store.get_meta("portfolio_day_start_equity")
+        expected = sum(len(self.config.by_shard(shard)) for shard in self.shards)
+        if expected and book["accounts"] < expected:
+            return  # never fix the day's baseline from a partial book
         if stored_day != today or not stored_value:
             if book["equity"] > 0:
                 self.store.set_meta("portfolio_day", today)
@@ -193,9 +199,17 @@ class Conductor:
 
     def _portfolio_stop(self, book: dict) -> str:
         limits = self.config.portfolio
-        expected = len(self.config.enabled())
+        expected = sum(len(self.config.by_shard(shard)) for shard in self.shards)
         if expected and book["accounts"] < expected:
-            return ""  # a partial book (paused shard, backoff, restart) must not fake a loss
+            # A partial book cannot prove a loss, but it must block entries and say so.
+            if self.store.get_meta("book_incomplete") != "1":
+                self.store.set_meta("book_incomplete", "1")
+                self.store.event("conductor", "book_incomplete",
+                                 accounts=book["accounts"], expected=expected)
+            return ""
+        if self.store.get_meta("book_incomplete") == "1":
+            self.store.set_meta("book_incomplete", "0")
+            self.store.event("conductor", "book_complete", accounts=book["accounts"])
         if self.day_start_equity and self.day_start_equity > 0 and book["equity"] > 0:
             change_pct = (book["equity"] - self.day_start_equity) / self.day_start_equity * 100
             if change_pct <= -limits.daily_stop_pct:
@@ -210,7 +224,7 @@ class Conductor:
         try:
             while True:
                 self.tick()
-                self.store.prune()
+                self.store.prune([a.name for a in self.config.enabled()])
                 time.sleep(self.interval)
         except KeyboardInterrupt:
             self.store.event("conductor", "interrupted")

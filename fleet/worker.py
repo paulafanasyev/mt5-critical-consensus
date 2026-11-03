@@ -162,7 +162,7 @@ class Worker:
         if snapshot.rate_to_usd() <= 0 and not account.is_real:
             return WorkerResult(account.name, "flat",
                                 f"нет курса {snapshot.currency}→USD: книга счёт не видит")
-        rate = snapshot.rate_to_usd()
+        rate = snapshot.rate_to_usd(account.currency_scale)
         day = self._day_state(account, snapshot, server_day)
         positions = risk.positions_for(account)  # includes manual positions: they move equity
 
@@ -171,7 +171,7 @@ class Worker:
         snapshot = risk.AccountSnapshot.read(server_day) or snapshot
         positions = risk.positions_for(account)
         self.store.equity(account.name, snapshot.login, snapshot.balance, snapshot.equity,
-                          len(positions), snapshot.floating, snapshot.currency, rate or 0.0,
+                          len(positions), snapshot.floating, snapshot.currency, rate,
                           server_day)
         self.store.save_positions(account.name, positions)
 
@@ -227,10 +227,14 @@ class Worker:
                                  gain=round(gain, 5))
                 continue
             try:
-                broker.close_position(position, spec)
+                closed_volume = broker.close_position(position, spec)
             except broker.BrokerError as exc:
                 self.store.event(account.name, "close_failed", symbol=name, error=str(exc))
                 continue
+            if closed_volume < float(position.volume) - 1e-9:
+                self.store.event(account.name, "partial_close", symbol=name,
+                                 closed=closed_volume, volume=float(position.volume))
+                continue  # keep the peak and manage the remainder next cycle
             closed += 1
             day.realized += float(position.profit)
             self.store.close_position_row(account.name, int(position.ticket))
@@ -262,9 +266,12 @@ class Worker:
             self.store.event(account.name, "hold", reason=reason)
             return 0
         book = self.store.portfolio([a.name for a in self.config.enabled()])
+        book_stop = self.store.portfolio([a.name for a in self.config.enabled()],
+                                         fresh_only=False)
         mirror = self.store.all_positions()
-        book_positions = [types.SimpleNamespace(symbol=symbol, volume=volume, sl=sl,
-                                                price_open=price_open, type=side)
+        book_positions = [types.SimpleNamespace(
+            symbol=symbol, volume=volume, sl=sl, price_open=price_open,
+            type=int(mt5.POSITION_TYPE_BUY) if side == "buy" else int(mt5.POSITION_TYPE_SELL))
                           for _acc, _ticket, symbol, side, volume, price_open, _profit,
                           sl, _tp, _magic in mirror]
         specs: dict[str, broker.BrokerSymbol | None] = {}
@@ -285,7 +292,7 @@ class Worker:
                                            max(spec.volume_min, account.risk.min_lots))
             ok, why = risk.can_open_portfolio(
                 self.config.portfolio, book["equity"], current_risk, new_risk,
-                book_positions, specs, day_pct)
+                book_positions, specs, day_pct, new_symbol=spec.name, new_volume=volume)
             if not ok:
                 self.store.event(account.name, "portfolio_hold", reason=why)
                 return 0
@@ -366,17 +373,18 @@ class Worker:
     def _day_state(self, account: Account, snapshot: risk.AccountSnapshot,
                    server_day: str) -> risk.DayState:
         stored = self.store.day(account.name)
+        try:
+            net_flow = risk.daily_net_flow(risk.day_start_datetime(server_day))
+        except Exception:  # noqa: BLE001 - history may lag right after midnight
+            net_flow = 0.0
         if stored and stored[0] == server_day:
             state = risk.DayState(day=server_day, start_balance=stored[1],
-                                  realized=stored[2], stopped=stored[3])
+                                  net_flow=net_flow, realized=stored[2], stopped=stored[3])
         else:
-            state = risk.DayState.fresh(snapshot.balance, server_day)
-        state.rollover(snapshot.balance, server_day)
-        if state.net_flow == 0.0:
-            try:
-                state.net_flow = risk.daily_net_flow(risk.day_start_datetime(state.day))
-            except Exception:  # noqa: BLE001 - history may lag right after midnight
-                state.net_flow = 0.0
+            # The balance already contains today's deposits, so the day opened at balance-flow.
+            state = risk.DayState.fresh(snapshot.balance - net_flow, server_day)
+            state.net_flow = net_flow
+        state.rollover(snapshot.balance - net_flow, server_day)
         return state
 
     def _save_day(self, account: Account, state: risk.DayState) -> None:
@@ -390,9 +398,10 @@ def run_shard(config: FleetConfig, store: Store, shard: int, dry_run: bool = Fal
     """Run one shard. A pause blocks new entries but never blocks exits."""
     worker = Worker(config, store, pause_file=pause_file, dry_run=dry_run,
                     allow_live=allow_live)
-    paused = bool(pause_file is not None and pause_file.exists())
     results = []
     for account in config.by_shard(shard):
+        # The pause file can appear mid-cycle: check it per account, not once per shard.
+        paused = bool(pause_file is not None and pause_file.exists())
         results.append(worker.run_account(account, allow_entries=not paused))
         time.sleep(0.3)
     return results
