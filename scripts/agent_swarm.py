@@ -518,10 +518,10 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
             pass
         if comment not in our_comments:
             cooldowns = state.setdefault("cooldowns", {})
-            cooldowns[symbol] = max(cooldowns.get(symbol, 0.0), time.time() + 600)
+            cooldowns[symbol] = max(cooldowns.get(symbol, 0.0), time.time() + 300)
             state["cooldowns"] = cooldowns
             log({"event": f"{symbol} ticket {ticket}: closed by the operator "
-                          f"(deal comment '{comment}'); symbol rests 10 minutes"})
+                          f"(deal comment '{comment}'); symbol rests 5 minutes"})
     state["open_tickets"] = current
     save_state(state)
 
