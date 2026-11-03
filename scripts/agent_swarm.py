@@ -446,7 +446,11 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
             log({"event": f"{position.symbol} ticket {position.ticket}: peak "
                           f"{peak:+.2f}, stop to breakeven retcode "
                           f"{None if result is None else result.retcode}"})
-        if position.profit <= max(1.0, peak * GIVEBACK_FRACTION):
+        # take the profit while it is still there: once a trade has been up, close it when it
+        # gives back the larger of five dollars and two fifths of its peak, instead of waiting
+        # for it to turn into a loss. The breakeven stop is the last line, this is the first.
+        giveback_floor = peak - max(5.0, 0.40 * peak)
+        if position.profit <= max(1.0, giveback_floor):
             tick = mt5.symbol_info_tick(position.symbol)
             result = mt5.order_send({
                 "action": mt5.TRADE_ACTION_DEAL, "symbol": position.symbol,
