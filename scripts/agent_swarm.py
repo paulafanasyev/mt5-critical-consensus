@@ -50,8 +50,8 @@ def agent(name: str, kind: str, symbol: str, lots: float, *, experimental: bool 
 
 AGENTS: list[dict] = [
     # --- gold and silver: the only instruments with a real edge on this venue --------
-    agent("ema-xau", "h1_ema", "XAUUSD", 0.01),
-    agent("ema-xag", "h1_ema", "XAGUSD", 0.01),
+    agent("ema-xau", "h1_ema", "XAUUSD", 0.04),
+    agent("ema-xag", "h1_ema", "XAGUSD", 0.03),
     # --- Monday long, the strongest calendar effect -------------------------------
     agent("mon-long-gbp", "monday_long", "GBPUSD", 0.03),
     agent("mon-long-aud", "monday_long", "AUDUSD", 0.03),
@@ -72,13 +72,13 @@ AGENTS: list[dict] = [
     agent("fh-jpy", "first_hour", "USDJPY", 0.03),
     agent("fh-cad", "first_hour", "USDCAD", 0.03),
     # --- scaling units on the two schemes currently in profit --------------------
-    agent("ema-xau-b", "h1_ema", "XAUUSD", 0.01),
+    agent("ema-xau-b", "h1_ema", "XAUUSD", 0.03),
     agent("mon-long-gbp-b", "monday_long", "GBPUSD", 0.02),
     # --- session drift: US index rises inside the US session ----------------------
     agent("us500-session", "session_long", "US500", 0.1),
     agent("us500-mon-session", "session_long", "US500", 0.1),
     # --- weekly momentum on metals (5-day return, hold 5 days) --------------------
-    agent("wm-xau", "weekly_momentum", "XAUUSD", 0.01),
+    agent("wm-xau", "weekly_momentum", "XAUUSD", 0.02),
     agent("wm-xag", "weekly_momentum", "XAGUSD", 0.01),
     # --- silver experiment: the same three rules measured on one metal -----------------
     agent("sil-ema", "h1_ema", "XAGUSD", 0.02, experimental=True),

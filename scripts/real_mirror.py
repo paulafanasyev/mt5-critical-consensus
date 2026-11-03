@@ -49,6 +49,23 @@ def save_state(state: dict) -> None:
     STATE.write_text(json.dumps(state), encoding="utf-8")
 
 
+def hourly_uptrend(mt5, symbol: str) -> bool:
+    """Price above EMA20 and EMA20 above EMA50 on H1 — only buy what is really rising."""
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 1, 60)
+    if rates is None or len(rates) < 50:
+        return False
+    closes = [float(rate["close"]) for rate in rates]
+
+    def ema(values, period):
+        weight = 2 / (period + 1)
+        result = values[0]
+        for value in values[1:]:
+            result = value * weight + result * (1 - weight)
+        return result
+
+    fast, slow = ema(closes, 20), ema(closes, 50)
+    return closes[-1] > fast > slow
+
 def demo_equity_trend(points: int = 6) -> float:
     """Change in demo equity over the last few supervisor heartbeats."""
     path = ROOT / "agent_data" / "supervisor.jsonl"
@@ -86,6 +103,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--daily-stop-pct", type=float, default=0.5)
     parser.add_argument("--min-position-profit", type=float, default=0.0,
                         help="mirror only positions at least this much in profit")
+    parser.add_argument("--real-tp-usd", type=float, default=3.0,
+                        help="bank the real copy at this profit, earlier than the demo")
+    parser.add_argument("--max-hold-min", type=int, default=90,
+                        help="close the real copy after this many minutes, earlier than the demo")
     args = parser.parse_args(argv)
 
     state = load_state()
@@ -181,6 +202,10 @@ def main(argv: list[str] | None = None) -> int:
                     for item in demo_positions:
                         if item["symbol"] in mirrored or item["profit"] < args.min_position_profit:
                             continue
+                        if item["type"] == 1 or not hourly_uptrend(mt5, item["symbol"]):
+                            log({"event": f"{item['symbol']}: not mirrored — the real account "
+                                          f"only buys what is really rising"})
+                            continue
                         tick = mt5.symbol_info_tick(item["symbol"])
                         if not tick:
                             continue
@@ -199,6 +224,31 @@ def main(argv: list[str] | None = None) -> int:
                         log({"event": f"{item['symbol']}: mirrored demo ticket "
                                       f"{item['ticket']} at {price:.5f} rtc "
                                       f"{None if result is None else result.retcode}"})
+            # sell a little earlier than the demo: own small target, own time limit
+            opened = state.setdefault("real_opened", {})
+            for position in real_positions:
+                key = str(position.ticket)
+                opened.setdefault(key, time.time())
+                age_min = (time.time() - opened[key]) / 60
+                target = args.real_tp_usd
+                if position.profit >= target or age_min >= args.max_hold_min:
+                    tick = mt5.symbol_info_tick(position.symbol)
+                    result = mt5.order_send({
+                        "action": mt5.TRADE_ACTION_DEAL, "symbol": position.symbol,
+                        "volume": position.volume,
+                        "type": mt5.ORDER_TYPE_SELL if position.type == 0
+                                else mt5.ORDER_TYPE_BUY,
+                        "position": position.ticket,
+                        "price": tick.bid if position.type == 0 else tick.ask,
+                        "deviation": 30, "magic": REAL_MAGIC,
+                        "type_filling": mt5.ORDER_FILLING_FOK,
+                        "comment": "real early exit"})
+                    opened.pop(key, None)
+                    log({"event": f"{position.symbol}: real copy banked early at "
+                                  f"{position.profit:+.2f} after {age_min:.0f} min, retcode "
+                                  f"{None if result is None else result.retcode}"})
+            state["real_opened"] = opened
+            save_state(state)
             mt5.shutdown()
             log({"event": f"HEARTBEAT demo_trend {trend:+.2f} growth {growth} "
                           f"real_equity {real_account.equity:.2f} mirrored {len(mirrored)}"})
