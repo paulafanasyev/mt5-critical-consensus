@@ -183,7 +183,7 @@ def dip_buy_state(symbol: str):
     recent_high = max(closes[-7:-1])
     drop = closes[-1] - recent_high
     reversed_up = closes[-1] > closes[-2] and lows[-1] >= min(lows[-3:])
-    if drop < -3 * atr and reversed_up:
+    if drop < -2.5 * atr and reversed_up:
         return "BUY", max(2 * atr, 0.0)
     return None
 
@@ -471,6 +471,22 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
                           f"from {peak:+.2f} to {position.profit:+.2f}, closed retcode "
                           f"{None if result is None else result.retcode}"})
             survivors = [p for p in survivors if p.ticket != position.ticket]
+            continue
+        if position.profit > 0 and peak_rejection(mt5, position):
+            tick = mt5.symbol_info_tick(position.symbol)
+            result = mt5.order_send({
+                "action": mt5.TRADE_ACTION_DEAL, "symbol": position.symbol,
+                "volume": position.volume,
+                "type": mt5.ORDER_TYPE_SELL if position.type == 0 else mt5.ORDER_TYPE_BUY,
+                "position": position.ticket,
+                "price": tick.bid if position.type == 0 else tick.ask,
+                "deviation": 30, "magic": position.magic,
+                "type_filling": mt5.ORDER_FILLING_FOK,
+                "comment": "peak exit"})
+            log({"event": f"{position.symbol} ticket {position.ticket}: rejected at the extreme "
+                          f"with {position.profit:+.2f}; closed at the peak retcode "
+                          f"{None if result is None else result.retcode}"})
+            survivors = [p for p in survivors if p.ticket != position.ticket]
 
     # 2. scale into a winner in steps: the stronger the profit, the more is added
     levels = state.setdefault("scale_levels", {})
@@ -612,6 +628,21 @@ def swarm_exposure(symbol: str) -> float:
 
     return sum(position.volume for position in (mt5.positions_get(symbol=symbol) or [])
                if position.magic in MAGIC_SET)
+
+
+def peak_rejection(mt5, position) -> bool:
+    """True when the last closed hourly bar rejected the extreme in the trade's direction."""
+    rates = mt5.copy_rates_from_pos(position.symbol, mt5.TIMEFRAME_H1, 1, 10)
+    if rates is None or len(rates) < 5:
+        return False
+    bars = [{"o": float(r["open"]), "h": float(r["high"]), "l": float(r["low"]),
+             "c": float(r["close"])} for r in rates]
+    last = bars[-1]
+    if position.type == 0:  # long: the high was made and the bar closed red
+        made_high = last["h"] >= max(bar["h"] for bar in bars[-4:])
+        return made_high and last["c"] < last["o"] and last["c"] < bars[-2]["c"]
+    made_low = last["l"] <= min(bar["l"] for bar in bars[-4:])
+    return made_low and last["c"] > last["o"] and last["c"] > bars[-2]["c"]
 
 
 def open_trade(mt5, spec: dict, side: str, tick, *, stop: float | None,
