@@ -1,27 +1,39 @@
 """Mirror the demo book onto the real account while the demo is in profit.
 
-The operator's rule: when the demo is growing, do the same on the real account. This script
-is the bridge. It runs two terminal sessions in one process, sequentially:
+The operator's rule: when the demo is growing, do the same on the real account. This script is the
+bridge. It runs two terminal sessions in one process, sequentially:
 
   1. read the demo account (the laboratory) through its own terminal;
-  2. decide, from the demo equity trend and each position's own profit, what deserves to be
-     mirrored;
-  3. connect to the separate real terminal and place the same trade with a much smaller
-     size, copying the stop and target;
+  2. decide, from the demo equity trend and each position's own profit, what deserves to be mirrored;
+  3. connect to the separate real terminal and place the same trade with a much smaller size,
+     copying the stop and target;
   4. close the real trade as soon as the demo counterpart is gone;
   5. stop everything for the day if the real account loses its daily allowance.
 
-It refuses to run unless the second terminal is logged into a real account.
+Nothing is sent by default. Every order in this file leaves through `send_order`, and `send_order`
+asks `fleet.livegate` at the moment of sending: the stand (`C:\\mt5-fleet\\PAUSE`) must be gone, this
+invocation must carry `--live`, and the registry must hold this login as `mode: real` with
+`enabled: true`. The registry's own `max_lots` for that row is a hard ceiling on what gets mirrored:
+a script that mirrors at its default 0.05 onto an account the operator capped at 0.01 is not
+copying the demo, it is multiplying the risk.
+
+It still refuses a terminal that is not logged into a real account — that check guards the money from
+a mis-wired path; the checks above guard the money from this script being run at all.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import pathlib
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from fleet import livegate  # noqa: E402
+
 LOG = ROOT / "agent_data" / "real_mirror.jsonl"
 STATE = ROOT / "agent_data" / "real_mirror_state.json"
 DEMO_MAGIC_FLOOR = 8180000
@@ -31,8 +43,9 @@ DEMO_TERMINAL = r"C:\mt5-exness\terminal64.exe"
 
 def log(event: dict) -> None:
     event["ts"] = datetime.now(timezone.utc).isoformat()
+    LOG.parent.mkdir(parents=True, exist_ok=True)
     with LOG.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event) + "\n")
+        handle.write(json.dumps(event, ensure_ascii=False) + "\n")
     print(f"[{event['ts'][11:19]}] {event['event']}", flush=True)
 
 
@@ -46,7 +59,23 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
     STATE.write_text(json.dumps(state), encoding="utf-8")
+
+
+def send_order(mt5, request: dict, gate) -> dict | None:
+    """The only door to the real account: ask permission now, not when the loop was entered.
+
+    The stand can appear between the start of a cycle and the moment of a send, so the answer is
+    read again here. A refused order returns None and the caller keeps its state unchanged: the
+    mirror must not remember a trade it never placed.
+    """
+    reason = gate()
+    if reason:
+        log({"event": f"NOT SENT {request.get('action')} {request.get('symbol')} "
+                      f"{request.get('volume')}: {reason}"})
+        return None
+    return mt5.order_send(request)
 
 
 def hourly_uptrend(mt5, symbol: str) -> bool:
@@ -65,6 +94,7 @@ def hourly_uptrend(mt5, symbol: str) -> bool:
 
     fast, slow = ema(closes, 20), ema(closes, 50)
     return closes[-1] > fast > slow
+
 
 def demo_equity_trend(points: int = 6) -> float:
     """Change in demo equity over the last few supervisor heartbeats."""
@@ -98,6 +128,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--real-path", required=True,
                         help="path to terminal64.exe of the real-account instance")
+    parser.add_argument("--live", action="store_true",
+                        help="единственный способ разрешить этому запуску тронуть реальные деньги")
+    parser.add_argument("--config", default="",
+                        help="реестр счетов; по умолчанию config/accounts.yaml")
     parser.add_argument("--interval-sec", type=int, default=30)
     parser.add_argument("--real-lots", type=float, default=0.01)
     parser.add_argument("--daily-stop-pct", type=float, default=0.5)
@@ -107,7 +141,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="bank the real copy at this profit, earlier than the demo")
     parser.add_argument("--max-hold-min", type=int, default=90,
                         help="close the real copy after this many minutes, earlier than the demo")
+    parser.add_argument("--once", action="store_true", help="один цикл и выйти")
     args = parser.parse_args(argv)
+    registry = pathlib.Path(args.config).resolve() if args.config else None
 
     state = load_state()
     daily_key = datetime.now(timezone.utc).date().isoformat()
@@ -145,13 +181,36 @@ def main(argv: list[str] | None = None) -> int:
             if real_account is None:
                 log({"event": "real terminal not logged in"})
                 mt5.shutdown()
+                if args.once:
+                    return 1
                 time.sleep(args.interval_sec)
                 continue
             if real_account.trade_mode != 2:
                 log({"event": f"refusing: {real_account.login} is not a real account"})
                 mt5.shutdown()
+                if args.once:
+                    return 1
                 time.sleep(args.interval_sec)
                 continue
+
+            # --- 2b. the operator's permission, asked for this account and read again per send ---
+            def gate() -> str:
+                return livegate.refusal(real_account.login, live=args.live,
+                                        server=str(real_account.server or ""),
+                                        config_path=registry)
+
+            reason = gate()
+            if reason:
+                log({"event": f"стоп, ничего не отправлено: {reason}"})
+                mt5.shutdown()
+                return 1
+            row = livegate.permitted_account(real_account.login,
+                                             server=str(real_account.server or ""),
+                                             config_path=registry)
+            lots = livegate.capped_lots(row, args.real_lots)
+            if lots < args.real_lots:
+                log({"event": f"лот срезан по реестру: {args.real_lots} → {lots} "
+                              f"(max_lots записи {row.name})"})
             if state.get("day_start_equity") is None:
                 state["day_start_equity"] = real_account.equity
                 save_state(state)
@@ -160,21 +219,25 @@ def main(argv: list[str] | None = None) -> int:
                 for position in [p for p in (mt5.positions_get() or [])
                                  if p.magic == REAL_MAGIC]:
                     tick = mt5.symbol_info_tick(position.symbol)
-                    mt5.order_send({"action": mt5.TRADE_ACTION_DEAL,
-                                    "symbol": position.symbol, "volume": position.volume,
-                                    "type": mt5.ORDER_TYPE_SELL if position.type == 0
-                                            else mt5.ORDER_TYPE_BUY,
-                                    "position": position.ticket,
-                                    "price": tick.bid if position.type == 0 else tick.ask,
-                                    "deviation": 30, "magic": REAL_MAGIC,
-                                    "type_filling": mt5.ORDER_FILLING_FOK,
-                                    "comment": "daily stop"})
+                    send_order(mt5, {"action": mt5.TRADE_ACTION_DEAL,
+                                     "symbol": position.symbol, "volume": position.volume,
+                                     "type": mt5.ORDER_TYPE_SELL if position.type == 0
+                                             else mt5.ORDER_TYPE_BUY,
+                                     "position": position.ticket,
+                                     "price": tick.bid if position.type == 0 else tick.ask,
+                                     "deviation": 30, "magic": REAL_MAGIC,
+                                     "type_filling": mt5.ORDER_FILLING_FOK,
+                                     "comment": "daily stop"}, gate)
                 state["halted"] = True
                 save_state(state)
                 log({"event": f"DAILY STOP: real equity {real_account.equity:.2f} below "
-                              f"{limit:.2f}, everything closed"})
+                              f"{limit:.2f}, всё своё закрыто"})
 
             real_positions = [p for p in (mt5.positions_get() or []) if p.magic == REAL_MAGIC]
+            other = len(mt5.positions_get() or []) - len(real_positions)
+            if other:
+                log({"event": f"{other} лот(ов) на реальном счёте не наши (magic != {REAL_MAGIC}): "
+                              f"не тронуты"})
             mirrored = {position.symbol: position for position in real_positions}
 
             if not state.get("halted"):
@@ -184,7 +247,7 @@ def main(argv: list[str] | None = None) -> int:
                     if symbol in open_demo_symbols:
                         continue
                     tick = mt5.symbol_info_tick(symbol)
-                    result = mt5.order_send({
+                    result = send_order(mt5, {
                         "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol,
                         "volume": position.volume,
                         "type": mt5.ORDER_TYPE_SELL if position.type == 0
@@ -193,8 +256,9 @@ def main(argv: list[str] | None = None) -> int:
                         "price": tick.bid if position.type == 0 else tick.ask,
                         "deviation": 30, "magic": REAL_MAGIC,
                         "type_filling": mt5.ORDER_FILLING_FOK,
-                        "comment": "demo closed"})
-                    log({"event": f"{symbol}: demo closed it, real closed too rtc "
+                        "comment": "demo closed"}, gate)
+                    log({"event": f"{symbol}: демо закрыл, реальная копия "
+                                  f"{'закрыта' if result else 'НЕ закрыта'} rtc "
                                   f"{None if result is None else result.retcode}"})
 
                 # --- 4. mirror what is growing ---
@@ -203,8 +267,8 @@ def main(argv: list[str] | None = None) -> int:
                         if item["symbol"] in mirrored or item["profit"] < args.min_position_profit:
                             continue
                         if item["type"] == 1 or not hourly_uptrend(mt5, item["symbol"]):
-                            log({"event": f"{item['symbol']}: not mirrored — the real account "
-                                          f"only buys what is really rising"})
+                            log({"event": f"{item['symbol']}: не зеркалировано — реальный счёт "
+                                          f"покупает только то, что действительно растёт"})
                             continue
                         tick = mt5.symbol_info_tick(item["symbol"])
                         if not tick:
@@ -212,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
                         side = mt5.ORDER_TYPE_BUY if item["type"] == 0 else mt5.ORDER_TYPE_SELL
                         price = tick.ask if item["type"] == 0 else tick.bid
                         request = {"action": mt5.TRADE_ACTION_DEAL, "symbol": item["symbol"],
-                                   "volume": args.real_lots, "type": side, "price": price,
+                                   "volume": lots, "type": side, "price": price,
                                    "deviation": 30, "magic": REAL_MAGIC,
                                    "type_filling": mt5.ORDER_FILLING_FOK,
                                    "comment": "mirror demo"}
@@ -220,20 +284,20 @@ def main(argv: list[str] | None = None) -> int:
                             request["sl"] = item["sl"]
                         if item["tp"]:
                             request["tp"] = item["tp"]
-                        result = mt5.order_send(request)
-                        log({"event": f"{item['symbol']}: mirrored demo ticket "
-                                      f"{item['ticket']} at {price:.5f} rtc "
-                                      f"{None if result is None else result.retcode}"})
+                        result = send_order(mt5, request, gate)
+                        if result is None:
+                            continue
+                        log({"event": f"{item['symbol']}: зеркалит демо билет {item['ticket']} "
+                                      f"по {price:.5f} лот {lots} rtc {result.retcode}"})
             # sell a little earlier than the demo: own small target, own time limit
             opened = state.setdefault("real_opened", {})
             for position in real_positions:
                 key = str(position.ticket)
                 opened.setdefault(key, time.time())
                 age_min = (time.time() - opened[key]) / 60
-                target = args.real_tp_usd
-                if position.profit >= target or age_min >= args.max_hold_min:
+                if position.profit >= args.real_tp_usd or age_min >= args.max_hold_min:
                     tick = mt5.symbol_info_tick(position.symbol)
-                    result = mt5.order_send({
+                    result = send_order(mt5, {
                         "action": mt5.TRADE_ACTION_DEAL, "symbol": position.symbol,
                         "volume": position.volume,
                         "type": mt5.ORDER_TYPE_SELL if position.type == 0
@@ -242,18 +306,23 @@ def main(argv: list[str] | None = None) -> int:
                         "price": tick.bid if position.type == 0 else tick.ask,
                         "deviation": 30, "magic": REAL_MAGIC,
                         "type_filling": mt5.ORDER_FILLING_FOK,
-                        "comment": "real early exit"})
-                    opened.pop(key, None)
-                    log({"event": f"{position.symbol}: real copy banked early at "
-                                  f"{position.profit:+.2f} after {age_min:.0f} min, retcode "
-                                  f"{None if result is None else result.retcode}"})
+                        "comment": "real early exit"}, gate)
+                    if result is not None:
+                        opened.pop(key, None)
+                        log({"event": f"{position.symbol}: копия зафиксирована раньше демо на "
+                                      f"{position.profit:+.2f} после {age_min:.0f} мин, rtc "
+                                      f"{result.retcode}"})
             state["real_opened"] = opened
             save_state(state)
             mt5.shutdown()
-            log({"event": f"HEARTBEAT demo_trend {trend:+.2f} growth {growth} "
+            log({"event": f"HEARTBEAT demo_trend {trend:+.2f} growth {growth} лот {lots} "
                           f"real_equity {real_account.equity:.2f} mirrored {len(mirrored)}"})
+            if args.once:
+                return 0
         except Exception as exc:  # noqa: BLE001 - the bridge must never die
             log({"event": f"cycle error {type(exc).__name__}: {exc}"})
+            if args.once:
+                return 1
         time.sleep(args.interval_sec)
 
 

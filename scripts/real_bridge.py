@@ -4,38 +4,52 @@ The MetaTrader5 Python API can only attach to one terminal at a time, and the de
 that channel. So the real account is driven by the inverse arrangement: an Expert Advisor lives
 inside the real terminal and exchanges files through the common MQL5\\Files folder.
 
-    EA  -> dsh_real_state.json   (account, equity, positions) every second
+    EA  -> dsh_real_state.json   (account, equity, positions with their magic) every second
     EA  <- dsh_real_cmd.json     (one command: open / close), read and deleted
 
-This process reads the state, mirrors only what survives the operator's rules, and refuses to
-send anything unless the terminal reports an Exness real account with money on it.
+Nothing in this file sends by default. `send_command` is the only door, and it asks `fleet.livegate`
+on every knock: the stand (`C:\\mt5-fleet\\PAUSE`) must be gone, this invocation must carry `--live`,
+and the registry must hold this login as a real account with `enabled: true`. The account is not
+hardcoded here any more than the money is — an earlier version carried
+`276261159@Exness-MT5Real26` in the source, which made any copy of this file a loaded gun pointed at
+one specific live account.
+
+And it closes only the lots it recognises as its own: the EA stamps `REAL_MAGIC` on what it opens,
+and a position with any other magic is the operator's money, which this process may count but must
+never close.
 """
 from __future__ import annotations
 
+import argparse
 import json
+import pathlib
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from fleet import livegate  # noqa: E402
+
 LOG = ROOT / "agent_data" / "real_bridge.jsonl"
 STATE = ROOT / "agent_data" / "real_bridge_state.json"
 COMMON = Path(r"C:\Users\Administrator\AppData\Roaming\MetaQuotes\Terminal\Common\Files")
 EA_STATE = COMMON / "dsh_real_state.json"
 EA_CMD = COMMON / "dsh_real_cmd.json"
 DEMO_TERMINAL = r"C:\Program Files\MetaTrader 5\terminal64.exe"
-REAL_SERVER = "Exness-MT5Real26"
-REAL_LOGIN = 276261159
+# The magic DSHRealBridge.mq5 stamps on everything it opens. A position with any other magic is the
+# operator's own lot: this process may count it in the risk it reports, but it must never close it.
+REAL_MAGIC = 8272026
 DAILY_STOP_PCT = 0.5
 REAL_LOTS = 0.01
-TP_USD = 3.0
-MAX_HOLD_MIN = 90
 
 
 def log(event: dict) -> None:
     event["ts"] = datetime.now(timezone.utc).isoformat()
+    LOG.parent.mkdir(parents=True, exist_ok=True)
     with LOG.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event) + "\n")
+        handle.write(json.dumps(event, ensure_ascii=False) + "\n")
     print(f"[{event['ts'][11:19]}] {event['event']}", flush=True)
 
 
@@ -49,21 +63,38 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
     STATE.write_text(json.dumps(state), encoding="utf-8")
 
 
-def read_ea_state() -> dict | None:
-    if not EA_STATE.exists():
+def read_ea_state(path: pathlib.Path = EA_STATE) -> dict | None:
+    if not path.exists():
         return None
     try:
-        return json.loads(EA_STATE.read_text(encoding="utf-8", errors="replace"))
+        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (json.JSONDecodeError, OSError):
         return None
 
 
-def send_command(command: dict) -> None:
-    EA_CMD.write_text(json.dumps(command), encoding="utf-8")
+def ours(ea: dict) -> list[dict]:
+    """The real positions this bridge opened — and only those.
+
+    A state file written by an EA that predates the `magic` field yields nothing here: no field, no
+    close. Guessing that an unlabelled lot was ours would mean closing the operator's trade.
+    """
+    return [p for p in (ea.get("positions") or []) if int(p.get("magic") or 0) == REAL_MAGIC]
+
+
+def send_command(command: dict, gate, cmd_path: pathlib.Path = EA_CMD) -> bool:
+    """The only door to a real account. `gate()` answers why it may not be walked right now."""
+    reason = gate()
+    if reason:
+        log({"event": f"NOT SENT {command}: {reason}"})
+        return False
+    cmd_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd_path.write_text(json.dumps(command), encoding="utf-8")
     log({"event": f"command to EA: {command}"})
+    return True
 
 
 def demo_book() -> list[dict] | None:
@@ -106,78 +137,99 @@ def hourly_uptrend(symbol: str) -> bool:
         mt5.shutdown()
 
 
-def main() -> int:
+def run_cycle(state: dict, gate, *, ea_path: pathlib.Path = EA_STATE,
+              cmd_path: pathlib.Path = EA_CMD) -> str:
+    """One pass over the two files; returns a sentence for the log."""
+    refusal = gate()
+    if refusal:
+        # Asked before anything else: a cycle nobody permitted must not even open the demo terminal.
+        return f"bridge idle: {refusal}"
+    ea = read_ea_state(ea_path)
+    if ea is None:
+        return "no EA state yet — is DSHRealBridge attached in the real terminal?"
+    if float(ea.get("balance") or 0) <= 0:
+        return f"real balance {ea.get('balance')} — no funds, bridge idle"
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    if state.get("day") != today:
+        state["day"] = today
+        state["day_start_equity"] = float(ea.get("equity") or 0)
+        state["halted"] = False
+        save_state(state)
+    day_start = float(state.get("day_start_equity") or ea.get("equity") or 0)
+    equity = float(ea.get("equity") or 0)
+    if day_start and equity < day_start * (1 - DAILY_STOP_PCT / 100) and not state.get("halted"):
+        for position in ours(ea):
+            send_command({"action": "close", "ticket": position["ticket"]}, gate, cmd_path)
+        state["halted"] = True
+        save_state(state)
+        return f"DAILY STOP: equity {equity} below {day_start:.2f}"
+    if state.get("halted"):
+        return "halted for the day"
+
+    book = demo_book()
+    if book is None:
+        return "demo book unavailable this cycle"
+    our_positions = ours(ea)
+    all_positions = ea.get("positions") or []
+    if len(our_positions) < len(all_positions):
+        log({"event": f"{len(all_positions) - len(our_positions)} лот(ов) на реальном счёте не наши "
+                      f"(magic != {REAL_MAGIC}): не закрыты и не тронуты"})
+    held = {p["symbol"] for p in all_positions}
+    demo_symbols = {item["symbol"] for item in book}
+
+    # close our own copy when the demo closed its own
+    for position in our_positions:
+        if position["symbol"] not in demo_symbols:
+            send_command({"action": "close", "ticket": position["ticket"]}, gate, cmd_path)
+            time.sleep(2)
+
+    # mirror only profitable demo buys in a confirmed uptrend
+    opened = state.setdefault("opened", {})
+    for item in book:
+        if item["type"] != 0 or item["symbol"] in held or item["profit"] <= 0:
+            continue
+        if not hourly_uptrend(item["symbol"]):
+            continue
+        if send_command({"action": "open", "symbol": item["symbol"], "side": 0,
+                         "lots": REAL_LOTS}, gate, cmd_path):
+            opened[item["symbol"]] = time.time()
+            save_state(state)
+            time.sleep(2)
+    return f"HEARTBEAT real {ea.get('login')} equity {equity} демо {len(book)}"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Real-account bridge (шлёт только с --live)")
+    parser.add_argument("--live", action="store_true",
+                        help="единственный способ разрешить этому запуску тронуть реальные деньги")
+    parser.add_argument("--config", default="",
+                        help="реестр счетов; по умолчанию config/accounts.yaml")
+    parser.add_argument("--interval-sec", type=int, default=10)
+    parser.add_argument("--once", action="store_true", help="один цикл и выйти")
+    args = parser.parse_args(argv)
+    registry = pathlib.Path(args.config).resolve() if args.config else None
+
+    def gate() -> str:
+        ea = read_ea_state() or {}
+        return livegate.refusal(ea.get("login"), live=args.live,
+                                server=str(ea.get("server") or ""), config_path=registry)
+
     state = load_state()
     log({"event": "REAL BRIDGE START (file channel, EA in the real terminal)"})
+    if not args.once:
+        reason = gate()
+        if reason:
+            log({"event": f"стоп, ничего не отправлено: {reason}"})
+            return 1
     while True:
         try:
-            ea = read_ea_state()
-            if ea is None:
-                log({"event": "no EA state yet — is DSHRealBridge attached in the real terminal?"})
-                time.sleep(10)
-                continue
-
-            # hard guard: only an Exness real account with money may receive orders
-            if ea.get("server") != REAL_SERVER or int(ea.get("login") or 0) != REAL_LOGIN:
-                log({"event": f"EA reports {ea.get('login')} {ea.get('server')} — not the real "
-                              f"account, bridge idle"})
-                time.sleep(15)
-                continue
-            if float(ea.get("balance") or 0) <= 0:
-                log({"event": f"real balance {ea.get('balance')} — no funds, bridge idle"})
-                time.sleep(30)
-                continue
-
-            today = datetime.now(timezone.utc).date().isoformat()
-            if state.get("day") != today:
-                state["day"] = today
-                state["day_start_equity"] = float(ea["equity"])
-                save_state(state)
-            day_start = float(state.get("day_start_equity") or ea["equity"])
-            if float(ea["equity"]) < day_start * (1 - DAILY_STOP_PCT / 100) and not state.get("halted"):
-                for position in ea.get("positions") or []:
-                    send_command({"action": "close", "ticket": position["ticket"]})
-                state["halted"] = True
-                save_state(state)
-                log({"event": f"DAILY STOP: equity {ea['equity']} below {day_start:.2f}"})
-            if state.get("halted"):
-                time.sleep(30)
-                continue
-
-            book = demo_book()
-            if book is None:
-                log({"event": "demo book unavailable this cycle"})
-                time.sleep(10)
-                continue
-            real_positions = {p["symbol"]: p for p in (ea.get("positions") or [])}
-            demo_symbols = {item["symbol"] for item in book}
-
-            # close the real copy when the demo closed its own
-            for symbol, position in list(real_positions.items()):
-                if symbol not in demo_symbols:
-                    send_command({"action": "close", "ticket": position["ticket"]})
-                    time.sleep(2)
-
-            # mirror only profitable demo buys in a confirmed uptrend
-            opened = state.setdefault("opened", {})
-            for item in book:
-                if item["type"] != 0 or item["symbol"] in real_positions:
-                    continue
-                if item["profit"] <= 0:
-                    continue
-                if not hourly_uptrend(item["symbol"]):
-                    continue
-                send_command({"action": "open", "symbol": item["symbol"], "side": 0,
-                              "lots": REAL_LOTS})
-                opened[item["symbol"]] = time.time()
-                save_state(state)
-                time.sleep(2)
-            save_state(state)
-            log({"event": f"HEARTBEAT real {ea.get('login')} equity {ea.get('equity')} "
-                          f"positions {len(ea.get('positions') or [])} demo {len(book)}"})
-        except Exception as exc:  # noqa: BLE001
+            log({"event": run_cycle(state, gate)})
+        except Exception as exc:  # noqa: BLE001 - the bridge must never die
             log({"event": f"cycle error {type(exc).__name__}: {exc}"})
-        time.sleep(10)
+        if args.once:
+            return 0
+        time.sleep(args.interval_sec)
 
 
 if __name__ == "__main__":

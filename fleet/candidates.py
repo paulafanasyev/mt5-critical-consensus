@@ -110,16 +110,19 @@ def ledger(store, limit: int = 5000) -> dict:
 
     An outcome is joined by account AND ticket: a ticket is unique on one server, not across the
     book this file keeps for every broker, so a bare ticket join would pay one account's trade out
-    of another's profit. A close the journal never tied to a candidate stays out of the profit
-    column, and a candidate the broker never named stays `blind`: counted, nothing borrowed to
-    explain it. The ledger exists to be checked against the broker's own history, so a guessed join
-    is worse than an empty column.
+    of another's profit. Only a ticket the broker's own comment named (`ticket_source == token`)
+    lends its outcome to the sums: an inferred ticket on a netting account carries the whole merged
+    position — the operator's lots included — so its money is reported as `closed_guessed` and
+    `guessed_profit_usd`, beside the totals rather than inside them. Rows sharing one ticket are
+    `shared_ticket`: the close belongs to that ticket, not to either entry, so none of them is
+    settled and none is called open. A candidate the broker never named at all stays `blind`.
 
     A dollar column is filled only from a row that says which currency its money was in. The broker
     quotes its tick value and reports its profit in the currency the account is kept in, so on a
     ruble account that number is rubles and on a cent account a hundredth of a dollar: `rate_to_usd`
-    is the witness that the number was converted, and a row without it is counted in `unpriced`
-    rather than added to a sum it does not belong to.
+    is the witness that the number was converted, and a row without it is counted — in
+    `settled_unpriced` for a close, `drift_unpriced` for a bill — rather than added to a sum it does
+    not belong to.
     """
     rows = store.events_of((KIND, CLOSED), limit=limit)
     notes: list[dict] = []
@@ -139,17 +142,33 @@ def ledger(store, limit: int = 5000) -> dict:
                 closed[(account, str(data.get("symbol") or "").casefold(), ticket)] = {
                     "ts": ts, "account": account, **data}
     journal_rows = store.count_events(KIND)
+    # One position can carry several candidate rows: on a netting account the park's own second entry
+    # folds into the same ticket as the first, and a restart can write the same fill twice. The close
+    # of such a ticket is one lot's money and cannot be said to belong to either row, so a shared
+    # ticket is named before the join is attempted and its close is left in the index instead of
+    # paid to whichever note happened to be read first.
+    per_ticket: dict[tuple, int] = {}
+    for note in notes:
+        ticket = int(note.get("ticket") or 0)
+        if ticket > 0:
+            key = (note["account"], str(note.get("symbol") or "").casefold(), ticket)
+            per_ticket[key] = per_ticket.get(key, 0) + 1
     trades = []
     for note in notes:
         ticket = int(note.get("ticket") or 0)
         key = (note["account"], str(note.get("symbol") or "").casefold(), ticket)
-        # Consumed, not looked up: two candidate rows carrying the same ticket (a restart that
-        # replayed the fill, a journal written twice) must not bill one close out twice.
-        result = closed.pop(key, None)
+        shared = ticket > 0 and per_ticket[key] > 1
+        # Consumed, not looked up: two candidate rows carrying the same ticket must not bill one
+        # close out twice, so only an unshared row is allowed to take it.
+        result = None if shared else closed.pop(key, None)
         priced = _num(note.get("rate_to_usd"), 6) is not None
         settled = result is not None
         profit_usd = (_num(result.get("profit_usd"), 2)
                       if settled and _num(result.get("rate_to_usd"), 6) is not None else None)
+        # The ticket is what ties an outcome to this entry. `token` means the comment this park sent
+        # named it; anything else means somebody inferred it, and on a netting account an inferred
+        # ticket carries the whole merged position — the operator's money included.
+        attributable = settled and note.get("ticket_source", "unknown") == "token"
         trades.append({
             "ticket": ticket,
             "ticket_source": note.get("ticket_source", "unknown"),
@@ -165,19 +184,38 @@ def ledger(store, limit: int = 5000) -> dict:
             "risk_usd": note.get("risk_usd"),
             "risk_reward": note.get("risk_reward"),
             "settled": settled,
-            "profit_gross_usd": profit_usd,
+            "shared": shared,
+            "attributable": attributable,
+            "profit_gross_usd": profit_usd if attributable else None,
+            "guessed_profit_usd": (profit_usd if settled and not attributable else None),
             "exit": result.get("reason") if settled else "",
             "closed_by": result.get("by", "") if settled else "",
         })
-    done = [t for t in trades if t["profit_gross_usd"] is not None]
+    # Only a ticket the broker's own comment named makes an outcome this book may add up.
+    done = [t for t in trades if t["attributable"]]
     won = [t for t in done if float(t["profit_gross_usd"]) > 0]
-    paid = [t for t in trades if isinstance(t["drift_cost_usd"], (int, float))]
-    measured = [t for t in trades if isinstance(t["drift_points"], (int, float))]
+    lost = [t for t in done if float(t["profit_gross_usd"]) < 0]
+    flat = [t for t in done if float(t["profit_gross_usd"]) == 0]
+    guessed_settled = [t for t in trades if t["guessed_profit_usd"] is not None]
     blind = [t for t in trades if t["ticket"] == 0]
+    # One ticket is one entry into the market. A retry that journalled the same fill twice must bill
+    # the wait once: two rows of 25 points are one 25-point drift, and summing per row would make the
+    # price of confirmation a multiple of how many lines the journal happened to keep.
+    seen: set[tuple] = set()
+    entries = []
+    for t in trades:
+        if t["ticket"]:
+            key = (t["account"], str(t["symbol"] or "").casefold(), t["ticket"])
+            if key in seen:
+                continue
+            seen.add(key)
+        entries.append(t)
+    paid = [t for t in entries if isinstance(t["drift_cost_usd"], (int, float))]
+    measured = [t for t in entries if isinstance(t["drift_points"], (int, float))]
     # A close that joined a candidate but arrived before the journal knew its currency: the trade
     # finished, and its money is still a number in a currency nobody wrote down.
-    unpriced = [t for t in trades if t["settled"] and t["profit_gross_usd"] is None]
-    guessed = [t for t in trades if t["ticket_source"] != "token"]
+    unpriced = [t for t in trades if t["settled"] and t["profit_gross_usd"] is None
+                and t["guessed_profit_usd"] is None]
     return {
         "candidates": len(trades),
         # How many candidates the journal holds in total, and whether this read saw all of them:
@@ -185,22 +223,35 @@ def ledger(store, limit: int = 5000) -> dict:
         "journal_rows": journal_rows,
         "truncated": journal_rows > len(trades),
         "closed": len(done),
-        "open": len([t for t in trades if t["ticket"] and not t["settled"]]),
+        "open": len([t for t in trades if t["ticket"] and not t["settled"] and not t["shared"]]),
         "blind": len(blind),
         "settled_unpriced": len(unpriced),
-        "drift_unpriced": len([t for t in trades
-                               if isinstance(t["drift_cost"], (int, float))
+        # A drift measured in points that nobody could price in dollars: not a zero, not a sum.
+        "drift_unpriced": len([t for t in entries
+                               if isinstance(t["drift_points"], (int, float))
                                and not isinstance(t["drift_cost_usd"], (int, float))]),
         # The joins nobody can vouch for: `only_position` guessed the ticket from a book with one
-        # lot on it, `unknown` never found one. Their outcomes are not in the profit column.
-        "guessed": len(guessed),
+        # lot on it, `unknown` never found one. Their outcomes are shown apart and never summed in.
+        "guessed": len([t for t in trades if t["ticket_source"] != "token"]),
+        "closed_guessed": len(guessed_settled),
+        "guessed_profit_usd": (round(sum(float(t["guessed_profit_usd"])
+                                         for t in guessed_settled), 2)
+                               if guessed_settled else 0.0),
+        # Rows sharing one ticket with another entry: the close of that ticket is one lot's money and
+        # this book cannot say whose, so none of them is settled and none is called open.
+        "shared_ticket": len([t for t in trades if t["shared"]]),
+        "flat": len(flat),
         "by_source": {source: len([t for t in trades if t["ticket_source"] == source])
                       for source in sorted({t["ticket_source"] for t in trades})},
-        "win_rate": round(100.0 * len(won) / len(done), 1) if done else None,
+        # A break-even exit is neither a win nor a loss: counting it as a loss would price a flat
+        # ticket as a defeat the strategy never had.
+        "win_rate": (round(100.0 * len(won) / (len(won) + len(lost)), 1)
+                     if won or lost else None),
         # Gross, exactly as the broker's own position report states it: no commission, no swap.
         "profit_gross_usd": (round(sum(float(t["profit_gross_usd"]) for t in done), 2)
                              if done else 0.0),
         "drift_cost_usd": round(sum(float(t["drift_cost_usd"]) for t in paid), 2) if paid else 0.0,
+        "drift_priced": len(paid),
         "mean_drift_points": (round(sum(float(t["drift_points"]) for t in measured)
                                     / len(measured), 2) if measured else None),
         "trades": trades,

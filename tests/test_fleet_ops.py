@@ -440,10 +440,48 @@ def test_a_book_the_journal_cannot_price_says_so_instead_of_summing_it(
     out = capsys.readouterr().out
     assert "нет билета" not in out  # the ticket exists; it is only a guess, not a blind row
     assert "итог не в $" in out and "оговорки:" in out
-    assert "закрыто 0" in out and "+0.00 USD" in out
+    assert "закрыто по билету брокера 0" in out and "+0.00 USD" in out
 
 
 def test_an_empty_candidate_book_is_reported_as_no_measurement(tmp_path: pathlib.Path, capsys) -> None:
     store_path = tmp_path / "fleet.sqlite"
     assert fleet_cli.main(["--store", str(store_path), "candidates"]) == 0
     assert "кандидатов пока нет" in capsys.readouterr().out
+
+
+def test_a_row_that_is_neither_open_nor_settled_is_printed_as_neither(
+        tmp_path: pathlib.Path, capsys) -> None:
+    """Two entries on one ticket: the close is one lot's money and the table cannot say whose."""
+    from fleet import candidates
+
+    store = Store(tmp_path / "fleet.sqlite")
+    for _ in range(2):
+        store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02, ticket=7,
+                    currency="USD", rate_to_usd=1.0, drift_points=25.0, drift_cost=0.5,
+                    drift_cost_usd=0.5, risk_usd=2.0)
+    assert fleet_cli.main(["--store", str(tmp_path / "fleet.sqlite"), "candidates"]) == 0
+    out = capsys.readouterr().out
+    assert "общий билет" in out and "делят один билет" in out
+    assert "закрыто по билету брокера 0" in out and "открыто 0" in out
+
+
+def test_a_settled_guess_is_out_of_the_sum_and_says_where_it_went(
+        tmp_path: pathlib.Path, capsys) -> None:
+    """The blocker: the header promised guessed joins stayed out of the totals it then summed.
+
+    Now the column shows `не в сумме`, and the caveat names the money it counted apart — a number the
+    reader can see is honest; one silently missing from the table is not.
+    """
+    from fleet import candidates
+
+    store = Store(tmp_path / "fleet.sqlite")
+    store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02, ticket=7,
+                ticket_source="only_position", currency="USD", rate_to_usd=1.0,
+                drift_points=4.0, drift_cost=0.08, drift_cost_usd=0.08, risk_usd=2.0)
+    store.event("a", "closed", symbol="EURUSD", ticket=7, reason="стоп", profit=-12.5,
+                by="брокер", currency="USD", rate_to_usd=1.0, profit_usd=-12.5)
+    assert fleet_cli.main(["--store", str(tmp_path / "fleet.sqlite"), "candidates"]) == 0
+    out = capsys.readouterr().out
+    assert "не в сумме" in out and "итог не в $" not in out
+    assert "закрыто по билету брокера 0" in out and "посчитано отдельно: 1 на -12.50 USD" in out
+    assert "+0.00 USD" in out  # the dollar column is empty because nothing was attributable

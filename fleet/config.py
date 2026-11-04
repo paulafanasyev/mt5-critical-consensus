@@ -17,6 +17,9 @@ DEFAULT_TERMINAL_SOURCE = pathlib.Path(r"C:\Program Files\MetaTrader 5")
 FLEET_ROOT = pathlib.Path(r"C:\mt5-fleet")
 DEFAULT_STORE = FLEET_ROOT / "fleet.sqlite"
 CONFIG_PATH = pathlib.Path(__file__).resolve().parents[1] / "config" / "accounts.yaml"
+# The stand is one file, in one place, and every process that can spend money looks at the same one.
+# A shard started by hand with no flag is the case that must not be able to trade.
+PAUSE_FILE = FLEET_ROOT / "PAUSE"
 
 
 class ConfigError(ValueError):
@@ -148,6 +151,17 @@ _PORTFOLIO_KEYS = {f.name for f in dataclasses.fields(PortfolioLimits)}
 # Keys a real registry may still carry from before the one-terminal-per-session rule was measured
 # away. They are ignored with a warning; a genuinely unknown key stays a hard error.
 _RETIRED_PORTFOLIO_KEYS = ("max_worker_processes",)
+
+
+def server_key(text) -> str:
+    """One server name, however it was typed.
+
+    The broker writes its own spelling into `account_info`, the registry is hand-edited, and the
+    terminal log is a text file someone saved with a trailing space. Every comparison of two account
+    identities — attach, the gate before a send, the `authorized on <server>` line, the real-money
+    permission — has to use this one normalisation, or a hand-typed registry refuses its own account.
+    """
+    return str(text or "").strip().casefold()
 
 
 def _check_keys(where: str, data: dict[str, Any], allowed: set[str]) -> None:

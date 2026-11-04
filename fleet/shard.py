@@ -15,7 +15,7 @@ import sys
 import time
 
 from . import worker
-from .config import DEFAULT_STORE, load
+from .config import CONFIG_PATH, DEFAULT_STORE, PAUSE_FILE, load
 from .store import Store
 
 
@@ -39,11 +39,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--live", action="store_true", help="разрешить реальные ордера")
-    parser.add_argument("--pause-file", default="")
+    # The stand is not a flag an operator has to remember to pass. A shard started by hand obeys the
+    # same file the conductor writes, so `PAUSE` on disk stops entries in every process on this box.
+    parser.add_argument("--pause-file", default=str(PAUSE_FILE))
     parser.add_argument("--parent-pid", type=int, default=0)
     args = parser.parse_args(argv)
 
-    config_path = pathlib.Path(args.config).resolve() if args.config else None
+    # The registry this process watches must be the registry it trades. `load(None)` reads
+    # CONFIG_PATH, so watching `None` because the operator used the documented `run --shards 0`
+    # would leave the halt inert while a live file was edited under the shard.
+    config_path = (pathlib.Path(args.config).resolve() if args.config
+                   else CONFIG_PATH.resolve())
     pause = pathlib.Path(args.pause_file) if args.pause_file else None
     store = Store(args.store)
     config = load(config_path)

@@ -1227,8 +1227,12 @@ def test_a_close_on_another_account_never_pays_this_trade(tmp_path) -> None:
     assert book["profit_gross_usd"] == 0.0
 
 
-def test_one_close_is_never_paid_out_twice(tmp_path) -> None:
-    """A replayed fill writes two candidates for one ticket: one of them gets the close, not both."""
+def test_two_rows_on_one_ticket_pay_the_drift_once_and_take_no_close(tmp_path) -> None:
+    """A retry journalled the same fill twice, and a netting merge stamps two entries one ticket.
+
+    Either way this book cannot say which line that ticket's close belongs to, so it pays none of
+    them and calls none of them open; and one entry into the market is one 25-point wait, not two.
+    """
     store = Store(tmp_path / "book.sqlite")
     for _ in range(2):
         store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02,
@@ -1238,9 +1242,103 @@ def test_one_close_is_never_paid_out_twice(tmp_path) -> None:
                 by="парк", currency="USD", rate_to_usd=1.0, profit_usd=50.0)
     book = candidates.ledger(store)
     assert book["candidates"] == 2
-    assert book["closed"] == 1 and book["open"] == 1
-    assert book["settled_unpriced"] == 0
-    assert book["profit_gross_usd"] == 50.0
+    assert book["closed"] == 0 and book["open"] == 0  # neither settled nor waiting: unattributable
+    assert book["shared_ticket"] == 2
+    assert [t["shared"] for t in book["trades"]] == [True, True]
+    assert book["profit_gross_usd"] == 0.0 and book["win_rate"] is None
+    assert book["drift_cost_usd"] == 0.5 and book["drift_priced"] == 1
+    assert book["mean_drift_points"] == 25.0
+
+
+def test_a_second_entry_on_the_same_ticket_is_not_called_open(tmp_path) -> None:
+    """The gap this replaced: the duplicate stayed «открыт» forever, because the close went to the first."""
+    store = Store(tmp_path / "book.sqlite")
+    store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02, ticket=7,
+                ticket_source="token", currency="USD", rate_to_usd=1.0, drift_points=25.0,
+                drift_cost=0.5, drift_cost_usd=0.5, risk_usd=2.0)
+    store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02, ticket=7,
+                ticket_source="only_position", currency="USD", rate_to_usd=1.0,
+                drift_points=25.0, drift_cost=0.5, drift_cost_usd=0.5, risk_usd=2.0)
+    store.event("a", "closed", symbol="EURUSD", ticket=7, reason="тейк", profit=50.0,
+                by="парк", currency="USD", rate_to_usd=1.0, profit_usd=50.0)
+    book = candidates.ledger(store)
+    assert book["open"] == 0 and book["shared_ticket"] == 2
+    assert book["guessed"] == 1  # one of the two rows still carries an inferred ticket
+
+
+def test_a_settled_guess_is_counted_and_shown_outside_the_sum(tmp_path) -> None:
+    """Finding: the CLI promised guessed joins stayed out of the totals while the ledger added them.
+
+    They are out now: `closed`, `win_rate` and `profit_gross_usd` are token-only, and a guessed
+    outcome still worth reading lives in its own counter.
+    """
+    store = Store(tmp_path / "book.sqlite")
+    store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02, ticket=7,
+                ticket_source="only_position", currency="USD", rate_to_usd=1.0,
+                drift_points=0.0, drift_cost=0.0, drift_cost_usd=0.0, risk_usd=2.0)
+    store.event("a", "closed", symbol="EURUSD", ticket=7, reason="стоп", profit=-12.5,
+                by="брокер", currency="USD", rate_to_usd=1.0, profit_usd=-12.5)
+    book = candidates.ledger(store)
+    assert book["closed"] == 0 and book["win_rate"] is None
+    assert book["profit_gross_usd"] == 0.0
+    assert book["closed_guessed"] == 1 and book["guessed_profit_usd"] == -12.5
+    row = book["trades"][0]
+    assert row["settled"] and not row["attributable"]
+    assert row["profit_gross_usd"] is None and row["guessed_profit_usd"] == -12.5
+    assert book["settled_unpriced"] == 0  # it is priced, it simply is not ours to sum
+
+
+def test_a_break_even_close_is_not_counted_as_a_loss(tmp_path) -> None:
+    store = Store(tmp_path / "book.sqlite")
+    for ticket, profit in ((7, 0.0), (8, 4.0), (9, -4.0)):
+        store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02,
+                    ticket=ticket, ticket_source="token", currency="USD", rate_to_usd=1.0,
+                    drift_points=1.0, drift_cost=0.02, drift_cost_usd=0.02, risk_usd=2.0)
+        store.event("a", "closed", symbol="EURUSD", ticket=ticket, reason="в ноль",
+                    profit=profit, by="парк", currency="USD", rate_to_usd=1.0,
+                    profit_usd=profit)
+    book = candidates.ledger(store)
+    assert book["closed"] == 3 and book["flat"] == 1
+    assert book["win_rate"] == 50.0  # one win of two decided trades, not one of three
+    assert book["profit_gross_usd"] == 0.0
+
+
+def test_a_drift_that_was_never_converted_is_never_printed_as_free(tmp_path: pathlib.Path,
+                                                                    capsys) -> None:
+    """Finding: points measured without a rate came out as «+0.00 USD суммарно» — a zero, not a gap."""
+    import sys
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import fleet_cli
+
+    store = Store(tmp_path / "book.sqlite")
+    store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02, ticket=7,
+                ticket_source="token", currency="RUB", drift_points=25.0,
+                drift_cost=0.5, risk_usd=2.0)
+    assert fleet_cli.main(["--store", str(store.path), "candidates"]) == 0
+    out = capsys.readouterr().out
+    assert "в долларах не посчитано" in out and "суммарно" not in out
+    assert "дрейф без курса" in out
+    assert "+0.00 USD суммарно" not in out
+
+
+def test_a_window_that_ran_out_before_any_candidate_says_that(tmp_path: pathlib.Path,
+                                                              capsys) -> None:
+    """Finding: a journal of closes with the window spent on them read as an empty book."""
+    import sys
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import fleet_cli
+
+    store = Store(tmp_path / "book.sqlite")
+    for index in range(4):
+        store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02,
+                    ticket=100 + index, drift_points=1.0)
+    for index in range(6):
+        store.event("a", "closed", symbol="EURUSD", ticket=100 + index, reason="стоп",
+                    profit=-1.0)
+    assert fleet_cli.main(["--store", str(store.path), "candidates", "--limit", "4"]) == 0
+    out = capsys.readouterr().out
+    assert "разобрано только" in out and "Увеличь --limit" in out
+    assert "кандидатов пока нет" not in out
 
 
 def test_a_short_window_is_reported_as_partial_not_as_an_empty_book(tmp_path) -> None:

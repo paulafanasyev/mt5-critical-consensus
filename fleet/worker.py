@@ -14,6 +14,7 @@ import dataclasses
 import datetime as dt
 import json
 import pathlib
+import re
 import sqlite3
 import time
 import traceback
@@ -22,7 +23,7 @@ import types
 import MetaTrader5 as mt5
 
 from . import broker, candidates, network, risk, strategy, terminals
-from .config import Account, FleetConfig, local_host
+from .config import Account, FleetConfig, local_host, server_key
 from .store import Store
 
 MAX_FAILURES = 5
@@ -154,11 +155,40 @@ def _server_key(text) -> str:
 
     The broker writes its own spelling into `account_info`, the registry is hand-edited, and the
     portable marker is a text file someone saved with a trailing space. Every comparison of two
-    account identities in this file has to use the same normalisation: attach() accepted
-    `"Exness-Demo "`, the gate before the send compared the raw strings, and the park then refused
-    its own account on every symbol while the operator read `identity_lost` in the journal.
+    account identities has to use the same normalisation, and it lives in `config` so the terminal
+    log reader and the real-money gate use it too: attach() accepted `"Exness-Demo "`, the gate
+    before the send compared the raw strings, and the park then refused its own account on every
+    symbol while the operator read `identity_lost` in the journal.
     """
-    return str(text or "").strip().casefold()
+    return server_key(text)
+
+
+_NUMBERS = re.compile(r"\d+(?:[.,]\d+)?")
+
+
+def _refusal_shape(text: str) -> str:
+    """Which broker rule fired, without the measurements that made it fire.
+
+    A refusal names a distance, and the distance is a live number: fingerprint the sentence as it
+    stands and the same refusal is re-announced every tick until the position closes, which is how a
+    park that asked the broker once reads in the journal as a broker in trouble.
+    """
+    return _NUMBERS.sub("#", str(text or ""))
+
+
+def _identity_matches(who, account: Account) -> bool:
+    """Whether the terminal answering right now is the account this risk slot was reserved for.
+
+    A window that answers with no login is a mismatch, not a crash: `int(None)` would raise through
+    the reservation it was supposed to cancel and leave a dollar slot nobody owns for its whole life.
+    """
+    if who is None:
+        return False
+    try:
+        login = int(who.login)
+    except (TypeError, ValueError):
+        return False
+    return (login, _server_key(who.server)) == (account.login, _server_key(account.server))
 
 
 def _host_key(name: str) -> str:
@@ -559,7 +589,9 @@ class Worker:
                                                current_sl=float(position.sl),
                                                current_tp=float(position.tp))
                 if refused:
-                    self._report_change(key, f"{be_level:.8f}|{refused}", account.name,
+                    # Shaped, not raw: the refusal quotes the distance it saw and the distance moves
+                    # every tick. An unshaped fingerprint is a new event each cycle for one broker rule.
+                    self._report_change(key, _refusal_shape(refused), account.name,
                                         "break_even_refused", symbol=name, ticket=ticket,
                                         detail=refused)
                 else:
@@ -888,18 +920,16 @@ class Worker:
             # The portable directory proved which window answered; only a live login proves whose
             # money this order would move. A manual re-login in that window is otherwise invisible.
             sending = not (self.dry_run or (account.is_real and not self.allow_live))
-            if sending:
-                who = mt5.account_info()
+            who = mt5.account_info() if sending else None
+            if sending and not _identity_matches(who, account):
                 # Normalised exactly like attach(): a registry that types `Servername ` must not
                 # pass the attach gate and then be refused by this one on every symbol.
-                if who is None or (int(who.login), _server_key(who.server)) != (
-                        account.login, _server_key(account.server)):
-                    self.store.release(slot)
-                    self.store.event(account.name, "identity_lost", symbol=spec.name,
-                                     detail=f"перед входом отвечает "
-                                            f"{getattr(who, 'login', None)}/"
-                                            f"{getattr(who, 'server', None)}")
-                    return 0
+                self.store.release(slot)
+                self.store.event(account.name, "identity_lost", symbol=spec.name,
+                                 detail=f"перед входом отвечает "
+                                        f"{getattr(who, 'login', None)}/"
+                                        f"{getattr(who, 'server', None)}")
+                return 0
             try:
                 if not sending:
                     self.store.release(slot)
@@ -913,10 +943,14 @@ class Worker:
             except broker.StopsRefused as exc:
                 # The server's own minimum distance, read before the send: nothing was ordered, the
                 # reservation is freed, and the plan is left intact instead of being widened into a
-                # trade whose risk nobody sized.
+                # trade whose risk nobody sized. Once per rule, not once per cycle: the same symbol
+                # refuses the same way until the strategy changes, and a journal full of repeats hides
+                # every other fact in it.
                 self.store.release(slot)
-                self.store.event(account.name, "entry_stops_refused", symbol=spec.name,
-                                 side=signal.side, volume=volume, detail=str(exc)[:300])
+                self._report_change(f"stopsrefused:{account.name}:{spec.name}",
+                                    _refusal_shape(str(exc)), account.name,
+                                    "entry_stops_refused", symbol=spec.name,
+                                    side=signal.side, volume=volume, detail=str(exc)[:300])
                 continue
             except broker.BrokerError as exc:
                 self.store.release(slot)
@@ -928,27 +962,32 @@ class Worker:
                 # nobody owns, and it holds the portfolio risk cap for its full 600 s.
                 self.store.release(slot)
                 raise
-            self.store.trade(account.name, snapshot.login, spec.name, signal.side,
-                             execution.volume, signal.price, volume, execution.retcode,
-                             signal.reason, execution.token)
-            self.store.event(account.name, "opened", symbol=spec.name, side=signal.side,
-                             volume=execution.volume, price=execution.price,
-                             requested=signal.price, reason=signal.reason)
-            fresh = broker.open_positions(spec.name, account.magic)
-            for position in fresh:
-                self._note_meta(f"atr:{account.name}:{int(position.ticket)}",
-                                f"{signal.atr:.8f}")
+            # Everything from the fill on is a fact about a lot the broker already owns. None of it
+            # may strand the reservation: a slot nobody releases holds the portfolio risk cap for its
+            # whole 600 s, and the money is already in the market whatever these writes answer.
             try:
-                fresh_positions = risk.positions_for(account)
-                self.store.save_positions(account.name, fresh_positions,
-                                          self._mirror_risk_usd(account, fresh_positions, rate))
-            except Exception as exc:  # noqa: BLE001 - the lot is already at the broker
-                # A read that failed after the fill must not strand the reservation: an owned slot
-                # nobody releases holds the portfolio risk cap for its full lifetime, and the next
-                # cycle re-reads the positions anyway.
-                self.store.event(account.name, "mirror_refresh_failed", symbol=spec.name,
-                                 error=f"{type(exc).__name__}: {exc}"[:160])
-            self.store.release(slot)
+                self.store.trade(account.name, snapshot.login, spec.name, signal.side,
+                                 execution.volume, signal.price, volume, execution.retcode,
+                                 signal.reason, execution.token)
+                self.store.event(account.name, "opened", symbol=spec.name, side=signal.side,
+                                 volume=execution.volume, price=execution.price,
+                                 requested=signal.price, reason=signal.reason)
+                fresh = broker.open_positions(spec.name, account.magic)
+                for position in fresh:
+                    self._note_meta(f"atr:{account.name}:{int(position.ticket)}",
+                                    f"{signal.atr:.8f}")
+                try:
+                    fresh_positions = risk.positions_for(account)
+                    self.store.save_positions(account.name, fresh_positions,
+                                              self._mirror_risk_usd(account, fresh_positions, rate))
+                except Exception as exc:  # noqa: BLE001 - the lot is already at the broker
+                    # A read that failed after the fill must not strand the reservation: an owned slot
+                    # nobody releases holds the portfolio risk cap for its full lifetime, and the next
+                    # cycle re-reads the positions anyway.
+                    self.store.event(account.name, "mirror_refresh_failed", symbol=spec.name,
+                                     error=f"{type(exc).__name__}: {exc}"[:160])
+            finally:
+                self.store.release(slot)
             self._mark_entry(account, spec.name)
             # Last, after the reservation is freed: bookkeeping must never be the reason a dollar
             # slot stays held. The lot is already at the broker and journalled as `opened`.

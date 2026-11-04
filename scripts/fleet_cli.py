@@ -289,27 +289,41 @@ def cmd_candidates(args: argparse.Namespace) -> int:
     """
     store = Store(args.store)
     book = candidates.ledger(store, limit=args.limit)
+    # The window ran out BEFORE the book is called empty: a journal with four hundred candidates and
+    # a --limit of twenty is not a park that traded nothing, and the reader who cannot see the cut
+    # draws exactly the opposite conclusion from the sentence below it.
+    if book["truncated"]:
+        print(f"ВНИМАНИЕ: в журнале {book['journal_rows']} кандидатов, разобрано только "
+              f"{book['candidates']} самых свежих — считайте цифры ниже частичными "
+              "(--limit больше)")
     if not book["candidates"]:
+        if book["truncated"]:
+            print(f"кандидатов в прочитанном окне нет: в журнале их {book['journal_rows']}, "
+                  f"но самые свежие строки — закрытия других сделок. Увеличь --limit.")
+            return 0
         print("кандидатов пока нет: парк не исполнил ни одной сделки, которую можно было бы "
               "считать. Это не «плохая статистика» — это отсутствие измерения.")
         return 0
     win_rate = "—" if book["win_rate"] is None else f"{book['win_rate']}%"
     drift_mean = "—" if book["mean_drift_points"] is None else f"{book['mean_drift_points']}"
-    print(f"кандидатов {book['candidates']} | закрыто {book['closed']} | "
-          f"открыто {book['open']} | без билета {book['blind']} | винрейт {win_rate}")
-    if book["truncated"]:
-        print(f"ВНИМАНИЕ: в журнале {book['journal_rows']} кандидатов, разобрано только "
-              f"{book['candidates']} самых свежих — считайте цифры ниже частичными "
-              "(--limit больше)")
+    print(f"кандидатов {book['candidates']} | закрыто по билету брокера {book['closed']} | "
+          f"открыто {book['open']} | без билета {book['blind']} | винрейт {win_rate}"
+          + (f" (ничьих {book['flat']})" if book["flat"] else ""))
     # A ticket nobody read from the order comment is not the same evidence as one the broker named,
-    # and a finished trade whose currency the journal never wrote down is not a zero: both are
-    # counted here instead of quietly disappearing from, or into, the dollar columns.
+    # a ticket two entries share is not one trade's outcome, and money the journal could not price
+    # is not a zero: all three are counted here instead of quietly leaving or entering the totals.
     caveats = []
     if book["guessed"]:
         sources = ", ".join(f"{source} {count}" for source, count in book["by_source"].items()
                             if source != "token")
         caveats.append(f"билет не прочитан из комментария (не «token»): {book['guessed']} "
-                       f"({sources}) — их исходы в сумме не участвуют")
+                       f"({sources}) — их исходы вне сумм и вне винрейта")
+    if book["closed_guessed"]:
+        caveats.append(f"из них закрыто и посчитано отдельно: {book['closed_guessed']} "
+                       f"на {book['guessed_profit_usd']:+.2f} USD")
+    if book["shared_ticket"]:
+        caveats.append(f"{book['shared_ticket']} строк делят один билет с другой сделкой: "
+                       "его закрытие не присоединено ни к одной из них")
     if book["settled_unpriced"]:
         caveats.append(f"сделка закрыта, валюты записи нет: {book['settled_unpriced']} — "
                        "в прибыль в долларах не вошла")
@@ -317,12 +331,19 @@ def cmd_candidates(args: argparse.Namespace) -> int:
         caveats.append(f"дрейф без курса к доллару: {book['drift_unpriced']} — в счёт не вошёл")
     if caveats:
         print("оговорки: " + "; ".join(caveats))
-    drift_bill = ("дрейфа не измерено ни по одному входу" if book["mean_drift_points"] is None
-                  else f"ожидание стоило {drift_mean} пунктов в среднем, "
-                       f"{book['drift_cost_usd']:+.2f} USD суммарно")
-    print(f"прибыль закрытых (валовая, как её отдаёт брокер — без комиссии и свопа, в долларах "
-          f"только там, где журнал назвал курс): {book['profit_gross_usd']:+.2f} USD | "
-          f"{drift_bill}")
+    if book["mean_drift_points"] is None:
+        drift_bill = "дрейфа не измерено ни по одному входу"
+    elif not book["drift_priced"]:
+        # Points were measured and never converted: printing `+0.00 USD` here would say the wait was
+        # free, when the truth is that nobody priced it.
+        drift_bill = (f"ожидание стоило {drift_mean} пунктов в среднем, в долларах не посчитано "
+                      f"(дрейф без курса: {book['drift_unpriced']})")
+    else:
+        drift_bill = (f"ожидание стоило {drift_mean} пунктов в среднем, "
+                      f"{book['drift_cost_usd']:+.2f} USD суммарно по {book['drift_priced']} входам")
+    print(f"прибыль закрытых по билету брокера (валовая, как её отдаёт брокер — без комиссии и "
+          f"свопа, в долларах только там, где журнал назвал курс): "
+          f"{book['profit_gross_usd']:+.2f} USD | {drift_bill}")
     print(f"\n{'тикет':>10} {'счёт':>10} {'символ':>10} {'стор':>5} {'лот':>6} "
           f"{'дрейф,п':>9} {'дрейф,$':>9} {'итог,$':>9} {'кто':>7} {'выход':>10}")
     for row in book["trades"]:
@@ -331,12 +352,22 @@ def cmd_candidates(args: argparse.Namespace) -> int:
         profit = row["profit_gross_usd"]
         volume = row["volume"]
         lot = f"{volume:.2f}" if isinstance(volume, (int, float)) else "—"
-        # A candidate with no ticket can never be joined to its own close, so «открыт» would be
-        # a lie about a trade that may well have finished long ago. A close the journal cannot
-        # price is said as such: it happened, and its money is in a currency nobody wrote down.
-        outcome = "нет билета" if row["ticket"] == 0 else (
-            "итог не в $" if row["settled"] and profit is None else (
-                "открыт" if profit is None else f"{profit:+.2f}"))
+        # A candidate with no ticket can never be joined to its own close, so «открыт» would be a
+        # lie about a trade that may well have finished long ago. A close the journal cannot price
+        # is said as such: it happened, and its money is in a currency nobody wrote down. A settled
+        # row whose ticket only was inferred finished, but its outcome is not this column's number.
+        if row["ticket"] == 0:
+            outcome = "нет билета"
+        elif row["shared"]:
+            outcome = "общий билет"
+        elif not row["settled"]:
+            outcome = "открыт"
+        elif row["guessed_profit_usd"] is None:
+            outcome = "итог не в $"
+        elif not row["attributable"]:
+            outcome = "не в сумме"
+        else:
+            outcome = f"{profit:+.2f}"
         print(f"{row['ticket']:>10} {row['account'][:10]:>10} {row['symbol'][:10]:>10} "
               f"{row['side']:>5} {lot:>6} "
               f"{f'{drift:.1f}' if drift is not None else '—':>9} "

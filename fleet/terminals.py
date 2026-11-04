@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import time
 
-from .config import Account
+from .config import Account, server_key
 
 SKIP_DIRS = {"config", "bases", "logs", "profiles", "sounds", "tester", "mql5"}
 WRITABLE_DIRS = ("config", "logs", "MQL5", "MQL5/Experts", "MQL5/Scripts", "profiles", "sounds",
@@ -306,8 +306,14 @@ def last_log_lines(account: Account, count: int = 40) -> list[str]:
 
 
 def authorized(account: Account) -> bool:
-    marker = f"authorized on {account.server}"
-    return any(marker in line for line in last_log_lines(account, 200))
+    """Whether this terminal's own log says the account's server authorised the login.
+
+    The registry is hand-edited and the log line is the broker's spelling, so both go through the
+    same normalisation as every other identity comparison: a registry that types `Servername ` or
+    `servername` must not leave the park waiting on a login that already happened.
+    """
+    marker = f"authorized on {server_key(account.server)}"
+    return any(marker in server_key(line) for line in last_log_lines(account, 200))
 
 
 def wait_authorized(account: Account, timeout: float = 30.0, poll: float = 1.5) -> bool:

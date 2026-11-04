@@ -94,6 +94,7 @@ void SendState()
          body += ",";
       first = false;
       body += "{\"ticket\":" + IntegerToString((long)ticket) +
+              ",\"magic\":" + IntegerToString((long)PositionGetInteger(POSITION_MAGIC)) +
               ",\"symbol\":\"" + PositionGetString(POSITION_SYMBOL) + "\"" +
               ",\"type\":" + IntegerToString((int)PositionGetInteger(POSITION_TYPE)) +
               ",\"volume\":" + DoubleToString(PositionGetDouble(POSITION_VOLUME), 2) +

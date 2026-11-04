@@ -17,10 +17,9 @@ import subprocess
 import sys
 import time
 
-from .config import FLEET_ROOT, FleetConfig, local_host, load
+from .config import FLEET_ROOT, PAUSE_FILE, FleetConfig, local_host, load
 from .store import Store
 
-PAUSE_FILE = FLEET_ROOT / "PAUSE"
 STATE_FILE = FLEET_ROOT / "conductor.json"
 LOCK_FILE = FLEET_ROOT / "conductor.lock"
 BACKOFF = (5, 10, 30, 60, 300)
