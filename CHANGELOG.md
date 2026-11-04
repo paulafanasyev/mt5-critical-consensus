@@ -143,6 +143,68 @@ machine with the shipped code (`python scripts/fleet_cli.py terminals`): two win
   with their timestamps, including that the last one's `opened: 1` counts a **dry-run** signal
   (USDJPY buy 0,1) and that no order ever left for the broker.
 
+### What the ownership and measurement critics found: the park signed somebody else's lots, and its own bill never printed
+
+Both accusations came from critics that read the installed API instead of the code's comments, and
+both were true. They were reproduced before being fixed: run against a snapshot of the previous
+`HEAD` (`agent_data/pre_fix`, same day), **18 of the tests in `tests/test_fleet_regressions.py`
+fail** — all seven of "whose lot decides which cap" and eleven of the measurement/candidate ones.
+The two new tests that pass there are `test_the_reply_object_itself_carries_no_position_id` and
+`test_a_broken_import_cannot_be_sneaked_past_the_allowlist`: they assert facts that were already
+true, which is exactly why the code was wrong and the suite was not.
+
+- `fleet/risk.py` + `fleet/worker.py` (`a shared account is not our book`): `can_open` counted
+  **every** position on the account against `max_open_positions`, and the exit pass modified and
+  closed whatever was on the signal symbol — including the operator's manual lot. Concentration
+  caps now read `risk.own_in(account, positions)` (magic equal to the account's), while the money
+  caps keep reading the whole account, because a manual lot moves the same equity. The exit pass
+  takes `own` and leaves `foreign` untouched, and reports it instead.
+- `fleet/config.py` (the account that would own everything): `magic` is the only field separating
+  the park's lots from the operator's, and MT5 marks a manual trade with `0`, so a registry with
+  `magic: 0` made every manual lot "ours". `magic <= 0` is now a `ConfigError` at load.
+- `fleet/worker.py::_report_foreign_lots` + `_report_change` (a signal that fires every cycle is
+  noise): the foreign book was announced once per ever; it is now announced once per **change** of
+  the ticket set, from one meta row per account, and a lot the park entered (an `atr:` note exists)
+  that now reports a foreign magic is announced as `park_lot_unattributed` — nobody is trailing it.
+- `fleet/worker.py::_meta`/`_note_meta` (a locked journal must not stand between an account and its
+  exits): `set_meta` propagated `sqlite3.OperationalError` after its 15 s busy timeout, so a report
+  could raise inside the exit pass. Reads and writes of report fingerprints now swallow only
+  `sqlite3.Error` and return "not noted", which re-announces next cycle rather than losing the fact.
+- `fleet/broker.py::resolve_ticket` (the measurement that justified the feature never fired):
+  `Execution.position_ticket` came from `getattr(result, "position_id", 0)`, and
+  `MetaTrader5.OrderSendResult` is an 11-field structseq — `retcode, deal, order, volume, price,
+  bid, ask, comment, request, request_id, retcode_external` — with **no** `position_id`. Every row
+  got ticket 0, `ledger()` joined nothing, `mean_drift_points` was `None` and `drift_cost_usd` 0,00
+  forever. Tickets are now resolved from the `fleet-<6 hex>` comment the order was stamped with,
+  falling back to "exactly one own lot on this symbol" and otherwise refusing to guess, with the
+  level recorded per row as `ticket_source` (`token` / `only_position` / `unknown`).
+- `fleet/strategy.py::_side_price` (a sell was billed for a cost it never paid): the signal price
+  was the ask for both sides, so every short entry showed the full spread as "drift, the price of
+  waiting". Buys are stamped at ask, sells at bid, and the stop/target geometry hangs off the same
+  side's price; `(bid, ask)` come from one tick read.
+- `fleet/candidates.py` + `scripts/fleet_cli.py` (three columns overclaimed): the profit column is
+  `profit_gross_usd` and is printed as gross — the broker's own figure, no commission, no swap —
+  because the park has no commission rate of its own to charge it with; a ledger cut short by its
+  limit prints `journal_rows` and says it is partial instead of looking like an empty book; a row
+  with no ticket says `нет билета` rather than `открыт`; and non-finite broker reads are blanks,
+  never numbers. The join is `(account, symbol.casefold(), ticket)`, consumed with `pop()`, so one
+  close cannot pay out two trades and a close on another account cannot pay this one.
+- `fleet/candidates.py::record` (a note that silently overwrites a journal column): keys the journal
+  owns (`ts`, `account`, `kind`) now raise instead of being spread into `Store.event`.
+- `fleet/store.py` + `fleet/worker.py`: `events_of(kinds, limit)` and `count_events(kind)` so the
+  ledger reads candidates and closes in one pass and can tell a truncated read from a small book;
+  a candidate note that raises writes `candidate_note_failed` and cannot abort the cycle behind it.
+- Tests: `tests/test_fleet_regressions.py` grew the two sections
+  "naming the position a fill made (measured against the installed API)" and
+  "whose lot decides which cap", plus candidate-behaviour tests including
+  `test_the_reply_object_itself_carries_no_position_id` — the root cause is asserted against the
+  installed package, not against a comment. Whole suite on this checkout: **1343 passed,
+  10 skipped in 129,31 s**; the five fleet files are **177**; `scripts/check_mql5_safety.py` re-run
+  same day: **473 invariants, 105 mutations rejected**. Under `FLEET_STRICT_GUARD=1` the fleet
+  files stay green, so none of them writes to the combat journal — which still holds
+  `3 cycle + 1 entry(dry)`, zero `opened`, zero `candidate`: the drift bill starts with the first
+  real lot, and `entry(gated)`/`entry(dry)` deliberately never enter the book.
+
 ## Unreleased — the status line that reported a live chain over a dead transport
 
 - `agent_data/live_gold_ema_policy.yaml` (a claim this repo's own evidence refutes): its header said the gold EMA 50/200 variant was "the only family that was positive in the two-year replay over real broker bars". Both study files say the opposite — `docs/evidence/gold_study_development.txt` gives `ema n=618 win 31.9% meanR -0.368 CI [-0.525,-0.205]` on PAXG and `docs/evidence/gold_study_development_xauusd.txt` gives `ema n=124 win 41.9% meanR -0.261 [-0.635,+0.139]` on the broker's own XAUUSD, and **every rule row in both tables is negative at the point estimate**. So the live forward run has been testing a hypothesis the replay already refuted, and its header was the reason. The comment now carries both tables, the −31,13 realized on 2026-11-02, and the fact that all three closes came from outside the chain (magic 0, empty comment) so they measure nothing. No key was changed: the file still runs EMA 50/200 with `max_open_positions: 1`, and a running process would not see a policy edit anyway — `load_policy()` is called once, at `scripts/run_mt5_demo_trading.py:1384`, not per cycle.
