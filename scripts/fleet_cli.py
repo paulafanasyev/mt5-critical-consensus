@@ -184,11 +184,18 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if pid is None:
         print(f"{account.name}: из {account.data_dir} ничего не запущено, останавливать нечего")
         return 0
-    Store(args.store).event(account.name, "window_stopped", pid=pid,
-                            directory=str(account.data_dir))
+    # taskkill can fail and say nothing: access denied, or the terminal re-spawned itself under a
+    # new pid. An operator who reads "остановлено" about a window that is still up will act on it.
+    still = sorted(terminals.pids_alive([pid]))
+    Store(args.store).event(account.name, "window_stopped" if not still else "window_stop_failed",
+                            pid=pid, directory=str(account.data_dir))
+    if still:
+        print(f"{account.name}: pid {pid} всё ещё работает — `taskkill` его не снял "
+              "(отказ доступа или терминал переродился); окно не остановлено")
+        return 1
     print(f"{account.name}: окно pid {pid} остановлено")
     print("  позиции у брокера остались открытыми: цикл парка поднимет окно сам, "
-          "но до тех пор по этому счету выходы не ведутся")
+          "но до тех пор по этому счёту выходы не ведутся")
     return 0
 
 
@@ -289,22 +296,33 @@ def cmd_candidates(args: argparse.Namespace) -> int:
     win_rate = "—" if book["win_rate"] is None else f"{book['win_rate']}%"
     drift_mean = "—" if book["mean_drift_points"] is None else f"{book['mean_drift_points']}"
     print(f"кандидатов {book['candidates']} | закрыто {book['closed']} | "
-          f"открыто {book['open']} | винрейт {win_rate}")
-    print(f"прибыль закрытых: {book['profit_usd']:+.2f} USD | ожидание стоило "
-          f"{drift_mean} пунктов в среднем, {book['drift_cost_usd']:+.2f} USD суммарно")
+          f"открыто {book['open']} | без билета {book['blind']} | винрейт {win_rate}")
+    if book["truncated"]:
+        print(f"ВНИМАНИЕ: в журнале {book['journal_rows']} кандидатов, разобрано только "
+              f"{book['candidates']} самых свежих — считайте цифры ниже частичными "
+              "(--limit больше)")
+    drift_bill = ("дрейфа не измерено ни по одному входу" if book["mean_drift_points"] is None
+                  else f"ожидание стоило {drift_mean} пунктов в среднем, "
+                       f"{book['drift_cost_usd']:+.2f} USD суммарно")
+    print(f"прибыль закрытых (валовая, как её отдаёт брокер — без комиссии и свопа): "
+          f"{book['profit_gross_usd']:+.2f} USD | {drift_bill}")
     print(f"\n{'тикет':>10} {'счёт':>10} {'символ':>10} {'стор':>5} {'лот':>6} "
           f"{'дрейф,п':>9} {'дрейф,$':>9} {'итог,$':>9} {'выход':>10}")
     for row in book["trades"]:
         drift = row["drift_points"]
         cost = row["drift_cost_usd"]
-        profit = row["profit_usd"]
+        profit = row["profit_gross_usd"]
         volume = row["volume"]
         lot = f"{volume:.2f}" if isinstance(volume, (int, float)) else "—"
+        # A candidate with no ticket can never be joined to its own close, so «открыт» would be
+        # a lie about a trade that may well have finished long ago.
+        outcome = "нет билета" if row["ticket"] == 0 else (
+            "открыт" if profit is None else f"{profit:+.2f}")
         print(f"{row['ticket']:>10} {row['account'][:10]:>10} {row['symbol'][:10]:>10} "
               f"{row['side']:>5} {lot:>6} "
               f"{f'{drift:.1f}' if drift is not None else '—':>9} "
               f"{f'{cost:+.2f}' if cost is not None else '—':>9} "
-              f"{f'{profit:+.2f}' if profit is not None else 'открыт':>9} "
+              f"{outcome:>10} "
               f"{str(row['exit'])[:10]:>10}")
     print("\nчто это доказывает: сколько пункта и доллара стоит подтверждение сигнала."
           "\nчего оно не доказывает: что раньше было бы лучше — для этого нужна прибыльная "

@@ -43,9 +43,22 @@ def _trend(name: str) -> str:
     return ""
 
 
-def _price(name: str) -> float:
+def _prices(name: str) -> tuple[float, float]:
+    """(bid, ask) for one symbol in one read: the two sides have to come from the same tick."""
     tick = mt5.symbol_info_tick(name)
-    return float(tick.ask) if tick else 0.0
+    if not tick:
+        return 0.0, 0.0
+    return float(tick.bid), float(tick.ask)
+
+
+def _side_price(bid: float, ask: float, side: str) -> float:
+    """The price this side can actually be filled at: a buy pays ask, a sell receives bid.
+
+    Stamping both sides with the ask bills a sell the whole spread as if it were the cost of
+    waiting for confirmation — at a still market the candidate book would charge a sell 30 points
+    for nothing — and it puts a sell's stop one spread from the price that triggers it.
+    """
+    return ask if side.casefold() == "buy" else bid
 
 
 def _passes_filters(account: Account, spec: broker.BrokerSymbol, atr: float,
@@ -67,8 +80,8 @@ def trend_signal(account: Account, base_symbol: str) -> Signal | None:
     atr = broker.atr(spec.name, mt5.TIMEFRAME_H1)
     if atr <= 0:
         return None
-    price = _price(spec.name)
-    if not _passes_filters(account, spec, atr, price):
+    bid, ask = _prices(spec.name)
+    if not _passes_filters(account, spec, atr, ask):
         return None
     direction = _trend(spec.name)
     if not direction:
@@ -83,10 +96,12 @@ def trend_signal(account: Account, base_symbol: str) -> Signal | None:
     if direction == "up":
         if last_close < fast:
             return None
+        price = _side_price(bid, ask, "buy")
         return Signal(base_symbol, "buy", "H4+H1 тренд вверх, цена над EMA21",
                       price, price - stop_distance, price + take_distance, atr)
     if last_close > fast:
         return None
+    price = _side_price(bid, ask, "sell")
     return Signal(base_symbol, "sell", "H4+H1 тренд вниз, цена под EMA21",
                   price, price + stop_distance, price - take_distance, atr)
 
@@ -99,8 +114,8 @@ def breakout_signal(account: Account, base_symbol: str, lookback: int = 24) -> S
     if bars is None or len(bars) < lookback + 2:
         return None
     atr = broker.atr(spec.name, mt5.TIMEFRAME_H1)
-    price = _price(spec.name)
-    if not _passes_filters(account, spec, atr, price):
+    bid, ask = _prices(spec.name)
+    if not _passes_filters(account, spec, atr, ask):
         return None
     window = bars[-(lookback + 1):-1]
     high = max(float(row["high"]) for row in window)
@@ -110,9 +125,11 @@ def breakout_signal(account: Account, base_symbol: str, lookback: int = 24) -> S
     stop_distance = atr * account.risk.stop_atr
     take_distance = atr * _take_atr(account)
     if close > high and direction == "up":
+        price = _side_price(bid, ask, "buy")
         return Signal(base_symbol, "buy", f"пробой {lookback}-часового максимума",
                       price, price - stop_distance, price + take_distance, atr)
     if close < low and direction == "down":
+        price = _side_price(bid, ask, "sell")
         return Signal(base_symbol, "sell", f"пробой {lookback}-часового минимума",
                       price, price + stop_distance, price - take_distance, atr)
     return None

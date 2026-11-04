@@ -17,7 +17,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from fleet import broker, candidates, conductor, terminals, worker  # noqa: E402
+from fleet import broker, candidates, conductor, config, terminals, worker  # noqa: E402
 from fleet.config import FleetConfig, PortfolioLimits  # noqa: E402
 from fleet.store import Store  # noqa: E402
 
@@ -909,7 +909,7 @@ def test_the_ledger_joins_by_ticket_and_counts_what_it_can_not_join(tmp_path) ->
     assert book["closed"] == 1
     assert book["blind"] == 1            # ticket 0 is counted, nothing is inferred about it
     assert book["open"] == 0
-    assert book["profit_usd"] == 3.2
+    assert book["profit_gross_usd"] == 3.2
     assert book["win_rate"] == 100.0
     assert book["drift_cost_usd"] == 0.6  # the drift bill covers both entries, closed or not
     assert [t["exit"] for t in book["trades"]] == ["trailing", ""]  # oldest entry first
@@ -1026,3 +1026,342 @@ def test_the_notice_is_quiet_when_the_ceiling_is_not_the_binding_limit(
     kinds = [kind for _ts, _a, kind, _p in store.recent_events(limit=50)]
     assert "risk_under_taken" not in kinds
     assert account.risk.max_lots == 0.10
+
+
+# --- naming the position a fill made (measured against the installed API) -------------------
+# MetaTrader5.OrderSendResult is an 11-field structure — retcode, deal, order, volume, price, bid,
+# ask, comment, request, request_id, retcode_external — and there is no position id in it. A join
+# that read `result.position_id` therefore read 0 for every trade ever taken, and the candidate
+# book could never meet its own outcomes.
+
+def _reply(**over):
+    fields = {"retcode": 10009, "deal": 555, "order": 554, "volume": 0.02, "price": 1.10002}
+    fields.update(over)
+    return types.SimpleNamespace(**fields)
+
+
+def _lot(ticket, comment, magic, volume=0.02):
+    return types.SimpleNamespace(ticket=ticket, comment=comment, volume=volume,
+                                 price_open=1.10002, magic=magic, symbol="EURUSD")
+
+
+def test_a_fill_is_named_by_the_comment_token_not_by_an_id_the_api_does_not_return(
+        monkeypatch) -> None:
+    fake = FakeMT5(results=[_reply()])
+    monkeypatch.setattr(broker, "mt5", fake)
+
+    def positions_get(symbol=None):
+        if not fake.sent:
+            return []
+        return [_lot(77, fake.sent[-1]["comment"], 7000000)]
+
+    monkeypatch.setattr(fake, "positions_get", positions_get)
+    result = broker.market_order(7000000, _spec(), "buy", 0.02, 1.098, 1.104, 0.002, 2.0)
+    assert result.position_ticket == 77
+    assert result.ticket_source == "token"
+    assert result.position_ticket != 555  # the deal number is a different id space
+
+
+def test_a_netting_account_that_merged_the_lot_is_still_named(monkeypatch) -> None:
+    """The position's comment is the first order's, but one lot on this symbol and magic exists."""
+    fake = FakeMT5(results=[_reply()])
+    monkeypatch.setattr(broker, "mt5", fake)
+    monkeypatch.setattr(fake, "positions_get",
+                        lambda symbol=None: [_lot(88, "fleet-older", 7000000, volume=0.05)])
+    result = broker.market_order(7000000, _spec(), "buy", 0.02, 1.098, 1.104, 0.002, 2.0)
+    assert (result.position_ticket, result.ticket_source) == (88, "only_position")
+
+
+def test_two_lots_on_one_symbol_are_never_guesses(monkeypatch) -> None:
+    """A hedge account with a second lot here has no answer: 0/unknown, and the book calls it blind."""
+    fake = FakeMT5(results=[_reply()])
+    monkeypatch.setattr(broker, "mt5", fake)
+    monkeypatch.setattr(fake, "positions_get", lambda symbol=None: [
+        _lot(91, "fleet-aaa", 7000000), _lot(92, "fleet-bbb", 7000000)])
+    result = broker.market_order(7000000, _spec(), "buy", 0.02, 1.098, 1.104, 0.002, 2.0)
+    assert (result.position_ticket, result.ticket_source) == (0, "unknown")
+    note = candidates.entry_note(types.SimpleNamespace(
+        side="buy", price=1.10000, stop=1.098, target=1.104, atr=0.001, reason="test"),
+        result, _spec(), 2.0)
+    assert note["ticket"] == 0 and note["ticket_source"] == "unknown"
+
+
+def test_the_reply_object_itself_carries_no_position_id() -> None:
+    """The defect this section exists for, pinned to the library that shipped it."""
+    import MetaTrader5
+
+    assert not hasattr(MetaTrader5.OrderSendResult, "position_id")
+
+
+# --- what the drift bill is measured against -------------------------------------------------
+def test_a_sell_is_stamped_at_the_price_it_can_actually_get(monkeypatch) -> None:
+    """Bid-and-ask are one tick apart, and a sell filled at that bid moved zero points.
+
+    Stamped at the ask, every sell would pay the spread as if it were the price of waiting for
+    confirmation, and the mean drift the book prints would be a fact about quote reading.
+    """
+    from fleet import strategy
+
+    monkeypatch.setattr(strategy.mt5, "symbol_info_tick",
+                        lambda name: types.SimpleNamespace(bid=1.09980, ask=1.10000))
+    bid, ask = strategy._prices("EURUSD")
+    assert strategy._side_price(bid, ask, "sell") == 1.09980
+    assert strategy._side_price(bid, ask, "buy") == 1.10000
+    note = candidates.entry_note(types.SimpleNamespace(
+        side="sell", price=1.09980, stop=1.10180, target=1.09580, atr=0.001, reason="test"),
+        types.SimpleNamespace(price=1.09980, volume=0.02, position_ticket=9,
+                              ticket_source="token"), _spec(), 2.0)
+    assert note["drift_points"] == 0.0
+    assert note["drift_cost_usd"] == 0.0
+
+
+def test_a_non_finite_price_is_blank_not_a_number_in_the_book() -> None:
+    """A broken broker read hands back NaN-shaped money; JSON cannot spell it and sums would eat it."""
+    signal = types.SimpleNamespace(side="buy", price=float("nan"), stop=1.098, target=1.104,
+                                   atr=0.001, reason="test")
+    execution = types.SimpleNamespace(price=float("inf"), volume=0.02, position_ticket=7,
+                                      ticket_source="token")
+    note = candidates.entry_note(signal, execution, _spec(), float("nan"))
+    assert note["fill_price"] is None and note["signal_price"] is None
+    assert note["drift_points"] is None and note["risk_usd"] is None
+    assert "drift_cost_usd" not in note
+
+
+def test_the_note_refuses_a_key_the_journal_already_owns(tmp_path) -> None:
+    """`event` writes ts/account/kind itself; a note that tried to carry one is a bug, not a row."""
+    from fleet.config import Account
+
+    account = Account(name="a", login=1, server="S", mode="demo")
+    store = Store(tmp_path / "book.sqlite")
+    with pytest.raises(ValueError, match="журнал"):
+        candidates.record(store, account, {"symbol": "EURUSD", "kind": "candidate"})
+    assert [kind for _ts, _a, kind, _p in store.recent_events(limit=5)] == []
+
+
+def test_a_broken_import_cannot_be_sneaked_past_the_allowlist() -> None:
+    """The AST gate has to stop `__import__("MetaTrader5")`, not only `import MetaTrader5`."""
+    import ast
+
+    tree = ast.parse(pathlib.Path(candidates.__file__).read_text(encoding="utf-8"))
+    called = {node.func.id for node in ast.walk(tree)
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    # The door into the interpreter: an allowlist of imports means nothing if these are callable.
+    assert called.isdisjoint({"__import__", "eval", "exec", "compile", "globals", "locals",
+                              "vars", "open", "breakpoint"})
+    # And no reach through a dunder attribute on an object the caller handed us.
+    assert not [node for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+                and str(node.attr).startswith("__")]
+
+
+def test_a_cycle_does_not_die_when_the_candidate_note_breaks(tmp_path, monkeypatch) -> None:
+    """The lot is already at the broker; a note is a note, and the day state sits behind it."""
+    account, store, runner = _entry_desk(tmp_path, monkeypatch, balance=1000.0, max_lots=0.10)
+    monkeypatch.setattr(candidates, "record",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("бумага кончилась")))
+    result = runner._cycle(account, allow_entries=True)
+    assert result.status == "ok" and result.opened == 1
+    kinds = [kind for _ts, _a, kind, _p in store.recent_events(limit=50)]
+    assert "candidate_note_failed" in kinds and "opened" in kinds
+
+
+def test_a_close_on_another_account_never_pays_this_trade(tmp_path) -> None:
+    """Tickets are unique per server, and this book is kept for every broker at once."""
+    store = Store(tmp_path / "book.sqlite")
+    store.event("exness", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02,
+                ticket=7, drift_points=25.0, drift_cost_usd=0.5, risk_usd=2.0)
+    store.event("gtc", "closed", symbol="EURUSD", ticket=7, reason="стоп", profit=-77.7)
+    book = candidates.ledger(store)
+    assert book["closed"] == 0
+    assert book["open"] == 1
+    assert book["profit_gross_usd"] == 0.0
+
+
+def test_one_close_is_never_paid_out_twice(tmp_path) -> None:
+    """A replayed fill writes two candidates for one ticket: one of them gets the close, not both."""
+    store = Store(tmp_path / "book.sqlite")
+    for _ in range(2):
+        store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02,
+                    ticket=7, drift_points=25.0, drift_cost_usd=0.5, risk_usd=2.0)
+    store.event("a", "closed", symbol="EURUSD", ticket=7, reason="тейк", profit=50.0)
+    book = candidates.ledger(store)
+    assert book["candidates"] == 2
+    assert book["closed"] == 1 and book["open"] == 1
+    assert book["profit_gross_usd"] == 50.0
+
+
+def test_a_short_window_is_reported_as_partial_not_as_an_empty_book(tmp_path) -> None:
+    """The limit is spent on candidates and closes only, and the reader says how many it missed."""
+    store = Store(tmp_path / "book.sqlite")
+    for index in range(300):
+        store.event("a", "hold", reason="шум журнала")
+    for index in range(4):
+        store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02,
+                    ticket=100 + index, drift_points=1.0, drift_cost_usd=0.1, risk_usd=2.0)
+    book = candidates.ledger(store, limit=3)
+    assert book["candidates"] == 3  # the newest three, not "nothing"
+    assert book["journal_rows"] == 4
+    assert book["truncated"] is True
+    assert candidates.ledger(store)["truncated"] is False
+
+
+# --- whose lot decides which cap (the first critic proved these on the committed code) ------
+def _position(ticket: int, magic, symbol: str = "EURUSD", volume: float = 0.10):
+    return types.SimpleNamespace(ticket=ticket, symbol=symbol, type=0, volume=volume,
+                                 price_open=1.10, profit=0.0, sl=1.098, tp=0.0, magic=magic,
+                                 time=0)
+
+
+def test_a_foreign_book_does_not_spend_our_position_cap(tmp_path) -> None:
+    """The count cap is this strategy's concentration limit, not the whole account's.
+
+    A book full of lots the operator placed himself against a cap of three freezes the park: every
+    cycle says "лимит позиций" and nothing trades. The money limits still read the whole account,
+    because a manual lot moves the same equity — that is why the same lots stop us when the money
+    is gone, not when the slots are.
+    """
+    from fleet import risk as risk_mod
+    from fleet.config import Account, RiskProfile
+
+    account = Account(name="a", login=1, server="S", mode="demo",
+                      risk=RiskProfile(max_open_positions=2))
+    snapshot = risk_mod.AccountSnapshot(login=1, server="S", currency="USD", balance=1000.0,
+                                        equity=1000.0, margin_free=1000.0, leverage=100,
+                                        positions=8, floating=0.0, server_day="2026-11-04")
+    day = risk_mod.DayState(day="2026-11-04", start_balance=1000.0)
+    foreign = [_position(ticket, 0) for ticket in range(1, 9)]
+    assert risk_mod.can_open(account, snapshot, day, foreign)[0] is True
+    ours = [_position(20 + ticket, account.magic) for ticket in range(2)]
+    allowed, reason = risk_mod.can_open(account, snapshot, day, ours + foreign)
+    assert allowed is False and "лимит" in reason
+
+
+def test_a_lot_that_reports_no_magic_at_all_is_not_ours(tmp_path) -> None:
+    """A missing field on a broker object is not a crash in the middle of an exit pass."""
+    from fleet import risk as risk_mod
+    from fleet.config import Account
+
+    account = Account(name="a", login=1, server="S", mode="demo")
+    bare = [types.SimpleNamespace(ticket=1, symbol="EURUSD", volume=0.1)]
+    assert risk_mod.own_in(account, bare) == []
+    assert risk_mod.magic_of(bare[0]) == 0
+    assert risk_mod.magic_of(_position(2, None)) == 0
+    assert [p.ticket for p in risk_mod.own_in(account, [_position(3, account.magic)])] == [3]
+
+
+def test_a_manual_lot_on_the_signal_symbol_does_not_cost_us_the_entry(tmp_path,
+                                                                      monkeypatch) -> None:
+    """max_positions_per_symbol is our rule about our own trades."""
+    account, store, runner = _entry_desk(tmp_path, monkeypatch, balance=1000.0, max_lots=0.10)
+    # 0.01 lot: its own stop risk stays inside the portfolio cap, so the only thing that could
+    # refuse this entry is the per-symbol rule reading a lot that is not ours.
+    monkeypatch.setattr(worker.risk, "positions_for", lambda acc: [_position(31, 0, volume=0.01)])
+    sent: list = []
+
+    def order(*args, **kwargs):
+        sent.append(args)
+        return types.SimpleNamespace(volume=0.10, price=1.10025, retcode=10009, token="t",
+                                     position_ticket=7, ticket_source="token")
+
+    monkeypatch.setattr(worker.broker, "market_order", order)
+    assert runner._cycle(account, allow_entries=True).opened == 1
+    assert len(sent) == 1
+
+
+def test_a_locked_journal_still_closes_the_parks_own_lot(tmp_path, monkeypatch) -> None:
+    """A report that cannot be written must not sit between this account and its exit.
+
+    The shared book is one sqlite file for every shard on the machine. A writer that meets a lock
+    it cannot wait out used to raise before the management loop even started, so a minute of
+    unmanaged risk was the price of a line of text nobody read.
+    """
+    import sqlite3
+
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    account = Account(name="a", login=1, server="S", mode="demo")
+    store = StoreCls(tmp_path / "book.sqlite")
+    runner = worker.Worker(FleetConfig(accounts=[account]), store, allow_live=True)
+    monkeypatch.setattr(worker.broker, "symbol_exact", lambda name: _spec())
+    monkeypatch.setattr(worker.mt5, "symbol_info_tick",
+                        lambda name: types.SimpleNamespace(bid=1.101, ask=1.101))
+    monkeypatch.setattr(worker.strategy, "break_even_level", lambda *a, **k: 1.1005)
+    monkeypatch.setattr(worker.strategy, "exit_reason", lambda *a, **k: "тейк")
+
+    def locked(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "set_meta", locked)
+    monkeypatch.setattr(store, "get_meta", locked)
+    closed: list[int] = []
+    monkeypatch.setattr(worker.broker, "close_position",
+                        lambda position, *a, **k: closed.append(int(position.ticket))
+                        or float(position.volume))
+    day = worker.risk.DayState(day="2026-11-04", start_balance=1000.0)
+    assert runner._manage_positions(account, day, [_position(41, account.magic)]) == 1
+    assert closed == [41]
+
+
+def test_the_foreign_lots_are_reported_from_one_meta_row_per_account(tmp_path,
+                                                                    monkeypatch) -> None:
+    """Announcing every new set must not grow the journal one permanent row per trade ever made."""
+    import sqlite3
+
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    account = Account(name="a", login=1, server="S", mode="demo")
+    store = StoreCls(tmp_path / "book.sqlite")
+    runner = worker.Worker(FleetConfig(accounts=[account]), store, allow_live=True)
+    monkeypatch.setattr(worker.broker, "symbol_exact", lambda name: _spec())
+    monkeypatch.setattr(worker.mt5, "symbol_info_tick",
+                        lambda name: types.SimpleNamespace(bid=1.101, ask=1.101))
+    day = worker.risk.DayState(day="2026-11-04", start_balance=1000.0)
+    for first in range(1, 30):
+        runner._manage_positions(account, day, [_position(100 + first, 0)])
+    with sqlite3.connect(store.path) as conn:
+        rows = conn.execute(
+            "SELECT key FROM meta WHERE key LIKE '%foreign_positions%'").fetchall()
+    assert len(rows) == 1  # one row, and its value moves with the set
+    events = [kind for _ts, _a, kind, _p in store.recent_events(limit=200)]
+    assert events.count("foreign_positions") >= 2  # every new fact is still said
+
+
+def test_a_lot_the_park_placed_with_a_lost_magic_is_named_as_unmanaged(tmp_path,
+                                                                       monkeypatch) -> None:
+    """Our own entry note plus someone else's magic is a live risk nobody is driving."""
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    account = Account(name="a", login=1, server="S", mode="demo")
+    store = StoreCls(tmp_path / "book.sqlite")
+    runner = worker.Worker(FleetConfig(accounts=[account]), store, allow_live=True)
+    monkeypatch.setattr(worker.broker, "symbol_exact", lambda name: _spec())
+    monkeypatch.setattr(worker.mt5, "symbol_info_tick",
+                        lambda name: types.SimpleNamespace(bid=1.101, ask=1.101))
+    store.set_meta(f"atr:{account.name}:51", "0.00100000")
+    day = worker.risk.DayState(day="2026-11-04", start_balance=1000.0)
+    runner._manage_positions(account, day, [_position(51, 0)])
+    rows = [json.loads(payload) for _ts, _a, kind, payload in store.recent_events(limit=20)
+            if kind == "park_lot_unattributed"]
+    assert len(rows) == 1 and rows[0]["tickets"] == [51]
+    runner._manage_positions(account, day, [_position(51, 0)])  # the same fact, next cycle
+    assert len([1 for _ts, _a, kind, _p in store.recent_events(limit=40)
+                 if kind == "park_lot_unattributed"]) == 1
+
+
+def test_an_account_configured_with_no_magic_would_own_every_manual_lot(tmp_path) -> None:
+    """Magic 0 is the mark a hand-placed trade carries; a park configured with it takes them all."""
+    from fleet.config import ConfigError
+
+    target = tmp_path / "accounts.yaml"
+    target.write_text("""
+accounts:
+  - name: a
+    login: 1
+    server: S
+    mode: demo
+    magic: 0
+""", encoding="utf-8")
+    with pytest.raises(ConfigError, match="magic"):
+        config.load(target)

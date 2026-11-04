@@ -114,6 +114,7 @@ def test_stopping_a_window_names_one_account_and_touches_only_it(
     stopped: list[str] = []
     monkeypatch.setattr(terminals, "stop",
                         lambda account: stopped.append(account.name) or 4242)
+    monkeypatch.setattr(terminals, "pids_alive", lambda pids: set())  # the kill really took
     code = fleet_cli.main(["--config", str(config_path), "--store", str(store_path),
                            "stop", "--account", "exness"])
     assert code == 0
@@ -124,6 +125,22 @@ def test_stopping_a_window_names_one_account_and_touches_only_it(
     assert ("window_stopped", "4242") in [
         (kind, str(json.loads(payload).get("pid")))
         for _, _, kind, payload in Store(store_path).recent_events(limit=5)]
+
+
+def test_a_window_that_survived_the_kill_is_not_reported_as_stopped(
+        tmp_path: pathlib.Path, monkeypatch, capsys) -> None:
+    """`taskkill` can be refused, and a terminal re-spawns itself: the claim must follow the pid."""
+    config_path = _two_broker_registry(tmp_path)
+    store_path = tmp_path / "fleet.sqlite"
+    monkeypatch.setattr(terminals, "stop", lambda account: 4242)
+    monkeypatch.setattr(terminals, "pids_alive", lambda pids: {4242})
+    code = fleet_cli.main(["--config", str(config_path), "--store", str(store_path),
+                           "stop", "--account", "exness"])
+    assert code == 1
+    output = capsys.readouterr().out
+    assert "всё ещё работает" in output and "окно pid 4242 остановлено" not in output
+    assert [kind for _, _, kind, _ in Store(store_path).recent_events(limit=5)] == [
+        "window_stop_failed"]
 
 
 def test_the_cli_refuses_to_stop_a_window_another_machine_drives(

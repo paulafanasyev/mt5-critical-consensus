@@ -14,6 +14,7 @@ import dataclasses
 import datetime as dt
 import json
 import pathlib
+import sqlite3
 import time
 import traceback
 import types
@@ -388,15 +389,39 @@ class Worker:
         return WorkerResult(account.name, "ok", f"equity {snapshot.equity:.2f}",
                             opened=opened, closed=closed)
 
+    def _meta(self, key: str) -> str | None:
+        """A journal read that cannot break the caller.
+
+        The notes are a cache and a report. A database locked by another shard for longer than the
+        busy timeout is a reason to say nothing this cycle, not a reason to leave a live position
+        without its exit rule.
+        """
+        try:
+            return self.store.get_meta(key)
+        except sqlite3.Error:
+            return None
+
+    def _note_meta(self, key: str, value: str) -> bool:
+        """Write a journal note; False when the journal would not take it."""
+        try:
+            self.store.set_meta(key, value)
+            return True
+        except sqlite3.Error:
+            return False
+
     def _announce_once(self, key: str, account_name: str, kind: str, **detail) -> None:
         """Write an event the first time a condition appears, not once per cycle per symbol.
 
         A 90 s cycle over a hundred accounts would otherwise fill the journal the operator has to
         read with the same line, and the line that matters would be lost in it.
         """
-        if self.store.get_meta(key) == "1":
+        if self._meta(key) == "1":
             return
-        self.store.set_meta(key, "1")
+        if not self._note_meta(key, "1"):
+            # The journal is locked. A report that cannot be written must not stop the caller,
+            # because the same call site sits between this account and its exits; next cycle tries
+            # again and the condition is still true either way.
+            return
         self.store.event(account_name, kind, **detail)
 
     def _second_window(self, account: Account) -> str:
@@ -468,18 +493,8 @@ class Worker:
         # but moving their stop to break-even or closing them on a trailing rule is taking the
         # trade away from the person who opened it. Ownership is the magic number we stamp on
         # every order; anything else on the account is reported and left alone.
-        own = [p for p in positions if int(p.magic) == int(account.magic)]
-        foreign = [p for p in positions if int(p.magic) != int(account.magic)]
-        if foreign:
-            # One announcement per distinct set of foreign lots, not per cycle and not once ever:
-            # a new manual trade is a new fact the operator has to see, the same one every 90 s is
-            # noise.
-            fingerprint = "|".join(f"{int(p.ticket)}:{int(p.magic)}" for p in foreign)
-            self._announce_once(_host_key(f"foreign_positions:{account.name}:{fingerprint}"),
-                                account.name, "foreign_positions",
-                                tickets=[int(p.ticket) for p in foreign],
-                                magics=sorted({int(p.magic) for p in foreign}),
-                                lots=round(sum(float(p.volume) for p in foreign), 4))
+        own = risk.own_in(account, positions)
+        foreign = [p for p in positions if risk.magic_of(p) != int(account.magic)]
         specs: dict[str, broker.BrokerSymbol | None] = {}
         for position in own:
             name = position.symbol
@@ -536,11 +551,50 @@ class Worker:
             self.store.event(account.name, "closed", symbol=name, reason=reason,
                              ticket=int(position.ticket),
                              profit=round(float(position.profit), 2))
+        self._report_foreign_lots(account, foreign)
         return closed
+
+    def _report_foreign_lots(self, account: Account, foreign: list) -> None:
+        """Say which lots on this account the park did not place — after the exits were taken.
+
+        Reported last on purpose: the operator's trades do not need a journal line before this
+        account's own risk is managed, and a write that fails must never sit in front of an exit.
+        """
+        if not foreign:
+            return
+        tickets = sorted(int(p.ticket) for p in foreign)
+        self._report_change(
+            _host_key(f"foreign_positions:{account.name}"), "|".join(map(str, tickets)),
+            account.name, "foreign_positions", tickets=tickets,
+            magics=sorted({risk.magic_of(p) for p in foreign}),
+            lots=round(sum(float(p.volume) for p in foreign), 4))
+        # A lot with our own entry note in the journal but someone else's magic is money the park
+        # put at risk and nobody now manages: the config magic changed, or a second park instance
+        # runs the same account. It must not be filed under "the operator's trade".
+        noted = [ticket for ticket in tickets if self._meta(f"atr:{account.name}:{ticket}")]
+        if noted:
+            self._report_change(_host_key(f"park_lot_unattributed:{account.name}"),
+                                "|".join(map(str, noted)), account.name,
+                                "park_lot_unattributed", tickets=noted, magic=account.magic,
+                                detail="наша запись входа есть, магии нет — лот никто не ведёт")
+
+    def _report_change(self, key: str, fingerprint: str, account_name: str, kind: str,
+                       **detail) -> None:
+        """Announce a condition that keeps changing: once per distinct value, from one meta row.
+
+        `_announce_once` says a thing once ever. A manual trade is a new fact every time one
+        appears, so it has to be re-announced — but the fingerprint goes in the value, not the
+        key, or the meta table grows one row per trade the account ever made.
+        """
+        if (self._meta(key) or "") == fingerprint:
+            return
+        if not self._note_meta(key, fingerprint):
+            return
+        self.store.event(account_name, kind, **detail)
 
     def _atr_entry(self, account: Account, position, spec: broker.BrokerSymbol) -> float:
         key = f"atr:{account.name}:{int(position.ticket)}"
-        stored = self.store.get_meta(key)
+        stored = self._meta(key)
         if stored:
             try:
                 return float(stored)
@@ -551,7 +605,7 @@ class Worker:
             atr_value = stop_distance / account.risk.stop_atr
         else:
             atr_value = broker.atr(spec.name, mt5.TIMEFRAME_H1)
-        self.store.set_meta(key, f"{atr_value:.8f}")
+        self._note_meta(key, f"{atr_value:.8f}")
         return atr_value
 
     # --- entries ------------------------------------------------------------------------
@@ -565,6 +619,7 @@ class Worker:
         if not allowed:
             self.store.event(account.name, "hold", reason=reason)
             return 0
+        own = risk.own_in(account, positions)
         mine = [a.name for a in self.config.local()]
         book = self.store.portfolio(mine)
         book_stop = self.store.portfolio(mine, fresh_only=False)
@@ -638,7 +693,9 @@ class Worker:
                                     account.name, "signal_symbol_unresolved",
                                     symbol=signal.base_symbol)
                 continue
-            same_symbol = [p for p in positions if p.symbol == spec.name]
+            # One lot per symbol is this strategy's rule about its own trades. The operator's
+            # position on the same symbol is his view, not a reason for the park to hold back.
+            same_symbol = [p for p in own if p.symbol == spec.name]
             if len(same_symbol) >= account.strategy.max_positions_per_symbol:
                 continue
             if self._in_cooldown(account, spec.name):
@@ -717,8 +774,8 @@ class Worker:
                              requested=signal.price, reason=signal.reason)
             fresh = broker.open_positions(spec.name, account.magic)
             for position in fresh:
-                self.store.set_meta(f"atr:{account.name}:{int(position.ticket)}",
-                                    f"{signal.atr:.8f}")
+                self._note_meta(f"atr:{account.name}:{int(position.ticket)}",
+                                f"{signal.atr:.8f}")
             try:
                 fresh_positions = risk.positions_for(account)
                 self.store.save_positions(account.name, fresh_positions,
@@ -733,8 +790,14 @@ class Worker:
             self._mark_entry(account, spec.name)
             # Last, after the reservation is freed: bookkeeping must never be the reason a dollar
             # slot stays held. The lot is already at the broker and journalled as `opened`.
-            candidates.record(self.store, account, candidates.entry_note(
-                signal, execution, spec, risk_money * (rate or 1.0)))
+            try:
+                candidates.record(self.store, account, candidates.entry_note(
+                    signal, execution, spec, risk_money * (rate or 1.0)))
+            except Exception as exc:  # noqa: BLE001 - a note is a note, the money is already out
+                # Losing one row of the candidate book must not abort the cycle: the day state,
+                # the cooldown and the remaining symbols all sit behind this line.
+                self.store.event(account.name, "candidate_note_failed", symbol=spec.name,
+                                 error=f"{type(exc).__name__}: {exc}"[:160])
             return 1
         return 0
 

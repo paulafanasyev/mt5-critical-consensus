@@ -143,8 +143,14 @@ def positions_for(account: Account) -> list:
     return list(positions)
 
 
-def own_positions(account: Account) -> list:
-    return [p for p in positions_for(account) if p.magic == account.magic]
+def magic_of(position) -> int:
+    """The magic stamped on this lot, or 0 for a manual trade. A missing field is not a crash."""
+    return int(getattr(position, "magic", 0) or 0)
+
+
+def own_in(account: Account, positions: list) -> list:
+    """The lots this park placed. Anything else on the account is somebody else's trade."""
+    return [p for p in positions if magic_of(p) == int(account.magic)]
 
 
 def can_open(account: Account, snapshot: AccountSnapshot, day: DayState,
@@ -156,7 +162,9 @@ def can_open(account: Account, snapshot: AccountSnapshot, day: DayState,
     if day.daily_pct(snapshot.equity) <= -risk.daily_stop_pct:
         day.stopped = True
         return False, f"дневной стоп {risk.daily_stop_pct:.2f}% достигнут"
-    if len(held) >= risk.max_open_positions:
+    # The count is a concentration limit for this strategy, so it counts our own lots. The money
+    # limits above read the whole account because a manual lot moves the same equity.
+    if len(own_in(account, held)) >= risk.max_open_positions:
         return False, "достигнут лимит позиций счёта"
     if snapshot.margin_free <= 0:
         return False, "нет свободной маржи"

@@ -479,6 +479,28 @@ class Store:
                 "SELECT ts, account, kind, payload FROM events ORDER BY rowid DESC LIMIT ?",
                 (limit,)).fetchall()
 
+    def events_of(self, kinds: tuple[str, ...], limit: int = 5000) -> list[tuple]:
+        """The newest rows of these kinds only, oldest first.
+
+        A shared journal holds thousands of equity and hold lines per trade worth reading. A reader
+        that spends its limit on ALL kinds answers "no candidates" for a book that has hundreds, so
+        the filter belongs in the SQL, not in the caller.
+        """
+        if not kinds:
+            return []
+        marks = ",".join("?" for _ in kinds)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT ts, account, kind, payload FROM events WHERE kind IN ({marks})"
+                " ORDER BY rowid DESC LIMIT ?", (*kinds, limit)).fetchall()
+        return list(reversed(rows))
+
+    def count_events(self, kind: str) -> int:
+        """How many rows of this kind the journal holds — the denominator for a truncated read."""
+        with self._connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM events WHERE kind=?",
+                                    (kind,)).fetchone()[0])
+
     def prune(self, active: list[str] | None = None,
               retention_days: int = RETENTION_DAYS) -> int:
         """Drop old history and orphaned mirrors; registered accounts keep their rows.

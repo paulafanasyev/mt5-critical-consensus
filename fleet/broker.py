@@ -49,6 +49,7 @@ class Execution:
     retcode: int
     token: str
     position_ticket: int = 0
+    ticket_source: str = "unknown"
 
 
 class BrokerError(RuntimeError):
@@ -191,6 +192,23 @@ def open_positions(symbol_name: str | None = None, magic: int | None = None) -> 
     return [p for p in positions if p.magic == magic]
 
 
+def resolve_ticket(token: str, symbol_name: str, magic: int) -> tuple[int, str]:
+    """Which position this fill made, and how sure of it we are.
+
+    "token" is the answer we wrote into the order comment, so it names our lot. "only_position" is
+    a netting account that added to a position whose comment is older than this order: one lot on
+    this symbol and magic, so there is nothing else it can be. "unknown" is a hedge account with
+    two lots on the same symbol, where guessing a ticket would join the wrong trade's outcome.
+    """
+    found = _find_by_token(token)
+    if found is not None:
+        return int(found.ticket), "token"
+    same = open_positions(symbol_name, magic)
+    if len(same) == 1:
+        return int(same[0].ticket), "only_position"
+    return 0, "unknown"
+
+
 def _find_by_token(token: str) -> Any | None:
     """Look for the position this attempt would have created (token lives in the comment)."""
     for position in mt5.positions_get() or []:
@@ -261,7 +279,7 @@ def market_order(magic: int, spec: BrokerSymbol, side: str, volume: float, sl: f
         if found is not None:
             return Execution(volume=float(found.volume), price=float(found.price_open),
                              retcode=mt5.TRADE_RETCODE_DONE, token=token,
-                             position_ticket=int(found.ticket))
+                             position_ticket=int(found.ticket), ticket_source="token")
         raise
     filled_price = float(getattr(result, "price", 0.0) or price)
     filled_volume = float(getattr(result, "volume", 0.0) or volume)
@@ -269,12 +287,14 @@ def market_order(magic: int, spec: BrokerSymbol, side: str, volume: float, sl: f
         filled_volume = volume
     # Slippage beyond the plan is real money: if it exceeded the allowed deviation, log it via
     # the retcode path; the caller compares price against the signal.
-    # A netting account names the resulting position by `position_id`. `deal` is a different id
-    # space, and anything that later joins this fill to the position's own exit must not treat a
-    # deal number as a ticket — the join would silently never match.
-    ticket = int(getattr(result, "position_id", 0) or 0)
+    # The answer names a deal and an order, not the position — in this API's OrderSendResult
+    # (`retcode, deal, order, volume, price, bid, ask, comment, request, request_id`) there is no
+    # position id at all, and a deal number used as a ticket joins to nothing. The token we wrote
+    # in the order comment is the only name that reaches the position itself.
+    ticket, source = resolve_ticket(token, spec.name, magic)
     return Execution(volume=filled_volume, price=filled_price,
-                     retcode=int(result.retcode), token=token, position_ticket=ticket)
+                     retcode=int(result.retcode), token=token, position_ticket=ticket,
+                     ticket_source=source)
 
 
 def modify_position(ticket: int, symbol_name: str, sl: float, tp: float, digits: int) -> Any:

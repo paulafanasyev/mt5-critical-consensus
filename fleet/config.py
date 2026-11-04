@@ -236,6 +236,12 @@ def account_from_dict(data: dict[str, Any]) -> Account:
         raise ConfigError(f"{where}: {exc}") from exc
     if account.mode not in ("demo", "real"):
         raise ConfigError(f"{where}: mode={account.mode!r}, допустимо demo|real")
+    if account.magic <= 0:
+        # Magic is the only thing that separates the park's lots from the operator's on a shared
+        # account, and a manual trade is marked with 0. A 0 here would make every manual lot an
+        # owned one — the trailing rule would close trades nobody asked it to manage.
+        raise ConfigError(f"{where}: magic={account.magic}, нужен положительный номер "
+                          f"(0 — это метка ручной сделки)")
     if not 0 < account.currency_scale <= 100:
         raise ConfigError(f"{where}: currency_scale={account.currency_scale!r} вне (0, 100]")
     if account.network not in ("direct", "vpn"):
