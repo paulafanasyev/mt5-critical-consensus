@@ -49,6 +49,100 @@ The critic's headline ("the tree was reverted, defect zero") turned out to be an
 - Tests that only ever passed over an unmeasured day: `test_try_entries_places_one_order` and `test_cycle_runs_the_real_entry_path` went red the moment the day gate became fail-closed. They had never seeded a measured day (and the first never seeded a book row at all), so the entry path had been proven against a baseline that does not exist — the same hole, approached from the other side.
 - Whole suite on this checkout: **1279 passed, 10 skipped in 100.17 s**, of which **113** are the five `tests/test_fleet*.py` files (44 in `tests/test_fleet_multi_terminal.py`).
 
+### What the fifth critic round closed: the census became evidence, and two tools stopped killing things they do not own
+
+Four critics reviewed the window census added in the previous round. Every finding below was
+reproduced against the working tree before being changed, and the census was re-measured on this
+machine with the shipped code (`python scripts/fleet_cli.py terminals`): two windows answering as
+`114929502@MetaQuotes-Demo` with balance 99 331,31 USD and two windows answering
+`(-10005, 'IPC timeout')` — 8,63 s for the whole field (8,37 s on the earlier run).
+
+- `fleet/worker.py::_second_window` (`an uncounted field is not a clean field`): the gate read a
+  missing census as "no second window" and, when one existed, ignored any window it could not read.
+  It now fails closed on all three states — no census of this machine, a census older than
+  `ROSTER_EVIDENCE_SECONDS`, or a window that neither named its account nor measured silent — with
+  `roster_unknown` in the journal. Silent is a real category and is not blind: a window publishing
+  its pipe and answering `(-10005, 'IPC timeout')` holds no session, therefore no margin, therefore
+  it is not a driver. The all-clear is now only announced when a **fresh** census saw the field
+  (`census="fresh"`), so the line never means "the evidence expired and we guessed clear". Tests
+  `test_no_census_at_all_is_not_a_clean_field`, `test_an_out_of_date_census_is_not_evidence`,
+  `test_a_window_the_os_would_not_name_closes_the_entries`, `test_the_parks_own_window_is_not_a_second_window`.
+- `fleet/worker.py` (`the census is a fact about one machine`): the roster and its error keys were
+  unscoped, while the shared SQLite book is written by several boxes — so box A traded on the
+  windows box B counted, and its own second driver never appeared. Keys are now host-scoped, the
+  same way the portfolio day keys already are. Test
+  `test_a_census_written_by_another_machine_is_not_this_machines_evidence`.
+- `fleet/worker.py` + `fleet/terminals.py` (`a probe must never raise a terminal`):
+  `initialize(path=...)` **starts** a terminal that is not running, so a window that died between
+  the process walk and the probe would have been opened by the census — with whatever session it
+  was seeded with. `pids_alive()` re-checks the whole pid set in one query before any probe, and an
+  empty `ExecutablePath` (Win32 hides it from another user's or an elevated session) is recorded as
+  a named blind spot instead of being probed: `initialize(path="")` means the default registered
+  terminal of this machine, which is somebody else's window. Tests
+  `test_a_window_that_died_before_the_probe_is_never_addressed`, and the blank-path assertion in
+  `test_a_window_the_os_would_not_name_closes_the_entries`.
+- `fleet/worker.py` (`believe the window that answered, not the path we asked`): a probe now keeps
+  the folder the terminal itself reports, falling back to the requested path only when the answer
+  is empty; and a window that opens the channel but returns no `account_info` is an error row, not
+  a silently empty one. `duplicated_accounts` groups on `login@server` casefolded and counts one
+  entry **per window**, so two windows of one folder count twice — it is the count of drivers that
+  spends the margin. Tests `test_the_census_believes_the_window_that_answers_not_the_path_we_asked`,
+  `test_duplicated_accounts_does_not_merge_two_brokers_one_login`.
+- `fleet/worker.py` (`the cadence is a measured cost`): 900 s refresh against 3600 s evidence meant
+  a census could be an hour older than the moment it was retaken — every cycle then traded on a
+  count nobody could vouch for. Now 300 s / 900 s, sized by the measured census cost above rather
+  than by taste; `test_the_census_cadence_is_written_in_minutes_not_symbols` pins both literals and
+  their order. `run_shard` stopped taking its own census before the accounts' cycles, and the
+  census is one walk per refresh window per process rather than per account
+  (`test_the_census_costs_one_walk_per_refresh_not_per_account`).
+- `fleet/risk.py` (`a dropped read is not an empty book` — money): `positions_for` returned `[]`
+  when `mt5.positions_get()` answered `None`, and the store's position mirror is **replaced** from
+  that list: one failed IPC deleted this account's open risk from every shard's money cap (which
+  then saw free risk and opened more) and skipped the exits of positions still live at the broker.
+  It now raises, and `own_positions` goes through the same reader.
+- `fleet/worker.py` (`a read that fails after the fill must not keep the reservation`): the
+  post-fill mirror refresh sat between `reserve` and `release` and was not covered by the
+  exception handler, so any failure there held a dollar reservation for its full 600 s and refused
+  entries park-wide. The re-read is wrapped, the failure is journalled as `mirror_refresh_failed`,
+  and the slot is released either way.
+- `fleet/worker.py::attach` (`a hand-typed label is not a different session`): server comparison is
+  case- and whitespace-insensitive. A registry written as `metaquotes-demo` against a broker that
+  spells `MetaQuotes-Demo` grounded a live account forever.
+- `scripts/fleet_cli.py` (`the operator could not read the tool that tells him who is in the box`):
+  every line the park's CLI prints is Russian, and it was the one CLI in this repo that did not
+  reconfigure its streams, so on a cp1252 console `terminals` died at the first Cyrillic character
+  of the header — and, because `UnicodeEncodeError` is a `ValueError`, died again inside the error
+  handler printing "ошибка конфигурации". Reproduced against the previous commit and covered by
+  `test_the_cli_reads_aloud_on_a_legacy_console`. `status` now also counts the windows that did not
+  name an account, and says plainly that with no census of this machine entries are closed while
+  exits keep running.
+- `fleet/network.py` + `fleet/conductor.py` (the last mass-kill surface): `stop_tunnel()` ran
+  `taskkill /IM openvpn.exe /F`, which closes every OpenVPN on the box — on a desk that reaches its
+  brokers through its own VPN, ending one account's tunnel put every other account dark. Sessions
+  are now read once with their command lines and only the ones the park started (marked by
+  `--log <TUNNEL_DIR>/...`) are signalled, optionally for one profile; the conductor journals how
+  many it stopped. Tests `test_stopping_the_tunnel_leaves_the_desks_own_vpn_alone`,
+  `test_the_tunnel_reader_separates_a_pid_from_its_command_line`.
+- Accepted, and now documented instead of quietly kept: `scripts/system_stop.ps1 -All` still closes
+  every `terminal64.exe` on the machine. It is the desk's emergency switch, not a park code path —
+  `docs/FLEET.md` says so, including that positions left behind stay unmanaged until a cycle raises
+  the window again. Orphan `second_window:*`/`no_symbol:*` meta rows are not pruned: they cost one
+  row per account, the gate itself recomputes from the census every cycle, and `status`/`terminals`
+  print the duplication whatever the journal decided to repeat.
+- Tests: `tests/test_fleet_multi_terminal.py` is now **70** tests and the five fleet files **141**;
+  two older entry tests went red the moment the gate became fail-closed — they had been proving the
+  entry path against a field nobody had counted, so they now seed a census
+  (`test_fleet_regressions.py::_own_window`). Whole suite on this checkout:
+  **1307 passed, 10 skipped in 117,31 s**; `scripts/check_mql5_safety.py` — **473 invariants,
+  105 mutations rejected**, which still does not prove compilation or execution on a terminal.
+- `docs/FLEET.md` (`where is the money`, answered from the book rather than from the design): the
+  park's own SQLite state was measured and written down — `trades 0`, `positions 0`, `book 0`, so
+  the profit the park has produced is **0,00 USD**; the single `equity` row (balance 99 311,33,
+  equity 99 310,21, 5 positions, floating −1,12) is the operator's own manual book on 114929502,
+  because `positions_for` deliberately reads the whole account. The four cycle events are named
+  with their timestamps, including that the last one's `opened: 1` counts a **dry-run** signal
+  (USDJPY buy 0,1) and that no order ever left for the broker.
+
 ## Unreleased — the status line that reported a live chain over a dead transport
 
 - `agent_data/live_gold_ema_policy.yaml` (a claim this repo's own evidence refutes): its header said the gold EMA 50/200 variant was "the only family that was positive in the two-year replay over real broker bars". Both study files say the opposite — `docs/evidence/gold_study_development.txt` gives `ema n=618 win 31.9% meanR -0.368 CI [-0.525,-0.205]` on PAXG and `docs/evidence/gold_study_development_xauusd.txt` gives `ema n=124 win 41.9% meanR -0.261 [-0.635,+0.139]` on the broker's own XAUUSD, and **every rule row in both tables is negative at the point estimate**. So the live forward run has been testing a hypothesis the replay already refuted, and its header was the reason. The comment now carries both tables, the −31,13 realized on 2026-11-02, and the fact that all three closes came from outside the chain (magic 0, empty comment) so they measure nothing. No key was changed: the file still runs EMA 50/200 with `max_open_positions: 1`, and a running process would not see a policy edit anyway — `load_policy()` is called once, at `scripts/run_mt5_demo_trading.py:1384`, not per cycle.
