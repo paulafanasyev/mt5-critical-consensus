@@ -17,7 +17,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from fleet import broker, conductor, terminals, worker  # noqa: E402
+from fleet import broker, candidates, conductor, terminals, worker  # noqa: E402
 from fleet.config import FleetConfig, PortfolioLimits  # noqa: E402
 from fleet.store import Store  # noqa: E402
 
@@ -294,6 +294,85 @@ def test_partial_close_keeps_the_peak_and_the_row(tmp_path, monkeypatch) -> None
     assert closed == 0  # not a full close
     assert store.peak(account.name, 7) == 0.0010  # peak preserved
     assert store.open_positions()[0][1] == "EURUSD"  # mirror row kept
+
+
+def test_a_manual_lot_counts_in_risk_but_is_never_touched(tmp_path, monkeypatch) -> None:
+    """The operator's own trade is his, not the park's.
+
+    Manual positions belong in the mirror and the caps because they move the same money, but a
+    trailing rule closing them, or a break-even move onto their stop, takes the trade away from the
+    person who opened it. Ownership is the magic the park stamps on its own orders.
+    """
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    account = Account(name="a", login=1, server="S", mode="demo")
+    store = StoreCls(tmp_path / "book.sqlite")
+    runner = worker.Worker(FleetConfig(accounts=[account]), store, allow_live=True)
+    spec = worker.broker.BrokerSymbol(name="EURUSD", digits=5, point=0.00001,
+                                      tick_size=0.00001, tick_value=1.0, volume_min=0.01,
+                                      volume_max=100.0, volume_step=0.01, stops_level=0,
+                                      freeze_level=0, spread=1, filling=3)
+    mine = types.SimpleNamespace(ticket=11, symbol="EURUSD", type=0, volume=0.10,
+                                 price_open=1.10, profit=5.0, sl=1.09, tp=0.0,
+                                 magic=account.magic, time=0)
+    theirs = types.SimpleNamespace(ticket=12, symbol="EURUSD", type=0, volume=0.20,
+                                   price_open=1.10, profit=9.0, sl=1.09, tp=0.0,
+                                   magic=0, time=0)
+    monkeypatch.setattr(worker.broker, "symbol_exact", lambda name: spec)
+    monkeypatch.setattr(worker.mt5, "symbol_info_tick",
+                        lambda name: types.SimpleNamespace(bid=1.101, ask=1.101))
+    monkeypatch.setattr(worker.strategy, "break_even_level", lambda *a, **k: 1.1005)
+    monkeypatch.setattr(worker.strategy, "exit_reason", lambda *a, **k: "тейк")
+    modified: list[int] = []
+    closed: list[int] = []
+    monkeypatch.setattr(worker.broker, "modify_position",
+                        lambda ticket, *a, **k: modified.append(ticket) or True)
+    monkeypatch.setattr(worker.broker, "close_position",
+                        lambda position, *a, **k: closed.append(int(position.ticket))
+                        or float(position.volume))
+    day = worker.risk.DayState(day="2026-11-04", start_balance=1000.0)
+    n = runner._manage_positions(account, day, [mine, theirs])
+
+    assert closed == [11] and modified == [11]  # ticket 12 was never signalled
+    assert n == 1  # only our own lot is reported as closed
+    kinds = [kind for _, _, kind, _ in store.recent_events(limit=10)]
+    assert "foreign_positions" in kinds
+    row = next(payload for _, _, kind, payload in store.recent_events(limit=10)
+               if kind == "foreign_positions")
+    assert json.loads(row)["tickets"] == [12]
+    assert json.loads(row)["lots"] == 0.2
+
+
+def test_a_new_manual_trade_is_reported_again(tmp_path, monkeypatch) -> None:
+    """Announce-once must not silence a second, different fact about the same account."""
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    account = Account(name="a", login=1, server="S", mode="demo")
+    store = StoreCls(tmp_path / "book.sqlite")
+    runner = worker.Worker(FleetConfig(accounts=[account]), store, allow_live=True)
+    spec = worker.broker.BrokerSymbol(name="EURUSD", digits=5, point=0.00001,
+                                      tick_size=0.00001, tick_value=1.0, volume_min=0.01,
+                                      volume_max=100.0, volume_step=0.01, stops_level=0,
+                                      freeze_level=0, spread=1, filling=3)
+    monkeypatch.setattr(worker.broker, "symbol_exact", lambda name: spec)
+    monkeypatch.setattr(worker.mt5, "symbol_info_tick",
+                        lambda name: types.SimpleNamespace(bid=1.101, ask=1.101))
+
+    def lot(ticket: int, volume: float) -> types.SimpleNamespace:
+        return types.SimpleNamespace(ticket=ticket, symbol="EURUSD", type=0, volume=volume,
+                                     price_open=1.10, profit=0.0, sl=0.0, tp=0.0, magic=0, time=0)
+
+    day = worker.risk.DayState(day="2026-11-04", start_balance=1000.0)
+    first = lot(21, 0.1)
+    runner._manage_positions(account, day, [first])
+    runner._manage_positions(account, day, [first])  # the same fact, 90 s later
+    assert len([1 for _, _, kind, _ in store.recent_events(limit=20)
+                if kind == "foreign_positions"]) == 1
+    runner._manage_positions(account, day, [first, lot(22, 0.1)])  # a new manual trade
+    assert len([1 for _, _, kind, _ in store.recent_events(limit=20)
+                if kind == "foreign_positions"]) == 2
 
 
 def test_reset_health_clears_the_breaker(tmp_path) -> None:
@@ -763,3 +842,124 @@ def test_cycle_runs_the_real_entry_path(tmp_path, monkeypatch) -> None:
     result = runner._cycle(account, allow_entries=True)
     assert result.status == "ok"
     assert sent == [1]  # the real _try_entries reached the broker call
+
+
+# --- the candidate book ------------------------------------------------------------------------
+def _note(side: str, asked: float, filled: float, volume: float = 0.02, ticket: int = 7):
+    signal = types.SimpleNamespace(side=side, price=asked, stop=filled - 0.002 if side == "buy"
+                                   else filled + 0.002, target=filled + 0.004 if side == "buy"
+                                   else filled - 0.004, atr=0.001, reason="test")
+    execution = types.SimpleNamespace(price=filled, volume=volume, position_ticket=ticket)
+    spec = types.SimpleNamespace(name="EURUSD", point=0.00001, tick_size=0.00001, tick_value=1.0)
+    return candidates.entry_note(signal, execution, spec, 2.0)
+
+
+def test_the_candidate_bill_is_paid_in_the_direction_the_trade_went() -> None:
+    """Slippage we profited from is a rebate, slippage we paid for is a cost. Signed, not absolute."""
+    worse = _note("buy", 1.10000, 1.10025)   # market ran away before the fill
+    assert worse["drift_points"] == 25.0
+    assert worse["drift_usd_per_lot"] == 25.0  # 1.0 per 0.00001 -> 100 000 USD per lot per unit
+    assert worse["drift_cost_usd"] == 0.5      # 0.50 USD on 0.02 lot
+    better = _note("buy", 1.10000, 1.09980)   # filled below the signalled price
+    assert better["drift_points"] == -20.0
+    assert better["drift_cost_usd"] == -0.4
+    sold = _note("sell", 1.10000, 1.09980)    # a sell filled lower is worse, not better
+    assert sold["drift_points"] == 20.0
+    assert sold["drift_cost_usd"] == 0.4
+
+
+def test_a_candidate_with_no_contract_size_is_left_blank_instead_of_guessed() -> None:
+    signal = types.SimpleNamespace(side="buy", price=1.10, stop=1.098, target=1.104,
+                                   atr=0.001, reason="test")
+    execution = types.SimpleNamespace(price=1.10, volume=0.02, position_ticket=7)
+    blind_spec = types.SimpleNamespace(name="EURUSD", point=0.00001, tick_size=0.0, tick_value=0.0)
+    bare = candidates.entry_note(signal, execution, blind_spec, 2.0)
+    assert bare["drift_points"] == 0.0
+    assert "drift_cost_usd" not in bare  # no broker contract -> no dollars, no invented ones
+    assert bare["risk_usd"] == 2.0
+
+
+def test_the_candidate_module_can_not_reach_a_broker() -> None:
+    """The one property that lets this book exist at all: it is journalling, not trading."""
+    import ast
+
+    tree = ast.parse(pathlib.Path(candidates.__file__).read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            imported.add(node.module.split(".")[0])
+    assert imported <= {"json", "math", "__future__"}
+    assert not hasattr(candidates, "mt5")
+    assert "MetaTrader5" not in pathlib.Path(candidates.__file__).read_text(encoding="utf-8")
+
+
+def test_the_ledger_joins_by_ticket_and_counts_what_it_can_not_join(tmp_path) -> None:
+    store = Store(tmp_path / "book.sqlite")
+    store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02,
+                ticket=7, drift_points=25.0, drift_cost_usd=0.5, risk_usd=2.0,
+                risk_reward=2.0)
+    store.event("a", candidates.KIND, symbol="XAUUSD", side="buy", volume=0.01,
+                ticket=0, drift_points=3.0, drift_cost_usd=0.1, risk_usd=1.0)
+    store.event("a", "closed", symbol="EURUSD", ticket=7, reason="trailing", profit=3.2)
+    store.event("a", "closed", symbol="EURUSD", reason="old row, no ticket")  # pre-ticket journal
+    book = candidates.ledger(store)
+    assert book["candidates"] == 2
+    assert book["closed"] == 1
+    assert book["blind"] == 1            # ticket 0 is counted, nothing is inferred about it
+    assert book["open"] == 0
+    assert book["profit_usd"] == 3.2
+    assert book["win_rate"] == 100.0
+    assert book["drift_cost_usd"] == 0.6  # the drift bill covers both entries, closed or not
+    assert [t["exit"] for t in book["trades"]] == ["trailing", ""]  # oldest entry first
+
+
+def test_the_cycle_journals_a_candidate_and_never_holds_the_risk_slot_for_it(
+        tmp_path, monkeypatch) -> None:
+    """The lot is at the broker before the book is written; a broken note must not strand money."""
+    from fleet import risk as risk_mod
+    from fleet.config import Account
+
+    account = Account(name="a", login=1, server="S", mode="demo")
+    store = Store(tmp_path / "book.sqlite")
+    store.set_portfolio_baseline(worker.local_host(), "2026-11-03", 1000.0)
+    _own_window(store, account)
+    runner = worker.Worker(FleetConfig(accounts=[account]), store)
+    spec = broker.BrokerSymbol(name="EURUSD", digits=5, point=0.00001, tick_size=0.00001,
+                               tick_value=1.0, volume_min=0.01, volume_max=100.0,
+                               volume_step=0.01, stops_level=0, freeze_level=0, spread=1,
+                               filling=3)
+    signal = types.SimpleNamespace(base_symbol="EURUSD", side="buy", reason="test",
+                                   price=1.10, stop=1.098, target=1.104, atr=0.001,
+                                   stop_distance=0.002)
+    snapshot = risk_mod.AccountSnapshot(login=1, server="S", currency="USD", balance=1000.0,
+                                        equity=1000.0, margin_free=1000.0, leverage=100,
+                                        positions=0, floating=0.0, server_day="2026-11-03")
+    order: list[str] = []
+    real_release, real_record = store.release, candidates.record
+    monkeypatch.setattr(store, "release",
+                        lambda slot: (order.append("release"), real_release(slot))[1])
+    monkeypatch.setattr(candidates, "record",
+                        lambda *a, **k: (order.append("record"), real_record(*a, **k))[1])
+    monkeypatch.setattr(risk_mod, "AccountSnapshot",
+                        types.SimpleNamespace(read=lambda *a, **k: snapshot))
+    monkeypatch.setattr(risk_mod, "positions_for", lambda acc: [])
+    monkeypatch.setattr(risk_mod, "daily_net_flow", lambda day: 0.0)
+    monkeypatch.setattr(risk_mod, "daily_realized", lambda day: 0.0)
+    monkeypatch.setattr(worker.Worker, "_manage_positions", lambda self, *a, **k: 0)
+    monkeypatch.setattr(worker.strategy, "signals", lambda acc: [signal])
+    monkeypatch.setattr(worker.broker, "symbol", lambda base: spec)
+    monkeypatch.setattr(worker.broker, "symbol_exact", lambda name: spec)
+    monkeypatch.setattr(worker.broker, "open_positions", lambda *a, **k: [])
+    monkeypatch.setattr(worker.broker, "market_order", lambda *a, **k: types.SimpleNamespace(
+        volume=0.02, price=1.10025, retcode=10009, token="t", position_ticket=7))
+    monkeypatch.setattr(worker.mt5, "account_info",
+                        lambda: types.SimpleNamespace(login=1, server="S"))
+    assert runner._cycle(account, allow_entries=True).status == "ok"
+    assert order == ["release", "record"]  # the reservation is freed before the book is touched
+    book = candidates.ledger(store)
+    assert book["candidates"] == 1
+    assert book["open"] == 1 and book["blind"] == 0
+    assert book["trades"][0]["drift_points"] == 25.0
+    assert book["trades"][0]["drift_cost_usd"] == 0.5

@@ -269,7 +269,10 @@ def market_order(magic: int, spec: BrokerSymbol, side: str, volume: float, sl: f
         filled_volume = volume
     # Slippage beyond the plan is real money: if it exceeded the allowed deviation, log it via
     # the retcode path; the caller compares price against the signal.
-    ticket = int(getattr(result, "deal", 0) or 0)
+    # A netting account names the resulting position by `position_id`. `deal` is a different id
+    # space, and anything that later joins this fill to the position's own exit must not treat a
+    # deal number as a ticket — the join would silently never match.
+    ticket = int(getattr(result, "position_id", 0) or 0)
     return Execution(volume=filled_volume, price=filled_price,
                      retcode=int(result.retcode), token=token, position_ticket=ticket)
 

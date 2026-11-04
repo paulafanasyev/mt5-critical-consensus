@@ -5,6 +5,7 @@ the startup file bytes, and the guarantee that a real account changes nothing wi
 """
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
 import types
@@ -88,6 +89,68 @@ accounts:
 
 # --- terminal provisioning ------------------------------------------------------------------
 
+def _two_broker_registry(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Two platforms on one box: one window is ours to stop, one belongs to another machine."""
+    config_path = tmp_path / "accounts.yaml"
+    config_path.write_text("""
+accounts:
+  - name: exness
+    login: 5001
+    server: Exness-Demo
+    mode: demo
+  - name: gtc
+    login: 5002
+    server: GTC-Demo
+    mode: demo
+    host: other-box
+""", encoding="utf-8")
+    return config_path
+
+
+def test_stopping_a_window_names_one_account_and_touches_only_it(
+        tmp_path: pathlib.Path, monkeypatch, capsys) -> None:
+    config_path = _two_broker_registry(tmp_path)
+    store_path = tmp_path / "fleet.sqlite"
+    stopped: list[str] = []
+    monkeypatch.setattr(terminals, "stop",
+                        lambda account: stopped.append(account.name) or 4242)
+    code = fleet_cli.main(["--config", str(config_path), "--store", str(store_path),
+                           "stop", "--account", "exness"])
+    assert code == 0
+    assert stopped == ["exness"]
+    output = capsys.readouterr().out
+    assert "pid 4242" in output
+    assert "остались открытыми" in output  # the consequence, not just the verb
+    assert ("window_stopped", "4242") in [
+        (kind, str(json.loads(payload).get("pid")))
+        for _, _, kind, payload in Store(store_path).recent_events(limit=5)]
+
+
+def test_the_cli_refuses_to_stop_a_window_another_machine_drives(
+        tmp_path: pathlib.Path, monkeypatch, capsys) -> None:
+    config_path = _two_broker_registry(tmp_path)
+    called: list[str] = []
+    monkeypatch.setattr(terminals, "stop", lambda account: called.append(account.name))
+    code = fleet_cli.main(["--config", str(config_path), "--store", str(tmp_path / "f.sqlite"),
+                           "stop", "--account", "gtc"])
+    assert code == 1
+    assert called == []
+    assert "чужое окно парк не гасит" in capsys.readouterr().out
+
+
+def test_stopping_a_window_that_is_not_up_says_so_and_journals_nothing(
+        tmp_path: pathlib.Path, monkeypatch, capsys) -> None:
+    """No pid means nothing was killed: a silent success must not read as a stopped window."""
+    config_path = _two_broker_registry(tmp_path)
+    store_path = tmp_path / "fleet.sqlite"
+    monkeypatch.setattr(terminals, "stop", lambda account: None)
+    code = fleet_cli.main(["--config", str(config_path), "--store", str(store_path),
+                           "stop", "--account", "exness"])
+    assert code == 0
+    assert "останавливать нечего" in capsys.readouterr().out
+    assert Store(store_path).recent_events(limit=5) == []  # nothing happened, nothing journalled
+
+
 def _source(tmp_path: pathlib.Path) -> pathlib.Path:
     source = tmp_path / "install"
     (source / "config").mkdir(parents=True)
@@ -116,14 +179,50 @@ def test_real_account_enables_live_trading_in_the_startup_file(tmp_path: pathlib
     assert b"AllowLiveTrading=1" in raw
 
 
-def test_provision_refreshes_binaries_replaced_at_source(tmp_path: pathlib.Path) -> None:
+def test_provision_refreshes_binaries_replaced_at_source(tmp_path: pathlib.Path,
+                                                         monkeypatch) -> None:
     source = _source(tmp_path)
     account = Account(name="a", login=125, server="Demo", mode="demo", terminal_source=source)
+    monkeypatch.setattr(terminals, "running_terminals", lambda: [])
     terminals.provision(account)
     assert (account.data_dir / "terminal64.exe").read_bytes() == b"binary-v1"
     (source / "terminal64.exe").write_bytes(b"binary-v2")
     terminals.provision(account)
     assert (account.data_dir / "terminal64.exe").read_bytes() == b"binary-v2"
+
+
+def test_provision_refuses_to_wipe_a_directory_a_window_is_running_from(
+        tmp_path: pathlib.Path, monkeypatch) -> None:
+    """Rebuilding under a live window is how the park used to orphan its own money.
+
+    The window keeps its positions and the margin they spend, while the directory it runs from is
+    gone: the park can no longer attach to it, and the census then reports a driver it cannot name.
+    """
+    account = Account(name="a", login=128, server="Demo", mode="demo",
+                      terminal_source=_source(tmp_path))
+    monkeypatch.setattr(terminals, "running_terminals", lambda: [])
+    terminals.provision(account)
+    (account.data_dir / "config" / "keep.txt").write_text("session", encoding="utf-8")
+    monkeypatch.setattr(terminals, "running_terminals",
+                        lambda: [(777, str(account.terminal_exe))])
+    with pytest.raises(FileExistsError, match="stop --account a"):
+        terminals.provision(account, force=True)
+    assert (account.data_dir / "config" / "keep.txt").read_text(encoding="utf-8") == "session"
+
+
+def test_provision_rebuilds_the_same_account_once_its_window_is_down(
+        tmp_path: pathlib.Path, monkeypatch) -> None:
+    account = Account(name="a", login=129, server="Demo", mode="demo",
+                      terminal_source=_source(tmp_path))
+    monkeypatch.setattr(terminals, "running_terminals", lambda: [])
+    terminals.provision(account)
+    (account.data_dir / "config" / "common.ini").write_text("stale", encoding="utf-8")
+    # A neighbour's window running from a different folder is not a reason to refuse.
+    monkeypatch.setattr(terminals, "running_terminals",
+                        lambda: [(888, str(account.data_dir.parent / "999-Demo" /
+                                           "terminal64.exe"))])
+    terminals.provision(account, force=True)
+    assert b"Login=129" in (account.data_dir / "config" / "common.ini").read_bytes()
 
 
 def test_seed_status_reports_a_missing_session(tmp_path: pathlib.Path) -> None:
@@ -223,3 +322,25 @@ def test_stopping_the_tunnel_leaves_the_desks_own_vpn_alone(monkeypatch) -> None
     assert killed == [["taskkill", "/PID", "222", "/F"]]
     assert network.stop_tunnel(profile=r"C:\openvpn\other.ovpn") == 0
     assert len(killed) == 1
+
+
+def test_the_candidate_ledger_reads_aloud_and_states_its_own_limits(
+        tmp_path: pathlib.Path, capsys) -> None:
+    """A table nobody can read is not a measurement — and a number that overclaims is worse."""
+    from fleet import candidates
+
+    store_path = tmp_path / "fleet.sqlite"
+    store = Store(store_path)
+    store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02, ticket=7,
+                drift_points=25.0, drift_cost_usd=0.5, risk_usd=2.0, risk_reward=2.0)
+    store.event("a", "closed", symbol="EURUSD", ticket=7, reason="trailing", profit=3.2)
+    assert fleet_cli.main(["--store", str(store_path), "candidates"]) == 0
+    out = capsys.readouterr().out
+    assert "3.20" in out and "0.50" in out
+    assert "чего оно не доказывает" in out
+
+
+def test_an_empty_candidate_book_is_reported_as_no_measurement(tmp_path: pathlib.Path, capsys) -> None:
+    store_path = tmp_path / "fleet.sqlite"
+    assert fleet_cli.main(["--store", str(store_path), "candidates"]) == 0
+    assert "кандидатов пока нет" in capsys.readouterr().out

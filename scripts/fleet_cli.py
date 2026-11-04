@@ -20,7 +20,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from fleet import conductor, risk, strategy, terminals, worker  # noqa: E402
+from fleet import candidates, conductor, risk, strategy, terminals, worker  # noqa: E402
 from fleet.broker import BrokerError, symbol  # noqa: E402
 from fleet.config import DEFAULT_STORE, ConfigError, load, local_host  # noqa: E402
 from fleet.store import Store, host_keys  # noqa: E402
@@ -164,6 +164,34 @@ def cmd_terminals(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stop(args: argparse.Namespace) -> int:
+    """Put one named account's own window down — never the desk's other terminals.
+
+    With several brokers on one machine there is no park path to stop a single window, and without
+    one `init --force` cannot rebuild an account's directory: it would wipe the folder a live
+    terminal is running from and leave that window holding positions nobody manages.
+    """
+    config = _config(args)
+    account = config.by_name(args.account)
+    if account is None:
+        print(f"счёт не найден: {args.account}")
+        return 1
+    problem = _pinned_elsewhere(account, config)
+    if problem:
+        print(f"{problem}: чужое окно парк не гасит")
+        return 1
+    pid = terminals.stop(account)
+    if pid is None:
+        print(f"{account.name}: из {account.data_dir} ничего не запущено, останавливать нечего")
+        return 0
+    Store(args.store).event(account.name, "window_stopped", pid=pid,
+                            directory=str(account.data_dir))
+    print(f"{account.name}: окно pid {pid} остановлено")
+    print("  позиции у брокера остались открытыми: цикл парка поднимет окно сам, "
+          "но до тех пор по этому счету выходы не ведутся")
+    return 0
+
+
 def cmd_once(args: argparse.Namespace) -> int:
     config = _config(args)
     store = Store(args.store)
@@ -242,6 +270,45 @@ def cmd_check(args: argparse.Namespace) -> int:
         runner.detach()
         if not account.keep_running:
             terminals.stop(account)
+    return 0
+
+
+def cmd_candidates(args: argparse.Namespace) -> int:
+    """The candidate ledger: every trade the park took, and what waiting for confirmation cost.
+
+    This is the only honest way to answer «входи раньше и bigger на реальных деньках»: the drift
+    column is the price the market had already given before the fill, priced by the broker's own
+    contract. Nothing here sends anything — the module it reads cannot even import the broker.
+    """
+    store = Store(args.store)
+    book = candidates.ledger(store, limit=args.limit)
+    if not book["candidates"]:
+        print("кандидатов пока нет: парк не исполнил ни одной сделки, которую можно было бы "
+              "считать. Это не «плохая статистика» — это отсутствие измерения.")
+        return 0
+    win_rate = "—" if book["win_rate"] is None else f"{book['win_rate']}%"
+    drift_mean = "—" if book["mean_drift_points"] is None else f"{book['mean_drift_points']}"
+    print(f"кандидатов {book['candidates']} | закрыто {book['closed']} | "
+          f"открыто {book['open']} | винрейт {win_rate}")
+    print(f"прибыль закрытых: {book['profit_usd']:+.2f} USD | ожидание стоило "
+          f"{drift_mean} пунктов в среднем, {book['drift_cost_usd']:+.2f} USD суммарно")
+    print(f"\n{'тикет':>10} {'счёт':>10} {'символ':>10} {'стор':>5} {'лот':>6} "
+          f"{'дрейф,п':>9} {'дрейф,$':>9} {'итог,$':>9} {'выход':>10}")
+    for row in book["trades"]:
+        drift = row["drift_points"]
+        cost = row["drift_cost_usd"]
+        profit = row["profit_usd"]
+        volume = row["volume"]
+        lot = f"{volume:.2f}" if isinstance(volume, (int, float)) else "—"
+        print(f"{row['ticket']:>10} {row['account'][:10]:>10} {row['symbol'][:10]:>10} "
+              f"{row['side']:>5} {lot:>6} "
+              f"{f'{drift:.1f}' if drift is not None else '—':>9} "
+              f"{f'{cost:+.2f}' if cost is not None else '—':>9} "
+              f"{f'{profit:+.2f}' if profit is not None else 'открыт':>9} "
+              f"{str(row['exit'])[:10]:>10}")
+    print("\nчто это доказывает: сколько пункта и доллара стоит подтверждение сигнала."
+          "\nчего оно не доказывает: что раньше было бы лучше — для этого нужна прибыльная "
+          "система, а измеренные прогоны на настоящих барах убыточны (docs/DEMO_RESULTS.md).")
     return 0
 
 
@@ -347,6 +414,10 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("--account", required=True)
     check.set_defaults(func=cmd_check)
 
+    stop = sub.add_parser("stop", help="остановить окно одного названного счёта")
+    stop.add_argument("--account", required=True)
+    stop.set_defaults(func=cmd_stop)
+
     run = sub.add_parser("run", help="запустить дирижёра")
     run.add_argument("--interval", type=int, default=30)
     run.add_argument("--dry-run", action="store_true")
@@ -367,6 +438,11 @@ def main(argv: list[str] | None = None) -> int:
     reset.set_defaults(func=cmd_reset_day)
     windows = sub.add_parser("terminals", help="что за окна запущены и чей в них счёт")
     windows.set_defaults(func=cmd_terminals)
+    cand = sub.add_parser("candidates",
+                          help="журнал сделок: что стоило ждать подтверждения входа")
+    cand.add_argument("--limit", type=int, default=5000,
+                      help="сколько последних событий журнала разобрать")
+    cand.set_defaults(func=cmd_candidates)
     health = sub.add_parser("reset-health", help="разблокировать счёт после circuit breaker")
     health.add_argument("--account", default="")
     health.set_defaults(func=cmd_reset_health)

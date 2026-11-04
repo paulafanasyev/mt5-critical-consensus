@@ -69,6 +69,12 @@ def _binary_fingerprint(path: pathlib.Path) -> str:
     return digest.hexdigest()[:16]
 
 
+def live_pids_in(directory: pathlib.Path) -> list[int]:
+    """Pids of terminals running out of exactly this portable directory."""
+    expected = str(directory / "terminal64.exe").lower()
+    return [pid for pid, path in running_terminals() if path.lower() == expected]
+
+
 def provision(account: Account, source: pathlib.Path | None = None,
               force: bool = False) -> pathlib.Path:
     """Create (or refresh) the portable directory for one account."""
@@ -82,6 +88,15 @@ def provision(account: Account, source: pathlib.Path | None = None,
     stale = (target.exists() and fingerprint_file.exists()
              and fingerprint_file.read_text(encoding="utf-8").strip() != current)
     if target.exists() and (force or stale):
+        # A wipe is a decommission, not an upgrade step: the window running from this directory
+        # holds live positions and the margin they spend. Rebuilding underneath it leaves a driver
+        # the park can no longer attach to, which is the one thing the census exists to notice.
+        live = live_pids_in(target)
+        if live:
+            raise FileExistsError(
+                f"из {target} работает терминал (pid {', '.join(str(pid) for pid in live)}): "
+                f"сначала пауза и остановка окна этого счёта — fleet_cli.py pause; "
+                f"fleet_cli.py stop --account {account.name}")
         shutil.rmtree(target, ignore_errors=True)
     target.mkdir(parents=True, exist_ok=True)
     _hardlink_tree(base, target)
@@ -219,7 +234,7 @@ def running_pid(account: Account) -> int | None:
     return pid
 
 
-def stop(account: Account) -> None:
+def stop(account: Account) -> int | None:
     """Stop this account's own terminal copy. Never any other terminal.
 
     The pid is looked up fresh: MT5 re-spawns itself after an update or a restart, and a cached pid
@@ -231,6 +246,7 @@ def stop(account: Account) -> None:
     _PID_CACHE.pop(str(account.data_dir).lower(), None)
     if pid:
         subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+    return pid
 
 
 # --- logs and authorization -----------------------------------------------------------------

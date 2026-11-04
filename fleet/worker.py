@@ -20,7 +20,7 @@ import types
 
 import MetaTrader5 as mt5
 
-from . import broker, network, risk, strategy, terminals
+from . import broker, candidates, network, risk, strategy, terminals
 from .config import Account, FleetConfig, local_host
 from .store import Store
 
@@ -463,8 +463,25 @@ class Worker:
     # --- position management ------------------------------------------------------------
     def _manage_positions(self, account: Account, day: risk.DayState, positions: list) -> int:
         closed = 0
+        # A lot the park did not place is the operator's, not the park's. Manual positions belong
+        # in the risk caps and the equity mirror — they move the money this account trades with —
+        # but moving their stop to break-even or closing them on a trailing rule is taking the
+        # trade away from the person who opened it. Ownership is the magic number we stamp on
+        # every order; anything else on the account is reported and left alone.
+        own = [p for p in positions if int(p.magic) == int(account.magic)]
+        foreign = [p for p in positions if int(p.magic) != int(account.magic)]
+        if foreign:
+            # One announcement per distinct set of foreign lots, not per cycle and not once ever:
+            # a new manual trade is a new fact the operator has to see, the same one every 90 s is
+            # noise.
+            fingerprint = "|".join(f"{int(p.ticket)}:{int(p.magic)}" for p in foreign)
+            self._announce_once(_host_key(f"foreign_positions:{account.name}:{fingerprint}"),
+                                account.name, "foreign_positions",
+                                tickets=[int(p.ticket) for p in foreign],
+                                magics=sorted({int(p.magic) for p in foreign}),
+                                lots=round(sum(float(p.volume) for p in foreign), 4))
         specs: dict[str, broker.BrokerSymbol | None] = {}
-        for position in positions:
+        for position in own:
             name = position.symbol
             if name not in specs:
                 specs[name] = broker.symbol_exact(name)
@@ -517,6 +534,7 @@ class Worker:
             day.realized += float(position.profit)
             self.store.close_position_row(account.name, int(position.ticket))
             self.store.event(account.name, "closed", symbol=name, reason=reason,
+                             ticket=int(position.ticket),
                              profit=round(float(position.profit), 2))
         return closed
 
@@ -698,6 +716,10 @@ class Worker:
                                  error=f"{type(exc).__name__}: {exc}"[:160])
             self.store.release(slot)
             self._mark_entry(account, spec.name)
+            # Last, after the reservation is freed: bookkeeping must never be the reason a dollar
+            # slot stays held. The lot is already at the broker and journalled as `opened`.
+            candidates.record(self.store, account, candidates.entry_note(
+                signal, execution, spec, risk_money * (rate or 1.0)))
             return 1
         return 0
 
