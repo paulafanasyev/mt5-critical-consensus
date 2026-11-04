@@ -22,8 +22,8 @@ if str(ROOT) not in sys.path:
 
 from fleet import conductor, risk, strategy, terminals, worker  # noqa: E402
 from fleet.broker import BrokerError, symbol  # noqa: E402
-from fleet.config import DEFAULT_STORE, load  # noqa: E402
-from fleet.store import Store  # noqa: E402
+from fleet.config import DEFAULT_STORE, load, local_host  # noqa: E402
+from fleet.store import Store, host_keys  # noqa: E402
 
 
 def _config(args: argparse.Namespace):
@@ -40,7 +40,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("нет включённых счетов; заполни config/accounts.yaml")
         return 1
     failures = 0
-    for account in config.enabled():
+    for account in _local(config, config.enabled()):
         try:
             target = terminals.provision(account, force=args.force)
             seed_ok, seed_detail = terminals.seed_status(account)
@@ -76,14 +76,27 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _local(config: FleetConfig, accounts: list) -> list:
+    """Accounts this machine may drive: a pinned account is never logged into from elsewhere."""
+    return [a for a in accounts if config.runs_here(a)]
+
+
+def _pinned_elsewhere(account, config: FleetConfig) -> str:
+    return "" if config.runs_here(account) else f"счёт закреплён за машиной {account.host}"
+
+
 def cmd_once(args: argparse.Namespace) -> int:
     config = _config(args)
     store = Store(args.store)
-    accounts = config.enabled()
+    accounts = _local(config, config.enabled())
     if args.account:
-        chosen = [a for a in accounts if a.name == args.account]
+        chosen = [a for a in config.enabled() if a.name == args.account]
         if not chosen:
             print(f"счёт не найден: {args.account}")
+            return 1
+        problem = _pinned_elsewhere(chosen[0], config)
+        if problem:
+            print(f"{problem}: здесь его не запускай")
             return 1
         accounts = chosen
     elif args.shard is not None:
@@ -115,6 +128,10 @@ def cmd_check(args: argparse.Namespace) -> int:
     account = config.by_name(args.account)
     if account is None:
         print(f"счёт не найден: {args.account}")
+        return 1
+    problem = _pinned_elsewhere(account, config)
+    if problem:
+        print(f"{problem}: здесь его не подключай")
         return 1
     runner = worker.Worker(config, Store(args.store), dry_run=True)
     error = runner.attach(account)
@@ -155,14 +172,20 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not config.enabled():
         print("нет включённых счетов")
         return 1
-    shards = [int(part) for part in args.shards.replace(" ", "").split(",") if part] or None
+    local = _local(config, config.enabled())
+    if not local:
+        print("на этой машине нет ни одного счёта: все закреплены за другими host")
+        return 1
+    shards = conductor.parse_shards(args.shards, config.shards()) or None
     engine = conductor.Conductor(config, Store(args.store), interval=args.interval,
                                  dry_run=args.dry_run, config_path=config_path, shards=shards,
-                                 allow_multi_shard=args.allow_multi_shard, live=args.live)
-    real = _real_names(config.enabled())
+                                 live=args.live, max_shards=args.max_shards)
+    real = _real_names(local)
     if real and not args.live:
         print(f"реальные счета {real}: ордера выключены, нужен --live")
-    print(f"парк: {len(config.enabled())} счетов, шарды {engine.shards}")
+    elsewhere = [a.name for a in config.enabled() if not config.runs_here(a)]
+    print(f"парк: {len(local)} счетов на этой машине, шарды {engine.shards}"
+          + (f", закреплены за другой машиной {elsewhere}" if elsewhere else ""))
     engine.run_forever(force_lock=args.force_lock)
     return 0
 
@@ -191,12 +214,17 @@ def cmd_reset_health(args: argparse.Namespace) -> int:
 
 def cmd_reset_day(args: argparse.Namespace) -> int:
     store = Store(args.store)
-    store.set_meta("portfolio_day", "")
-    store.set_meta("portfolio_day_start_equity", "0")
-    store.set_meta("portfolio_registry_hash", "")
+    host = local_host()
+    day_key, base_key, registry_key = host_keys(host)
+    # Only this machine's keys. The unscoped legacy pair stays: another box sharing this book may
+    # not have taken its own starting baseline from it yet, and wiping it would leave that machine
+    # with no day measured at all — which its entry gate reads as "nothing to stop for".
+    for key in (day_key, base_key, registry_key, f"portfolio_day_held:{host}",
+                f"portfolio_day_held_since:{host}"):
+        store.set_meta(key, "")
     conductor.PAUSE_FILE.unlink(missing_ok=True)
-    store.event("cli", "reset_day")
-    print("дневная база портфеля сброшена, пауза снята")
+    store.event("cli", "reset_day", host=host)
+    print(f"дневная база портфеля сброшена для машины {host}, пауза снята")
     return 0
 
 
@@ -231,7 +259,9 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--live", action="store_true")
     run.add_argument("--shards", default="", help="например 0 или 0,2")
-    run.add_argument("--allow-multi-shard", action="store_true")
+    run.add_argument("--max-shards", type=int, default=None,
+                     help=f"потолок шардов на этой машине (по умолчанию "
+                          f"{conductor.Conductor.MAX_SHARDS})")
     run.add_argument("--force-lock", action="store_true",
                      help="снять залипший lock дирижёра")
     run.set_defaults(func=cmd_run)

@@ -45,6 +45,7 @@ def _stub_mt5() -> types.ModuleType:
     }.items():
         setattr(module, constant, value)
     module.account_info = _Unavailable().__getattr__
+    module.terminal_info = lambda *a, **k: None
     module.initialize = lambda *a, **k: False
     module.shutdown = lambda: None
     module.last_error = lambda: (-9999, "stub")

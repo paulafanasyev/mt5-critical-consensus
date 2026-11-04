@@ -1,9 +1,14 @@
-"""Terminal provisioning and channel handoff.
+"""Terminal provisioning and process control.
 
 One portable directory per account: binaries hard-linked from a clean install (so hundreds of
 accounts cost megabytes), private config/logs, a startup file that points the terminal at exactly
-one account, and no secrets written to disk. Because MT5 serves the Python API on a single port per
-Windows session, the fleet stops every other fleet terminal before it hands the channel over.
+one account, and no secrets written to disk.
+
+The channel is per terminal, not per machine: measured on a box with three terminals running, each
+published its own named pipe (MT5.Terminal.<64 hex>) and MetaTrader5.initialize(path=...) answered
+from the terminal whose executable we named, from several processes at once. Loopback TCP 22346 was
+bound by exactly one of the three and had nothing to do with which terminal answered. So this module
+never stops one terminal to make room for another: it only ever stops the copy it is asked to stop.
 """
 from __future__ import annotations
 
@@ -14,11 +19,13 @@ import shutil
 import subprocess
 import time
 
-from .config import FLEET_ROOT, Account
+from .config import Account
 
 SKIP_DIRS = {"config", "bases", "logs", "profiles", "sounds", "tester", "mql5"}
 WRITABLE_DIRS = ("config", "logs", "MQL5", "MQL5/Experts", "MQL5/Scripts", "profiles", "sounds",
                  "Tester")
+# Session material a manual login leaves behind; copied from seed_config, cleared before every copy.
+_SEED_FILES = ("accounts.dat", "servers.dat", "srvsettings.dat", "settings.ini")
 
 _PID_CACHE: dict[str, tuple[float, int | None]] = {}
 _CACHE_TTL = 15.0
@@ -97,15 +104,22 @@ def seed_status(account: Account) -> tuple[bool, str]:
 
 
 def _seed_saved_session(account: Account) -> None:
-    """Copy a session saved by an earlier manual login (accounts/servers data)."""
+    """Copy a session saved by an earlier manual login (accounts/servers data).
+
+    The broker's accounts.dat holds every login that terminal has saved, not only this one, and it
+    is binary: the park cannot filter it. So a previous seed's session files are always cleared
+    first — a portable copy must never carry a stranger's saved logins into a new broker's folder.
+    """
+    config_dir = account.data_dir / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    for pattern in _SEED_FILES:
+        (config_dir / pattern).unlink(missing_ok=True)  # common.ini is ours; these are sessions
     if not account.seed_config:
         return
     seed_dir = pathlib.Path(account.seed_config)
     if not seed_dir.exists():
         return
-    config_dir = account.data_dir / "config"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    for pattern in ("accounts.dat", "servers.dat", "srvsettings.dat", "settings.ini"):
+    for pattern in _SEED_FILES:
         candidate = seed_dir / pattern
         if candidate.exists():
             shutil.copy2(candidate, config_dir / pattern)
@@ -146,7 +160,6 @@ def launch(account: Account, extra_args: tuple[str, ...] = ()) -> subprocess.Pop
     if not account.terminal_exe.exists():
         raise FileNotFoundError(f"терминал не подготовлен: {account.terminal_exe}")
     _PID_CACHE.pop(str(account.data_dir).lower(), None)
-    _invalidate_port_cache()
     creation = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     return subprocess.Popen([str(account.terminal_exe), "/portable", *extra_args],
                             cwd=str(account.data_dir), creationflags=creation, close_fds=True,
@@ -183,48 +196,17 @@ def running_pid(account: Account) -> int | None:
 
 
 def stop(account: Account) -> None:
-    pid = running_pid(account)
+    """Stop this account's own terminal copy. Never any other terminal.
+
+    The pid is looked up fresh: MT5 re-spawns itself after an update or a restart, and a cached pid
+    would then kill a process that is already gone and leave the live window running.
+    """
+    expected = str(account.terminal_exe).lower()
+    pid = next((candidate for candidate, path in _terminal_processes()
+                if path.lower() == expected), None)
+    _PID_CACHE.pop(str(account.data_dir).lower(), None)
     if pid:
         subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
-        _PID_CACHE[str(account.data_dir).lower()] = (time.time(), None)
-        _invalidate_port_cache()
-
-
-def _invalidate_port_cache() -> None:
-    """A killed terminal must not leave a stale port owner behind for the next account."""
-    try:
-        from . import worker
-
-        worker._PORT_OWNER_CACHE["ts"] = 0.0
-        worker._PORT_OWNER_CACHE["pid"] = 0
-    except Exception:  # noqa: BLE001 - cache invalidation is best effort
-        pass
-
-
-def stop_all() -> None:
-    """Kill every MT5 terminal: the API port must be free before another terminal starts."""
-    subprocess.run(["taskkill", "/IM", "terminal64.exe", "/F"], capture_output=True)
-    _PID_CACHE.clear()
-    _invalidate_port_cache()
-
-
-def stop_other_fleet(keep_dir: pathlib.Path | None = None) -> int:
-    """Stop fleet terminals except the one whose exact executable path is ``keep_dir``."""
-    keep_exe = (str(pathlib.Path(keep_dir) / "terminal64.exe").lower()
-                if keep_dir is not None else "")
-    stopped = 0
-    for pid, path in _terminal_processes():
-        normalized = path.lower()
-        if str(FLEET_ROOT).lower() not in normalized:
-            continue
-        if keep_exe and normalized == keep_exe:
-            continue
-        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
-        stopped += 1
-    if stopped:
-        _PID_CACHE.clear()
-        _invalidate_port_cache()
-    return stopped
 
 
 # --- logs and authorization -----------------------------------------------------------------

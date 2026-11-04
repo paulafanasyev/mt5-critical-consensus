@@ -9,6 +9,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import pathlib
+import socket
+import sys
 from typing import Any
 
 DEFAULT_TERMINAL_SOURCE = pathlib.Path(r"C:\Program Files\MetaTrader 5")
@@ -96,7 +98,6 @@ class PortfolioLimits:
     max_usd_lots: float = 1.00
     max_open_positions: int = 60
     daily_stop_pct: float = 2.0
-    max_worker_processes: int = 1  # one terminal owns the API port per Windows session
 
 
 @dataclasses.dataclass(slots=True)
@@ -110,15 +111,32 @@ class FleetConfig:
     def by_name(self, name: str) -> Account | None:
         return next((a for a in self.accounts if a.name == name), None)
 
+    def runs_here(self, account: Account) -> bool:
+        """A pinned account belongs to exactly one machine: never log into it from another."""
+        return not account.host or account.host.casefold() == local_host()
+
+    def local(self) -> list[Account]:
+        """Enabled accounts this machine owns.
+
+        The book is a file on this machine, so only these rows are ever refreshed here: counting a
+        row of an account pinned elsewhere would weigh a number nobody on this host keeps current.
+        """
+        return [a for a in self.enabled() if self.runs_here(a)]
+
     def by_shard(self, shard: int) -> list[Account]:
-        return [a for a in self.enabled() if a.shard == shard]
+        return [a for a in self.enabled() if a.shard == shard and self.runs_here(a)]
 
     def shards(self) -> list[int]:
-        return sorted({a.shard for a in self.enabled()})
+        return sorted({a.shard for a in self.enabled() if self.runs_here(a)})
 
 
 def _slug(text: str) -> str:
     return "".join(c if c.isalnum() else "-" for c in str(text)).strip("-").lower()
+
+
+def local_host() -> str:
+    """This machine's name, compared casefolded: Windows host names are not stable in case."""
+    return (socket.gethostname() or "").casefold()
 
 
 # --- loading and validation -----------------------------------------------------------------
@@ -127,6 +145,9 @@ _ACCOUNT_KEYS = {f.name for f in dataclasses.fields(Account)} - {"risk", "strate
 _RISK_KEYS = {f.name for f in dataclasses.fields(RiskProfile)}
 _STRATEGY_KEYS = {f.name for f in dataclasses.fields(StrategyProfile)}
 _PORTFOLIO_KEYS = {f.name for f in dataclasses.fields(PortfolioLimits)}
+# Keys a real registry may still carry from before the one-terminal-per-session rule was measured
+# away. They are ignored with a warning; a genuinely unknown key stays a hard error.
+_RETIRED_PORTFOLIO_KEYS = ("max_worker_processes",)
 
 
 def _check_keys(where: str, data: dict[str, Any], allowed: set[str]) -> None:
@@ -199,6 +220,12 @@ def account_from_dict(data: dict[str, Any]) -> Account:
         raise ConfigError(f"{where}: enabled должен быть true/false")
     if "terminal_source" in payload:
         payload["terminal_source"] = pathlib.Path(str(payload["terminal_source"]))
+    if "host" in payload:
+        # `host:` with no value parses as None, and a None pin must not mean "run me everywhere".
+        if not isinstance(payload["host"], str):
+            raise ConfigError(f"{where}: host должен быть именем машины (строкой), "
+                              f"получено {payload['host']!r}; без закрепления ключ просто убери")
+        payload["host"] = payload["host"].strip()
     for key, kind in (("login", int), ("magic", int), ("shard", int),
                       ("currency_scale", float)):
         if key in payload:
@@ -245,7 +272,16 @@ def load(path: pathlib.Path | None = None) -> FleetConfig:
     if not isinstance(items, list):
         raise ConfigError("accounts должен быть списком")
     accounts = [account_from_dict(item) for item in items]
-    portfolio_data = data.get("portfolio", {})
+    portfolio_data = dict(data.get("portfolio", {}))
+    if isinstance(data.get("portfolio"), dict):
+        retired = [key for key in _RETIRED_PORTFOLIO_KEYS if key in portfolio_data]
+        for key in retired:
+            portfolio_data.pop(key)
+        if retired:
+            # A retired ceiling must not brick a park that boots from a task scheduler: the key
+            # limited nothing real (the one-terminal-per-session rule it encoded was a myth).
+            print(f"реестр: {retired} в portfolio больше не используется — убери из файла",
+                  file=sys.stderr)
     _check_keys("portfolio", portfolio_data, _PORTFOLIO_KEYS)
     portfolio = PortfolioLimits(**_typed(
         portfolio_data, "portfolio",

@@ -26,7 +26,6 @@ def isolated_fleet_root(tmp_path, monkeypatch):
     """Provision into a temporary fleet root: tests must never touch the real fleet folder."""
     root = tmp_path / "fleet"
     monkeypatch.setattr(fleet_config, "FLEET_ROOT", root)
-    monkeypatch.setattr(terminals, "FLEET_ROOT", root)
     monkeypatch.setattr(fleet_cli.worker, "Worker", fleet_cli.worker.Worker)
     return root
 from fleet import terminals, worker  # noqa: E402

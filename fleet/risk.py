@@ -13,7 +13,7 @@ import math
 
 import MetaTrader5 as mt5
 
-from . import broker
+from . import broker, naming
 from .config import Account, PortfolioLimits
 
 
@@ -213,13 +213,11 @@ def can_open_portfolio(limits: PortfolioLimits, equity_usd: float, risk_money: f
 
 
 def broker_is_gold(symbol_name: str) -> bool:
-    upper = symbol_name.upper()
-    return "XAU" in upper or "GOLD" in upper
+    return naming.is_gold(symbol_name)
 
 
 def broker_is_usd_pair(symbol_name: str) -> bool:
-    upper = symbol_name.upper()
-    return (upper.startswith("USD") or upper.endswith("USD")) and not broker_is_gold(upper)
+    return naming.is_usd_pair(symbol_name)
 
 
 def size_for(account: Account, spec: broker.BrokerSymbol, stop_distance: float,

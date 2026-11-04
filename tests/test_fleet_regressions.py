@@ -181,7 +181,6 @@ class FakePopen:
 def test_conductor_passes_config_and_store_and_uses_the_shard_filter(
         tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(conductor.subprocess, "Popen", FakePopen)
-    monkeypatch.setattr(conductor.terminals, "stop_all", lambda: None)
     store = Store(tmp_path / "book.sqlite")
     config = FleetConfig()
     engine = conductor.Conductor(config, store, config_path=tmp_path / "accounts.yaml",
@@ -193,21 +192,24 @@ def test_conductor_passes_config_and_store_and_uses_the_shard_filter(
     assert "--parent-pid" in command
 
 
-def test_multi_shard_is_refused_on_one_machine() -> None:
-    with pytest.raises(ValueError, match="один шард"):
-        conductor.Conductor(FleetConfig(), Store(":memory:"), shards=[0, 1])
+def test_several_shards_are_allowed_on_one_machine() -> None:
+    # Each terminal has its own channel, so shards do not fight over a port.
+    engine = conductor.Conductor(FleetConfig(), Store(":memory:"), shards=[0, 1, 2])
+    assert engine.shards == [0, 1, 2]
 
 
 def test_pause_stops_the_park_and_resume_brings_it_back(tmp_path, monkeypatch) -> None:
+    from fleet import terminals as fleet_terminals
+
     monkeypatch.setattr(conductor, "PAUSE_FILE", tmp_path / "PAUSE")
     monkeypatch.setattr(conductor, "STATE_FILE", tmp_path / "state.json")
     spawned: list[list[str]] = []
     stopped: list[int] = []
 
-    def fake_stop_all():
-        stopped.append(1)
+    def fake_stop(account):
+        stopped.append(account.login)
 
-    monkeypatch.setattr(conductor.terminals, "stop_all", fake_stop_all)
+    monkeypatch.setattr(fleet_terminals, "stop", fake_stop)
     monkeypatch.setattr(conductor.subprocess, "Popen",
                         lambda command, **kwargs: _record(spawned, command))
     engine = conductor.Conductor(FleetConfig(), Store(tmp_path / "book.sqlite"), shards=[0])
@@ -224,6 +226,8 @@ def test_pause_stops_the_park_and_resume_brings_it_back(tmp_path, monkeypatch) -
     conductor.PAUSE_FILE.unlink()
     engine.tick()
     assert len(spawned) == before  # existing shard is reused, not duplicated
+    engine.stop()
+    assert not stopped  # ending the park ends its shard processes, never a terminal
 
 
 def _record(sink: list, command: list) -> FakePopen:
@@ -234,7 +238,6 @@ def _record(sink: list, command: list) -> FakePopen:
 def test_restart_backoff_prevents_a_crash_loop(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(conductor, "PAUSE_FILE", tmp_path / "absent")
     monkeypatch.setattr(conductor, "STATE_FILE", tmp_path / "state.json")
-    monkeypatch.setattr(conductor.terminals, "stop_all", lambda: None)
     spawned: list[list[str]] = []
     monkeypatch.setattr(conductor.subprocess, "Popen",
                         lambda command, **kwargs: _record(spawned, command))
@@ -345,7 +348,6 @@ def test_portfolio_stop_alarms_on_an_incomplete_book(tmp_path, monkeypatch) -> N
 
     monkeypatch.setattr(conductor, "PAUSE_FILE", tmp_path / "PAUSE")
     monkeypatch.setattr(conductor, "STATE_FILE", tmp_path / "state.json")
-    monkeypatch.setattr(conductor.terminals, "stop_other_fleet", lambda *a, **k: None)
     monkeypatch.setattr(conductor.subprocess, "Popen",
                         lambda command, **kwargs: _record([], command))
     store = Store(tmp_path / "book.sqlite")
@@ -414,6 +416,9 @@ def test_try_entries_places_one_order(tmp_path, monkeypatch) -> None:
                             volume=0.01, price=1.10, retcode=10009, token="t"))
     monkeypatch.setattr(worker.broker, "open_positions", lambda *a, **k: [])
     monkeypatch.setattr(worker.risk, "can_open", lambda *a, **k: (True, ""))
+    # The send-time identity gate wants the attached window to answer as this account.
+    monkeypatch.setattr(worker.mt5, "account_info",
+                        lambda: types.SimpleNamespace(login=1, server="S"))
     snapshot = risk_mod.AccountSnapshot(login=1, server="S", currency="USD", balance=1000.0,
                                        equity=1000.0, margin_free=1000.0, leverage=100,
                                        positions=0, floating=0.0, server_day="2026-11-03")
@@ -537,22 +542,6 @@ def test_day_state_does_not_publish_flows(tmp_path, monkeypatch) -> None:
     assert day.net_flow == 100.0
 
 
-def test_port_owner_caches_a_free_port(tmp_path, monkeypatch) -> None:
-    calls = {"n": 0}
-
-    class FakeRun:
-        def __init__(self, *a, **k):
-            calls["n"] += 1
-            self.stdout = ""
-            self.stderr = ""
-
-    monkeypatch.setattr(worker.subprocess, "run", FakeRun, raising=False)
-    monkeypatch.setattr(worker, "_PORT_OWNER_CACHE", {"ts": 0.0, "pid": 0}, raising=False)
-    worker.port_owner()
-    worker.port_owner()
-    assert calls["n"] == 1  # the second lookup is served from the cache
-
-
 def test_book_flows_ignore_a_payload_with_a_different_balance(tmp_path) -> None:
     from fleet.config import Account, FleetConfig
     from fleet.store import Store as StoreCls
@@ -589,6 +578,9 @@ def test_cycle_completes_and_publishes_flows(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(risk_mod, "daily_realized", lambda day: 0.0)
     monkeypatch.setattr(worker.Worker, "_manage_positions", lambda self, *a, **k: 0)
     monkeypatch.setattr(worker.Worker, "_try_entries", lambda self, *a, **k: 0)
+    # The cycle keys its flow witness on the broker's own day: pin it, or the test only holds
+    # until the wall clock reaches the next date.
+    monkeypatch.setattr(risk_mod, "server_day_now", lambda: "2026-11-03")
     result = runner._cycle(account, allow_entries=True)
     assert result.status == "ok"
     assert store.get_meta("dayflows:a:2026-11-03") is not None  # published after equity
@@ -625,6 +617,7 @@ def test_cycle_publishes_flows_with_the_final_balance(tmp_path, monkeypatch) -> 
     monkeypatch.setattr(risk_mod, "daily_realized", lambda day: 0.0)
     monkeypatch.setattr(worker.Worker, "_manage_positions", lambda self, *a, **k: 1)
     monkeypatch.setattr(worker.Worker, "_try_entries", lambda self, *a, **k: 0)
+    monkeypatch.setattr(risk_mod, "server_day_now", lambda: "2026-11-03")
     runner._cycle(account, allow_entries=True)
     payload = store.get_meta("dayflows:a:2026-11-03")
     assert payload is not None
@@ -673,6 +666,7 @@ def test_flows_are_published_before_equity_so_a_withdrawal_cannot_fake_a_stop(tm
     monkeypatch.setattr(risk_mod, "daily_realized", lambda day: 0.0)
     monkeypatch.setattr(worker.Worker, "_manage_positions", lambda self, *a, **k: 0)
     monkeypatch.setattr(worker.Worker, "_try_entries", lambda self, *a, **k: 0)
+    monkeypatch.setattr(risk_mod, "server_day_now", lambda: "2026-11-03")
     runner._cycle(account, allow_entries=True)
     payload = store.get_meta("dayflows:a:2026-11-03")
     assert payload is not None
@@ -686,7 +680,6 @@ def test_interleaving_between_publish_and_equity_never_fakes_a_stop(tmp_path, mo
 
     monkeypatch.setattr(conductor, "PAUSE_FILE", tmp_path / "PAUSE")
     monkeypatch.setattr(conductor, "STATE_FILE", tmp_path / "state.json")
-    monkeypatch.setattr(conductor.terminals, "stop_other_fleet", lambda *a, **k: None)
     monkeypatch.setattr(conductor.subprocess, "Popen", lambda c, **k: _record([], c))
     store = StoreCls(tmp_path / "book.sqlite")
     account = Account(name="a", login=1, server="S", mode="demo")
@@ -741,6 +734,9 @@ def test_cycle_runs_the_real_entry_path(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(worker.broker, "market_order",
                         lambda *a, **k: sent.append(1) or types.SimpleNamespace(
                             volume=0.02, price=1.10, retcode=10009, token="t"))
+    # The send-time identity gate wants the attached window to answer as this account.
+    monkeypatch.setattr(worker.mt5, "account_info",
+                        lambda: types.SimpleNamespace(login=1, server="S"))
     result = runner._cycle(account, allow_entries=True)
     assert result.status == "ok"
     assert sent == [1]  # the real _try_entries reached the broker call

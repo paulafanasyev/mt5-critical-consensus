@@ -1,16 +1,18 @@
-"""Worker: owns the API channel for one account at a time and trades its shard's accounts.
+"""Worker: one connection per terminal, and it only ever trades the account it verified.
 
-MT5 exposes one API channel per Windows session, so a worker hands the channel from account to
-account: preflight the port, raise the tunnel if the broker needs one, verify the login, manage
-every position on the account (including manual ones), gate entries with account and book limits
-reserved atomically, then release the terminal.
+Measured on a box with three terminals running: each terminal publishes its own named pipe and
+MetaTrader5.initialize(path=...) answers from the terminal whose executable was named, from several
+processes at once. Nothing about the channel is exclusive to a session, so a worker does not stop
+another terminal to make room, and it does not care which process holds loopback port 22346. What it
+does care about is identity: before any order it checks that the terminal which answered is this
+account's own copy and this account's own login, because a park running several brokers at once has
+no excuse for trading the wrong window.
 """
 from __future__ import annotations
 
 import dataclasses
 import datetime as dt
 import pathlib
-import subprocess
 import time
 import traceback
 import types
@@ -18,10 +20,9 @@ import types
 import MetaTrader5 as mt5
 
 from . import broker, network, risk, strategy, terminals
-from .config import Account, FleetConfig
+from .config import Account, FleetConfig, local_host
 from .store import Store
 
-PORT = 22346
 MAX_FAILURES = 5
 
 
@@ -34,40 +35,25 @@ class WorkerResult:
     closed: int = 0
 
 
-_PORT_OWNER_CACHE: dict[str, float | int] = {"ts": 0.0, "pid": 0}
+def _directory(path_text: str) -> str:
+    """Normalize the install directory a terminal reports, for comparison."""
+    return str(path_text or "").strip().strip('"').rstrip("\\/").casefold()
 
 
-def port_owner(max_age: float = 20.0) -> int | None:
-    """Pid listening on the MT5 API port, cached briefly: the lookup costs ~2 s."""
-    cached_pid = int(_PORT_OWNER_CACHE.get("pid", 0) or 0)
-    cached_age = time.time() - float(_PORT_OWNER_CACHE.get("ts", 0))
-    # A free port is a fact worth caching for a couple of seconds: the lookup costs seconds.
-    ttl = max_age if cached_pid else min(max_age, 4.0)
-    if _PORT_OWNER_CACHE.get("ts") and cached_age < ttl:
-        return cached_pid or None
-    script = ("Get-NetTCPConnection -LocalPort 22346 -State Listen -ErrorAction SilentlyContinue"
-              " | Select-Object -First 1 -ExpandProperty OwningProcess")
-    result = subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                            capture_output=True, text=True)
-    text = result.stdout.strip()
-    pid = int(text) if text.isdigit() else 0
-    _PORT_OWNER_CACHE["ts"] = time.time()
-    _PORT_OWNER_CACHE["pid"] = pid
-    return pid or None
+def answered_by(account: Account) -> tuple[bool, str]:
+    """Is the terminal that answered to initialize() the one this account owns?
 
-
-def port_is_free_or_ours(account: Account) -> tuple[bool, str]:
-    owner = port_owner()
-    if owner is None:
+    Fail-closed: an empty answer is a refusal, not a pass. A park that cannot prove which window it
+    is driving must not send orders through it.
+    """
+    info = mt5.terminal_info()
+    answered = _directory(getattr(info, "path", "") if info is not None else "")
+    expected = _directory(account.data_dir)
+    if not answered:
+        return False, "терминал не сообщил свой путь: непонятно, кто отвечает"
+    if answered == expected:
         return True, ""
-    script = (f"Get-CimInstance Win32_Process -Filter \"ProcessId={owner}\" | "
-              "Select-Object -ExpandProperty CommandLine")
-    result = subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                            capture_output=True, text=True)
-    command = (result.stdout or "").lower()
-    if str(account.data_dir).lower() in command:
-        return True, ""
-    return False, f"порт {PORT} занят чужим процессом {owner}"
+    return False, f"отвечает другой терминал: {answered} вместо {expected}"
 
 
 class Worker:
@@ -87,10 +73,6 @@ class Worker:
                 return f"нужен туннель: {detail}"
         if not account.terminal_exe.exists():
             terminals.provision(account)
-        terminals.stop_other_fleet(keep_dir=account.data_dir)
-        ok, detail = port_is_free_or_ours(account)
-        if not ok:
-            return detail
         if terminals.running_pid(account) is None:
             terminals.launch(account)
         password = terminals.password_for(account)
@@ -117,6 +99,11 @@ class Worker:
             else:
                 tail = " | ".join(terminals.last_log_lines(account, 4))
                 return f"initialize: {mt5.last_error()} ({tail})"
+        # Which window answered? With several brokers running side by side this is not assumed.
+        ok, detail = answered_by(account)
+        if not ok:
+            self.detach()
+            return detail
         info = mt5.account_info()
         if info is None:
             mt5.shutdown()
@@ -199,7 +186,8 @@ class Worker:
                 parts[2] = f"{snapshot.balance:.8f}"
                 flows_payload = "|".join(parts)
             self.store.set_meta(f"dayflows:{account.name}:{server_day}", flows_payload)
-        self.store.save_positions(account.name, positions)
+        self.store.save_positions(account.name, positions,
+                                  self._mirror_risk_usd(account, positions, rate))
 
         self.store.equity(account.name, snapshot.login, snapshot.balance, snapshot.equity,
                           len(positions), snapshot.floating, snapshot.currency, rate,
@@ -296,31 +284,44 @@ class Worker:
         if not allowed:
             self.store.event(account.name, "hold", reason=reason)
             return 0
-        book = self.store.portfolio([a.name for a in self.config.enabled()])
-        book_stop = self.store.portfolio([a.name for a in self.config.enabled()],
-                                         fresh_only=False)
-        mirror = self.store.all_positions(max_age=10 ** 9)  # caps: last known, not only fresh
+        mine = [a.name for a in self.config.local()]
+        book = self.store.portfolio(mine)
+        book_stop = self.store.portfolio(mine, fresh_only=False)
+        mirror = self.store.all_positions(max_age=10 ** 9, names=mine)  # last known, not only fresh
         book_positions = [types.SimpleNamespace(
-            symbol=symbol, volume=volume, sl=sl, price_open=price_open,
+            symbol=symbol, volume=volume, sl=sl, price_open=price_open, ticket=int(ticket),
             type=int(mt5.POSITION_TYPE_BUY) if side == "buy" else int(mt5.POSITION_TYPE_SELL))
-                          for _acc, _ticket, symbol, side, volume, price_open, _profit,
-                          sl, _tp, _magic in mirror]
+                          for _acc, ticket, symbol, side, volume, price_open, _profit,
+                          sl, _tp, _magic, _risk_usd in mirror]
         specs: dict[str, broker.BrokerSymbol | None] = {}
         for position in book_positions:
             specs[position.symbol] = broker.symbol_exact(position.symbol)
-        atrs: dict[str, float] = {}
-        for position in book_positions:
-            if float(getattr(position, "sl", 0.0) or 0.0) <= 0:
-                spec_for_atr = specs.get(position.symbol)
-                if spec_for_atr is not None:
-                    atrs[position.symbol] = broker.atr(spec_for_atr.name, mt5.TIMEFRAME_H1)
-        atr_by_symbol = dict(atrs)
         current_risk = 0.0
-        for position in book_positions:
+        unpriced_risk = 0
+        for row, position in zip(mirror, book_positions):
+            stored = row[10]
+            if stored is not None and float(stored) > 0:
+                # Priced by the broker that holds it, in that account's currency, already
+                # converted to dollars: this terminal has never seen that contract.
+                current_risk += float(stored)
+                continue
+            if row[0] != account.name:
+                # Somebody else's account, and its own shard could not price this stop. Re-pricing
+                # it here would use our contract and our dollar rate for a broker we do not speak
+                # to, and a cent or ruble account would silently cost a hundredth or a hundredth-
+                # hundredth of its real risk.
+                unpriced_risk += 1
+                continue
             spec = specs.get(position.symbol)
-            stop_atr = account.risk.stop_atr
-            current_risk += risk.position_risk_money(
-                position, spec, atr_by_symbol.get(position.symbol, 0.0), stop_atr)
+            if spec is None:
+                unpriced_risk += 1
+                continue
+            money = risk.position_risk_money(
+                position, spec, self._atr_entry(account, position, spec), account.risk.stop_atr)
+            if not money > 0:
+                unpriced_risk += 1  # a zero here is a broker that described no tick value
+                continue
+            current_risk += money * rate
         if book_stop.get("unpriced", 0) > 0:
             if self.store.get_meta(f"unpriced_warned:{account.name}") != "1":
                 self.store.set_meta(f"unpriced_warned:{account.name}", "1")
@@ -330,6 +331,11 @@ class Worker:
         if self.store.get_meta(f"unpriced_warned:{account.name}") == "1":
             self.store.set_meta(f"unpriced_warned:{account.name}", "0")
             self.store.event(account.name, "unpriced_book_resolved")
+        if unpriced_risk:
+            # Counting an unmeasurable stop as zero would let the portfolio risk cap pass a book
+            # whose real risk nobody has added up yet.
+            self.store.event(account.name, "portfolio_risk_unpriced", count=unpriced_risk)
+            return 0
         day_pct = self._portfolio_day_pct(book_stop["equity"])
         for signal in strategy.signals(account):
             spec = broker.symbol(signal.base_symbol)
@@ -346,19 +352,33 @@ class Worker:
                 continue
             risk_money = spec.distance_money(signal.stop_distance, volume)
             ok, why = risk.can_open_portfolio(
-                self.config.portfolio, book_stop["equity"], current_risk, risk_money,
+                self.config.portfolio, book_stop["equity"], current_risk, risk_money * rate,
                 book_positions, specs, day_pct, new_symbol=spec.name, new_volume=volume,
                 new_side=signal.side)
             if not ok:
                 self.store.event(account.name, "portfolio_hold", reason=why)
                 return 0
             reserved, why, slot = self.store.reserve(account.name, spec.name, volume,
-                                                     self.config.portfolio, book["equity"])
+                                                     self.config.portfolio, book["equity"],
+                                                     risk_usd=risk_money * rate,
+                                                     open_risk_usd=current_risk)
             if not reserved:
                 self.store.event(account.name, "portfolio_hold", reason=why)
                 return 0
+            # The portable directory proved which window answered; only a live login proves whose
+            # money this order would move. A manual re-login in that window is otherwise invisible.
+            sending = not (self.dry_run or (account.is_real and not self.allow_live))
+            if sending:
+                who = mt5.account_info()
+                if who is None or (int(who.login), str(who.server)) != (account.login, account.server):
+                    self.store.release(slot)
+                    self.store.event(account.name, "identity_lost", symbol=spec.name,
+                                     detail=f"перед входом отвечает "
+                                            f"{getattr(who, 'login', None)}/"
+                                            f"{getattr(who, 'server', None)}")
+                    return 0
             try:
-                if self.dry_run or (account.is_real and not self.allow_live):
+                if not sending:
                     self.store.release(slot)
                     self.store.event(account.name, "entry(gated)", symbol=spec.name,
                                      side=signal.side, volume=volume, reason=signal.reason,
@@ -372,6 +392,11 @@ class Worker:
                 self.store.event(account.name, "entry_failed", symbol=spec.name,
                                  error=str(exc))
                 continue
+            except Exception:
+                # Anything else unwinds the whole cycle. A slot left behind is a money reservation
+                # nobody owns, and it holds the portfolio risk cap for its full 600 s.
+                self.store.release(slot)
+                raise
             self.store.trade(account.name, snapshot.login, spec.name, signal.side,
                              execution.volume, signal.price, volume, execution.retcode,
                              signal.reason, execution.token)
@@ -382,7 +407,9 @@ class Worker:
             for position in fresh:
                 self.store.set_meta(f"atr:{account.name}:{int(position.ticket)}",
                                     f"{signal.atr:.8f}")
-            self.store.save_positions(account.name, risk.positions_for(account))
+            fresh_positions = risk.positions_for(account)
+            self.store.save_positions(account.name, fresh_positions,
+                                      self._mirror_risk_usd(account, fresh_positions, rate))
             self.store.release(slot)
             self._mark_entry(account, spec.name)
             return 1
@@ -405,12 +432,44 @@ class Worker:
         self.store.set_meta(f"entry:{account.name}:{symbol_name}",
                             dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"))
 
+    def _mirror_risk_usd(self, account: Account, positions: list, rate: float) -> dict[int, float]:
+        """Price this account's own stop risk in dollars, by the broker that holds it.
+
+        A peer shard reading the mirror cannot resolve these symbols: a contract on another broker
+        means a different amount of money per point, and its name may not exist here at all.
+        """
+        if rate <= 0:
+            return {}
+        priced: dict[int, float] = {}
+        specs: dict[str, broker.BrokerSymbol | None] = {}
+        for position in positions:
+            name = str(position.symbol)
+            if name not in specs:
+                specs[name] = broker.symbol_exact(name)
+            spec = specs[name]
+            if spec is None:
+                continue  # stays NULL in the mirror: a reader must not read it as no risk
+            money = risk.position_risk_money(
+                position, spec, self._atr_entry(account, position, spec),
+                account.risk.stop_atr)
+            if not money > 0:
+                # A contract the broker described with a zero tick value, or a stop we could not
+                # measure, prices to 0.0 — and 0.0 in the mirror is a lie the portfolio cap believes.
+                continue
+            priced[int(position.ticket)] = money * rate
+        return priced
+
     # --- book day -----------------------------------------------------------------------
     def _portfolio_day_pct(self, equity_usd: float) -> float:
-        start = self.store.get_meta("portfolio_day_start_equity")
-        day = self.store.get_meta("portfolio_day")
+        day, start = self.store.portfolio_baseline(local_host())
         today = risk.server_day_now()
-        if not start or day != today:
+        if not start:
+            return 0.0
+        if day and today < day:
+            # This broker's clock has not reached the portfolio day yet; nothing to compare.
+            # The other direction is deliberately allowed: the portfolio day is the slowest live
+            # clock, so an account already on the next one is still inside the measured day, and
+            # refusing to look would blind the stop exactly when the ahead clock is trading.
             return 0.0
         try:
             value = float(start)

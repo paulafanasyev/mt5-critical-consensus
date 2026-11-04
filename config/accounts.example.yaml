@@ -5,6 +5,12 @@
 # Обязательные поля: name, login, server, mode (demo|real).
 # network: vpn требует vpn_profile — путь к .ovpn.
 # currency_scale: 0.01 для центовых счетов (100000 «центов» = $1000), иначе не задавать.
+#
+# Счета с разных платформ живут в одном парке и в нескольких терминалах сразу: у каждого счёта
+# своя portable-папка и свой канал (pipe), поэтому брокеры не мешают друг другу. terminal_source —
+# установка именно того брокера, чей это счёт; если не указан, берётся C:\Program Files\MetaTrader 5.
+# Имена инструментов у брокеров разные (XAUUSDc, EURUSD.pro), поиск по суффиксу делается сам.
+# host — закрепление счёта за машиной: с другой машины он не подключается и не торгуется.
 
 accounts:
   - name: demo-metaquotes
@@ -39,6 +45,7 @@ accounts:
     shard: 1
     magic: 7000002
     password_env: EXNESS_REAL_PASSWORD
+    terminal_source: C:\Program Files\Exness MT5Real26
     seed_config: C:\path\to\broker-x\config
     symbols: [GBPUSD, EURUSD, XAUUSD]
     strategy:
@@ -63,6 +70,7 @@ accounts:
     network: direct
     shard: 2
     magic: 7000003
+    terminal_source: C:\Program Files\GTC Go MT5
     symbols: [EURUSD, GBPUSD]
     risk:
       risk_per_trade_pct: 0.20
@@ -76,4 +84,3 @@ portfolio:
   max_usd_lots: 1.00
   max_open_positions: 60
   daily_stop_pct: 2.0
-  max_worker_processes: 1
