@@ -5,7 +5,9 @@ backoff, the single-shard rule, and real-account gating — each is a bug that o
 """
 from __future__ import annotations
 
+import dataclasses
 import json
+import os
 import pathlib
 import sys
 import time
@@ -845,27 +847,45 @@ def test_cycle_runs_the_real_entry_path(tmp_path, monkeypatch) -> None:
 
 
 # --- the candidate book ------------------------------------------------------------------------
-def _note(side: str, asked: float, filled: float, volume: float = 0.02, ticket: int = 7):
+def _note(side: str, asked: float, filled: float, volume: float = 0.02, ticket: int = 7,
+          currency: str = "USD", rate: float = 1.0):
     signal = types.SimpleNamespace(side=side, price=asked, stop=filled - 0.002 if side == "buy"
                                    else filled + 0.002, target=filled + 0.004 if side == "buy"
                                    else filled - 0.004, atr=0.001, reason="test")
     execution = types.SimpleNamespace(price=filled, volume=volume, position_ticket=ticket)
     spec = types.SimpleNamespace(name="EURUSD", point=0.00001, tick_size=0.00001, tick_value=1.0)
-    return candidates.entry_note(signal, execution, spec, 2.0)
+    return candidates.entry_note(signal, execution, spec, 2.0, currency, rate)
 
 
 def test_the_candidate_bill_is_paid_in_the_direction_the_trade_went() -> None:
     """Slippage we profited from is a rebate, slippage we paid for is a cost. Signed, not absolute."""
     worse = _note("buy", 1.10000, 1.10025)   # market ran away before the fill
     assert worse["drift_points"] == 25.0
-    assert worse["drift_usd_per_lot"] == 25.0  # 1.0 per 0.00001 -> 100 000 USD per lot per unit
-    assert worse["drift_cost_usd"] == 0.5      # 0.50 USD on 0.02 lot
-    better = _note("buy", 1.10000, 1.09980)   # filled below the signalled price
+    assert worse["drift_cost_per_lot"] == 25.0  # 1.0 per 0.00001 -> 100 000 per lot per unit
+    assert worse["drift_cost"] == 0.5           # 0.50 of the account currency on 0.02 lot
+    assert worse["drift_cost_usd"] == 0.5       # a USD account: the bill is already in dollars
+    better = _note("buy", 1.10000, 1.09980)    # filled below the signalled price
     assert better["drift_points"] == -20.0
     assert better["drift_cost_usd"] == -0.4
-    sold = _note("sell", 1.10000, 1.09980)    # a sell filled lower is worse, not better
+    sold = _note("sell", 1.10000, 1.09980)     # a sell filled lower is worse, not better
     assert sold["drift_points"] == 20.0
     assert sold["drift_cost_usd"] == 0.4
+
+
+def test_the_drift_bill_is_converted_and_never_relabelled() -> None:
+    """The broker's tick value is money in the ACCOUNT currency, so a dollar column has to be a product.
+
+    On a ruble account printing tick_value under a dollar sign overstates the bill about a hundred
+    times, and a cent account understates it a hundred times. Where the worker handed over no rate,
+    the dollar column is blank: an unpriced bill is a counter, not a sum.
+    """
+    rub = _note("buy", 1.10000, 1.10025, currency="RUB", rate=0.01)
+    assert rub["currency"] == "RUB" and rub["rate_to_usd"] == 0.01
+    assert rub["drift_cost"] == 0.5
+    assert rub["drift_cost_usd"] == 0.005
+    unpriced = _note("buy", 1.10000, 1.10025, currency="RUB", rate=0.0)
+    assert unpriced["drift_cost"] == 0.5
+    assert unpriced["drift_cost_usd"] is None and unpriced["rate_to_usd"] is None
 
 
 def test_a_candidate_with_no_contract_size_is_left_blank_instead_of_guessed() -> None:
@@ -873,9 +893,10 @@ def test_a_candidate_with_no_contract_size_is_left_blank_instead_of_guessed() ->
                                    atr=0.001, reason="test")
     execution = types.SimpleNamespace(price=1.10, volume=0.02, position_ticket=7)
     blind_spec = types.SimpleNamespace(name="EURUSD", point=0.00001, tick_size=0.0, tick_value=0.0)
-    bare = candidates.entry_note(signal, execution, blind_spec, 2.0)
+    bare = candidates.entry_note(signal, execution, blind_spec, 2.0, "USD", 1.0)
     assert bare["drift_points"] == 0.0
-    assert "drift_cost_usd" not in bare  # no broker contract -> no dollars, no invented ones
+    assert "drift_cost" not in bare and "drift_cost_usd" not in bare
+    # no broker contract -> no money in any currency, no invented ones
     assert bare["risk_usd"] == 2.0
 
 
@@ -898,21 +919,49 @@ def test_the_candidate_module_can_not_reach_a_broker() -> None:
 def test_the_ledger_joins_by_ticket_and_counts_what_it_can_not_join(tmp_path) -> None:
     store = Store(tmp_path / "book.sqlite")
     store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02,
-                ticket=7, drift_points=25.0, drift_cost_usd=0.5, risk_usd=2.0,
+                ticket=7, ticket_source="token", currency="USD", rate_to_usd=1.0,
+                drift_points=25.0, drift_cost=0.5, drift_cost_usd=0.5, risk_usd=2.0,
                 risk_reward=2.0)
     store.event("a", candidates.KIND, symbol="XAUUSD", side="buy", volume=0.01,
-                ticket=0, drift_points=3.0, drift_cost_usd=0.1, risk_usd=1.0)
-    store.event("a", "closed", symbol="EURUSD", ticket=7, reason="trailing", profit=3.2)
+                ticket=0, ticket_source="unknown", currency="USD", rate_to_usd=1.0,
+                drift_points=3.0, drift_cost=0.1, drift_cost_usd=0.1, risk_usd=1.0)
+    store.event("a", "closed", symbol="EURUSD", ticket=7, reason="trailing", profit=3.2,
+                by="парк", currency="USD", rate_to_usd=1.0, profit_usd=3.2)
     store.event("a", "closed", symbol="EURUSD", reason="old row, no ticket")  # pre-ticket journal
     book = candidates.ledger(store)
     assert book["candidates"] == 2
     assert book["closed"] == 1
     assert book["blind"] == 1            # ticket 0 is counted, nothing is inferred about it
     assert book["open"] == 0
+    assert book["guessed"] == 1          # the ticket-less row is the one nobody can vouch for
     assert book["profit_gross_usd"] == 3.2
     assert book["win_rate"] == 100.0
     assert book["drift_cost_usd"] == 0.6  # the drift bill covers both entries, closed or not
     assert [t["exit"] for t in book["trades"]] == ["trailing", ""]  # oldest entry first
+    assert [t["closed_by"] for t in book["trades"]] == ["парк", ""]  # who ended the trade
+
+
+def test_a_row_the_journal_cannot_price_is_counted_not_summed(tmp_path) -> None:
+    """A finished trade whose money was never converted, and a guessed ticket, get their own counters.
+
+    Old journal rows and a cent or ruble account read before the worker knew its rate would otherwise
+    be added to a dollar column as if the number were already dollars.
+    """
+    store = Store(tmp_path / "book.sqlite")
+    store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02, ticket=7,
+                ticket_source="only_position", currency="RUB", drift_points=25.0,
+                drift_cost=0.5, risk_usd=2.0)
+    store.event("a", "closed", symbol="EURUSD", ticket=7, reason="стоп", profit=-12.5,
+                by="брокер")
+    book = candidates.ledger(store)
+    assert book["candidates"] == 1
+    assert book["closed"] == 0 and book["open"] == 0   # settled, but not in dollars
+    assert book["settled_unpriced"] == 1
+    assert book["drift_unpriced"] == 1
+    assert book["guessed"] == 1 and book["by_source"] == {"only_position": 1}
+    assert book["profit_gross_usd"] == 0.0 and book["drift_cost_usd"] == 0.0
+    assert book["win_rate"] is None
+    assert book["trades"][0]["settled"] is True and book["trades"][0]["exit"] == "стоп"
 
 
 def test_the_cycle_journals_a_candidate_and_never_holds_the_risk_slot_for_it(
@@ -1110,9 +1159,9 @@ def test_a_sell_is_stamped_at_the_price_it_can_actually_get(monkeypatch) -> None
     note = candidates.entry_note(types.SimpleNamespace(
         side="sell", price=1.09980, stop=1.10180, target=1.09580, atr=0.001, reason="test"),
         types.SimpleNamespace(price=1.09980, volume=0.02, position_ticket=9,
-                              ticket_source="token"), _spec(), 2.0)
+                              ticket_source="token"), _spec(), 2.0, "USD", 1.0)
     assert note["drift_points"] == 0.0
-    assert note["drift_cost_usd"] == 0.0
+    assert note["drift_cost"] == 0.0 and note["drift_cost_usd"] == 0.0
 
 
 def test_a_non_finite_price_is_blank_not_a_number_in_the_book() -> None:
@@ -1168,8 +1217,10 @@ def test_a_close_on_another_account_never_pays_this_trade(tmp_path) -> None:
     """Tickets are unique per server, and this book is kept for every broker at once."""
     store = Store(tmp_path / "book.sqlite")
     store.event("exness", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02,
-                ticket=7, drift_points=25.0, drift_cost_usd=0.5, risk_usd=2.0)
-    store.event("gtc", "closed", symbol="EURUSD", ticket=7, reason="стоп", profit=-77.7)
+                ticket=7, currency="USD", rate_to_usd=1.0,
+                drift_points=25.0, drift_cost=0.5, drift_cost_usd=0.5, risk_usd=2.0)
+    store.event("gtc", "closed", symbol="EURUSD", ticket=7, reason="стоп", profit=-77.7,
+                by="брокер", currency="EUR", rate_to_usd=1.1, profit_usd=-85.47)
     book = candidates.ledger(store)
     assert book["closed"] == 0
     assert book["open"] == 1
@@ -1181,11 +1232,14 @@ def test_one_close_is_never_paid_out_twice(tmp_path) -> None:
     store = Store(tmp_path / "book.sqlite")
     for _ in range(2):
         store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02,
-                    ticket=7, drift_points=25.0, drift_cost_usd=0.5, risk_usd=2.0)
-    store.event("a", "closed", symbol="EURUSD", ticket=7, reason="тейк", profit=50.0)
+                    ticket=7, currency="USD", rate_to_usd=1.0,
+                    drift_points=25.0, drift_cost=0.5, drift_cost_usd=0.5, risk_usd=2.0)
+    store.event("a", "closed", symbol="EURUSD", ticket=7, reason="тейк", profit=50.0,
+                by="парк", currency="USD", rate_to_usd=1.0, profit_usd=50.0)
     book = candidates.ledger(store)
     assert book["candidates"] == 2
     assert book["closed"] == 1 and book["open"] == 1
+    assert book["settled_unpriced"] == 0
     assert book["profit_gross_usd"] == 50.0
 
 
@@ -1365,3 +1419,456 @@ accounts:
 """, encoding="utf-8")
     with pytest.raises(ConfigError, match="magic"):
         config.load(target)
+
+
+# --- the book that already exists on disk (measured on the production journal) ---------------
+
+OLD_TABLES = """
+CREATE TABLE equity (ts TEXT, account TEXT, login INTEGER, balance REAL, equity REAL,
+                     positions INTEGER, floating REAL);
+CREATE TABLE trades (ts TEXT, account TEXT, login INTEGER, symbol TEXT, side TEXT, volume REAL,
+                     price REAL, sl REAL, tp REAL, retcode INTEGER, comment TEXT);
+"""
+
+
+def test_a_book_written_before_the_contract_columns_gains_them(tmp_path) -> None:
+    """`CREATE TABLE IF NOT EXISTS` never touches a table that exists, so old rows block new code.
+
+    Measured on the live journal: `equity` had no currency/rate_to_usd and `trades` had no
+    requested_price/requested_volume/token. Every cycle died in the first INSERT, and the second
+    one sat after the broker had already filled the order.
+    """
+    import sqlite3
+
+    path = tmp_path / "book.sqlite"
+    conn = sqlite3.connect(path)
+    conn.executescript(OLD_TABLES)
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+
+    conn = sqlite3.connect(path)
+    columns = {table: [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+               for table in ("equity", "trades")}
+    conn.close()
+    assert {"currency", "rate_to_usd"} <= set(columns["equity"])
+    assert {"requested_price", "requested_volume", "token"} <= set(columns["trades"])
+    store.equity("a", 1, 1000.0, 1000.0, 0, 0.0, currency="EUR", rate_to_usd=1.08)
+    store.trade("a", 1, "EURUSD", "buy", 0.1, 1.0, 0.1, 10009, "reason", "tok")
+    assert store.account_equity("a") == pytest.approx(1080.0)
+
+
+def test_a_lost_journal_row_is_reported_lost(tmp_path, monkeypatch) -> None:
+    """A report that cannot be written must not mark itself announced.
+
+    The journal can be locked by another window for the whole cycle. The park keeps trading — the
+    row is a money trail, not a guard — but the caller has to be able to tell the two outcomes.
+    """
+    import sqlite3
+
+    store = Store(tmp_path / "book.sqlite")
+
+    def locked():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "_connect", locked)
+    assert store.event("a", "close", ticket=51) is False
+    conn = sqlite3.connect(tmp_path / "book.sqlite")
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+    conn.close()
+    assert '"close"' in store.trail.read_text(encoding="utf-8")  # the paper copy is all that is left
+
+
+def test_the_prune_keeps_the_cooldown_and_loses_the_dead_ticket_note(tmp_path) -> None:
+    """One lifetime rule for both kinds of note deleted the cooldown every 30 seconds.
+
+    `entry:<account>:<symbol>` is the park's promise not to re-enter a symbol for
+    `cooldown_minutes`; it belongs to no ticket. `atr:<account>:<ticket>` belongs to a lot that
+    really does die. Pruning both against the position book meant a symbol cooled down, went
+    un-cooled and re-entered on the next cycle — forever.
+    """
+    import datetime as dt
+
+    store = Store(tmp_path / "book.sqlite")
+
+    class P:
+        ticket, symbol, type, volume = 51, "EURUSD", 0, 0.1
+        price_open, profit, sl, tp, magic = 1.1, 0.0, 1.09, 0.0, 7
+
+    store.save_positions("a", [P()])
+    store.set_meta("atr:a:51", "0.00120000")
+    store.set_meta("entry:a:EURUSD",
+                   dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"))
+    store.set_meta("entry:a:XAUUSD",
+                   (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30))
+                   .isoformat(timespec="seconds"))
+    store.prune()
+    assert store.get_meta("atr:a:51") == "0.00120000"
+    assert store.get_meta("entry:a:EURUSD")  # its cooldown has not run out
+    assert store.get_meta("entry:a:XAUUSD") is None  # a month stale, worthless
+    store.close_position_row("a", 51)
+    store.prune()
+    assert store.get_meta("atr:a:51") is None  # the lot is gone, so is its ATR
+
+
+def test_the_mirror_answers_which_lots_the_book_last_saw(tmp_path) -> None:
+    """A ticket that left the broker's book without our asking is a close nobody journalled."""
+    store = Store(tmp_path / "book.sqlite")
+
+    class P:
+        ticket, symbol, type, volume = 51, "EURUSD", 0, 0.1
+        price_open, profit, sl, tp, magic = 1.1, 0.0, 1.09, 0.0, 7
+
+    store.save_positions("a", [P()])
+    assert store.mirrored_positions("a") == {51: (7, 0.1, "EURUSD")}
+    with store._connect() as conn:  # noqa: SLF001 - same package, the clock is what is being moved
+        conn.execute("UPDATE positions SET updated_epoch=?", (time.time() - 900 - 1,))
+    assert store.mirrored_positions("a") == {}  # a stale picture proves nothing about a close
+
+
+def _managed(tmp_path, monkeypatch):
+    """A worker whose broker answers with the fixed EURUSD spec and a live tick."""
+    from fleet.config import Account, FleetConfig
+
+    account = Account(name="a", login=1, server="S", mode="demo")
+    store = Store(tmp_path / "book.sqlite")
+    runner = worker.Worker(FleetConfig(accounts=[account]), store, allow_live=True)
+    monkeypatch.setattr(worker.broker, "symbol_exact", lambda name: _spec())
+    monkeypatch.setattr(worker.mt5, "symbol_info_tick",
+                        lambda name: types.SimpleNamespace(bid=1.101, ask=1.101))
+    return account, store, runner
+
+
+def _of(store, kind: str) -> list[dict]:
+    return [json.loads(payload) for _ts, _a, k, payload in store.recent_events(limit=200)
+            if k == kind]
+
+
+def test_a_lot_the_broker_closed_is_journalled_with_its_own_profit(tmp_path,
+                                                                   monkeypatch) -> None:
+    """A stop the broker hit is a finished trade, and the candidate book has to be paid for it.
+
+    Every close ordered here writes its own journal line, so a ticket that stood in last cycle's
+    mirror and is absent from this book left on its own — at its stop, from the platform, by a server
+    rule. Missing those left the ledger calling a settled trade open forever: the drift bill counted
+    against a profit column that never filled, and nobody could check the park against the broker.
+    """
+    account, store, runner = _managed(tmp_path, monkeypatch)
+    store.save_positions("a", [_position(41, account.magic)])  # last cycle saw our lot
+
+    def deals(position):  # noqa: ARG001 - the ticket arrives as a keyword
+        return [types.SimpleNamespace(entry=0, profit=0.0, comment="fleet-1"),  # the opening deal
+                types.SimpleNamespace(entry=1, profit=-12.5, comment="[SL]")]  # the closing one
+
+    monkeypatch.setattr(worker.mt5, "history_deals_get", deals)
+    day = worker.risk.DayState(day="2026-11-04", start_balance=1000.0)
+    assert runner._manage_positions(account, day, [], "EUR", 1.10) == 0
+    assert _of(store, "closed") == [{"symbol": "EURUSD", "ticket": 41, "reason": "[SL]",
+                                     "by": "брокер", "profit": -12.5, "currency": "EUR",
+                                     "rate_to_usd": 1.1, "profit_usd": -13.75}]
+    runner._manage_positions(account, day, [], "EUR", 1.10)
+    assert len(_of(store, "closed")) == 1  # said once: the mirror row went with the report
+
+
+def test_a_broker_close_the_history_cannot_price_is_left_unpriced(tmp_path, monkeypatch) -> None:
+    """An exit whose deal the terminal will not show is a missing number, not a result of zero."""
+    account, store, runner = _managed(tmp_path, monkeypatch)
+    store.save_positions("a", [_position(41, account.magic)])
+    monkeypatch.setattr(worker.mt5, "history_deals_get", lambda **_k: None)  # history read failed
+    day = worker.risk.DayState(day="2026-11-04", start_balance=1000.0)
+    runner._manage_positions(account, day, [], "EUR", 1.10)
+    row = _of(store, "closed")[0]
+    assert row["by"] == "брокер" and row["ticket"] == 41 and row["symbol"] == "EURUSD"
+    assert row["profit"] is None and row["profit_usd"] is None
+
+
+def test_a_manual_lot_merged_into_ours_is_not_modified_or_closed(tmp_path,
+                                                                 monkeypatch) -> None:
+    """On a netting account his trade folds into our ticket, so the magic alone no longer says whose.
+
+    The mirror remembers how much of this ticket we asked for, and volume beyond it stops every order
+    this park would send for that ticket: a trailing exit here would close his lot along with ours
+    without ever asking him.
+    """
+    account, store, runner = _managed(tmp_path, monkeypatch)
+    store.save_positions("a", [_position(31, account.magic)])
+    merged = _position(31, account.magic, volume=0.20)
+    sent: list[str] = []
+    monkeypatch.setattr(worker.broker, "modify_position",
+                        lambda *a, **k: sent.append("modify"))
+    monkeypatch.setattr(worker.broker, "close_position",
+                        lambda position, *a, **k: sent.append("close")
+                        or float(position.volume))
+    monkeypatch.setattr(worker.strategy, "break_even_level", lambda *a, **k: 1.1005)
+    monkeypatch.setattr(worker.strategy, "exit_reason", lambda *a, **k: "тейк")
+    day = worker.risk.DayState(day="2026-11-04", start_balance=1000.0)
+    assert runner._manage_positions(account, day, [merged], "USD", 1.0) == 0
+    assert sent == []  # not one order into a ticket that is two people's money
+    assert _of(store, "lot_merged_with_manual")[0]["lots"] == [
+        {"ticket": 31, "asked": 0.1, "now": 0.2}]
+    runner._manage_positions(account, day, [merged], "USD", 1.0)
+    assert len(_of(store, "lot_merged_with_manual")) == 1  # the same fact is said once
+
+
+def test_the_risk_mirror_prices_the_operators_lot_without_claiming_it(tmp_path,
+                                                                     monkeypatch) -> None:
+    """The money cap counts his lot; the authorship note must still say the park never placed it.
+
+    The dollar mirror used to ask for this account's entry ATR of every position, which wrote
+    `atr:<account>:<ticket>` for the operator's trades too — and the reporter then read its own note
+    back and raised `park_lot_unattributed`, the alarm for a lot we placed whose magic has gone, on a
+    machine where nothing of ours was lost.
+    """
+    account, store, runner = _managed(tmp_path, monkeypatch)
+    his = _position(52, 0, volume=0.30)
+    priced = runner._mirror_risk_usd(account, [his], 1.0)
+    assert priced == {52: pytest.approx(60.0)}  # 200 points of stop distance at $1/point, 0.30 lot
+    assert store.get_meta("atr:a:52") is None  # his money in the sum, his trade not ours to drive
+    day = worker.risk.DayState(day="2026-11-04", start_balance=1000.0)
+    runner._manage_positions(account, day, [his], "USD", 1.0)
+    assert _of(store, "park_lot_unattributed") == []
+    assert len(_of(store, "foreign_positions")) == 1
+
+
+def test_a_lot_without_a_stop_costs_the_book_a_number_instead_of_a_guess(tmp_path,
+                                                                         monkeypatch) -> None:
+    """A manual trade with no stop has no measurable risk, and the mirror has to say so.
+
+    The fallback used to price `abs(price_open - 0)` as the stop distance: gold at 2000 became an ATR
+    of 2000 and a risk figure nobody had ever asked the broker to hold. A ticket the mirror leaves
+    NULL is read by every shard as a reason to stop opening, never as a risk of zero.
+    """
+    account, store, runner = _managed(tmp_path, monkeypatch)
+    naked = _position(53, 0)
+    naked.sl = 0.0
+    assert runner._mirror_risk_usd(account, [naked], 1.0) == {}
+    assert store.get_meta("atr:a:53") is None
+
+
+def test_a_lot_with_nothing_to_price_keeps_the_rules_the_broker_holds(tmp_path,
+                                                                     monkeypatch) -> None:
+    """No entry ATR means the ATR rules stand down — not that this lot runs without protection.
+
+    0.0 is what `strategy` already reads as "no ATR": the target and stop-distance rules disable
+    themselves, while the broker's own stop, the giveback from the peak and the time cap keep running
+    on numbers the position itself carries.
+    """
+    account, store, runner = _managed(tmp_path, monkeypatch)
+    seen: list[float] = []
+    monkeypatch.setattr(worker.strategy, "break_even_level",
+                        lambda _a, _p, _s, atr: seen.append(atr) or None)
+    monkeypatch.setattr(worker.strategy, "exit_reason", lambda *a, **k: "")
+    naked = _position(41, account.magic)
+    naked.sl = 0.0
+    day = worker.risk.DayState(day="2026-11-04", start_balance=1000.0)
+    runner._manage_positions(account, day, [naked], "USD", 1.0)
+    assert seen == [0.0]
+    assert store.get_meta("atr:a:41") is None  # nothing was persisted as this lot's entry ATR
+    assert len(_of(store, "lot_atr_unpriced")) == 1
+    runner._manage_positions(account, day, [naked], "USD", 1.0)
+    assert len(_of(store, "lot_atr_unpriced")) == 1  # and it is not repeated every cycle
+
+
+def test_an_emptied_manual_book_is_said_once(tmp_path, monkeypatch) -> None:
+    """The operator closing his own trades is a fact worth one line, and the line has an end."""
+    account, store, runner = _managed(tmp_path, monkeypatch)
+    day = worker.risk.DayState(day="2026-11-04", start_balance=1000.0)
+    runner._manage_positions(account, day, [_position(60, 0)], "USD", 1.0)
+    runner._manage_positions(account, day, [], "USD", 1.0)
+    assert len(_of(store, "manual_lots_cleared")) == 1
+    runner._manage_positions(account, day, [], "USD", 1.0)
+    assert len(_of(store, "manual_lots_cleared")) == 1  # an empty book is said once, not per cycle
+
+
+def test_a_journal_rebuilt_under_the_park_does_not_arm_the_day_stop(tmp_path) -> None:
+    """An empty book beside an existing money trail is amnesia, not a new day.
+
+    This is the state a scratch script with the wrong path leaves on this machine: the `.jsonl`
+    copy of the trail survives, the SQLite book does not. Re-taking the baseline from today's
+    equity would move the daily stop onto the number the losses already produced, so the day stays
+    unmeasured — which holds entries — until the operator resets it on purpose.
+    """
+    path = tmp_path / "book.sqlite"
+    # The state a loss leaves behind: the paper trail of a park that traded, and no SQLite book.
+    (tmp_path / "book.jsonl").write_text(
+        json.dumps({"ts": "2026-11-04T09:00:00+00:00", "account": "a", "kind": "closed",
+                    "ticket": 51}) + "\n", encoding="utf-8")
+
+    store = Store(path)
+    assert store.created_new and store.trail_existed
+    store.equity("a", 1, 900.0, 900.0, 0, 0.0)
+    engine = conductor.Conductor(FleetConfig(), store, shards=[0])
+    engine._remember_baseline(store.portfolio(["a"]))
+    assert engine.day_start_equity is None
+    kinds = [kind for _ts, _a, kind, _p in store.recent_events(40)]
+    assert "journal_recreated" in kinds and "new_day" not in kinds
+
+    store.event("cli", "reset_day", host=conductor.local_host())  # the operator's answer
+    later = conductor.Conductor(FleetConfig(), store, shards=[0])
+    later._remember_baseline(store.portfolio(["a"]))
+    assert later.day_start_equity == pytest.approx(900.0)
+    assert [k for _ts, _a, k, _p in store.recent_events(40)].count("journal_recreated") == 1
+
+
+# --- the shard reads its registry, and the broker reads its own contract -----------------------
+def _registry_yaml(name: str = "exness", login: int = 777001) -> str:
+    return (f"accounts:\n  - name: {name}\n    login: {login}\n"
+            f"    server: Exness-MT5Real26\n    mode: demo\n    shard: 0\n"
+            f"    symbols: [EURUSD]\n")
+
+
+def _drive_shard(tmp_path, monkeypatch, steps, *, cycles: int):
+    """Run the shard loop with trading counted, mutating the registry between cycles.
+
+    A shard cycles until it is killed, so `time.sleep` is the only seam: step k runs after cycle k,
+    and the driver ends the run by raising out of a later sleep.
+    """
+    from fleet import shard
+
+    registry = tmp_path / "accounts.yaml"
+    registry.write_text(_registry_yaml(), encoding="utf-8")
+    store_path = tmp_path / "book.sqlite"
+    traded: list[str] = []
+    slept: list[int] = []
+    monkeypatch.setattr(shard.worker, "run_shard",
+                        lambda config, store, index, **kwargs: (
+                            traded.append(config.accounts[0].name) or []))
+
+    def fake_sleep(seconds):
+        slept.append(len(slept) + 1)
+        step = steps[len(slept) - 1] if len(slept) <= len(steps) else None
+        if step is not None:
+            step(registry)
+            if registry.exists():
+                # A rewrite inside one clock tick leaves st_mtime where it was, and a shard that
+                # saw no change would be right: the test has to change the file, not its contents.
+                os.utime(registry, (time.time() + 7 * len(slept),) * 2)
+        if len(slept) >= cycles:
+            raise SystemExit("end of the driven run")
+
+    monkeypatch.setattr(shard.time, "sleep", fake_sleep)
+    with pytest.raises(SystemExit):
+        shard.main(["--shard", "0", "--config", str(registry), "--store", str(store_path)])
+    return traded, Store(store_path)
+
+
+def test_a_registry_the_shard_cannot_read_stops_it_from_trading(tmp_path, monkeypatch) -> None:
+    """The loop swallowed every exception, including the one that says the registry is broken.
+
+    A reload that raised fell into the same handler as a bad tick: sleep, then cycle again on the
+    config loaded while the file was still sane — accounts, caps and modes the registry on disk no
+    longer describes, silently, every 90 seconds.
+    """
+    def break_it(path: pathlib.Path) -> None:
+        path.write_text("accounts: [\n", encoding="utf-8")
+
+    traded, store = _drive_shard(tmp_path, monkeypatch, [break_it], cycles=3)
+    assert traded == ["exness"]
+    rejected = _of(store, "config_rejected")
+    assert len(rejected) == 1 and rejected[0]["error"] and rejected[0]["shard"] == 0
+    assert _of(store, "config_reloaded") == []
+
+
+def test_a_registry_that_fails_validation_is_a_halt_too(tmp_path, monkeypatch) -> None:
+    """YAML that parses and is wrong is the common case: `load` raises ConfigError, not a traceback."""
+    def break_it(path: pathlib.Path) -> None:
+        path.write_text("accounts: []\nphantom: 1\n", encoding="utf-8")
+
+    traded, store = _drive_shard(tmp_path, monkeypatch, [break_it], cycles=3)
+    assert traded == ["exness"] and len(_of(store, "config_rejected")) == 1
+
+
+def test_a_vanished_registry_is_a_refusal_not_a_permission(tmp_path, monkeypatch) -> None:
+    """The reload used to sit behind `path.exists()`: delete the file and the shard kept trading.
+
+    The config in memory is the last good one, which is exactly the stale registry this module
+    promises not to trade — and the guard made the silence permanent, because a missing file never
+    changes its stamp.
+    """
+    traded, store = _drive_shard(tmp_path, monkeypatch, [lambda path: path.unlink()], cycles=3)
+    assert traded == ["exness"]
+    assert len(_of(store, "config_rejected")) == 1
+
+
+def test_the_shard_trades_again_the_minute_the_registry_is_readable(tmp_path, monkeypatch) -> None:
+    """A halt that cannot end is an outage: recovery has to be as loud as the refusal."""
+    def break_it(path: pathlib.Path) -> None:
+        path.write_text("accounts: []\nphantom: 1\n", encoding="utf-8")
+
+    def fix_it(path: pathlib.Path) -> None:
+        path.write_text(_registry_yaml(), encoding="utf-8")
+
+    traded, store = _drive_shard(tmp_path, monkeypatch, [break_it, fix_it], cycles=4)
+    assert traded == ["exness"] * 3
+    reloaded = _of(store, "config_reloaded")
+    assert len(reloaded) == 1 and reloaded[0]["recovered_from"]
+
+
+def _stops_spec(stops_level: int = 0, freeze_level: int = 0) -> broker.BrokerSymbol:
+    return dataclasses.replace(_spec(), stops_level=stops_level, freeze_level=freeze_level)
+
+
+def test_a_geometry_the_broker_bans_is_named_before_anything_is_sent() -> None:
+    """`trade_stops_level` is the server's own minimum, measured from the live price, per side.
+
+    A buy hangs its stop below the price and its target above it; a sell is the mirror image. A level
+    on the wrong side is not a tight stop — it is a plan that crosses the market.
+    """
+    tight = _stops_spec(stops_level=300)  # 300 points = 0.0030
+    assert "стоп" in broker.stops_refusal(tight, True, 1.10002, 1.098, 1.104)
+    assert "тейк" in broker.stops_refusal(tight, True, 1.10002, 1.096, 1.10202)
+    assert broker.stops_refusal(tight, True, 1.10002, 1.096, 1.10402) == ""
+    assert "стоп" in broker.stops_refusal(tight, False, 1.10000, 1.10200, 1.096)
+    assert broker.stops_refusal(tight, False, 1.10000, 1.10400, 1.096) == ""
+    assert "стоп" in broker.stops_refusal(tight, True, 1.10002, 1.104, 1.106)
+    # A server that names no minimum takes the plan exactly as the model wrote it.
+    assert broker.stops_refusal(_spec(), True, 1.10002, 1.10001, 1.10003) == ""
+
+
+def test_a_lot_inside_the_freeze_band_is_locked_and_says_so() -> None:
+    """`trade_freeze_level` locks a position the moment price comes near its standing stop.
+
+    The check is on the levels the broker already holds, not on the ones we are about to ask for:
+    asking is what the server forbids.
+    """
+    frozen = _stops_spec(freeze_level=10)
+    assert "блокирует" in broker.stops_refusal(frozen, True, 1.10100, 1.10090, 1.105,
+                                              current_sl=1.10090)
+    assert broker.stops_refusal(frozen, True, 1.10100, 1.10090, 1.105,
+                                current_sl=1.10050) == ""
+
+
+def test_an_order_the_server_would_reject_is_never_sent(monkeypatch) -> None:
+    """A refusal costs a journal line; a send costs money in flight and a retcode read after the fact."""
+    fake = FakeMT5(results=[_reply()])
+    monkeypatch.setattr(broker, "mt5", fake)
+    with pytest.raises(broker.StopsRefused, match="стоп"):
+        broker.market_order(7000000, _stops_spec(stops_level=300), "buy", 0.02,
+                            1.098, 1.104, 0.002, 2.0)
+    assert fake.sent == []
+
+
+def test_a_break_even_the_server_would_reject_is_said_once_and_never_sent(tmp_path,
+                                                                         monkeypatch) -> None:
+    """A rejected repair of a live stop must not strand the exit rules that run after it."""
+    account, store, runner = _managed(tmp_path, monkeypatch)
+    monkeypatch.setattr(worker.broker, "symbol_exact",
+                        lambda name: _stops_spec(stops_level=100))
+    store.save_positions("a", [_position(41, account.magic)])
+    sent: list[str] = []
+    monkeypatch.setattr(worker.broker, "modify_position", lambda *a, **k: sent.append("modify"))
+    monkeypatch.setattr(worker.broker, "close_position",
+                        lambda position, *a, **k: sent.append("close") or float(position.volume))
+    monkeypatch.setattr(worker.strategy, "break_even_level", lambda *a, **k: 1.1005)
+    exits: list[int] = []
+    monkeypatch.setattr(worker.strategy, "exit_reason", lambda *a, **k: exits.append(1) or None)
+    day = worker.risk.DayState(day="2026-11-04", start_balance=1000.0)
+    positions = [_position(41, account.magic)]
+    assert runner._manage_positions(account, day, positions, "USD", 1.0) == 0
+    assert sent == []
+    rows = _of(store, "break_even_refused")
+    assert len(rows) == 1 and rows[0]["ticket"] == 41 and "стоп" in rows[0]["detail"]
+    assert exits  # the lot is still managed: only the repair stands down
+    runner._manage_positions(account, day, positions, "USD", 1.0)
+    assert len(_of(store, "break_even_refused")) == 1  # the same fact is said once

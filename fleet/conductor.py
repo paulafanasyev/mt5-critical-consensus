@@ -229,8 +229,35 @@ class Conductor:
         self.store.event("conductor", "paused",
                          reason=PAUSE_FILE.read_text(encoding="utf-8")[:200])
 
+    def _journal_recreation(self) -> bool:
+        """True while this process is trading a book that was rebuilt under the park.
+
+        An empty journal is not an empty day. Lots opened before the loss are still live at the
+        broker, the day may already be deep in the red, and taking the baseline from today's equity
+        would re-arm the daily stop at the number that red produced — the fail-open a restart is not
+        supposed to have. The hold costs nothing but entries, and it ends the moment the operator
+        runs `reset-day`: that row can only exist in a book created after the loss, so it is an
+        answer to this recreation and not to an older one.
+        """
+        if not (self.store.created_new and self.store.trail_existed):
+            return False
+        rows = self.store.events_of(("journal_recreated", "reset_day"), limit=5000)
+        newest = rows[-1][2] if rows else ""
+        if newest == "journal_recreated":
+            return True
+        if newest == "reset_day":
+            return False
+        self.store.event("conductor", "journal_recreated", trail=str(self.store.trail),
+                         detail="книга создана заново при уже существующем журнале сделок: "
+                                "дневная база не вооружена, входы стоят; fleet_cli.py reset-day — "
+                                "начать день от текущего капитала")
+        return True
+
     def _remember_baseline(self, book: dict) -> None:
         host = local_host()
+        if self._journal_recreation():
+            self.day_start_equity = None
+            return
         # Only the shards this process actually spawns get refreshed by it. Held the day against
         # every local account, a park started with `--shards 0` would watch shard 1's rows go dark
         # and hold the day for good: correct arithmetic, and a book that never trades again.

@@ -301,13 +301,30 @@ def cmd_candidates(args: argparse.Namespace) -> int:
         print(f"ВНИМАНИЕ: в журнале {book['journal_rows']} кандидатов, разобрано только "
               f"{book['candidates']} самых свежих — считайте цифры ниже частичными "
               "(--limit больше)")
+    # A ticket nobody read from the order comment is not the same evidence as one the broker named,
+    # and a finished trade whose currency the journal never wrote down is not a zero: both are
+    # counted here instead of quietly disappearing from, or into, the dollar columns.
+    caveats = []
+    if book["guessed"]:
+        sources = ", ".join(f"{source} {count}" for source, count in book["by_source"].items()
+                            if source != "token")
+        caveats.append(f"билет не прочитан из комментария (не «token»): {book['guessed']} "
+                       f"({sources}) — их исходы в сумме не участвуют")
+    if book["settled_unpriced"]:
+        caveats.append(f"сделка закрыта, валюты записи нет: {book['settled_unpriced']} — "
+                       "в прибыль в долларах не вошла")
+    if book["drift_unpriced"]:
+        caveats.append(f"дрейф без курса к доллару: {book['drift_unpriced']} — в счёт не вошёл")
+    if caveats:
+        print("оговорки: " + "; ".join(caveats))
     drift_bill = ("дрейфа не измерено ни по одному входу" if book["mean_drift_points"] is None
                   else f"ожидание стоило {drift_mean} пунктов в среднем, "
                        f"{book['drift_cost_usd']:+.2f} USD суммарно")
-    print(f"прибыль закрытых (валовая, как её отдаёт брокер — без комиссии и свопа): "
-          f"{book['profit_gross_usd']:+.2f} USD | {drift_bill}")
+    print(f"прибыль закрытых (валовая, как её отдаёт брокер — без комиссии и свопа, в долларах "
+          f"только там, где журнал назвал курс): {book['profit_gross_usd']:+.2f} USD | "
+          f"{drift_bill}")
     print(f"\n{'тикет':>10} {'счёт':>10} {'символ':>10} {'стор':>5} {'лот':>6} "
-          f"{'дрейф,п':>9} {'дрейф,$':>9} {'итог,$':>9} {'выход':>10}")
+          f"{'дрейф,п':>9} {'дрейф,$':>9} {'итог,$':>9} {'кто':>7} {'выход':>10}")
     for row in book["trades"]:
         drift = row["drift_points"]
         cost = row["drift_cost_usd"]
@@ -315,14 +332,17 @@ def cmd_candidates(args: argparse.Namespace) -> int:
         volume = row["volume"]
         lot = f"{volume:.2f}" if isinstance(volume, (int, float)) else "—"
         # A candidate with no ticket can never be joined to its own close, so «открыт» would be
-        # a lie about a trade that may well have finished long ago.
+        # a lie about a trade that may well have finished long ago. A close the journal cannot
+        # price is said as such: it happened, and its money is in a currency nobody wrote down.
         outcome = "нет билета" if row["ticket"] == 0 else (
-            "открыт" if profit is None else f"{profit:+.2f}")
+            "итог не в $" if row["settled"] and profit is None else (
+                "открыт" if profit is None else f"{profit:+.2f}"))
         print(f"{row['ticket']:>10} {row['account'][:10]:>10} {row['symbol'][:10]:>10} "
               f"{row['side']:>5} {lot:>6} "
               f"{f'{drift:.1f}' if drift is not None else '—':>9} "
               f"{f'{cost:+.2f}' if cost is not None else '—':>9} "
               f"{outcome:>10} "
+              f"{(row['closed_by'] or '—')[:7]:>7} "
               f"{str(row['exit'])[:10]:>10}")
     print("\nчто это доказывает: сколько пункта и доллара стоит подтверждение сигнала."
           "\nчего оно не доказывает: что раньше было бы лучше — для этого нужна прибыльная "

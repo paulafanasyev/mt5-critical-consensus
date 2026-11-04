@@ -1115,7 +1115,8 @@ def test_a_blocked_account_still_manages_every_position_it_holds(tmp_path, monke
     monkeypatch.setattr(risk_mod, "server_day_now", lambda: day.day)
     monkeypatch.setattr(worker.Worker, "_mirror_risk_usd", lambda self, *a, **k: {})
     monkeypatch.setattr(worker.Worker, "_manage_positions",
-                        lambda self, acc, d, positions: seen.append(len(positions)) or 1)
+                        lambda self, acc, d, positions, *extra:
+                        seen.append(len(positions)) or 1)
     result = runner._cycle(account, allow_entries=True)
     assert seen == [1]  # management ran, and ran with the position in hand
     assert result.closed == 1 and result.opened == 0
@@ -1314,3 +1315,45 @@ def test_the_cli_reads_aloud_on_a_legacy_console(tmp_path, monkeypatch) -> None:
     stream.flush()
     assert code == 0
     assert "портфель" in buf.getvalue().decode("utf-8")
+
+
+# --- the identity question, asked the same way every time --------------------------------------
+def test_the_gate_before_the_send_reads_a_hand_typed_server_name_as_attach_does(
+        tmp_path, monkeypatch) -> None:
+    """A registry someone typed says ` s ` where the broker says `S`: attach() knew, the send gate did not.
+
+    The park attached, sized the lot and reserved the risk against its own account, then refused to
+    spend it — journalling `identity_lost`, the line that means «this window was hijacked», on every
+    symbol, forever.
+    """
+    account, runner, store, sent, snapshot, day, _spec = _entry_harness(tmp_path, monkeypatch,
+                                                                        (1, "S"))
+    account.server = " s "
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 1
+    assert sent == [1]
+    assert not any(kind == "identity_lost" for _ts, _a, kind, _p in store.recent_events(40))
+
+
+def test_a_server_that_only_looks_similar_is_still_someone_else(tmp_path, monkeypatch) -> None:
+    """Normalising case and space must not turn the gate into a substring test."""
+    account, runner, store, sent, snapshot, day, _spec = _entry_harness(tmp_path, monkeypatch,
+                                                                        (1, "S-MT5Real26"))
+    account.server = "S"
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert sent == []
+    assert any(kind == "identity_lost" for _ts, _a, kind, _p in store.recent_events(40))
+
+
+def test_a_stop_the_broker_will_not_take_is_a_hold_and_the_money_goes_back(
+        tmp_path, monkeypatch) -> None:
+    """The refusal arrives after the reservation: a slot nobody owns holds the portfolio cap for a
+    full ten minutes, and a hold written as an error teaches the operator to ignore `entry_failed`."""
+    account, runner, store, sent, snapshot, day, _spec = _entry_harness(tmp_path, monkeypatch,
+                                                                        (1, "S"))
+    monkeypatch.setattr(worker.broker, "market_order", lambda *a, **k: (
+        (_ for _ in ()).throw(worker.broker.StopsRefused("EURUSD: стоп в 20.0 п. от цены"))))
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert sent == []
+    assert not store.reserved_volume()
+    kinds = [kind for _ts, _a, kind, _p in store.recent_events(40)]
+    assert "entry_stops_refused" in kinds and "entry_failed" not in kinds and "opened" not in kinds

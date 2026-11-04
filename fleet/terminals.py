@@ -121,22 +121,49 @@ def seed_status(account: Account) -> tuple[bool, str]:
     return True, ""
 
 
+def _detach(path: pathlib.Path) -> None:
+    """Give this name its own bytes before anything writes through it.
+
+    A portable folder is assembled from hardlinks, and the operator's own install can still be one
+    of the names on that inode: measured on this machine, `Config/common.ini`, `Config/terminal.ini`
+    and six more files under `C:\\mt5-fleet\\terminals\\114929502-metaquotes-demo` each carry three
+    links, one of them in `C:\\Program Files\\MetaTrader 5\\Config`. `open(path, "w")` truncates the
+    inode and not the name, so provisioning would rewrite the settings of the terminal the operator
+    is trading in — his server list, his window layout, his login defaults.
+    """
+    try:
+        if os.stat(path).st_nlink <= 1:
+            return
+        data = path.read_bytes()
+    except OSError:
+        return
+    path.unlink(missing_ok=True)
+    path.write_bytes(data)
+
+
 def _seed_saved_session(account: Account) -> None:
     """Copy a session saved by an earlier manual login (accounts/servers data).
 
     The broker's accounts.dat holds every login that terminal has saved, not only this one, and it
-    is binary: the park cannot filter it. So a previous seed's session files are always cleared
-    first — a portable copy must never carry a stranger's saved logins into a new broker's folder.
+    is binary: the park cannot filter it. So the session files are cleared immediately before a
+    replacement is copied — a portable copy must never carry a stranger's saved logins into a new
+    broker's folder.
+
+    The clear is therefore gated on the replacement actually existing. A registry entry with no
+    `seed_config`, or one pointing at a folder with no accounts.dat, would otherwise delete the
+    working login this portable directory already has and copy nothing back: the terminal then
+    starts at a password prompt the park cannot answer, and every entry of that account is gone for
+    the day. `seed_status` says the same thing to the operator before a launch.
     """
     config_dir = account.data_dir / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
-    for pattern in _SEED_FILES:
-        (config_dir / pattern).unlink(missing_ok=True)  # common.ini is ours; these are sessions
     if not account.seed_config:
         return
     seed_dir = pathlib.Path(account.seed_config)
-    if not seed_dir.exists():
+    if not (seed_dir / "accounts.dat").exists():
         return
+    for pattern in _SEED_FILES:
+        (config_dir / pattern).unlink(missing_ok=True)  # common.ini is ours; these are sessions
     for pattern in _SEED_FILES:
         candidate = seed_dir / pattern
         if candidate.exists():
@@ -168,7 +195,9 @@ def write_startup_config(account: Account) -> None:
         "Period=H1",
         "",
     ]
-    with (config_dir / "common.ini").open("w", encoding="utf-8", newline="\r\n") as handle:
+    target = config_dir / "common.ini"
+    _detach(target)  # this name may still be the operator's own install file
+    with target.open("w", encoding="utf-8", newline="\r\n") as handle:
         handle.write("\n".join(lines))
 
 

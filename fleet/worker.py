@@ -144,9 +144,21 @@ def duplicated_accounts(rows: list[dict]) -> dict[str, list[str]]:
     for row in rows:
         if row.get("login") is None:
             continue
-        key = f"{row['login']}@{str(row.get('server') or '').casefold()}"
+        key = f"{row['login']}@{_server_key(row.get('server'))}"
         by.setdefault(key, []).append(str(row.get("dir") or row.get("exe") or ""))
     return {key: sorted(dirs) for key, dirs in by.items() if len(dirs) > 1}
+
+
+def _server_key(text) -> str:
+    """One server name, however it was typed.
+
+    The broker writes its own spelling into `account_info`, the registry is hand-edited, and the
+    portable marker is a text file someone saved with a trailing space. Every comparison of two
+    account identities in this file has to use the same normalisation: attach() accepted
+    `"Exness-Demo "`, the gate before the send compared the raw strings, and the park then refused
+    its own account on every symbol while the operator read `identity_lost` in the journal.
+    """
+    return str(text or "").strip().casefold()
 
 
 def _host_key(name: str) -> str:
@@ -290,8 +302,7 @@ class Worker:
             mt5.shutdown()
             return "нет данных счёта после initialize"
         # The broker spells its server name; a registry typed by hand may not match its case.
-        if info.login != account.login or (str(info.server).strip().casefold()
-                                           != account.server.casefold()):
+        if info.login != account.login or _server_key(info.server) != _server_key(account.server):
             mt5.shutdown()
             return f"привязан чужой счёт {info.login}/{info.server}"
         # The YAML label is not evidence: the broker's own trade_mode decides demo vs real.
@@ -362,7 +373,7 @@ class Worker:
         day, flows_payload = self._day_state(account, snapshot, server_day)
         positions = risk.positions_for(account)  # includes manual positions: they move equity
 
-        closed = self._manage_positions(account, day, positions)
+        closed = self._manage_positions(account, day, positions, snapshot.currency, rate)
         # Re-read after management so the gates judge the account as it is now, not as it was.
         snapshot = risk.AccountSnapshot.read(server_day) or snapshot
         positions = risk.positions_for(account)
@@ -452,8 +463,7 @@ class Worker:
             others = sorted(str(row.get("dir") or row.get("exe") or "")
                             for row in rows
                             if row.get("login") == account.login
-                            and str(row.get("server") or "").casefold()
-                            == account.server.casefold()
+                            and _server_key(row.get("server")) == _server_key(account.server)
                             and str(row.get("dir") or "") != mine)
             blind = sorted(str(row.get("dir") or row.get("exe") or "") or "<окно без пути>"
                            for row in blind_windows(rows))
@@ -486,7 +496,8 @@ class Worker:
         return ""
 
     # --- position management ------------------------------------------------------------
-    def _manage_positions(self, account: Account, day: risk.DayState, positions: list) -> int:
+    def _manage_positions(self, account: Account, day: risk.DayState, positions: list,
+                          currency: str = "", rate: float = 0.0) -> int:
         closed = 0
         # A lot the park did not place is the operator's, not the park's. Manual positions belong
         # in the risk caps and the equity mirror — they move the money this account trades with —
@@ -495,9 +506,18 @@ class Worker:
         # every order; anything else on the account is reported and left alone.
         own = risk.own_in(account, positions)
         foreign = [p for p in positions if risk.magic_of(p) != int(account.magic)]
+        # The book's picture of the previous cycle, which is the only witness for two questions the
+        # live list cannot ask: which of our lots the broker has already closed, and which lot grew
+        # volume nobody here ordered.
+        mirror = self.store.mirrored_positions(account.name)
+        self._journal_broker_closes(account, mirror, positions, currency, rate)
+        merged = self._merged_lots(account, mirror, positions)
         specs: dict[str, broker.BrokerSymbol | None] = {}
         for position in own:
             name = position.symbol
+            ticket = int(position.ticket)
+            if ticket in merged:
+                continue  # reported: this ticket is two people's money now, and ours is not all of it
             if name not in specs:
                 specs[name] = broker.symbol_exact(name)
             spec = specs[name]
@@ -506,6 +526,16 @@ class Worker:
                                  reason="нет спецификации символа")
                 continue
             atr_entry = self._atr_entry(account, position, spec)
+            if atr_entry is None:
+                # Nothing can say what this lot was sized from, so the rules that borrow that
+                # number stand down. The broker's own stop and target, the giveback from the peak
+                # and the time cap are priced by the position itself and keep running: 0.0 is how
+                # `strategy` spells "no ATR", and unlike an invented ATR it moves nothing.
+                self._announce_once(f"lotunpriced:{account.name}:{ticket}", account.name,
+                                    "lot_atr_unpriced", symbol=name, ticket=ticket,
+                                    detail="входной ATR неизвестен: правила по ATR стоят, "
+                                           "брокерские стоп/тейк, откат и время работают")
+                atr_entry = 0.0
             tick = mt5.symbol_info_tick(name)
             if tick is None:
                 continue
@@ -520,14 +550,30 @@ class Worker:
             be_level = strategy.break_even_level(account, position, spec, atr_entry)
             if (be_level is not None and not self.dry_run
                     and not (account.is_real and not self.allow_live)):
-                try:
-                    broker.modify_position(int(position.ticket), name, be_level,
-                                           float(position.tp), spec.digits)
-                    self.store.event(account.name, "break_even", symbol=name,
-                                     ticket=int(position.ticket), sl=be_level)
-                except broker.BrokerError as exc:
-                    self.store.event(account.name, "break_even_failed", symbol=name,
-                                     error=str(exc))
+                # The server owns the minimum distance it accepts, and for a standing lot it also
+                # locks the position while the price is inside `freeze_level` of its stop or target.
+                # Asking with an order buys a rejected modify that reads like a broker outage; the
+                # refusal leaves the protection exactly where the broker has it now.
+                key = f"bestops:{account.name}:{ticket}"
+                refused = broker.stops_refusal(spec, is_buy, price, be_level, float(position.tp),
+                                               current_sl=float(position.sl),
+                                               current_tp=float(position.tp))
+                if refused:
+                    self._report_change(key, f"{be_level:.8f}|{refused}", account.name,
+                                        "break_even_refused", symbol=name, ticket=ticket,
+                                        detail=refused)
+                else:
+                    try:
+                        broker.modify_position(ticket, name, be_level,
+                                               float(position.tp), spec.digits)
+                        self.store.event(account.name, "break_even", symbol=name,
+                                         ticket=ticket, sl=be_level)
+                        if self._meta(key):
+                            # Cleared, not left: a refusal next week on the same level is a new fact.
+                            self._note_meta(key, "")
+                    except broker.BrokerError as exc:
+                        self.store.event(account.name, "break_even_failed", symbol=name,
+                                         error=str(exc))
 
             reason = strategy.exit_reason(account, position, spec, peak, atr_entry)
             if not reason:
@@ -546,13 +592,85 @@ class Worker:
                                  closed=closed_volume, volume=float(position.volume))
                 continue  # keep the peak and manage the remainder next cycle
             closed += 1
-            day.realized += float(position.profit)
-            self.store.close_position_row(account.name, int(position.ticket))
-            self.store.event(account.name, "closed", symbol=name, reason=reason,
-                             ticket=int(position.ticket),
-                             profit=round(float(position.profit), 2))
+            profit = float(position.profit)
+            # `day.realized` counts only the closes ordered here: the broker's own history already
+            # carries every other close into the balance, so borrowing it again would double the day.
+            day.realized += profit
+            self.store.close_position_row(account.name, ticket)
+            self._report_closed(account, ticket, name, reason, profit, currency, rate,
+                                by="парк")
         self._report_foreign_lots(account, foreign)
         return closed
+
+    def _report_closed(self, account: Account, ticket: int, symbol: str, reason: str,
+                       profit: float, currency: str, rate: float, by: str,
+                       priced: bool = True) -> None:
+        """Journal one finished lot in the money it was booked in and the money we can compare.
+
+        The profit the broker reports is in the account's own currency, which on this park can be a
+        ruble or a cent account: joined to the candidate book without a rate it would be read as
+        dollars. `rate_to_usd` travels with the row so the ledger can price what it says, and stays
+        NULL when nobody could resolve the rate — an unpriced close is missing from the sum, not 0.
+        """
+        self.store.event(account.name, "closed", symbol=symbol, ticket=ticket, reason=reason,
+                         by=by, profit=round(profit, 2) if priced else None,
+                         currency=currency or "", rate_to_usd=rate if rate > 0 else None,
+                         profit_usd=(round(profit * rate, 2)
+                                     if priced and rate > 0 else None))
+
+    def _journal_broker_closes(self, account: Account, mirror: dict, positions: list,
+                               currency: str, rate: float) -> None:
+        """Write the exits the broker took without asking this park.
+
+        Every close ordered here is journalled where it is ordered, so a ticket that stood in last
+        cycle's book and is absent from this one left on its own — at its own stop or target, from
+        the platform, or by a server rule. Missing those is what makes a candidate book that never
+        pays out: the trade ran and finished, and the ledger is left calling it open forever while
+        the drift bill keeps being counted against a profit column that stays empty.
+        """
+        live = {int(p.ticket) for p in positions}
+        ours = int(account.magic)
+        gone = sorted((ticket, symbol) for ticket, (magic, _volume, symbol) in mirror.items()
+                      if magic == ours and ticket not in live)
+        for ticket, symbol in gone:
+            result = broker.position_result(ticket)
+            # An empty history is not a flat exit: the broker settled this lot somewhere we cannot
+            # read today, so the close is journalled unpriced rather than as a zero.
+            profit, comment = result if result else (0.0, "")
+            self._report_closed(account, ticket, symbol, comment or "стоп/тейк брокера",
+                                profit, currency, rate, by="брокер", priced=result is not None)
+            self.store.close_position_row(account.name, ticket)
+
+    def _merged_lots(self, account: Account, mirror: dict, positions: list) -> set[int]:
+        """Tickets of ours carrying volume we did not add, reported and left alone.
+
+        On a netting account the operator's manual trade in the same direction folds into the
+        position this park opened: the magic still says ours, but the ticket is now two people's
+        money, and a trailing exit here would close his lot along with ours without ever asking.
+        The mirror holds the only record of how much of this ticket we asked for, so growth past it
+        stops modify and close for that ticket — a shrunken lot is not a merge: a partial close by
+        either of us, or the broker trimming it, is reported by the closes above and managed as is.
+        """
+        merged: dict[int, tuple[float, float]] = {}
+        for position in positions:
+            ticket = int(position.ticket)
+            seen = mirror.get(ticket)
+            if seen is None or risk.magic_of(position) != int(account.magic):
+                continue  # a lot new to the book has no previous volume it could have grown past
+            volume = float(position.volume)
+            if volume > seen[1] + 1e-9:
+                merged[ticket] = (seen[1], volume)
+        if merged:
+            self._report_change(
+                _host_key(f"lotmerged:{account.name}"),
+                "|".join(f"{ticket}:{asked:.4f}:{volume:.4f}"
+                         for ticket, (asked, volume) in sorted(merged.items())),
+                account.name, "lot_merged_with_manual",
+                lots=[{"ticket": ticket, "asked": asked, "now": volume}
+                      for ticket, (asked, volume) in sorted(merged.items())],
+                detail="ручной лот влился в наш на netting-счёте: этот билет парк не модифицирует "
+                       "и не закрывает")
+        return set(merged)
 
     def _report_foreign_lots(self, account: Account, foreign: list) -> None:
         """Say which lots on this account the park did not place — after the exits were taken.
@@ -560,18 +678,28 @@ class Worker:
         Reported last on purpose: the operator's trades do not need a journal line before this
         account's own risk is managed, and a write that fails must never sit in front of an exit.
         """
+        key = _host_key(f"foreign_positions:{account.name}")
         if not foreign:
+            if self._meta(key):
+                self._note_meta(key, "")
+                self.store.event(account.name, "manual_lots_cleared",
+                                 detail="ручных позиций на счёте больше нет")
             return
-        tickets = sorted(int(p.ticket) for p in foreign)
+        # The volume belongs in the fingerprint: a manual lot that grew — or folded into one of our
+        # tickets, which `lot_merged_with_manual` reports separately — is a different fact, and a
+        # fingerprint of bare tickets would keep quiet about it.
+        fingerprint = "|".join(f"{int(p.ticket)}:{risk.magic_of(p)}:{float(p.volume):.4f}"
+                               for p in sorted(foreign, key=lambda p: int(p.ticket)))
         self._report_change(
-            _host_key(f"foreign_positions:{account.name}"), "|".join(map(str, tickets)),
-            account.name, "foreign_positions", tickets=tickets,
+            key, fingerprint, account.name, "foreign_positions",
+            tickets=sorted(int(p.ticket) for p in foreign),
             magics=sorted({risk.magic_of(p) for p in foreign}),
             lots=round(sum(float(p.volume) for p in foreign), 4))
         # A lot with our own entry note in the journal but someone else's magic is money the park
         # put at risk and nobody now manages: the config magic changed, or a second park instance
         # runs the same account. It must not be filed under "the operator's trade".
-        noted = [ticket for ticket in tickets if self._meta(f"atr:{account.name}:{ticket}")]
+        noted = [ticket for ticket in sorted(int(p.ticket) for p in foreign)
+                 if self._meta(f"atr:{account.name}:{ticket}")]
         if noted:
             self._report_change(_host_key(f"park_lot_unattributed:{account.name}"),
                                 "|".join(map(str, noted)), account.name,
@@ -592,19 +720,37 @@ class Worker:
             return
         self.store.event(account_name, kind, **detail)
 
-    def _atr_entry(self, account: Account, position, spec: broker.BrokerSymbol) -> float:
+    def _atr_entry(self, account: Account, position,
+                   spec: broker.BrokerSymbol) -> float | None:
+        """The ATR this lot was sized from, or None while nobody can say.
+
+        `atr:<account>:<ticket>` is an authorship note: it is written when this park places the lot,
+        and it is what makes a lot carrying someone else's magic still ours. Two ways the old code
+        turned that note into a fabrication. A journal locked by another shard reads as an absent
+        note, so the value computed here was persisted as the entry ATR of a lot that had been sized
+        with a different number — and every later cycle believed the note it had just poisoned. And a
+        lot with no stop priced `abs(price_open - 0)`: gold at 2000 gave an ATR of 2000, and the
+        break-even and trailing rules then moved a stop by a distance nobody had ever asked for.
+        """
         key = f"atr:{account.name}:{int(position.ticket)}"
-        stored = self._meta(key)
+        try:
+            stored = self.store.get_meta(key)
+        except sqlite3.Error:
+            self._announce_once(f"atrlock:{account.name}:{int(position.ticket)}", account.name,
+                                "entry_atr_unreadable", symbol=spec.name,
+                                ticket=int(position.ticket),
+                                detail="журнал залочен: нота входа не читается, лот без правила")
+            return None
         if stored:
             try:
                 return float(stored)
             except ValueError:
                 pass
-        stop_distance = abs(float(position.price_open) - float(getattr(position, "sl", 0) or 0))
-        if stop_distance > 0 and account.risk.stop_atr > 0:
-            atr_value = stop_distance / account.risk.stop_atr
-        else:
-            atr_value = broker.atr(spec.name, mt5.TIMEFRAME_H1)
+        stop = float(getattr(position, "sl", 0.0) or 0.0)
+        stop_distance = abs(float(position.price_open) - stop) if stop > 0 else 0.0
+        if stop_distance <= 0 or account.risk.stop_atr <= 0:
+            return None
+        atr_value = stop_distance / account.risk.stop_atr
         self._note_meta(key, f"{atr_value:.8f}")
         return atr_value
 
@@ -634,6 +780,7 @@ class Worker:
             specs[position.symbol] = broker.symbol_exact(position.symbol)
         current_risk = 0.0
         unpriced_risk = 0
+        naked: list[int] = []  # our account's lots whose stop nobody wrote down
         for row, position in zip(mirror, book_positions):
             stored = row[10]
             if stored is not None and float(stored) > 0:
@@ -652,10 +799,13 @@ class Worker:
             if spec is None:
                 unpriced_risk += 1
                 continue
-            money = risk.position_risk_money(
-                position, spec, self._atr_entry(account, position, spec), account.risk.stop_atr)
+            money = risk.position_risk_money(position, spec, 0.0, account.risk.stop_atr)
             if not money > 0:
+                # A lot with no stop on this account is the operator's, and its risk is a distance
+                # nobody has written down: counted as unpriced, which holds entries, rather than
+                # guessed from an ATR this park never traded and stamped as our authorship.
                 unpriced_risk += 1  # a zero here is a broker that described no tick value
+                naked.append(position.ticket)
                 continue
             current_risk += money * rate
         if book_stop.get("unpriced", 0) > 0:
@@ -670,7 +820,8 @@ class Worker:
         if unpriced_risk:
             # Counting an unmeasurable stop as zero would let the portfolio risk cap pass a book
             # whose real risk nobody has added up yet.
-            self.store.event(account.name, "portfolio_risk_unpriced", count=unpriced_risk)
+            self.store.event(account.name, "portfolio_risk_unpriced", count=unpriced_risk,
+                             naked_tickets=naked[:10])
             return 0
         day_pct = self._portfolio_day_pct(book_stop["equity"])
         unmeasured_key = f"day_unmeasured:{account.name}"
@@ -739,7 +890,10 @@ class Worker:
             sending = not (self.dry_run or (account.is_real and not self.allow_live))
             if sending:
                 who = mt5.account_info()
-                if who is None or (int(who.login), str(who.server)) != (account.login, account.server):
+                # Normalised exactly like attach(): a registry that types `Servername ` must not
+                # pass the attach gate and then be refused by this one on every symbol.
+                if who is None or (int(who.login), _server_key(who.server)) != (
+                        account.login, _server_key(account.server)):
                     self.store.release(slot)
                     self.store.event(account.name, "identity_lost", symbol=spec.name,
                                      detail=f"перед входом отвечает "
@@ -751,11 +905,19 @@ class Worker:
                     self.store.release(slot)
                     self.store.event(account.name, "entry(gated)", symbol=spec.name,
                                      side=signal.side, volume=volume, reason=signal.reason,
-                                     risk_usd=round(risk_money * (rate or 1.0), 2))
+                                     risk_usd=round(risk_money * rate, 2))
                     return 1
                 execution = broker.market_order(
                     account.magic, spec, signal.side, volume, signal.stop, signal.target,
                     signal.stop_distance, risk_money)
+            except broker.StopsRefused as exc:
+                # The server's own minimum distance, read before the send: nothing was ordered, the
+                # reservation is freed, and the plan is left intact instead of being widened into a
+                # trade whose risk nobody sized.
+                self.store.release(slot)
+                self.store.event(account.name, "entry_stops_refused", symbol=spec.name,
+                                 side=signal.side, volume=volume, detail=str(exc)[:300])
+                continue
             except broker.BrokerError as exc:
                 self.store.release(slot)
                 self.store.event(account.name, "entry_failed", symbol=spec.name,
@@ -792,7 +954,7 @@ class Worker:
             # slot stays held. The lot is already at the broker and journalled as `opened`.
             try:
                 candidates.record(self.store, account, candidates.entry_note(
-                    signal, execution, spec, risk_money * (rate or 1.0)))
+                    signal, execution, spec, risk_money * rate, snapshot.currency, rate))
             except Exception as exc:  # noqa: BLE001 - a note is a note, the money is already out
                 # Losing one row of the candidate book must not abort the cycle: the day state,
                 # the cooldown and the remaining symbols all sit behind this line.
@@ -819,10 +981,17 @@ class Worker:
                             dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"))
 
     def _mirror_risk_usd(self, account: Account, positions: list, rate: float) -> dict[int, float]:
-        """Price this account's own stop risk in dollars, by the broker that holds it.
+        """Price this account's stop risk in dollars, by the broker that holds it.
 
         A peer shard reading the mirror cannot resolve these symbols: a contract on another broker
         means a different amount of money per point, and its name may not exist here at all.
+
+        Every lot is priced here, the operator's included — his trade moves this account's money and
+        therefore belongs in another shard's risk sum — but only by the stop the broker actually
+        holds. Nothing in this function writes the `atr:` authorship note: this mirror prices other
+        people's risk caps, it does not decide who is driving a lot, and an older version that called
+        `_atr_entry` here stamped the operator's tickets with our entry ATR and then reported them as
+        park lots nobody was managing. A lot with no stop prices to nothing and stays NULL.
         """
         if rate <= 0:
             return {}
@@ -835,9 +1004,7 @@ class Worker:
             spec = specs[name]
             if spec is None:
                 continue  # stays NULL in the mirror: a reader must not read it as no risk
-            money = risk.position_risk_money(
-                position, spec, self._atr_entry(account, position, spec),
-                account.risk.stop_atr)
+            money = risk.position_risk_money(position, spec, 0.0, account.risk.stop_atr)
             if not money > 0:
                 # A contract the broker described with a zero tick value, or a stop we could not
                 # measure, prices to 0.0 — and 0.0 in the mirror is a lie the portfolio cap believes.

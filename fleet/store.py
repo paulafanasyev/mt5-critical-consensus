@@ -63,6 +63,19 @@ CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity(ts);
 RETENTION_DAYS = 30
 POSITIONS_TTL_SECONDS = 900
 BOOK_FRESH_SECONDS = 3600
+# Longer than any cooldown a registry can honestly ask for; the marker is worthless after it.
+COOLDOWN_KEEP_DAYS = 7
+
+# Columns a live book does not have yet. Measured on this machine on the production journal:
+# `equity` had 7 columns (no currency, no rate_to_usd) and `trades` had the pre-contract split
+# (price/sl/tp instead of requested_price/requested_volume/token), so the current INSERTs raised
+# OperationalError there — one inside the cycle before any entry, one after a fill the broker had
+# already accepted. `CREATE TABLE IF NOT EXISTS` cannot fix that, because it never touches a table
+# that already exists.
+_MIGRATIONS: list[tuple[str, list[tuple[str, str]]]] = [
+    ("equity", [("currency", "TEXT"), ("rate_to_usd", "REAL")]),
+    ("trades", [("requested_price", "REAL"), ("requested_volume", "REAL"), ("token", "TEXT")]),
+]
 
 # The portfolio day is measured over one machine's book, so its keys carry that machine: two boxes
 # sharing this file each own a different set of accounts, and one global baseline would let the
@@ -84,6 +97,11 @@ class Store:
         self.path = pathlib.Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.trail = self.path.with_suffix(".jsonl")
+        # Measured before the file is created, because a journal only disappears at an outside
+        # hand: a moved file, a wiped directory, a scratch script pointed at the wrong path. The
+        # trail next to it survives that, so the pair says whether this book is new or amnesiac.
+        self.created_new = not self.path.exists()
+        self.trail_existed = self.trail.exists()
         with self._connect() as conn:
             conn.executescript(SCHEMA)
             columns = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
@@ -93,6 +111,15 @@ class Store:
             slots = {row[1] for row in conn.execute("PRAGMA table_info(risk_slots)")}
             if "risk_usd" not in slots:
                 conn.execute("ALTER TABLE risk_slots ADD COLUMN risk_usd REAL NOT NULL DEFAULT 0")
+            # `CREATE TABLE IF NOT EXISTS` keeps an old table exactly as it was, so a book written
+            # before these columns existed would fail its first real INSERT — for trades that is
+            # after the broker already filled the order, which is the worst place in the file to
+            # discover it. Migrate the same way `risk_usd` above does.
+            for table, added in _MIGRATIONS:
+                have = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                for column, definition in added:
+                    if column not in have:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30)
@@ -101,9 +128,17 @@ class Store:
         return conn
 
     # --- writes -------------------------------------------------------------------------
-    def event(self, account: str, kind: str, **payload) -> None:
+    def event(self, account: str, kind: str, **payload) -> bool:
+        """Write one journal row. Returns whether the row reached the SQLite book.
+
+        The row is money-trail only — nothing that guards a position reads it — so a locked book
+        must not stop the caller. But the caller has to be able to tell "announced" from "lost":
+        a report that marks itself announced after a failed write is a fact nobody will ever learn.
+        A rejected row still goes to the `.jsonl` copy beside the book, so the loss leaves evidence.
+        """
         stamp = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
         record = {"ts": stamp, "account": account, "kind": kind, **payload}
+        written = False
         for attempt in range(3):
             try:
                 with self._connect() as conn:
@@ -111,16 +146,17 @@ class Store:
                         "INSERT INTO events (ts, account, kind, payload) VALUES (?,?,?,?)",
                         (stamp, account, kind,
                          json.dumps(payload, ensure_ascii=False, default=str)))
+                written = True
                 break
             except sqlite3.OperationalError:
-                if attempt == 2:
-                    return
-                time.sleep(0.2 * (attempt + 1))
+                if attempt < 2:
+                    time.sleep(0.2 * (attempt + 1))
         try:
             with self.trail.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
         except OSError:
             pass
+        return written
 
     def equity(self, account: str, login: int, balance: float, equity: float,
                positions: int, floating: float, currency: str = "USD",
@@ -193,6 +229,28 @@ class Store:
             conn.execute("DELETE FROM positions WHERE account=? AND ticket=?",
                          (account, ticket))
             conn.execute("DELETE FROM peaks WHERE account=? AND ticket=?", (account, ticket))
+
+    def mirrored_positions(
+            self, account: str,
+            max_age: float = POSITIONS_TTL_SECONDS) -> dict[int, tuple[int, float, str]]:
+        """The book's last picture of one account: {ticket: (magic, volume, symbol)}.
+
+        Two questions can only be answered against the previous cycle. Which of our lots are gone
+        now — the broker closed them at their own stop and no code of ours was asked to do it. And
+        which lot carries volume we did not ask for — on a netting account the operator's manual
+        trade merges into our record, and the ticket that says "ours" is then a sum of two people's
+        money. The symbol travels with the row because a journalled close is joined to the
+        candidate book by account, symbol and ticket, and a close without a name cannot be paid out.
+        A stale mirror is not evidence of either, so rows older than the mirror's own TTL are left
+        out.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT ticket, magic, volume, symbol FROM positions WHERE account=?"
+                " AND updated_epoch > ?",
+                (account, time.time() - max_age)).fetchall()
+        return {int(ticket): (int(magic or 0), float(volume or 0.0), str(symbol))
+                for ticket, magic, volume, symbol in rows}
 
     def peak(self, account: str, ticket: int) -> float:
         with self._connect() as conn:
@@ -542,9 +600,23 @@ class Store:
                 if key.rsplit(":", 1)[-1] not in keep]
             conn.executemany("DELETE FROM meta WHERE key=?", [(k,) for k in stale])
             conn.execute("DELETE FROM meta WHERE key LIKE 'netflow:%'")
-            conn.execute("DELETE FROM meta WHERE (key LIKE 'atr:%' OR key LIKE 'entry:%')"
-                         " AND key NOT IN (SELECT 'atr:' || account || ':' || ticket"
-                         " FROM positions)")
+            # A per-ticket note dies with its position. A cooldown marker does not belong to a
+            # ticket at all — it is `entry:<account>:<symbol>` and its lifetime is the strategy's
+            # `cooldown_minutes` — so it ages out by the timestamp stored in its value. Sharing one
+            # rule for both meant every 30 s prune deleted the cooldown and the park could re-enter
+            # a symbol on the next cycle, forever. The three ticket namespaces below all end in
+            # `<account>:<ticket>`, so one membership test against the live book covers them.
+            live_tickets = {f"{account}:{ticket}" for account, ticket in conn.execute(
+                "SELECT account, ticket FROM positions").fetchall()}
+            dead_notes = [key for (key,) in conn.execute(
+                "SELECT key FROM meta WHERE key LIKE 'atr:%' OR key LIKE 'atrlock:%'"
+                " OR key LIKE 'lotunpriced:%' OR key LIKE 'bestops:%'").fetchall()
+                if key.split(":", 1)[1] not in live_tickets]
+            conn.executemany("DELETE FROM meta WHERE key=?", [(k,) for k in dead_notes])
+            conn.execute("DELETE FROM meta WHERE key LIKE 'entry:%'"
+                         " AND substr(value, 1, 10) < ?",
+                         ((dt.datetime.now(dt.timezone.utc)
+                           - dt.timedelta(days=COOLDOWN_KEEP_DAYS)).strftime("%Y-%m-%d"),))
         return removed
 
 

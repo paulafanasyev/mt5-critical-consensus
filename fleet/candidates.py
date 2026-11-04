@@ -36,7 +36,8 @@ def _num(value, digits: int = 8) -> float | None:
     return round(number, digits) if math.isfinite(number) else None
 
 
-def entry_note(signal, execution, spec, risk_usd: float) -> dict:
+def entry_note(signal, execution, spec, risk_usd: float, currency: str = "",
+               rate: float = 0.0) -> dict:
     """Describe one trade at the moment it was taken: prices, geometry, and the drift already paid.
 
     `drift_points` is how far the market had already moved in our favour between the price the
@@ -47,6 +48,12 @@ def entry_note(signal, execution, spec, risk_usd: float) -> dict:
     Both numbers have to be prices THIS side can get; the strategy stamps a sell at bid for that
     reason. Measured against an ask, a sell would pay the spread on a still market and the bill
     would be a story about how the book reads the quote, not about waiting.
+
+    `drift_cost` is the bill in the currency the account is kept in, because that is what the
+    broker's own tick value is quoted in — not dollars. A ruble account would print a ruble number
+    under a dollar sign and a cent account a number a hundred times too small, so the note carries
+    the account currency and the rate the worker already paid for, and the dollar column is only
+    written while that rate exists. An unpriced bill stays blank instead of becoming a false sum.
     """
     fill = _num(execution.price)
     asked = _num(signal.price)
@@ -67,6 +74,8 @@ def entry_note(signal, execution, spec, risk_usd: float) -> dict:
         "ticket": int(getattr(execution, "position_ticket", 0) or 0),
         "ticket_source": str(getattr(execution, "ticket_source", "unknown")),
         "risk_usd": _num(risk_usd, 4),
+        "currency": str(currency or ""),
+        "rate_to_usd": _num(rate, 6) if rate > 0 else None,
         "drift_points": (round((fill - asked) * direction / point, 2)
                          if fill is not None and asked is not None and point > 0 else None),
     }
@@ -77,12 +86,14 @@ def entry_note(signal, execution, spec, risk_usd: float) -> dict:
     tick_size = _num(getattr(spec, "tick_size", 0.0), 12) or 0.0
     tick_value = _num(getattr(spec, "tick_value", 0.0), 8) or 0.0
     if tick_size > 0 and tick_value > 0 and fill is not None and asked is not None:
-        # Dollars of entry price given away to confirmation, priced by the broker's own contract:
+        # Money of entry price given away to confirmation, priced by the broker's own contract:
         # (tick_value / tick_size) is the money per unit of price per one lot.
         per_lot = tick_value / tick_size
         given = (fill - asked) * direction
-        note["drift_usd_per_lot"] = round(given * per_lot, 4)
-        note["drift_cost_usd"] = round(given * per_lot * float(execution.volume), 4)
+        note["drift_cost_per_lot"] = round(given * per_lot, 4)
+        note["drift_cost"] = round(given * per_lot * float(execution.volume), 4)
+        note["drift_cost_usd"] = (round(note["drift_cost"] * float(rate), 4)
+                                  if rate > 0 else None)
     return note
 
 
@@ -103,6 +114,12 @@ def ledger(store, limit: int = 5000) -> dict:
     column, and a candidate the broker never named stays `blind`: counted, nothing borrowed to
     explain it. The ledger exists to be checked against the broker's own history, so a guessed join
     is worse than an empty column.
+
+    A dollar column is filled only from a row that says which currency its money was in. The broker
+    quotes its tick value and reports its profit in the currency the account is kept in, so on a
+    ruble account that number is rubles and on a cent account a hundredth of a dollar: `rate_to_usd`
+    is the witness that the number was converted, and a row without it is counted in `unpriced`
+    rather than added to a sum it does not belong to.
     """
     rows = store.events_of((KIND, CLOSED), limit=limit)
     notes: list[dict] = []
@@ -129,6 +146,10 @@ def ledger(store, limit: int = 5000) -> dict:
         # Consumed, not looked up: two candidate rows carrying the same ticket (a restart that
         # replayed the fill, a journal written twice) must not bill one close out twice.
         result = closed.pop(key, None)
+        priced = _num(note.get("rate_to_usd"), 6) is not None
+        settled = result is not None
+        profit_usd = (_num(result.get("profit_usd"), 2)
+                      if settled and _num(result.get("rate_to_usd"), 6) is not None else None)
         trades.append({
             "ticket": ticket,
             "ticket_source": note.get("ticket_source", "unknown"),
@@ -136,18 +157,27 @@ def ledger(store, limit: int = 5000) -> dict:
             "symbol": note.get("symbol", ""),
             "side": note.get("side", ""),
             "volume": note.get("volume"),
+            "currency": str(note.get("currency") or ""),
+            "rate_to_usd": _num(note.get("rate_to_usd"), 6),
             "drift_points": note.get("drift_points"),
-            "drift_cost_usd": note.get("drift_cost_usd"),
+            "drift_cost": note.get("drift_cost"),
+            "drift_cost_usd": note.get("drift_cost_usd") if priced else None,
             "risk_usd": note.get("risk_usd"),
             "risk_reward": note.get("risk_reward"),
-            "profit_gross_usd": _num(result.get("profit"), 2) if result else None,
-            "exit": result.get("reason") if result else "",
+            "settled": settled,
+            "profit_gross_usd": profit_usd,
+            "exit": result.get("reason") if settled else "",
+            "closed_by": result.get("by", "") if settled else "",
         })
     done = [t for t in trades if t["profit_gross_usd"] is not None]
     won = [t for t in done if float(t["profit_gross_usd"]) > 0]
     paid = [t for t in trades if isinstance(t["drift_cost_usd"], (int, float))]
     measured = [t for t in trades if isinstance(t["drift_points"], (int, float))]
     blind = [t for t in trades if t["ticket"] == 0]
+    # A close that joined a candidate but arrived before the journal knew its currency: the trade
+    # finished, and its money is still a number in a currency nobody wrote down.
+    unpriced = [t for t in trades if t["settled"] and t["profit_gross_usd"] is None]
+    guessed = [t for t in trades if t["ticket_source"] != "token"]
     return {
         "candidates": len(trades),
         # How many candidates the journal holds in total, and whether this read saw all of them:
@@ -155,8 +185,17 @@ def ledger(store, limit: int = 5000) -> dict:
         "journal_rows": journal_rows,
         "truncated": journal_rows > len(trades),
         "closed": len(done),
-        "open": len([t for t in trades if t["profit_gross_usd"] is None]) - len(blind),
+        "open": len([t for t in trades if t["ticket"] and not t["settled"]]),
         "blind": len(blind),
+        "settled_unpriced": len(unpriced),
+        "drift_unpriced": len([t for t in trades
+                               if isinstance(t["drift_cost"], (int, float))
+                               and not isinstance(t["drift_cost_usd"], (int, float))]),
+        # The joins nobody can vouch for: `only_position` guessed the ticket from a book with one
+        # lot on it, `unknown` never found one. Their outcomes are not in the profit column.
+        "guessed": len(guessed),
+        "by_source": {source: len([t for t in trades if t["ticket_source"] == source])
+                      for source in sorted({t["ticket_source"] for t in trades})},
         "win_rate": round(100.0 * len(won) / len(done), 1) if done else None,
         # Gross, exactly as the broker's own position report states it: no commission, no swap.
         "profit_gross_usd": (round(sum(float(t["profit_gross_usd"]) for t in done), 2)

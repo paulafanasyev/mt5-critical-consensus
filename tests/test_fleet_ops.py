@@ -188,6 +188,69 @@ def test_startup_config_has_single_crlf_and_no_password(tmp_path: pathlib.Path) 
     assert b"AllowLiveTrading=0" in raw  # demo account: live trading is not enabled
 
 
+def test_a_portable_config_on_a_shared_inode_is_detached_before_it_is_written(
+        tmp_path: pathlib.Path) -> None:
+    """A hardlink is two names for one file: writing one rewrites the other.
+
+    Measured on this machine: `Config/common.ini` and seven more under
+    `C:\\mt5-fleet\\terminals\\114929502-metaquotes-demo` carry three links each, one of them in
+    `C:\\Program Files\\MetaTrader 5\\Config`. `open(path, "w")` truncates the inode, so the park's
+    first start-up file would have replaced the settings of the terminal the operator trades in.
+    """
+    import os
+
+    account = Account(name="a", login=123, server="Demo", mode="demo",
+                      terminal_source=_source(tmp_path))
+    terminals.provision(account)
+    ours = account.data_dir / "config" / "common.ini"
+    install = tmp_path / "install" / "common.ini"
+    try:
+        install.unlink(missing_ok=True)
+        os.link(ours, install)
+    except OSError:
+        pytest.skip("this filesystem has no hardlinks")
+    operator_bytes = b"[Common]\r\nServer=Operator-Own-Install\r\n"
+    install.write_bytes(operator_bytes)
+    assert os.stat(ours).st_nlink == 2
+
+    terminals.write_startup_config(account)
+
+    assert os.stat(ours).st_nlink == 1
+    assert install.read_bytes() == operator_bytes  # the install kept its own file
+    assert b"Login=123" in ours.read_bytes() and b"Operator-Own" not in ours.read_bytes()
+
+
+def test_a_second_provision_without_a_seed_keeps_the_login_that_already_works(
+        tmp_path: pathlib.Path) -> None:
+    """A missing `seed_config` is a reason not to copy, not a licence to erase.
+
+    The operator's manual login leaves `accounts.dat` in this portable folder, and every `run`
+    re-provisions it. Clearing the session material before checking whether a replacement exists
+    left the terminal at a password prompt the park cannot answer — with its own working session in
+    the recycle bin of the code path that deleted it.
+    """
+    source = _source(tmp_path)
+    account = Account(name="a", login=123, server="Demo", mode="demo", terminal_source=source)
+    terminals.provision(account)
+    session = account.data_dir / "config" / "accounts.dat"
+    session.write_bytes(b"saved-login-of-this-account")
+
+    terminals.provision(account)  # what `run` does again on every start
+
+    assert session.read_bytes() == b"saved-login-of-this-account"
+    ok, detail = terminals.seed_status(account)
+    assert not ok and "seed_config" in detail
+
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    (seed / "accounts.dat").write_bytes(b"another-brokers-saved-logins")
+    seeded = Account(name="b", login=124, server="Demo", mode="demo", terminal_source=source,
+                     seed_config=seed)
+    terminals.provision(seeded)
+    assert (seeded.data_dir / "config" / "accounts.dat").read_bytes() == (
+        b"another-brokers-saved-logins")
+
+
 def test_real_account_enables_live_trading_in_the_startup_file(tmp_path: pathlib.Path) -> None:
     account = Account(name="r", login=124, server="Live", mode="real",
                       terminal_source=_source(tmp_path))
@@ -349,12 +412,35 @@ def test_the_candidate_ledger_reads_aloud_and_states_its_own_limits(
     store_path = tmp_path / "fleet.sqlite"
     store = Store(store_path)
     store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02, ticket=7,
-                drift_points=25.0, drift_cost_usd=0.5, risk_usd=2.0, risk_reward=2.0)
-    store.event("a", "closed", symbol="EURUSD", ticket=7, reason="trailing", profit=3.2)
+                ticket_source="token", currency="USD", rate_to_usd=1.0,
+                drift_points=25.0, drift_cost=0.5, drift_cost_usd=0.5, risk_usd=2.0,
+                risk_reward=2.0)
+    store.event("a", "closed", symbol="EURUSD", ticket=7, reason="trailing", profit=3.2,
+                by="парк", currency="USD", rate_to_usd=1.0, profit_usd=3.2)
     assert fleet_cli.main(["--store", str(store_path), "candidates"]) == 0
     out = capsys.readouterr().out
     assert "3.20" in out and "0.50" in out
+    assert "кто" in out and "парк" in out
     assert "чего оно не доказывает" in out
+
+
+def test_a_book_the_journal_cannot_price_says_so_instead_of_summing_it(
+        tmp_path: pathlib.Path, capsys) -> None:
+    """Old rows carry a bare number and no currency: the CLI must name them, not add them to dollars."""
+    from fleet import candidates
+
+    store_path = tmp_path / "fleet.sqlite"
+    store = Store(store_path)
+    store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02, ticket=7,
+                ticket_source="only_position", currency="RUB", drift_points=25.0,
+                drift_cost=0.5, risk_usd=2.0)
+    store.event("a", "closed", symbol="EURUSD", ticket=7, reason="стоп", profit=-12.5,
+                by="брокер")
+    assert fleet_cli.main(["--store", str(store_path), "candidates"]) == 0
+    out = capsys.readouterr().out
+    assert "нет билета" not in out  # the ticket exists; it is only a guess, not a blind row
+    assert "итог не в $" in out and "оговорки:" in out
+    assert "закрыто 0" in out and "+0.00 USD" in out
 
 
 def test_an_empty_candidate_book_is_reported_as_no_measurement(tmp_path: pathlib.Path, capsys) -> None:

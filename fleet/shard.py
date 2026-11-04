@@ -1,7 +1,9 @@
 """Shard process: trades one group of accounts, reloads the registry, and dies with its parent.
 
 A shard never dies silently on a single bad cycle, never trades a stale registry, and never keeps
-trading after the conductor that started it is gone.
+trading after the conductor that started it is gone. A registry it cannot read is treated as the
+worst kind of stale: the shard stops cycling at all rather than spend money on the config it
+loaded before the file broke.
 """
 from __future__ import annotations
 
@@ -46,18 +48,32 @@ def main(argv: list[str] | None = None) -> int:
     store = Store(args.store)
     config = load(config_path)
     fingerprint = config_path.stat().st_mtime if config_path and config_path.exists() else 0.0
+    halted = ""  # why this shard will not trade; empty means the registry on disk is trusted
 
     while True:
         if args.parent_pid and not _parent_alive(args.parent_pid):
             store.event("shard", "parent_gone", shard=args.shard, parent=args.parent_pid)
             return 0
+        stamp = config_path.stat().st_mtime if config_path and config_path.exists() else None
+        if config_path and stamp != fingerprint:
+            # The file changed under this process. Until the new one is readable, the config in
+            # memory is a registry we know to be wrong: the accounts, caps or modes on disk are not
+            # the ones these numbers describe, and trading them is the stale registry this module
+            # promises never to trade. Halt, say it once per broken version, wait for a good one.
+            try:
+                config = load(config_path)
+            except Exception as exc:  # noqa: BLE001 - a bad registry stops entries, not the shard
+                halted = f"{type(exc).__name__}: {exc}"[:400]
+                store.event("shard", "config_rejected", shard=args.shard, path=str(config_path),
+                            error=halted)
+            else:
+                store.event("shard", "config_reloaded", shard=args.shard, recovered_from=halted)
+                halted = ""
+            fingerprint = stamp
+        if halted:
+            time.sleep(args.interval)
+            continue
         try:
-            if config_path and config_path.exists():
-                stamp = config_path.stat().st_mtime
-                if stamp != fingerprint:
-                    config = load(config_path)
-                    fingerprint = stamp
-                    store.event("shard", "config_reloaded", shard=args.shard)
             results = worker.run_shard(config, store, args.shard, dry_run=args.dry_run,
                                        pause_file=pause, allow_live=args.live)
             for result in results:

@@ -58,6 +58,14 @@ class BrokerError(RuntimeError):
         self.retcode = retcode
 
 
+class StopsRefused(BrokerError):
+    """The geometry we planned is one this broker's server will not accept — said before the send.
+
+    Distinct from a rejection: a rejection costs a round trip and arrives as a retcode, this is the
+    park reading the server's own contract first. The entry path journals it as a hold, not an error.
+    """
+
+
 _RETRYABLE = ()
 _PARTIAL = 10010
 
@@ -210,9 +218,18 @@ def resolve_ticket(token: str, symbol_name: str, magic: int) -> tuple[int, str]:
 
 
 def _find_by_token(token: str) -> Any | None:
-    """Look for the position this attempt would have created (token lives in the comment)."""
+    """Look for the position this attempt would have created (token lives in the comment).
+
+    The whole comment we sent, not the bare token: a token is a short string, and `12ab` is inside
+    `fleet-12ab3c45` as surely as it is inside its own order. Matching the substring joined one
+    fill to another lot's ticket, and the candidate book then paid that trade out of the wrong
+    position's profit.
+    """
+    if not token:
+        return None
+    needle = f"fleet-{token}"
     for position in mt5.positions_get() or []:
-        if token and token in str(getattr(position, "comment", "")):
+        if needle in str(getattr(position, "comment", "")):
             return position
     return None
 
@@ -249,6 +266,47 @@ def _send_with_fallback(request: dict[str, Any], spec: BrokerSymbol) -> Any:
     raise BrokerError(f"сделка не прошла: {last_error}")
 
 
+def stops_refusal(spec: BrokerSymbol, is_buy: bool, market_price: float, sl: float, tp: float,
+                  current_sl: float = 0.0, current_tp: float = 0.0) -> str:
+    """Why this broker's server would refuse the geometry we planned, or "" when it would take it.
+
+    `trade_stops_level` and `trade_freeze_level` are facts about the server, not about the model:
+    a stop or target closer to the live price than the first is retcode 10016, and a position whose
+    standing stop or target sits inside the second is locked against any change. Learning either by
+    sending the order means learning it while the money is already in flight, and for the modify
+    path it means a rejected break-even that looks like a broker outage.
+
+    Nothing here is clamped, on purpose. A lot is sized for the stop distance the strategy computed:
+    pushing the stop out to the broker's minimum spends more than the reservation the portfolio book
+    made, and moving a target changes what the candidate journal records as the trade's geometry. A
+    level the server will not take is a refusal the operator can read, not a silent rewrite.
+    """
+    if spec.point <= 0:
+        return ""
+    gap = max(int(spec.stops_level), 0) * spec.point
+    frozen = max(int(spec.freeze_level), 0) * spec.point
+    if frozen > 0:
+        for label, standing in (("стопа", current_sl), ("тейка", current_tp)):
+            if standing > 0 and abs(market_price - standing) <= frozen:
+                return (f"брокер блокирует правку: до существующего {label} "
+                        f"{abs(market_price - standing) / spec.point:.1f} п. при freeze_level "
+                        f"{int(spec.freeze_level)}")
+    if gap <= 0:
+        return ""
+    # A buy's stop hangs below its price and its target above it; for a sell both roles swap. The
+    # distance is measured on the side the level belongs to, so a level on the wrong side of the
+    # price comes out negative and is refused by the same rule.
+    for label, value, above in (("стоп", sl, -1.0), ("тейк", tp, 1.0)):
+        if value <= 0:
+            continue
+        side = above if is_buy else -above
+        distance = (value - market_price) if side > 0 else (market_price - value)
+        if distance < gap:
+            return (f"{label} в {distance / spec.point:.1f} п. от цены; брокер требует не ближе "
+                    f"{int(spec.stops_level)} п. (trade_stops_level)")
+    return ""
+
+
 def market_order(magic: int, spec: BrokerSymbol, side: str, volume: float, sl: float,
                  tp: float, stop_distance: float, risk_money: float,
                  comment: str = "fleet") -> Execution:
@@ -259,6 +317,9 @@ def market_order(magic: int, spec: BrokerSymbol, side: str, volume: float, sl: f
     token = uuid.uuid4().hex[:6]
     is_buy = side.lower() == "buy"
     price = float(tick.ask if is_buy else tick.bid)
+    refused = stops_refusal(spec, is_buy, price, sl, tp)
+    if refused:
+        raise StopsRefused(f"{spec.name}: {refused} — вход не отправлен")
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": spec.name,
@@ -346,6 +407,21 @@ def close_position(position: Any, spec: BrokerSymbol, comment: str = "fleet-exit
             return closed
         time.sleep(0.5)
     return closed
+
+
+def position_result(ticket: int) -> tuple[float, str] | None:
+    """What the broker booked for a position that has left its book: gross P/L and last comment.
+
+    None when the history says nothing about the ticket — a close the park did not order still has
+    to be journalled, and `None` keeps it honest as an exit nobody priced. A closing deal carries
+    the P/L and the entry deal carries none, which is the same rule `risk.daily_realized` uses.
+    """
+    deals = mt5.history_deals_get(position=int(ticket))
+    if not deals:
+        return None
+    profit = sum(float(getattr(deal, "profit", 0.0) or 0.0)
+                 for deal in deals if int(getattr(deal, "entry", -1)) == 1)
+    return profit, str(getattr(deals[-1], "comment", "") or "").strip()
 
 
 def _deviation_points(tick: Any, spec: BrokerSymbol) -> int:
