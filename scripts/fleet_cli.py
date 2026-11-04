@@ -84,11 +84,17 @@ def cmd_status(args: argparse.Namespace) -> int:
     census = worker.roster_rows(store)
     if census is not None:
         logged = [row for row in census if row.get("login") is not None]
-        print(f"\nокна на этой машине: {len(census)}, с логином {len(logged)}")
+        blind = worker.blind_windows(census)
+        print(f"\nокна на этой машине: {len(census)}, с логином {len(logged)},"
+              f" не назвали счёт: {len(blind)}")
         for key, dirs in sorted(worker.duplicated_accounts(census).items()):
             print(f"  {key}: {len(dirs)} окна ({', '.join(dirs)}) — входы по этому счёту закрыты")
+        if blind:
+            print(f"  {len(blind)} окно не ответили по существу — парк не считает поле чистым,"
+                  " входы закрыты (команда `terminals` покажет каждое)")
     else:
-        print("\nпереписи окон не было больше часа: запусти `terminals`")
+        print("\nсвежей переписи окон этой машины нет: входы закрыты, выходы идут."
+              " Перепись снимает сам цикл; `terminals` — вручную.")
     print("\nпоследние события:")
     for stamp, account, kind, payload in store.recent_events(args.events):
         print(f"  {stamp} {account:20} {kind:16} {payload[:110]}")
@@ -107,14 +113,16 @@ def _pinned_elsewhere(account, config: FleetConfig) -> str:
 def cmd_terminals(args: argparse.Namespace) -> int:
     """Census of the windows on this machine: which terminal is up, whose account it holds, how much money.
 
-    Read-only. Nothing here launches or stops a terminal: the census walks the process list and asks
-    the windows that are already up to name their account.
+    Read-only. Nothing here launches or stops a terminal: the census walks the process list, checks
+    each pid is still up, and asks only those windows to name their account — `initialize` starts a
+    terminal that is not running, so a path that is no longer alive is never probed. Cost is one
+    probe per window, and a window that is up but not logged in costs the full 4 s timeout.
     """
     store = Store(args.store)
     config = None
     try:
         config = _config(args)
-    except ConfigError as exc:
+    except Exception as exc:  # noqa: BLE001 - a broken registry must not hide the windows
         print(f"реестр не прочитан ({exc}); показываю только окна")
     rows = worker.refresh_roster(store, force=True)
     if not rows:
@@ -123,7 +131,8 @@ def cmd_terminals(args: argparse.Namespace) -> int:
     print(f"{'папка терминала':38} {'логин':>10} {'сервер':22} {'баланс':>12} {'equity':>12}")
     for row in rows:
         if row.get("login") is None:
-            print(f"{row['dir'] or row['exe']:38} {'—':>10} не отвечает: {row.get('error', '')}")
+            print(f"{row.get('dir') or row.get('exe') or '<без пути>':38} {'—':>10}"
+                  f" не отвечает: {row.get('error', '')}")
             continue
         balance = float(row.get("balance") or 0.0)
         equity = float(row.get("equity") or 0.0)
@@ -133,6 +142,10 @@ def cmd_terminals(args: argparse.Namespace) -> int:
     for key, dirs in sorted(duplicates.items()):
         print(f"\nВНИМАНИЕ: счёт {key} открыт в {len(dirs)} окнах: {', '.join(dirs)}."
               " Свободные деньги у них общие: входы по этому счёту парк закрывает.")
+    blind = worker.blind_windows(rows)
+    if blind:
+        print(f"\nВНИМАНИЕ: {len(blind)} окно не назвали счёт и не молчат измеренно"
+              " (-10005): парк не считает поле чистым, входы закрыты.")
     seen = {row["dir"] for row in rows if row.get("login") is not None}
     owned = {worker.window_dir(str(a.data_dir)) for a in (config.accounts if config else [])}
     idle = [row for row in rows if row.get("login") is not None

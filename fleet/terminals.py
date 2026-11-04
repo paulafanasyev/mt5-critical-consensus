@@ -31,9 +31,12 @@ _PID_CACHE: dict[str, tuple[float, int | None]] = {}
 _CACHE_TTL = 15.0
 
 
-def _ps(script: str) -> str:
-    result = subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                            capture_output=True, text=True)
+def _ps(script: str, timeout: int = 30) -> str:
+    try:
+        result = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                                capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return ""
     return result.stdout or ""
 
 
@@ -182,6 +185,22 @@ def running_terminals() -> list[tuple[int, str]]:
         if pid_text.strip().isdigit():
             rows.append((int(pid_text.strip()), path.strip()))
     return rows
+
+
+def pids_alive(pids: list[int]) -> set[int]:
+    """Which of these process ids are still up — one query, never one per window.
+
+    The census asks a window who it is with `initialize(path=...)`, and initialize starts a terminal
+    that is not running. A window that died between the process walk and the probe would therefore
+    be opened by the census, with the saved session it was seeded with: so the probe only ever
+    addresses a pid that is still alive at the moment of the probe.
+    """
+    if not pids:
+        return set()
+    wanted = {int(pid) for pid in pids}
+    script = ("Get-Process -Id " + ",".join(str(pid) for pid in sorted(wanted)) +
+              " -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }")
+    return {int(line) for line in _ps(script).splitlines() if line.strip().isdigit()}
 
 
 def running_pid(account: Account) -> int | None:

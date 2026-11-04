@@ -29,10 +29,18 @@ MAX_FAILURES = 5
 # How often a cycle re-asks the running windows who they are logged into, and how long an answer
 # stays evidence. Sizing is a fraction of the balance this terminal can see; a second window logged
 # into the same account spends the same free margin, and nobody but the broker adds the two up.
-ROSTER_REFRESH_SECONDS = 900.0
-ROSTER_EVIDENCE_SECONDS = 3600.0
+# Measured here (4 windows up): the two authorised ones answer in ~0.2 s each, the two unauthorised
+# ones cost the full probe timeout — 8.37 s for the whole census. The cadence is what decides how
+# long a manual login stays invisible, so it is set by that cost, not by politeness.
+ROSTER_REFRESH_SECONDS = 300.0
+ROSTER_EVIDENCE_SECONDS = 900.0
 ROSTER_META_KEY = "terminal_roster"
+ROSTER_ERROR_META_KEY = "terminal_roster_error"
 ROSTER_PROBE_TIMEOUT_MS = 4000
+# Measured: an unauthorised window publishes its pipe and answers (-10005, 'IPC timeout') until
+# somebody logs in. It holds no margin, so it is not a second driver. Anything else that cannot be
+# read — a silent process whose path the OS would not name, a probe that threw — is a blind spot.
+ROSTER_SILENT_ERROR = "-10005"
 
 
 @dataclasses.dataclass(slots=True)
@@ -75,21 +83,33 @@ def scan_roster(paths: list[str] | None = None) -> list[dict]:
     if paths is None:
         paths = [path for _pid, path in terminals.running_terminals()]
     rows: list[dict] = []
-    for exe in sorted(set(paths), key=str.lower):
+    for exe in sorted(paths, key=str.lower):
         row = {"exe": exe, "dir": window_dir(exe), "login": None, "server": "",
                "currency": "", "balance": None, "equity": None, "error": ""}
+        if not str(exe).strip():
+            # Win32_Process hides ExecutablePath from another user's or an elevated session. An
+            # empty path is not "no terminal": initialize(path="") means the default registered
+            # one, which the census would then start and count as someone else's window. It stays a
+            # blind spot — named as one — rather than becoming a probe.
+            row["error"] = "путь процесса не читается: окно есть, кто в нём — неизвестно"
+            rows.append(row)
+            continue
         try:
             if not mt5.initialize(path=exe, timeout=ROSTER_PROBE_TIMEOUT_MS):
                 row["error"] = str(mt5.last_error())
             else:
                 window = mt5.terminal_info()
                 account = mt5.account_info()
-                row["dir"] = window_dir(getattr(window, "path", "") if window else "")
+                # The answer is authoritative: initialize(path=A) can be answered by window B, and
+                # the folder we requested would then hide B's driver under A's name.
+                row["dir"] = window_dir(getattr(window, "path", "") if window else "") or row["dir"]
                 row["login"] = getattr(account, "login", None)
                 row["server"] = str(getattr(account, "server", "") or "")
                 row["balance"] = getattr(account, "balance", None)
                 row["equity"] = getattr(account, "equity", None)
                 row["currency"] = str(getattr(account, "currency", "") or "")
+                if row["login"] is None:
+                    row["error"] = "терминал открыл канал, но не назвал счёт"
         except Exception as exc:  # noqa: BLE001 - one hung window must not lose the whole census
             row["error"] = f"{type(exc).__name__}: {exc}"
         finally:
@@ -102,19 +122,40 @@ def scan_roster(paths: list[str] | None = None) -> list[dict]:
     return rows
 
 
+def is_silent(row: dict) -> bool:
+    """A window measured to hold no session: it publishes its pipe and answers nothing until login."""
+    return (row.get("login") is None and ROSTER_SILENT_ERROR in str(row.get("error") or ""))
+
+
+def blind_windows(rows: list[dict]) -> list[dict]:
+    """Windows the census could neither read nor rule out. They are not evidence of a clear field."""
+    return [row for row in rows if row.get("login") is None and not is_silent(row)]
+
+
 def duplicated_accounts(rows: list[dict]) -> dict[str, list[str]]:
     """Which accounts answer from more than one window on this machine.
 
-    Key is `login@server`, value the directories that say so. Two windows on one account is not two
-    accounts: it is one pile of free margin with two drivers.
+    Key is `login@server` lowercased, value one entry per window that says so — two windows of the
+    same folder count twice, because it is the count of drivers that spends the margin, not the
+    count of spellings.
     """
-    by: dict[str, set[str]] = {}
+    by: dict[str, list[str]] = {}
     for row in rows:
         if row.get("login") is None:
             continue
-        key = f"{row['login']}@{row.get('server') or ''}"
-        by.setdefault(key, set()).add(row.get("dir") or str(row.get("exe") or ""))
+        key = f"{row['login']}@{str(row.get('server') or '').casefold()}"
+        by.setdefault(key, []).append(str(row.get("dir") or row.get("exe") or ""))
     return {key: sorted(dirs) for key, dirs in by.items() if len(dirs) > 1}
+
+
+def _host_key(name: str) -> str:
+    """A key that belongs to one machine.
+
+    The census is a fact about THIS machine's process list and the book is shared between boxes
+    (that is why the portfolio day keys are host-scoped), so an unscoped census would have box A
+    trade on the windows box B counted — and its own second driver would never appear.
+    """
+    return f"{name}@{local_host()}"
 
 
 def refresh_roster(store: Store, *, force: bool = False, now: float | None = None) -> list[dict]:
@@ -124,12 +165,14 @@ def refresh_roster(store: Store, *, force: bool = False, now: float | None = Non
     would otherwise drop the connection the cycle is trading on.
     """
     moment = time.time() if now is None else now
-    taken, rows = _roster_payload(store.get_meta(ROSTER_META_KEY))
+    taken, rows = _roster_payload(store.get_meta(_host_key(ROSTER_META_KEY)))
     if not force and rows is not None and taken is not None \
             and moment - taken < ROSTER_REFRESH_SECONDS:
         return rows
-    scanned = scan_roster()
-    store.set_meta(ROSTER_META_KEY, json.dumps({"taken": moment, "rows": scanned}))
+    processes = terminals.running_terminals()
+    live = terminals.pids_alive([pid for pid, _path in processes])
+    scanned = scan_roster([path for pid, path in processes if pid in live])
+    store.set_meta(_host_key(ROSTER_META_KEY), json.dumps({"taken": moment, "rows": scanned}))
     return scanned
 
 
@@ -144,14 +187,14 @@ def _roster_payload(text: str | None) -> tuple[float | None, list[dict] | None]:
 
 
 def roster_rows(store: Store, *, now: float | None = None) -> list[dict] | None:
-    """The last census, or None when there is none to believe.
+    """The last census of THIS machine, or None when there is none to believe.
 
-    Missing, unreadable or months old is not evidence of a clear field, but it is not evidence of a
-    second window either: the census is an extra net under the identity binding in attach(), which
-    is what actually proves the money this cycle trades is the money the registry names.
+    Missing, unreadable, written by another host or older than ROSTER_EVIDENCE_SECONDS: the caller
+    does not know who is in the field, and the gate treats that as a reason not to open — the same
+    way an unmeasured day or an unpriced peer position is a reason not to open.
     """
     moment = time.time() if now is None else now
-    taken, rows = _roster_payload(store.get_meta(ROSTER_META_KEY))
+    taken, rows = _roster_payload(store.get_meta(_host_key(ROSTER_META_KEY)))
     if rows is None or taken is None or moment - taken > ROSTER_EVIDENCE_SECONDS:
         return None
     return rows
@@ -187,14 +230,21 @@ class Worker:
         """Take the census of running windows before anything is attached.
 
         It has to happen here: every probe ends with shutdown(), so probing after attach() would
-        drop the live connection this cycle trades on. A census that cannot be taken is not a
-        reason to stop trading — attach() is what proves the account, the census only widens the
-        view to the windows the park does not drive.
+        drop the live connection this cycle trades on. A census that cannot be taken costs the
+        entries — the gate below fails closed on it — but never the exits, which is why the cycle
+        still runs and still manages what is open.
         """
         try:
             refresh_roster(self.store)
         except Exception as exc:  # noqa: BLE001 - one unreadable process list must not cost a cycle
-            self.store.event("shard", "roster_error", error=f"{type(exc).__name__}: {exc}"[:200])
+            detail = f"{type(exc).__name__}: {exc}"[:200]
+            if self.store.get_meta(_host_key(ROSTER_ERROR_META_KEY)) != detail:
+                self.store.set_meta(_host_key(ROSTER_ERROR_META_KEY), detail)
+                self.store.event("shard", "roster_error", error=detail)
+            return
+        if self.store.get_meta(_host_key(ROSTER_ERROR_META_KEY)):
+            self.store.set_meta(_host_key(ROSTER_ERROR_META_KEY), "")
+            self.store.event("shard", "roster_restored")
 
     def attach(self, account: Account) -> str:
         if account.network == "vpn":
@@ -238,7 +288,9 @@ class Worker:
         if info is None:
             mt5.shutdown()
             return "нет данных счёта после initialize"
-        if info.login != account.login or info.server != account.server:
+        # The broker spells its server name; a registry typed by hand may not match its case.
+        if info.login != account.login or (str(info.server).strip().casefold()
+                                           != account.server.casefold()):
             mt5.shutdown()
             return f"привязан чужой счёт {info.login}/{info.server}"
         # The YAML label is not evidence: the broker's own trade_mode decides demo vs real.
@@ -336,6 +388,17 @@ class Worker:
         return WorkerResult(account.name, "ok", f"equity {snapshot.equity:.2f}",
                             opened=opened, closed=closed)
 
+    def _announce_once(self, key: str, account_name: str, kind: str, **detail) -> None:
+        """Write an event the first time a condition appears, not once per cycle per symbol.
+
+        A 90 s cycle over a hundred accounts would otherwise fill the journal the operator has to
+        read with the same line, and the line that matters would be lost in it.
+        """
+        if self.store.get_meta(key) == "1":
+            return
+        self.store.set_meta(key, "1")
+        self.store.event(account_name, kind, **detail)
+
     def _second_window(self, account: Account) -> str:
         """Refuse new entries while this account is open in a window the park does not drive.
 
@@ -344,33 +407,57 @@ class Worker:
         money at the same time. Free margin is one number on the broker's side, and two drivers each
         sizing to a fraction of the balance spend it twice; exits must keep running regardless,
         because an unmanaged position is worse than an unused signal.
+
+        The gate fails closed on a field it cannot see: no census of this machine, or a window that
+        neither named its account nor measured-silent, is not evidence that nobody else drives this
+        money. It is the same rule the park already applies to an unmeasured day and an unpriced
+        peer position.
         """
         rows = roster_rows(self.store)
-        key = f"second_window:{account.name}"
+        key = _host_key(f"second_window:{account.name}")
         others: list[str] = []
-        if rows is not None:
+        blind: list[str] = []
+        reason = ""
+        if rows is None:
+            fingerprint = "no-census"
+            reason = ("переписи окон этой машины нет (или она старше часа): непонятно, кто ещё "
+                      "водит эти деньги — входы закрыты, выходы идут как обычно")
+        else:
             mine = window_dir(str(account.data_dir))
-            others = sorted({row["dir"] for row in rows
-                             if row.get("login") == account.login
-                             and str(row.get("server") or "").casefold()
-                             == account.server.casefold()
-                             and row["dir"] and row["dir"] != mine})
-        if others:
-            fingerprint = "|".join(others)
+            others = sorted(str(row.get("dir") or row.get("exe") or "")
+                            for row in rows
+                            if row.get("login") == account.login
+                            and str(row.get("server") or "").casefold()
+                            == account.server.casefold()
+                            and str(row.get("dir") or "") != mine)
+            blind = sorted(str(row.get("dir") or row.get("exe") or "") or "<окно без пути>"
+                           for row in blind_windows(rows))
+            if others:
+                fingerprint = "|".join(others)
+                reason = (f"счёт {account.login}@{account.server} открыт ещё в {len(others)} окне "
+                          f"({', '.join(others)}): свободные деньги общего счёта тратятся дважды, "
+                          "входы закрыты")
+            elif blind:
+                fingerprint = "blind|" + "|".join(blind)
+                reason = (f"{len(blind)} окно не назвали свой счёт ({', '.join(blind)}): перепись "
+                          "их не видит, а не считает чистыми — входы закрыты")
+            else:
+                fingerprint = ""
+        if fingerprint:
             if (self.store.get_meta(key) or "") != fingerprint:
                 self.store.set_meta(key, fingerprint)
-                self.store.event(account.name, "account_second_window",
-                                 login=account.login, server=account.server, windows=others)
-            return (f"счёт {account.login}@{account.server} открыт ещё в {len(others)} окне "
-                    f"({', '.join(others)}): свободные деньги общего счёта тратятся дважды, "
-                    "входы закрыты")
+                self.store.event(account.name,
+                                 "account_second_window" if others else "roster_unknown",
+                                 login=account.login, server=account.server,
+                                 windows=others or blind,
+                                 census="absent" if rows is None else "on_file")
+            return reason
         if self.store.get_meta(key):
-            # The all-clear is announced whatever ended the block — the windows closed or the census
-            # went stale — because an operator who saw the warning has to see the reason it lifted.
+            # Only a census that actually saw the field can lift the block, so the all-clear always
+            # means what its name says: this machine was counted and holds one window for this money.
             self.store.set_meta(key, "")
             self.store.event(account.name, "account_single_window", login=account.login,
-                             server=account.server,
-                             census="fresh" if rows is not None else "expired")
+                             server=account.server, census="fresh")
         return ""
 
     # --- position management ------------------------------------------------------------
@@ -527,6 +614,11 @@ class Worker:
         for signal in strategy.signals(account):
             spec = broker.symbol(signal.base_symbol)
             if spec is None:
+                # A signal nobody can resolve is not a quiet no-trade: the park earns nothing and
+                # the operator has to see which name the broker does not offer here.
+                self._announce_once(f"no_symbol:{account.name}:{signal.base_symbol}",
+                                    account.name, "signal_symbol_unresolved",
+                                    symbol=signal.base_symbol)
                 continue
             same_symbol = [p for p in positions if p.symbol == spec.name]
             if len(same_symbol) >= account.strategy.max_positions_per_symbol:
@@ -594,9 +686,16 @@ class Worker:
             for position in fresh:
                 self.store.set_meta(f"atr:{account.name}:{int(position.ticket)}",
                                     f"{signal.atr:.8f}")
-            fresh_positions = risk.positions_for(account)
-            self.store.save_positions(account.name, fresh_positions,
-                                      self._mirror_risk_usd(account, fresh_positions, rate))
+            try:
+                fresh_positions = risk.positions_for(account)
+                self.store.save_positions(account.name, fresh_positions,
+                                          self._mirror_risk_usd(account, fresh_positions, rate))
+            except Exception as exc:  # noqa: BLE001 - the lot is already at the broker
+                # A read that failed after the fill must not strand the reservation: an owned slot
+                # nobody releases holds the portfolio risk cap for its full lifetime, and the next
+                # cycle re-reads the positions anyway.
+                self.store.event(account.name, "mirror_refresh_failed", symbol=spec.name,
+                                 error=f"{type(exc).__name__}: {exc}"[:160])
             self.store.release(slot)
             self._mark_entry(account, spec.name)
             return 1

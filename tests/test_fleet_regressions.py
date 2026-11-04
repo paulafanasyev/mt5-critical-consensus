@@ -5,8 +5,10 @@ backoff, the single-shard rule, and real-account gating — each is a bug that o
 """
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
+import time
 import types
 
 import pytest
@@ -18,6 +20,21 @@ if str(ROOT) not in sys.path:
 from fleet import broker, conductor, terminals, worker  # noqa: E402
 from fleet.config import FleetConfig, PortfolioLimits  # noqa: E402
 from fleet.store import Store  # noqa: E402
+
+
+def _own_window(store, account) -> None:
+    """A census saying exactly one window on this machine holds this account.
+
+    The entry gate is fail-closed: with no fresh census of the machine's terminal windows the park
+    cannot show that this account's free margin is not being spent by a driver it has not counted,
+    so it refuses new entries and keeps managing what it already holds. A test that wants an order
+    to reach the broker has to supply that proof.
+    """
+    row = {"exe": "", "dir": worker.window_dir(str(account.data_dir)), "login": account.login,
+           "server": account.server, "currency": "USD", "balance": 1000.0, "equity": 1000.0,
+           "error": ""}
+    store.set_meta(f"{worker.ROSTER_META_KEY}@{worker.local_host()}",
+                   json.dumps({"taken": time.time(), "rows": [row]}))
 
 
 # --- order execution -------------------------------------------------------------------------
@@ -402,6 +419,7 @@ def test_try_entries_places_one_order(tmp_path, monkeypatch) -> None:
     # The day gate refuses an unmeasured day, so this book needs a measured one to enter under.
     store.set_portfolio_baseline(worker.local_host(), "2026-11-03", 1000.0)
     store.equity("a", 1, 1000.0, 1000.0, 0, 0.0, "USD", 1.0, "2026-11-03")
+    _own_window(store, account)
     runner = worker.Worker(FleetConfig(accounts=[account]), store, dry_run=False)
     spec = worker.broker.BrokerSymbol(name="EURUSD", digits=5, point=0.00001,
                                       tick_size=0.00001, tick_value=1.0, volume_min=0.01,
@@ -714,6 +732,7 @@ def test_cycle_runs_the_real_entry_path(tmp_path, monkeypatch) -> None:
     account = Account(name="a", login=1, server="S", mode="demo")
     store = StoreCls(tmp_path / "book.sqlite")
     store.set_portfolio_baseline(worker.local_host(), "2026-11-03", 1000.0)
+    _own_window(store, account)
     runner = worker.Worker(FleetConfig(accounts=[account]), store)
     spec = worker.broker.BrokerSymbol(name="EURUSD", digits=5, point=0.00001,
                                       tick_size=0.00001, tick_value=1.0, volume_min=0.01,

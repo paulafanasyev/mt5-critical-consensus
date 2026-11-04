@@ -96,6 +96,16 @@ def fleet(tmp_path, monkeypatch):
     return store, events
 
 
+@pytest.fixture(autouse=True)
+def _windows_are_alive(monkeypatch):
+    """A census probe only addresses a pid that is still up, which PowerShell answers.
+
+    In a test the process list it hands over IS the liveness decision: nothing here may shell out,
+    and nothing here may silently drop every window because a query returned nothing.
+    """
+    monkeypatch.setattr(terminals, "pids_alive", lambda pids: set(pids))
+
+
 @pytest.fixture
 def attach(monkeypatch):
     """Replace the library the worker talks to, so no real terminal is ever addressed."""
@@ -340,6 +350,9 @@ def _entry_harness(tmp_path, monkeypatch, answering):
                                         equity=1000.0, margin_free=1000.0, leverage=100,
                                         positions=0, floating=0.0, server_day="2026-11-03")
     day = risk_mod.DayState(day="2026-11-03", start_balance=1000.0)
+    # A counted field with one window: the entry gate refuses to open while the census is missing,
+    # and an entry test has to be about the thing it tests, not about the census underneath it.
+    _census(store, [_row(str(account.data_dir), 1)])
     return account, runner, store, sent, snapshot, day, spec
 
 
@@ -853,12 +866,19 @@ def test_prune_leaves_a_row_another_machine_is_writing(tmp_path) -> None:
 
 # --- the census: which window holds which account ---------------------------------------------
 
-def _census(store: Store, rows: list[dict], taken: float | None = None) -> None:
-    """Write the census the way the park writes it at the start of a cycle."""
+def _census(store: Store, rows: list[dict], taken: float | None = None,
+            host: str | None = None) -> None:
+    """Write the census the way the park writes it at the start of a cycle: keyed by its machine."""
     import time as time_mod
 
-    store.set_meta(worker.ROSTER_META_KEY, json.dumps(
+    key = f"{worker.ROSTER_META_KEY}@{host or fleet_config.local_host()}"
+    store.set_meta(key, json.dumps(
         {"taken": time_mod.time() if taken is None else taken, "rows": rows}))
+
+
+def _forget_census(store: Store) -> None:
+    """Leave this machine with no census on file — the state of a fresh book or a pruned meta."""
+    store.set_meta(f"{worker.ROSTER_META_KEY}@{fleet_config.local_host()}", "")
 
 
 def _row(directory: str, login: int | None, server: str = "S") -> dict:
@@ -868,30 +888,37 @@ def _row(directory: str, login: int | None, server: str = "S") -> dict:
 
 
 class CensusMT5:
-    """Several windows answering at once: each names its own folder and its own account."""
+    """Several windows answering at once, each naming ITS OWN folder.
+
+    A window is given as `path: (login, server)` and may add a third element — the folder it
+    actually reports. That crossing (we ask A, B answers) is measured behaviour of the API and the
+    one thing the census must not paper over, so the fake cannot echo the requested path back.
+    """
 
     ACCOUNT_TRADE_MODE_REAL = 2
 
-    def __init__(self, windows: dict[str, tuple[int | None, str]]) -> None:
-        self.windows = {worker.window_dir(path): value for path, value in windows.items()}
+    def __init__(self, windows: dict[str, tuple]) -> None:
+        self.windows: dict[str, tuple] = {}
+        for path, value in windows.items():
+            reported = value[2] if len(value) > 2 else path
+            self.windows[worker.window_dir(path)] = (value[0], value[1], worker.window_dir(reported))
         self.initialize_calls: list[dict] = []
         self.shutdowns = 0
-        self.current: tuple[int | None, str] | None = None
+        self.current: tuple | None = None
 
     def initialize(self, **kwargs) -> bool:
         self.initialize_calls.append(kwargs)
-        folder = worker.window_dir(str(kwargs.get("path", "")))
-        self.current = self.windows.get(folder)
+        self.current = self.windows.get(worker.window_dir(str(kwargs.get("path", ""))))
         return self.current is not None and self.current[0] is not None
 
     def last_error(self):
         return (-10005, "IPC timeout")
 
     def terminal_info(self):
-        return types.SimpleNamespace(path=str(self.initialize_calls[-1]["path"]))
+        return types.SimpleNamespace(path=self.current[2] if self.current else "")
 
     def account_info(self):
-        login, server = self.current or (None, "")
+        login, server = (self.current[0], self.current[1]) if self.current else (None, "")
         return types.SimpleNamespace(login=login, server=server, currency="USD",
                                      balance=1000.0, equity=1000.0)
 
@@ -926,8 +953,28 @@ def test_the_census_asks_a_window_for_nothing_but_its_name(tmp_path, monkeypatch
     monkeypatch.setattr(terminals, "running_terminals",
                         lambda: [(7, r"C:\mt5-team\terminal64.exe")])
     worker.refresh_roster(Store(tmp_path / "book.sqlite"))
-    assert fake.initialize_calls == [{"path": r"C:\mt5-team\terminal64.exe",
-                                      "timeout": worker.ROSTER_PROBE_TIMEOUT_MS}]
+    assert fake.initialize_calls == [{"path": r"C:\mt5-team\terminal64.exe", "timeout": 4000}]
+    # A census runs inside the trading cycle: a probe that waits a minute would starve the exits.
+    assert worker.ROSTER_PROBE_TIMEOUT_MS <= 5000
+
+
+def test_a_window_that_died_before_the_probe_is_never_addressed(tmp_path, monkeypatch) -> None:
+    """initialize() starts a terminal that is not running: a vanished pid must not be probed.
+
+    The process walk and the probe are moments apart, and MT5 re-spawns itself on updates. Without
+    the liveness re-check the census would raise the window that just closed — seeded with a saved
+    session, so it would log in and drive money nobody asked it to.
+    """
+    store = Store(tmp_path / "book.sqlite")
+    fake = CensusMT5({r"C:\mt5-team": (1, "S")})
+    monkeypatch.setattr(worker, "mt5", fake)
+    monkeypatch.setattr(terminals, "running_terminals",
+                        lambda: [(7, r"C:\mt5-team\terminal64.exe"),
+                                 (8, r"C:\mt5-gone\terminal64.exe")])
+    monkeypatch.setattr(terminals, "pids_alive", lambda pids: {7})
+    rows = worker.refresh_roster(store)
+    assert [row["dir"] for row in rows] == ["c:\\mt5-team"]
+    assert [call["path"] for call in fake.initialize_calls] == [r"C:\mt5-team\terminal64.exe"]
 
 
 def test_a_window_that_stays_silent_is_recorded_not_fatal(tmp_path, monkeypatch) -> None:
@@ -959,7 +1006,41 @@ def test_the_census_is_taken_once_per_refresh_window(tmp_path, monkeypatch) -> N
     assert len(fake.initialize_calls) == 1
     worker.refresh_roster(store, now=taken + worker.ROSTER_REFRESH_SECONDS)
     assert len(fake.initialize_calls) == 2
-    assert len(store.get_meta(worker.ROSTER_META_KEY)) > 0
+    assert len(store.get_meta(worker._host_key(worker.ROSTER_META_KEY))) > 0
+
+
+def test_the_census_cadence_is_written_in_minutes_not_symbols() -> None:
+    """The two windows are literals here because swapping them silently disables the gate.
+
+    Refresh longer than evidence means the census is stale by the time it is retaken: every cycle
+    then trades on a count nobody can vouch for. Measured cost of one full census on four windows,
+    two of them unauthorised, is 8.4 s — the cadence is set by that, not by taste.
+    """
+    assert worker.ROSTER_REFRESH_SECONDS == 300.0
+    assert worker.ROSTER_EVIDENCE_SECONDS == 900.0
+    assert worker.ROSTER_REFRESH_SECONDS < worker.ROSTER_EVIDENCE_SECONDS
+
+
+def test_the_census_costs_one_walk_per_refresh_not_per_account(tmp_path, monkeypatch, fleet) -> None:
+    """The census is inside every account's cycle; the cadence is what keeps that affordable.
+
+    Four windows × two accounts × two cycles would be sixteen probes — several seconds each on a
+    silent window — while two cycles over a shared book need one walk. A census that cost per
+    account would starve the exits it is supposed to leave alone.
+    """
+    store, _events = fleet
+    fake = CensusMT5({r"C:\mt5-a": (1, "S"), r"C:\mt5-b": (2, "G")})
+    monkeypatch.setattr(worker, "mt5", fake)
+    monkeypatch.setattr(terminals, "running_terminals",
+                        lambda: [(1, r"C:\mt5-a\terminal64.exe"),
+                                 (2, r"C:\mt5-b\terminal64.exe")])
+    accounts = [make_account("a", 1, "S", shard=0), make_account("b", 2, "G", shard=0)]
+    monkeypatch.setattr(worker.Worker, "attach", lambda self, acc: "")
+    monkeypatch.setattr(worker.Worker, "_cycle",
+                        lambda self, acc, allow_entries=True: worker.WorkerResult(acc.name, "ok"))
+    for _ in range(2):
+        worker.run_shard(FleetConfig(accounts=accounts), store, 0)
+    assert len(fake.initialize_calls) == 2
 
 
 # --- the gate: one account, one driver ---------------------------------------------------------
@@ -1011,8 +1092,41 @@ def test_the_second_window_is_announced_once_while_it_last(tmp_path, monkeypatch
     assert kinds.count("account_second_window") == 1
 
 
+def test_a_blocked_account_still_manages_every_position_it_holds(tmp_path, monkeypatch) -> None:
+    """The gate closes new entries and nothing else.
+
+    Moving the census check to the top of the cycle — the obvious tidy place for it — would stop
+    break-even and stop-trailing on a live position for as long as somebody else holds the same
+    account. That trade is never worth the signal it saves, so it is pinned here at cycle level.
+    """
+    from fleet import risk as risk_mod
+
+    account, runner, store, sent, snapshot, day, _spec = _gate(
+        tmp_path, monkeypatch, [_row(r"C:\mt5-team", 1)])
+    position = types.SimpleNamespace(ticket=11, symbol="EURUSD", type=0, volume=0.01,
+                                     price_open=1.10, profit=0.0, sl=1.098, tp=1.104, magic=7)
+    seen: list[int] = []
+    monkeypatch.setattr(risk_mod, "AccountSnapshot",
+                        types.SimpleNamespace(read=lambda *a, **k: snapshot))
+    monkeypatch.setattr(risk_mod, "positions_for", lambda acc: [position])
+    monkeypatch.setattr(risk_mod, "daily_net_flow", lambda d: 0.0)
+    monkeypatch.setattr(risk_mod, "daily_realized", lambda d: 0.0)
+    monkeypatch.setattr(risk_mod, "server_day_now", lambda: day.day)
+    monkeypatch.setattr(worker.Worker, "_mirror_risk_usd", lambda self, *a, **k: {})
+    monkeypatch.setattr(worker.Worker, "_manage_positions",
+                        lambda self, acc, d, positions: seen.append(len(positions)) or 1)
+    result = runner._cycle(account, allow_entries=True)
+    assert seen == [1]  # management ran, and ran with the position in hand
+    assert result.closed == 1 and result.opened == 0
+    assert sent == []  # not one order sent into the shared margin
+
+
 def test_an_out_of_date_census_is_not_evidence(tmp_path, monkeypatch) -> None:
-    """A window that closed an hour ago must not keep the account grounded for good."""
+    """A count nobody can vouch for opens the field no more than a clean one does.
+
+    The block lifts when the park re-counts the windows — the cycle takes a census every
+    ROSTER_REFRESH_SECONDS — not because the old count aged out and became unknown-safe.
+    """
     import time as time_mod
 
     account, runner, store, sent, snapshot, day, _spec = _gate(
@@ -1020,9 +1134,93 @@ def test_an_out_of_date_census_is_not_evidence(tmp_path, monkeypatch) -> None:
     assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
     _census(store, [_row(str(account.data_dir), 1), _row(r"C:\mt5-team", 1)],
             taken=time_mod.time() - worker.ROSTER_EVIDENCE_SECONDS - 1)
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    kinds = [kind for _, _, kind, _ in store.recent_events(30)]
+    assert "account_single_window" not in kinds  # the field was never seen clear, so no all-clear
+    assert "roster_unknown" in kinds
+    _census(store, [_row(str(account.data_dir), 1)])
     assert runner._try_entries(account, snapshot, [], day, 1.0) == 1
     kinds = [kind for _, _, kind, _ in store.recent_events(30)]
-    assert "account_single_window" in kinds  # the operator sees the all-clear, not silence
+    assert "account_single_window" in kinds  # and the operator sees why it lifted
+
+
+def test_no_census_at_all_is_not_a_clean_field(tmp_path, monkeypatch) -> None:
+    """A park that has not counted this machine's windows cannot claim nobody shares the money."""
+    account, runner, store, sent, snapshot, day, _spec = _entry_harness(tmp_path, monkeypatch, (1, "S"))
+    _forget_census(store)
+    assert worker.roster_rows(store) is None
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert sent == []
+
+
+def test_a_census_written_by_another_machine_is_not_this_machines_evidence(tmp_path,
+                                                                            monkeypatch) -> None:
+    """The book is shared; the process list is not.
+
+    Box B's census lists box B's windows. Read as evidence here it would say "one window per
+    account" while box A holds a second driver that B never saw.
+    """
+    account, runner, store, sent, snapshot, day, _spec = _gate(
+        tmp_path, monkeypatch, [_row(r"C:\mt5-team", 1)])
+    _forget_census(store)
+    _census(store, [_row(str(account.data_dir), 1)], host="box-that-is-not-this-one")
+    assert worker.roster_rows(store) is None
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert sent == []
+    kinds = [kind for _, _, kind, _ in store.recent_events(30)]
+    assert "roster_unknown" in kinds
+
+
+def test_a_window_the_os_would_not_name_closes_the_entries(tmp_path, monkeypatch) -> None:
+    """Win32 hides ExecutablePath from another user's session: an unnamed window is not a clean one."""
+    store = Store(tmp_path / "book.sqlite")
+    fake = CensusMT5({})
+    monkeypatch.setattr(worker, "mt5", fake)
+    monkeypatch.setattr(terminals, "running_terminals", lambda: [(99, "")])
+    rows = worker.refresh_roster(store)
+    assert rows[0]["login"] is None and rows[0]["error"]
+    assert [row["dir"] for row in worker.blind_windows(rows)] == [""]
+    assert fake.initialize_calls == []  # an empty path would mean "the default terminal": never ask
+    account, runner, _store, sent, snapshot, day, _spec = _gate(tmp_path, monkeypatch, [])
+    _census(store, rows)
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert sent == []
+
+
+def test_an_empty_census_counts_as_a_field_with_no_other_driver(tmp_path, monkeypatch) -> None:
+    """No window is up at census time — the park's own copy is started by attach()."""
+    account, runner, store, sent, snapshot, day, _spec = _gate(tmp_path, monkeypatch, [])
+    _census(store, [])
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 1
+    assert sent == [1]
+
+
+def test_the_census_believes_the_window_that_answers_not_the_path_we_asked(
+        tmp_path, monkeypatch) -> None:
+    """initialize(path=A) can be answered by window B — measured, not folklore.
+
+    Naming the row after the request would collapse two windows into one folder, hide the second
+    driver, and let both spend the same free margin.
+    """
+    store = Store(tmp_path / "book.sqlite")
+    fake = CensusMT5({r"C:\mt5-team\terminal64.exe": (1, "S", r"C:\mt5-exness"),
+                      r"C:\mt5-exness\terminal64.exe": (1, "S", r"C:\mt5-exness")})
+    monkeypatch.setattr(worker, "mt5", fake)
+    monkeypatch.setattr(terminals, "running_terminals",
+                        lambda: [(1, r"C:\mt5-team\terminal64.exe"),
+                                 (2, r"C:\mt5-exness\terminal64.exe")])
+    rows = worker.refresh_roster(store)
+    assert [row["dir"] for row in rows] == ["c:\\mt5-exness", "c:\\mt5-exness"]
+    assert worker.duplicated_accounts(rows) == {"1@s": ["c:\\mt5-exness", "c:\\mt5-exness"]}
+
+
+def test_duplicated_accounts_does_not_merge_two_brokers_one_login(tmp_path) -> None:
+    """Login 1 at Exness and login 1 at GTC are two piles of money, not one driver."""
+    rows = [_row(r"C:\mt5-a", 1, "Exness-MT5Real26"), _row(r"C:\mt5-b", 1, "GTC-Go-Live")]
+    assert worker.duplicated_accounts(rows) == {}
+    assert worker.duplicated_accounts([_row(r"C:\mt5-a", 1, "Exness-MT5Real26"),
+                                       _row(r"C:\mt5-b", 1, "exness-mt5real26")]) == {
+        "1@exness-mt5real26": ["c:\\mt5-a", "c:\\mt5-b"]}
 
 
 def test_the_census_runs_before_anything_is_attached(tmp_path, monkeypatch, fleet) -> None:
@@ -1078,7 +1276,9 @@ def test_terminals_shows_two_windows_holding_one_account(tmp_path, monkeypatch, 
                            "terminals"])
     out = capsys.readouterr().out
     assert code == 0
-    assert "114929502@MetaQuotes-Demo открыт в 2 окнах" in out
+    # The warning names the account by its identity key, login@server in lowercase: that is the
+    # same spelling the gate groups windows by, so what the operator reads is what was counted.
+    assert "114929502@metaquotes-demo открыт в 2 окнах" in out
     assert "mt5-exness" in out and "mt5-team" in out
 
 

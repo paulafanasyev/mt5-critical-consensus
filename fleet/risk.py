@@ -130,12 +130,21 @@ def day_start_datetime(day: str) -> dt.datetime:
 
 
 def positions_for(account: Account) -> list:
-    """Every position on the account, not only ours: a manual lot still moves the equity."""
-    return list(mt5.positions_get() or [])
+    """Every position on the account, not only ours: a manual lot still moves the equity.
+
+    None from the terminal is a failed read, not an empty book. The store's position mirror is
+    replaced from this list, so treating a dropped IPC as "flat" deletes this account's open risk
+    from every shard's money cap — the cap then sees free risk and opens more — and skips the exits
+    of positions that are still live at the broker.
+    """
+    positions = mt5.positions_get()
+    if positions is None:
+        raise RuntimeError(f"позиции не прочитаны: {mt5.last_error()}")
+    return list(positions)
 
 
 def own_positions(account: Account) -> list:
-    return [p for p in mt5.positions_get() or [] if p.magic == account.magic]
+    return [p for p in positions_for(account) if p.magic == account.magic]
 
 
 def can_open(account: Account, snapshot: AccountSnapshot, day: DayState,
