@@ -311,6 +311,17 @@ def cmd_reset_day(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Every line this CLI prints is Russian. A cp1252 console or a pipe raises UnicodeEncodeError
+    # on the first Cyrillic character, which is a ValueError — so the crash was caught by the error
+    # handler below and it crashed again printing the message. UTF-8 with replacement cannot abort
+    # a status read while the park is trading.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
     parser = argparse.ArgumentParser(description="MT5 fleet")
     parser.add_argument("--config", default="", help="путь к accounts.yaml")
     parser.add_argument("--store", default=str(DEFAULT_STORE))

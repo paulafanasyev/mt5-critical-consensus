@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import io
 import json
 import pathlib
 import sys
@@ -1294,3 +1295,22 @@ def test_status_shows_the_census_without_probing_a_terminal(tmp_path, monkeypatc
     out = capsys.readouterr().out
     assert "окна на этой машине: 2" in out
     assert "входы по этому счёту закрыты" in out
+
+
+def test_the_cli_reads_aloud_on_a_legacy_console(tmp_path, monkeypatch) -> None:
+    """A cp1252 stdout used to abort `status` on its first Russian line.
+
+    Worse than a garbled word: `UnicodeEncodeError` is a `ValueError`, so the CLI's own error
+    handler caught it and then crashed printing "ошибка конфигурации" in Cyrillic too. The operator
+    running this on a Russian Windows box — the normal case — got a traceback instead of a census.
+    """
+    buf = io.BytesIO()
+    stream = io.TextIOWrapper(buf, encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", stream)
+    registry = tmp_path / "accounts.yaml"
+    registry.write_text(_TWO_WINDOWS, encoding="utf-8")
+    code = fleet_cli.main(["--config", str(registry), "--store", str(tmp_path / "book.sqlite"),
+                           "status"])
+    stream.flush()
+    assert code == 0
+    assert "портфель" in buf.getvalue().decode("utf-8")

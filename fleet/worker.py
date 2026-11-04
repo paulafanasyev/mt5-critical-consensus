@@ -30,8 +30,8 @@ MAX_FAILURES = 5
 # stays evidence. Sizing is a fraction of the balance this terminal can see; a second window logged
 # into the same account spends the same free margin, and nobody but the broker adds the two up.
 # Measured here (4 windows up): the two authorised ones answer in ~0.2 s each, the two unauthorised
-# ones cost the full probe timeout — 8.37 s for the whole census. The cadence is what decides how
-# long a manual login stays invisible, so it is set by that cost, not by politeness.
+# ones cost the full probe timeout — 8.37 s and 8.63 s on two runs of the same field. The cadence is
+# what decides how long a manual login stays invisible, so it is set by that cost, not by politeness.
 ROSTER_REFRESH_SECONDS = 300.0
 ROSTER_EVIDENCE_SECONDS = 900.0
 ROSTER_META_KEY = "terminal_roster"
