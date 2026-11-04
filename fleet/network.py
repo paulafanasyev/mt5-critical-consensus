@@ -31,6 +31,25 @@ def openvpn_pids() -> list[int]:
     return [int(part) for part in result.stdout.split() if part.isdigit()]
 
 
+def openvpn_sessions() -> list[tuple[int, str]]:
+    """(pid, command line) of every openvpn process up.
+
+    The command line is what tells the park's own tunnel from the trading desk's VPN: this module
+    always starts openvpn with `--log <TUNNEL_DIR>\\openvpn-<profile>.log`, and nothing else on the
+    box writes there.
+    """
+    script = ('Get-CimInstance Win32_Process -Filter "Name=\'openvpn.exe\'" | '
+              'ForEach-Object { "$($_.ProcessId)`t$($_.CommandLine)" }')
+    result = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                            capture_output=True, text=True)
+    rows: list[tuple[int, str]] = []
+    for line in (result.stdout or "").splitlines():
+        pid, _sep, command = line.partition("\t")
+        if pid.strip().isdigit():
+            rows.append((int(pid.strip()), command))
+    return rows
+
+
 def tunnel_up(profile: str) -> bool:
     """A tunnel is up only if this profile's own session log ends with a successful start."""
     if not openvpn_pids():
@@ -82,5 +101,20 @@ def ensure_tunnel(profile: str, timeout: float = 60.0) -> tuple[bool, str]:
     return False, f"туннель не поднялся за {int(timeout)} с (лог {log})"
 
 
-def stop_tunnel() -> None:
-    subprocess.run(["taskkill", "/IM", "openvpn.exe", "/F"], capture_output=True)
+def stop_tunnel(profile: str = "") -> int:
+    """Stop only the tunnels this repo raised; returns how many.
+
+    `taskkill /IM openvpn.exe /F` killed every OpenVPN on the box. On a trading desk that is not a
+    cleanup: the desk's own VPN carries the broker's network for everything else on the machine, so
+    stopping one account's tunnel made every other account go dark. The park always passes
+    `--log <TUNNEL_DIR>/...`, so that argument names its own sessions and nothing else; a profile
+    narrows it to one.
+    """
+    mark = (f"--log {session_log(profile)}" if profile else f"--log {TUNNEL_DIR}").lower()
+    killed = 0
+    for pid, command in openvpn_sessions():
+        if mark not in command.lower():
+            continue
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+        killed += 1
+    return killed

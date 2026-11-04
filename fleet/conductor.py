@@ -162,7 +162,9 @@ class Conductor:
 
         # Only a tunnel this machine was asked to raise: shards elsewhere keep their own VPN.
         if any(a.network == "vpn" for a in self.config.enabled() if self.config.runs_here(a)):
-            network.stop_tunnel()
+            killed = network.stop_tunnel()
+            if killed:
+                self.store.event("conductor", "tunnel_stopped", sessions=killed)
 
     # --- supervision --------------------------------------------------------------------
     def tick(self) -> dict:

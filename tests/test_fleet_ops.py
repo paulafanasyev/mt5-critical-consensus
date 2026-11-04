@@ -187,3 +187,39 @@ def test_real_account_writes_no_orders_and_changes_no_stop_without_live(
     day = worker.risk.DayState(day="2026-11-03", start_balance=1000.0)
     runner._manage_positions(account, day, [position])
     assert calls["order_send"] == 0 and calls["modify"] == 0 and calls.get("close", 0) == 0
+
+
+# --- the VPN tunnel is the park's own, and only the park's ---------------------------------------
+
+def test_the_tunnel_reader_separates_a_pid_from_its_command_line(monkeypatch) -> None:
+    """One CIM call, one line per session: the tab is the only thing keeping pid and args apart."""
+    from fleet import network
+
+    out = ("111\tC:\\Program Files\\OpenVPN\\bin\\openvpn.exe --config C:\\openvpn\\a.ovpn\n"
+           "222\t\n")
+    monkeypatch.setattr(network.subprocess, "run",
+                        lambda *a, **k: types.SimpleNamespace(stdout=out))
+    assert network.openvpn_sessions() == [
+        (111, "C:\\Program Files\\OpenVPN\\bin\\openvpn.exe --config C:\\openvpn\\a.ovpn"),
+        (222, "")]
+
+
+def test_stopping_the_tunnel_leaves_the_desks_own_vpn_alone(monkeypatch) -> None:
+    """The park's tunnel is named by the session log it was started with — nothing else is.
+
+    `taskkill /IM openvpn.exe /F` closed every OpenVPN on the box, including the one the trading
+    desk uses to reach its brokers: ending one account's tunnel then put every other account dark.
+    """
+    from fleet import network
+
+    sessions = [(111, '"C:\\Program Files\\OpenVPN\\bin\\openvpn.exe" --config '
+                      '"C:\\Users\\desk\\config\\corp.ovpn"'),
+                (222, '"C:\\Program Files\\OpenVPN\\bin\\openvpn.exe" --config '
+                      "C:\\openvpn\\broker.ovpn --log C:\\openvpn\\openvpn-broker.log --verb 3")]
+    killed: list[list[str]] = []
+    monkeypatch.setattr(network, "openvpn_sessions", lambda: sessions)
+    monkeypatch.setattr(network.subprocess, "run", lambda cmd, **k: killed.append(cmd))
+    assert network.stop_tunnel() == 1
+    assert killed == [["taskkill", "/PID", "222", "/F"]]
+    assert network.stop_tunnel(profile=r"C:\openvpn\other.ovpn") == 0
+    assert len(killed) == 1
