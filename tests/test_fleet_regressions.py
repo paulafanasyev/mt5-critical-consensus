@@ -963,3 +963,66 @@ def test_the_cycle_journals_a_candidate_and_never_holds_the_risk_slot_for_it(
     assert book["open"] == 1 and book["blind"] == 0
     assert book["trades"][0]["drift_points"] == 25.0
     assert book["trades"][0]["drift_cost_usd"] == 0.5
+
+
+def _entry_desk(tmp_path, monkeypatch, *, balance: float, max_lots: float,
+                fill: float = 1.10025):
+    """A worker whose entry path reaches a stubbed broker, with one buy signal on EURUSD."""
+    from fleet import risk as risk_mod
+    from fleet.config import Account, RiskProfile
+
+    account = Account(name="a", login=1, server="S", mode="demo",
+                      risk=RiskProfile(risk_per_trade_pct=0.25, max_lots=max_lots))
+    store = Store(tmp_path / "book.sqlite")
+    store.set_portfolio_baseline(worker.local_host(), "2026-11-03", balance)
+    _own_window(store, account)
+    runner = worker.Worker(FleetConfig(accounts=[account]), store)
+    spec = broker.BrokerSymbol(name="EURUSD", digits=5, point=0.00001, tick_size=0.00001,
+                               tick_value=1.0, volume_min=0.01, volume_max=100.0,
+                               volume_step=0.01, stops_level=0, freeze_level=0, spread=1,
+                               filling=3)
+    signal = types.SimpleNamespace(base_symbol="EURUSD", side="buy", reason="test",
+                                   price=1.10, stop=1.098, target=1.104, atr=0.001,
+                                   stop_distance=0.002)
+    snapshot = risk_mod.AccountSnapshot(login=1, server="S", currency="USD", balance=balance,
+                                        equity=balance, margin_free=balance, leverage=100,
+                                        positions=0, floating=0.0, server_day="2026-11-03")
+    monkeypatch.setattr(risk_mod, "AccountSnapshot",
+                        types.SimpleNamespace(read=lambda *a, **k: snapshot))
+    monkeypatch.setattr(risk_mod, "positions_for", lambda acc: [])
+    monkeypatch.setattr(risk_mod, "daily_net_flow", lambda day: 0.0)
+    monkeypatch.setattr(risk_mod, "daily_realized", lambda day: 0.0)
+    monkeypatch.setattr(worker.Worker, "_manage_positions", lambda self, *a, **k: 0)
+    monkeypatch.setattr(worker.strategy, "signals", lambda acc: [signal])
+    monkeypatch.setattr(worker.broker, "symbol", lambda base: spec)
+    monkeypatch.setattr(worker.broker, "symbol_exact", lambda name: spec)
+    monkeypatch.setattr(worker.broker, "open_positions", lambda *a, **k: [])
+    monkeypatch.setattr(worker.broker, "market_order", lambda *a, **k: types.SimpleNamespace(
+        volume=max_lots, price=fill, retcode=10009, token="t", position_ticket=7))
+    monkeypatch.setattr(worker.mt5, "account_info",
+                        lambda: types.SimpleNamespace(login=1, server="S"))
+    return account, store, runner
+
+
+def test_a_lot_ceiling_that_swallows_the_configured_risk_is_said_out_loud(
+        tmp_path, monkeypatch) -> None:
+    """0.25% promised, 0.02% taken: sizing quietly under a ceiling is a money lie the operator
+    has to see once, not a number he can only discover by reading the code."""
+    account, store, runner = _entry_desk(tmp_path, monkeypatch, balance=100000.0, max_lots=0.10)
+    assert runner._cycle(account, allow_entries=True).status == "ok"
+    rows = [json.loads(p) for _ts, _a, kind, p in store.recent_events(limit=50)
+            if kind == "risk_under_taken"]
+    assert len(rows) == 1  # once per symbol per configuration, not once per cycle
+    assert rows[0]["max_lots"] == 0.10 and rows[0]["taken_lots"] == 0.10
+    assert rows[0]["wanted_lots"] == 1.25  # 0.25% of 100 000 over 200 USD of loss per lot
+    assert rows[0]["effective_pct"] == 0.02
+
+
+def test_the_notice_is_quiet_when_the_ceiling_is_not_the_binding_limit(
+        tmp_path, monkeypatch) -> None:
+    """A small account sizes below its ceiling on its own: nothing is being swallowed there."""
+    account, store, runner = _entry_desk(tmp_path, monkeypatch, balance=1000.0, max_lots=0.10)
+    assert runner._cycle(account, allow_entries=True).status == "ok"
+    kinds = [kind for _ts, _a, kind, _p in store.recent_events(limit=50)]
+    assert "risk_under_taken" not in kinds
+    assert account.risk.max_lots == 0.10

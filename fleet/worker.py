@@ -648,6 +648,21 @@ class Worker:
                 self.store.event(account.name, "skip", symbol=spec.name, reason="объём 0")
                 continue
             risk_money = spec.distance_money(signal.stop_distance, volume)
+            per_lot = spec.distance_money(signal.stop_distance, 1.0)
+            if per_lot > 0 and volume >= account.risk.max_lots - 1e-9:
+                # The lot sits on the operator's ceiling, so the risk the config promises is not
+                # the risk being taken. Sizing quietly is how a 0.25% account trades 0.03% for
+                # months: the number has to be said out loud, once per symbol per configuration.
+                wanted = (snapshot.balance * account.risk.risk_per_trade_pct / 100.0) / per_lot
+                if wanted > volume + spec.volume_step:
+                    self._announce_once(
+                        _host_key(f"lot_cap:{account.name}:{spec.name}:"
+                                  f"{account.risk.max_lots}:{account.risk.risk_per_trade_pct}"),
+                        account.name, "risk_under_taken", symbol=spec.name,
+                        configured_pct=account.risk.risk_per_trade_pct,
+                        max_lots=account.risk.max_lots, wanted_lots=round(wanted, 3),
+                        taken_lots=volume,
+                        effective_pct=round(risk_money / snapshot.balance * 100, 4))
             ok, why = risk.can_open_portfolio(
                 self.config.portfolio, book_stop["equity"], current_risk, risk_money * rate,
                 book_positions, specs, day_pct, new_symbol=spec.name, new_volume=volume,
