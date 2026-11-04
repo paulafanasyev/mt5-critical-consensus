@@ -315,7 +315,17 @@ class Store:
 
     def portfolio(self, active: list[str] | None = None,
                   fresh_only: bool = True) -> dict[str, float]:
-        """The book in USD; the stop uses fresh_only=False so a stale account is not forgotten."""
+        """The book in USD; the stop uses fresh_only=False so a stale account is not forgotten.
+
+        An empty `active` is not "everything", it is "nothing". Only `None` reads the whole file,
+        and that is the operator's view: a machine whose registry names only another box's accounts
+        would otherwise count a peer's money as its own equity, take its day baseline from it and
+        set its daily stop against a drawdown it never had.
+        """
+        empty = {"balance": 0.0, "equity": 0.0, "positions": 0.0, "floating": 0.0,
+                 "accounts": 0.0, "unpriced": 0.0}
+        if active is not None and not active:
+            return dict(empty)
         now = time.time() - 3600 if fresh_only else 0.0
         with self._connect() as conn:
             if active:
@@ -333,8 +343,7 @@ class Store:
                     " SUM(CASE WHEN equity_usd IS NULL THEN 1 ELSE 0 END) FROM book"
                     " WHERE updated_epoch > ?", (now,)).fetchone()
         if not row or not row[0]:
-            return {"balance": 0.0, "equity": 0.0, "positions": 0.0, "floating": 0.0,
-                    "accounts": 0.0, "unpriced": 0.0}
+            return dict(empty)
         return {"balance": row[1] or 0.0, "equity": row[2] or 0.0,
                 "positions": float(row[3] or 0), "floating": row[4] or 0.0,
                 "accounts": float(row[0]),
@@ -446,9 +455,12 @@ class Store:
 
         `names` is this machine's book. A row belonging to an account another box writes has a
         risk number this machine can neither read nor re-price, and counting it would let one
-        peer's dark shard veto every entry on every other machine forever.
+        peer's dark shard veto every entry on every other machine forever. An empty `names` means
+        this machine holds nothing, so it reads nothing; only `None` asks for the whole file.
         """
         cutoff = time.time() - max_age
+        if names is not None and not names:
+            return []
         with self._connect() as conn:
             if names:
                 marks = ",".join("?" for _ in names)

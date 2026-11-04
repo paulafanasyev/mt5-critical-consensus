@@ -399,6 +399,9 @@ def test_try_entries_places_one_order(tmp_path, monkeypatch) -> None:
 
     account = Account(name="a", login=1, server="S", mode="demo")
     store = StoreCls(tmp_path / "book.sqlite")
+    # The day gate refuses an unmeasured day, so this book needs a measured one to enter under.
+    store.set_portfolio_baseline(worker.local_host(), "2026-11-03", 1000.0)
+    store.equity("a", 1, 1000.0, 1000.0, 0, 0.0, "USD", 1.0, "2026-11-03")
     runner = worker.Worker(FleetConfig(accounts=[account]), store, dry_run=False)
     spec = worker.broker.BrokerSymbol(name="EURUSD", digits=5, point=0.00001,
                                       tick_size=0.00001, tick_value=1.0, volume_min=0.01,
@@ -710,6 +713,7 @@ def test_cycle_runs_the_real_entry_path(tmp_path, monkeypatch) -> None:
 
     account = Account(name="a", login=1, server="S", mode="demo")
     store = StoreCls(tmp_path / "book.sqlite")
+    store.set_portfolio_baseline(worker.local_host(), "2026-11-03", 1000.0)
     runner = worker.Worker(FleetConfig(accounts=[account]), store)
     spec = worker.broker.BrokerSymbol(name="EURUSD", digits=5, point=0.00001,
                                       tick_size=0.00001, tick_value=1.0, volume_min=0.01,

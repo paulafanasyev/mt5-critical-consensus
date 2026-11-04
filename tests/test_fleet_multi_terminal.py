@@ -26,7 +26,7 @@ import fleet_cli  # noqa: E402
 from fleet import conductor, terminals, worker  # noqa: E402
 from fleet import config as fleet_config  # noqa: E402
 from fleet.config import Account, FleetConfig, PortfolioLimits, load  # noqa: E402
-from fleet.store import Store  # noqa: E402
+from fleet.store import Store, host_keys  # noqa: E402
 
 
 def make_account(name: str, login: int, server: str, **overrides) -> Account:
@@ -313,6 +313,10 @@ def _entry_harness(tmp_path, monkeypatch, answering):
     # machine this one does not run is not counted here at all (see the veto test below).
     peer = make_account("gtc", 2, "GTC-Go-Live")
     store = Store(tmp_path / "book.sqlite")
+    # The day the entries are gated against has to be a measurement the conductor made, not an
+    # absent one: an unmeasured day now refuses entries instead of reporting a 0 % day.
+    store.set_portfolio_baseline(fleet_config.local_host(), "2026-11-03", 1000.0)
+    store.equity("a", 1, 1000.0, 1000.0, 0, 0.0, "USD", 1.0, "2026-11-03")
     runner = worker.Worker(FleetConfig(accounts=[account, peer]), store, dry_run=False)
     spec = worker.broker.BrokerSymbol(name="EURUSD", digits=5, point=0.00001, tick_size=0.00001,
                                       tick_value=1.0, volume_min=0.01, volume_max=100.0,
@@ -342,6 +346,7 @@ def test_an_order_is_refused_when_the_window_changed_its_login(tmp_path, monkeyp
     # The portable directory proves WHICH terminal answers; only the live login proves whose money.
     account, runner, store, sent, snapshot, day, _spec = _entry_harness(tmp_path, monkeypatch,
                                                                         (999, "Someone-Else"))
+    store.equity("a", 1, 1000.0, 1000.0, 0, 0.0, "USD", 1.0, "2026-11-03")
     opened = runner._try_entries(account, snapshot, [], day, 1.0)
     assert opened == 0 and sent == []
     assert any(kind == "identity_lost" for _, _, kind, _ in store.recent_events(20))
@@ -600,9 +605,37 @@ def test_a_reset_day_on_one_machine_leaves_the_other_one_measured(tmp_path, monk
     store = Store(tmp_path / "book.sqlite")
     store.set_portfolio_baseline("box-a", "2026-11-03", 1000.0)
     store.set_portfolio_baseline("box-b", "2026-11-03", 700.0)
+    store.set_portfolio_registry_hash("box-a", "abcdef1234")
     fleet_cli_mod.cmd_reset_day(argparse.Namespace(store=str(tmp_path / "book.sqlite")))
     assert store.portfolio_baseline("box-a") == ("", "")  # cleared, and not re-taken from a peer
     assert store.portfolio_baseline("box-b") == ("2026-11-03", "700.00")
+    # the composition of the book survives a day reset; a reset is not a registry change
+    assert store.portfolio_registry_hash("box-a") == "abcdef1234"
+
+
+def test_a_day_held_for_hours_is_announced_once(tmp_path, monkeypatch) -> None:
+    """One quiet broker over a weekend is one fact, not a couple of hundred identical events."""
+    import time as time_mod
+
+    from fleet.store import BOOK_FRESH_SECONDS
+
+    monkeypatch.setattr(conductor, "PAUSE_FILE", tmp_path / "PAUSE")
+    store = Store(tmp_path / "book.sqlite")
+    exness = make_account("exness", 1, "Exness-MT5Real26")   # silent since yesterday
+    gtc = make_account("gtc", 2, "GTC-Go-Live")              # already in the next day
+    engine = conductor.Conductor(FleetConfig(accounts=[exness, gtc]), store, shards=[0])
+    _seed_day(store, engine, "2026-11-02", 2000.0)
+    store.equity("exness", 1, 980.0, 980.0, 0, 0.0, server_day="2026-11-02")
+    store.equity("gtc", 2, 980.0, 980.0, 0, 0.0, server_day="2026-11-03")
+    with store._connect() as conn:
+        conn.execute("UPDATE book SET updated_epoch=? WHERE account='exness'",
+                     (time_mod.time() - BOOK_FRESH_SECONDS - 1,))
+    book = store.portfolio([exness.name, gtc.name])
+    for _ in range(3):
+        engine._remember_baseline(book)  # the same dark shard, three consecutive ticks
+    kinds = [kind for _, _, kind, _ in store.recent_events(20)]
+    assert kinds.count("portfolio_day_held") == 1
+    assert store.get_meta(f"portfolio_day_held:{fleet_config.local_host()}") == "exness"
 
 
 def test_an_account_another_machine_writes_does_not_veto_entries_here(tmp_path,
@@ -722,6 +755,69 @@ def test_a_change_on_another_box_does_not_rebase_this_day(tmp_path, monkeypatch)
     assert engine.day_start_equity == 2000.0
     kinds = [kind for _, _, kind, _ in store.recent_events(20)]
     assert "baseline_rebased" not in kinds
+
+
+def test_a_machine_with_no_accounts_of_its_own_writes_no_day(tmp_path, monkeypatch) -> None:
+    """A registry whose every account belongs to another box has no book of its own to measure."""
+    monkeypatch.setattr(conductor, "PAUSE_FILE", tmp_path / "PAUSE")
+    store = Store(tmp_path / "book.sqlite")
+    peer = make_account("gtc", 2, "GTC-Go-Live", host="box-z")
+    engine = conductor.Conductor(FleetConfig(accounts=[peer]), store)
+    store.equity("gtc", 2, 500.0, 500.0, 0, 0.0, "USD", 1.0, "2026-11-03")
+    engine._remember_baseline(store.portfolio([a.name for a in engine.config.local()]))
+    assert store.claim_portfolio_baseline(fleet_config.local_host()) == (None, None)
+    kinds = [kind for _, _, kind, _ in store.recent_events(20)]
+    assert "new_day" not in kinds and "baseline_rebased" not in kinds
+
+
+def test_an_empty_book_is_not_the_whole_shared_file(tmp_path) -> None:
+    """`[]` is this machine owning nothing; only `None` asks for every account in the file."""
+    store = Store(tmp_path / "book.sqlite")
+    store.equity("gtc", 2, 500.0, 500.0, 0, 0.0, "USD", 1.0, "2026-11-03")
+    store.save_positions("gtc", [types.SimpleNamespace(
+        ticket=7, symbol="XAUUSDc", type=0, volume=0.05, price_open=1.10, profit=0.0,
+        sl=1.098, tp=0.0, magic=7)], {7: 12.0})
+    assert store.portfolio([])["equity"] == 0.0
+    assert store.portfolio(["gtc"])["equity"] == 500.0  # the same file, read with a name in it
+    assert store.all_positions(max_age=10 ** 9, names=[]) == []
+    assert len(store.all_positions(max_age=10 ** 9)) == 1
+
+
+def test_status_reports_this_machines_book_not_the_shared_file(tmp_path, capsys,
+                                                               monkeypatch) -> None:
+    """The operator's money line is this machine's caps, not the sum of every box sharing the file."""
+    import fleet_cli as fleet_cli_mod
+
+    monkeypatch.setattr(conductor, "STATE_FILE", tmp_path / "conductor.json")
+    monkeypatch.setattr(fleet_cli_mod, "_config",
+                        lambda args: FleetConfig(accounts=[
+                            make_account("mine", 1, "S"),
+                            make_account("theirs", 2, "T", host="box-z")]))
+    store = Store(tmp_path / "book.sqlite")
+    store.equity("mine", 1, 1000.0, 1000.0, 0, 0.0, "USD", 1.0, "2026-11-03")
+    store.equity("theirs", 2, 5000.0, 5000.0, 0, 0.0, "USD", 1.0, "2026-11-03")
+    code = fleet_cli_mod.cmd_status(argparse.Namespace(store=str(tmp_path / "book.sqlite"),
+                                                       events=5, config=""))
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "портфель этой машины: equity 1000.00 USD" in out
+    assert "theirs" in out and "другая машина" in out  # the peer row stays visible, marked
+    assert "строк чужих машин: 1" in out
+
+
+def test_an_unmeasured_day_does_not_read_as_a_zero_percent_day(tmp_path, monkeypatch) -> None:
+    """No baseline is not "nothing lost today": an upgrade or `reset-day` must not open the gate."""
+    account, runner, store, sent, snapshot, day, _spec = _entry_harness(tmp_path, monkeypatch,
+                                                                        (1, "S"))
+    store.equity("a", 1, 800.0, 800.0, 0, 0.0, "USD", 1.0, "2026-11-03")  # -20 % against 1000
+    assert runner._portfolio_day_pct(800.0) == pytest.approx(-20.0)
+    for key in host_keys(fleet_config.local_host())[:2]:
+        store.set_meta(key, "")                       # exactly what `reset-day` leaves
+    assert runner._portfolio_day_pct(800.0) is None
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0 and sent == []
+    assert any(kind == "portfolio_day_unmeasured" for _, _, kind, _ in store.recent_events(20))
+    store.set_portfolio_baseline(fleet_config.local_host(), "2026-11-03", 800.0)
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 1 and sent == [1]
 
 
 def test_a_crash_after_reserving_gives_the_money_back(tmp_path, monkeypatch) -> None:

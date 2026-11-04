@@ -337,6 +337,17 @@ class Worker:
             self.store.event(account.name, "portfolio_risk_unpriced", count=unpriced_risk)
             return 0
         day_pct = self._portfolio_day_pct(book_stop["equity"])
+        unmeasured_key = f"day_unmeasured:{account.name}"
+        if day_pct is None:
+            # Nobody has measured this machine's day yet, so the daily loss limit is not a number.
+            if self.store.get_meta(unmeasured_key) != "1":
+                self.store.set_meta(unmeasured_key, "1")
+                self.store.event(account.name, "portfolio_day_unmeasured",
+                                 day=self.store.portfolio_baseline(local_host())[0] or "")
+            return 0
+        if self.store.get_meta(unmeasured_key) == "1":
+            self.store.set_meta(unmeasured_key, "0")
+            self.store.event(account.name, "portfolio_day_measured", day_pct=round(day_pct, 2))
         for signal in strategy.signals(account):
             spec = broker.symbol(signal.base_symbol)
             if spec is None:
@@ -460,11 +471,17 @@ class Worker:
         return priced
 
     # --- book day -----------------------------------------------------------------------
-    def _portfolio_day_pct(self, equity_usd: float) -> float:
-        day, start = self.store.portfolio_baseline(local_host())
+    def _portfolio_day_pct(self, equity_usd: float) -> float | None:
+        """This machine's day result in percent, or None when the day was never measured.
+
+        None is not 0.0. `can_open_portfolio` reads this as "how much has today cost", and a
+        missing measurement answered with 0 % tells a broker that nothing has been lost — which is
+        exactly what an upgrade, a `reset-day` or a conductor that has not ticked yet leaves behind.
+        """
+        day, start = self.store.claim_portfolio_baseline(local_host())
         today = risk.server_day_now()
         if not start:
-            return 0.0
+            return None
         if day and today < day:
             # This broker's clock has not reached the portfolio day yet; nothing to compare.
             # The other direction is deliberately allowed: the portfolio day is the slowest live
@@ -474,9 +491,9 @@ class Worker:
         try:
             value = float(start)
         except ValueError:
-            return 0.0
+            return None
         if value <= 0 or equity_usd <= 0:
-            return 0.0
+            return None
         return (equity_usd - value) / value * 100
 
     # --- day state ----------------------------------------------------------------------

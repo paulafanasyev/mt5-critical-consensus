@@ -22,7 +22,7 @@ if str(ROOT) not in sys.path:
 
 from fleet import conductor, risk, strategy, terminals, worker  # noqa: E402
 from fleet.broker import BrokerError, symbol  # noqa: E402
-from fleet.config import DEFAULT_STORE, load, local_host  # noqa: E402
+from fleet.config import DEFAULT_STORE, ConfigError, load, local_host  # noqa: E402
 from fleet.store import Store, host_keys  # noqa: E402
 
 
@@ -56,6 +56,10 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     store = Store(args.store)
+    try:
+        mine = {a.name for a in _config(args).local()}
+    except ConfigError:
+        mine = None  # no readable registry: the file is all this command knows
     rows = store.latest_equity()
     if not rows:
         print("данных пока нет; запусти once или run")
@@ -63,11 +67,18 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"{'аккаунт':24} {'логин':>10} {'баланс':>12} {'equity':>12} {'поз':>4} "
               f"{'плавающий':>10} {'валюта':>6}")
         for account, login, balance, equity, positions, floating, currency in rows:
+            foreign = "" if mine is None or account in mine else "  ← другая машина"
             print(f"{account:24} {login:>10} {balance:>12.2f} {equity:>12.2f} {positions:>4}"
-                  f" {floating:>+10.2f} {currency:>6}")
-    book = store.portfolio()
-    print(f"\nпортфель: equity {book['equity']:.2f} USD | счётов {int(book['accounts'])}"
+                  f" {floating:>+10.2f} {currency:>6}{foreign}")
+    book_all = store.portfolio()
+    book = store.portfolio(sorted(mine)) if mine is not None else book_all
+    label = "портфель этой машины" if mine is not None else "портфель (реестр не прочитан)"
+    print(f"\n{label}: equity {book['equity']:.2f} USD | счётов {int(book['accounts'])}"
           f" | позиций {int(book['positions'])} | плавающий {book['floating']:+.2f}")
+    extra = int(book_all["accounts"] - book["accounts"])
+    if extra > 0:
+        print(f"в файле ещё строк чужих машин: {extra}."
+              " Лимиты парка считаются только по книге этой машины.")
     if conductor.STATE_FILE.exists():
         print(f"дирижёр: {conductor.STATE_FILE.read_text(encoding='utf-8')[:400]}")
     print("\nпоследние события:")
@@ -215,11 +226,14 @@ def cmd_reset_health(args: argparse.Namespace) -> int:
 def cmd_reset_day(args: argparse.Namespace) -> int:
     store = Store(args.store)
     host = local_host()
-    day_key, base_key, registry_key = host_keys(host)
+    day_key, base_key, _registry_key = host_keys(host)
     # Only this machine's keys. The unscoped legacy pair stays: another box sharing this book may
     # not have taken its own starting baseline from it yet, and wiping it would leave that machine
     # with no day measured at all — which its entry gate reads as "nothing to stop for".
-    for key in (day_key, base_key, registry_key, f"portfolio_day_held:{host}",
+    # The registry hash stays too: it records which accounts the book covers, and a day reset is
+    # not a change of composition. Losing it would make the next tick announce a `baseline_rebased`
+    # that blames a registry change which never happened.
+    for key in (day_key, base_key, f"portfolio_day_held:{host}",
                 f"portfolio_day_held_since:{host}"):
         store.set_meta(key, "")
     conductor.PAUSE_FILE.unlink(missing_ok=True)

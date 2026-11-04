@@ -24,6 +24,9 @@ PAUSE_FILE = FLEET_ROOT / "PAUSE"
 STATE_FILE = FLEET_ROOT / "conductor.json"
 LOCK_FILE = FLEET_ROOT / "conductor.lock"
 BACKOFF = (5, 10, 30, 60, 300)
+# A dark shard re-announces itself this often. An hour would write two hundred identical events
+# over a quiet weekend, and the operator who has to read the trail does not need that.
+DAY_HOLD_REANNOUNCE_SECONDS = 6 * 3600
 
 
 def parse_shards(text: str, known: list[int]) -> list[int]:
@@ -248,7 +251,7 @@ class Conductor:
             # that already lost yesterday's damage. The day waits, and the stop stays armed.
             now = time.time()
             last = float(self.store.get_meta(since_key) or 0.0)
-            if "|".join(dark) != held or now - last >= 3600:
+            if "|".join(dark) != held or now - last >= DAY_HOLD_REANNOUNCE_SECONDS:
                 self.store.set_meta(held_key, "|".join(dark))
                 self.store.set_meta(since_key, f"{now:.0f}")
                 self.store.event("conductor", "portfolio_day_held", day=stored_day, dark=dark,
