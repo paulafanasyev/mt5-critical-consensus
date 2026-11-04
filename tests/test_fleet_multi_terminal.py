@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import pathlib
 import sys
 import types
@@ -849,3 +850,247 @@ def test_prune_leaves_a_row_another_machine_is_writing(tmp_path) -> None:
     store.prune(["here"])
     assert store.account_equity("other-box") == 0.0  # nobody has written it for two hours
 
+
+# --- the census: which window holds which account ---------------------------------------------
+
+def _census(store: Store, rows: list[dict], taken: float | None = None) -> None:
+    """Write the census the way the park writes it at the start of a cycle."""
+    import time as time_mod
+
+    store.set_meta(worker.ROSTER_META_KEY, json.dumps(
+        {"taken": time_mod.time() if taken is None else taken, "rows": rows}))
+
+
+def _row(directory: str, login: int | None, server: str = "S") -> dict:
+    return {"exe": f"{directory}\\terminal64.exe", "dir": worker.window_dir(directory),
+            "login": login, "server": server, "currency": "USD", "balance": 1000.0,
+            "equity": 1000.0, "error": ""}
+
+
+class CensusMT5:
+    """Several windows answering at once: each names its own folder and its own account."""
+
+    ACCOUNT_TRADE_MODE_REAL = 2
+
+    def __init__(self, windows: dict[str, tuple[int | None, str]]) -> None:
+        self.windows = {worker.window_dir(path): value for path, value in windows.items()}
+        self.initialize_calls: list[dict] = []
+        self.shutdowns = 0
+        self.current: tuple[int | None, str] | None = None
+
+    def initialize(self, **kwargs) -> bool:
+        self.initialize_calls.append(kwargs)
+        folder = worker.window_dir(str(kwargs.get("path", "")))
+        self.current = self.windows.get(folder)
+        return self.current is not None and self.current[0] is not None
+
+    def last_error(self):
+        return (-10005, "IPC timeout")
+
+    def terminal_info(self):
+        return types.SimpleNamespace(path=str(self.initialize_calls[-1]["path"]))
+
+    def account_info(self):
+        login, server = self.current or (None, "")
+        return types.SimpleNamespace(login=login, server=server, currency="USD",
+                                     balance=1000.0, equity=1000.0)
+
+    def shutdown(self) -> None:
+        self.shutdowns += 1
+
+
+def test_folder_and_exe_are_the_same_window() -> None:
+    """Measured on build 6296: a running terminal names its folder, the process list names the exe."""
+    assert worker.window_dir(r"C:\mt5-team\terminal64.exe") == worker.window_dir(r"C:\mt5-team")
+    assert worker.window_dir("C:\\mt5-team\\") == worker.window_dir("c:/mt5-team/terminal64.exe")
+
+
+def test_the_census_names_the_account_in_every_running_window(tmp_path, monkeypatch) -> None:
+    store = Store(tmp_path / "book.sqlite")
+    fake = CensusMT5({r"C:\mt5-exness": (114929502, "MetaQuotes-Demo"),
+                      r"C:\mt5-team": (777001, "Exness-MT5Real26")})
+    monkeypatch.setattr(worker, "mt5", fake)
+    monkeypatch.setattr(terminals, "running_terminals",
+                        lambda: [(1, r"C:\mt5-team\terminal64.exe"),
+                                 (2, r"C:\mt5-exness\terminal64.exe")])
+    rows = worker.refresh_roster(store)
+    assert {row["dir"] for row in rows} == {"c:\\mt5-exness", "c:\\mt5-team"}
+    assert {row["login"] for row in rows} == {114929502, 777001}
+    assert fake.shutdowns == 2  # every visit ends: the census never parks in someone's window
+
+
+def test_the_census_asks_a_window_for_nothing_but_its_name(tmp_path, monkeypatch) -> None:
+    """No login, no password: a probe that signs in would change who is driving the money."""
+    fake = CensusMT5({r"C:\mt5-team": (1, "S")})
+    monkeypatch.setattr(worker, "mt5", fake)
+    monkeypatch.setattr(terminals, "running_terminals",
+                        lambda: [(7, r"C:\mt5-team\terminal64.exe")])
+    worker.refresh_roster(Store(tmp_path / "book.sqlite"))
+    assert fake.initialize_calls == [{"path": r"C:\mt5-team\terminal64.exe",
+                                      "timeout": worker.ROSTER_PROBE_TIMEOUT_MS}]
+
+
+def test_a_window_that_stays_silent_is_recorded_not_fatal(tmp_path, monkeypatch) -> None:
+    """An unauthenticated copy answers nothing: the census writes the silence and moves on."""
+    fake = CensusMT5({r"C:\mt5-team": (1, "S"), r"C:\mt5-silent": (None, "")})
+    monkeypatch.setattr(worker, "mt5", fake)
+    monkeypatch.setattr(terminals, "running_terminals",
+                        lambda: [(1, r"C:\mt5-team\terminal64.exe"),
+                                 (2, r"C:\mt5-silent\terminal64.exe")])
+    rows = worker.refresh_roster(Store(tmp_path / "book.sqlite"))
+    silent = [row for row in rows if row["login"] is None]
+    assert [row["dir"] for row in silent] == ["c:\\mt5-silent"]
+    assert "IPC timeout" in silent[0]["error"]
+    assert worker.duplicated_accounts(rows) == {}
+
+
+def test_the_census_is_taken_once_per_refresh_window(tmp_path, monkeypatch) -> None:
+    """Two cycles in a row must not each walk every window: the answer is good for a while."""
+    import time as time_mod
+
+    store = Store(tmp_path / "book.sqlite")
+    fake = CensusMT5({r"C:\mt5-team": (1, "S")})
+    monkeypatch.setattr(worker, "mt5", fake)
+    monkeypatch.setattr(terminals, "running_terminals",
+                        lambda: [(1, r"C:\mt5-team\terminal64.exe")])
+    taken = time_mod.time()
+    worker.refresh_roster(store, now=taken)
+    worker.refresh_roster(store, now=taken + worker.ROSTER_REFRESH_SECONDS - 1)
+    assert len(fake.initialize_calls) == 1
+    worker.refresh_roster(store, now=taken + worker.ROSTER_REFRESH_SECONDS)
+    assert len(fake.initialize_calls) == 2
+    assert len(store.get_meta(worker.ROSTER_META_KEY)) > 0
+
+
+# --- the gate: one account, one driver ---------------------------------------------------------
+
+def _gate(tmp_path, monkeypatch, rows: list[dict], directory: str | None = None):
+    """One signal, one slot, and a census that says what else holds this account."""
+    account, runner, store, sent, snapshot, day, _spec = _entry_harness(
+        tmp_path, monkeypatch, (1, "S"))
+    mine = directory or str(account.data_dir)
+    _census(store, [_row(mine, 1)] + rows)
+    return account, runner, store, sent, snapshot, day, None
+
+
+def test_a_second_window_on_the_account_closes_new_entries(tmp_path, monkeypatch) -> None:
+    account, runner, store, sent, snapshot, day, _spec = _gate(
+        tmp_path, monkeypatch, [_row(r"C:\mt5-team", 1)])
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert sent == []
+    events = [(kind, payload) for _, _, kind, payload in store.recent_events(20)]
+    assert any(kind == "account_second_window" and "mt5-team" in payload for kind, payload in events)
+
+
+def test_the_parks_own_window_is_not_a_second_window(tmp_path, monkeypatch) -> None:
+    account, runner, store, sent, snapshot, day, _spec = _gate(tmp_path, monkeypatch, [])
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 1
+    assert sent == [1]
+
+
+def test_another_brokers_window_does_not_close_this_account(tmp_path, monkeypatch) -> None:
+    account, runner, store, sent, snapshot, day, _spec = _gate(
+        tmp_path, monkeypatch, [_row(r"C:\mt5-gtc", 424242, "GTC-Go-Live")])
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 1
+    assert sent == [1]
+
+
+def test_a_window_on_another_server_is_another_pile_of_money(tmp_path, monkeypatch) -> None:
+    """Same login number at a different broker: two accounts, and only one of them is ours."""
+    account, runner, store, sent, snapshot, day, _spec = _gate(
+        tmp_path, monkeypatch, [_row(r"C:\mt5-team", 1, "GTC-Go-Live")])
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 1
+
+
+def test_the_second_window_is_announced_once_while_it_last(tmp_path, monkeypatch) -> None:
+    account, runner, store, sent, snapshot, day, _spec = _gate(
+        tmp_path, monkeypatch, [_row(r"C:\mt5-team", 1)])
+    for _ in range(3):
+        runner._try_entries(account, snapshot, [], day, 1.0)
+    kinds = [kind for _, _, kind, _ in store.recent_events(30)]
+    assert kinds.count("account_second_window") == 1
+
+
+def test_an_out_of_date_census_is_not_evidence(tmp_path, monkeypatch) -> None:
+    """A window that closed an hour ago must not keep the account grounded for good."""
+    import time as time_mod
+
+    account, runner, store, sent, snapshot, day, _spec = _gate(
+        tmp_path, monkeypatch, [_row(r"C:\mt5-team", 1)])
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    _census(store, [_row(str(account.data_dir), 1), _row(r"C:\mt5-team", 1)],
+            taken=time_mod.time() - worker.ROSTER_EVIDENCE_SECONDS - 1)
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 1
+    kinds = [kind for _, _, kind, _ in store.recent_events(30)]
+    assert "account_single_window" in kinds  # the operator sees the all-clear, not silence
+
+
+def test_the_census_runs_before_anything_is_attached(tmp_path, monkeypatch, fleet) -> None:
+    """A probe ends with shutdown(): taken after the attach it would drop the live connection."""
+    store, _events = fleet
+    order: list[str] = []
+    account = make_account("a", 1, "S", shard=0)
+    monkeypatch.setattr(worker, "refresh_roster",
+                        lambda store_arg, **k: order.append("census") or [])
+    monkeypatch.setattr(worker.Worker, "attach",
+                        lambda self, acc: order.append(f"attach:{acc.name}") or "тест: окна нет")
+    results = worker.run_shard(FleetConfig(accounts=[account]), store, 0)
+    assert order == ["census", "attach:a"]
+    assert [r.status for r in results] == ["error"]
+
+
+def test_a_cycle_survives_a_process_list_it_cannot_read(tmp_path, monkeypatch, fleet) -> None:
+    """No process list is not a reason to lose the cycle: exits still have to run."""
+    store, _events = fleet
+    account = make_account("a", 1, "S", shard=0)
+
+    def explode():
+        raise OSError("no process list")
+
+    monkeypatch.setattr(terminals, "running_terminals", explode)
+    attached: list[str] = []
+    monkeypatch.setattr(worker.Worker, "attach",
+                        lambda self, acc: attached.append(acc.name) or "тест: окна нет")
+    results = worker.run_shard(FleetConfig(accounts=[account]), store, 0)
+    assert [r.status for r in results] == ["error"]
+    assert attached == ["a"]  # an uncountable field costs the census, not the cycle
+    assert any(kind == "roster_error" for _, _, kind, _ in store.recent_events(10))
+
+
+# --- what the operator sees --------------------------------------------------------------------
+
+_TWO_WINDOWS = """
+accounts:
+  - name: metaquotes
+    login: 114929502
+    server: MetaQuotes-Demo
+    mode: demo
+"""
+
+
+def test_terminals_shows_two_windows_holding_one_account(tmp_path, monkeypatch, capsys) -> None:
+    registry = tmp_path / "accounts.yaml"
+    registry.write_text(_TWO_WINDOWS, encoding="utf-8")
+    rows = [_row(r"C:\mt5-exness", 114929502, "MetaQuotes-Demo"),
+            _row(r"C:\mt5-team", 114929502, "MetaQuotes-Demo")]
+    monkeypatch.setattr(worker, "scan_roster", lambda paths=None: rows)
+    code = fleet_cli.main(["--config", str(registry), "--store", str(tmp_path / "b.sqlite"),
+                           "terminals"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "114929502@MetaQuotes-Demo открыт в 2 окнах" in out
+    assert "mt5-exness" in out and "mt5-team" in out
+
+
+def test_status_shows_the_census_without_probing_a_terminal(tmp_path, monkeypatch, capsys) -> None:
+    store = Store(tmp_path / "book.sqlite")
+    registry = tmp_path / "accounts.yaml"
+    registry.write_text(_TWO_WINDOWS, encoding="utf-8")
+    _census(store, [_row(r"C:\mt5-exness", 114929502, "MetaQuotes-Demo"),
+                    _row(r"C:\mt5-team", 114929502, "MetaQuotes-Demo")])
+    monkeypatch.setattr(worker, "scan_roster",
+                        lambda paths=None: pytest.fail("status must not probe terminals"))
+    fleet_cli.main(["--config", str(registry), "--store", str(tmp_path / "book.sqlite"), "status"])
+    out = capsys.readouterr().out
+    assert "окна на этой машине: 2" in out
+    assert "входы по этому счёту закрыты" in out

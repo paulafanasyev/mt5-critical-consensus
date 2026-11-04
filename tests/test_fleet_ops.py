@@ -147,7 +147,7 @@ def test_pid_cache_does_not_pin_a_missing_process(tmp_path: pathlib.Path, monkey
     def fake_processes():
         return next(answers, [])
 
-    monkeypatch.setattr(terminals, "_terminal_processes", fake_processes)
+    monkeypatch.setattr(terminals, "running_terminals", fake_processes)
     monkeypatch.setattr(terminals, "_PID_CACHE", {})
     assert terminals.running_pid(account) is None
     assert terminals.running_pid(account) == 9  # a cached "None" must not stick

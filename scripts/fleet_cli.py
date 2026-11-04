@@ -81,6 +81,14 @@ def cmd_status(args: argparse.Namespace) -> int:
               " Лимиты парка считаются только по книге этой машины.")
     if conductor.STATE_FILE.exists():
         print(f"дирижёр: {conductor.STATE_FILE.read_text(encoding='utf-8')[:400]}")
+    census = worker.roster_rows(store)
+    if census is not None:
+        logged = [row for row in census if row.get("login") is not None]
+        print(f"\nокна на этой машине: {len(census)}, с логином {len(logged)}")
+        for key, dirs in sorted(worker.duplicated_accounts(census).items()):
+            print(f"  {key}: {len(dirs)} окна ({', '.join(dirs)}) — входы по этому счёту закрыты")
+    else:
+        print("\nпереписи окон не было больше часа: запусти `terminals`")
     print("\nпоследние события:")
     for stamp, account, kind, payload in store.recent_events(args.events):
         print(f"  {stamp} {account:20} {kind:16} {payload[:110]}")
@@ -94,6 +102,53 @@ def _local(config: FleetConfig, accounts: list) -> list:
 
 def _pinned_elsewhere(account, config: FleetConfig) -> str:
     return "" if config.runs_here(account) else f"счёт закреплён за машиной {account.host}"
+
+
+def cmd_terminals(args: argparse.Namespace) -> int:
+    """Census of the windows on this machine: which terminal is up, whose account it holds, how much money.
+
+    Read-only. Nothing here launches or stops a terminal: the census walks the process list and asks
+    the windows that are already up to name their account.
+    """
+    store = Store(args.store)
+    config = None
+    try:
+        config = _config(args)
+    except ConfigError as exc:
+        print(f"реестр не прочитан ({exc}); показываю только окна")
+    rows = worker.refresh_roster(store, force=True)
+    if not rows:
+        print("ни одного запущенного терминала: парк пока ничего не видит")
+        return 0
+    print(f"{'папка терминала':38} {'логин':>10} {'сервер':22} {'баланс':>12} {'equity':>12}")
+    for row in rows:
+        if row.get("login") is None:
+            print(f"{row['dir'] or row['exe']:38} {'—':>10} не отвечает: {row.get('error', '')}")
+            continue
+        balance = float(row.get("balance") or 0.0)
+        equity = float(row.get("equity") or 0.0)
+        print(f"{row['dir']:38} {row['login']:>10} {str(row['server'])[:22]:22}"
+              f" {balance:>12.2f} {equity:>12.2f}")
+    duplicates = worker.duplicated_accounts(rows)
+    for key, dirs in sorted(duplicates.items()):
+        print(f"\nВНИМАНИЕ: счёт {key} открыт в {len(dirs)} окнах: {', '.join(dirs)}."
+              " Свободные деньги у них общие: входы по этому счёту парк закрывает.")
+    seen = {row["dir"] for row in rows if row.get("login") is not None}
+    owned = {worker.window_dir(str(a.data_dir)) for a in (config.accounts if config else [])}
+    idle = [row for row in rows if row.get("login") is not None
+            and config is not None and row["dir"] not in owned]
+    if idle:
+        print(f"\nокна, которых нет в реестре (их парк не ведёт): {len(idle)}")
+        for row in idle:
+            print(f"  {row['dir']} — {row['login']}@{row['server']}")
+    if config is not None:
+        waiting = sorted(a.name for a in config.local()
+                         if worker.window_dir(str(a.data_dir)) not in seen)
+        if waiting:
+            print(f"\nсчета этой машины без запущенного окна: {', '.join(waiting)}."
+                  " Окно поднимает парк (init + run); пока его нет, по этим счетам в книге"
+                  " нет ни одного свежего числа.")
+    return 0
 
 
 def cmd_once(args: argparse.Namespace) -> int:
@@ -286,6 +341,8 @@ def main(argv: list[str] | None = None) -> int:
     resume.set_defaults(func=cmd_pause, action="resume")
     reset = sub.add_parser("reset-day", help="сбросить дневную базу портфеля")
     reset.set_defaults(func=cmd_reset_day)
+    windows = sub.add_parser("terminals", help="что за окна запущены и чей в них счёт")
+    windows.set_defaults(func=cmd_terminals)
     health = sub.add_parser("reset-health", help="разблокировать счёт после circuit breaker")
     health.add_argument("--account", default="")
     health.set_defaults(func=cmd_reset_health)

@@ -166,7 +166,12 @@ def launch(account: Account, extra_args: tuple[str, ...] = ()) -> subprocess.Pop
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def _terminal_processes() -> list[tuple[int, str]]:
+def running_terminals() -> list[tuple[int, str]]:
+    """Every terminal64.exe window up on this machine, with the directory it runs from.
+
+    Read-only, and the only honest census there is: a terminal is who it is by its own path, and
+    that is also the list the roster probe walks.
+    """
     output = _ps("Get-CimInstance Win32_Process -Filter \"Name='terminal64.exe'\" | "
                  "ForEach-Object { \"$($_.ProcessId)|$($_.ExecutablePath)\" }")
     rows: list[tuple[int, str]] = []
@@ -186,7 +191,7 @@ def running_pid(account: Account) -> int | None:
     if cached and now - cached[0] < _CACHE_TTL:
         return cached[1]
     expected = str(account.terminal_exe).lower()
-    pid = next((candidate for candidate, path in _terminal_processes()
+    pid = next((candidate for candidate, path in running_terminals()
                 if path.lower() == expected), None)
     if pid is not None:
         _PID_CACHE[key] = (now, pid)
@@ -202,7 +207,7 @@ def stop(account: Account) -> None:
     would then kill a process that is already gone and leave the live window running.
     """
     expected = str(account.terminal_exe).lower()
-    pid = next((candidate for candidate, path in _terminal_processes()
+    pid = next((candidate for candidate, path in running_terminals()
                 if path.lower() == expected), None)
     _PID_CACHE.pop(str(account.data_dir).lower(), None)
     if pid:
