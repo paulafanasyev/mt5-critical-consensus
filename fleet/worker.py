@@ -27,11 +27,13 @@ from .config import Account, FleetConfig, PAUSE_FILE, local_host, server_key
 from .store import Store
 
 MAX_FAILURES = 5
-# How often one account may put its clock in the journal. The hold is automatic and runs every
-# cycle; the line is only its report. Measured on the live demo account on 2026-11-05, a terminal
-# whose symbol is not subscribed yet flapped between the live tick and its own cached daily bar on
-# nearly every cycle — an untimed report would write about thirty copies of one sentence an hour
-# into the single book the operator reads. The same shape as the conductor's held portfolio day.
+# How often one account may put one and the same clock sentence in the journal, per direction: the
+# hold is re-reported while it lasts, and the recovery is not throttled away by the hold it ends.
+# The hold itself is automatic and runs every cycle; the line is only its report. Measured on the
+# live demo account on 2026-11-05, a terminal whose symbol was not subscribed yet flapped between the
+# live tick and its own cached daily bar on nearly every cycle: twelve copies of these two sentences
+# in nine and a half minutes, one every 48 seconds, i.e. about seventy-five an hour into the single
+# book the operator reads. The same shape as the conductor's held portfolio day.
 DAY_CLOCK_REANNOUNCE_SECONDS = 6 * 3600
 
 # How often a cycle re-asks the running windows who they are logged into, and how long an answer
@@ -415,8 +417,9 @@ class Worker:
         """The day this account is already being measured on, when its clock came back without it.
 
         `risk.server_day_now()` reads the terminal's own quotes, and a quote can be a cached daily
-        bar from the last sync of a symbol nobody subscribed: measured on the live park, the same
-        window answered 2026-11-05 and, four minutes later, 2026-11-03. The conductor refuses that
+        bar from the last sync of a symbol nobody subscribed: measured on the live park 2026-11-05,
+        three cycles in a row of one and the same window answered 2026-11-03, 2026-11-05,
+        2026-11-03, 35-70 seconds apart. The conductor refuses that
         for the portfolio — `Conductor._remember_baseline` holds the day, because rebasing onto
         equity that already lost silently re-arms the daily stop. The account has the same hazard one
         level down and nothing was standing in front of it: `DayState` compares the day as a string,
@@ -435,32 +438,35 @@ class Worker:
         return stored[0] if held else server_day
 
     def _note_day_clock(self, account: Account, state: str, held_day: str, clock_day: str) -> None:
-        """Report a clock that slipped behind its measured day, once per change and per window.
+        """Report a clock that slipped behind its measured day, once per direction per window.
 
-        `dayclock:<account>` holds the last state the journal was told about and when, so a clock
-        flapping between a live tick and its own cached bar costs one line, not one per cycle.
+        The hold itself runs every cycle whether or not the journal says so; what the journal must
+        not do is write one sentence seventy-five times an hour, which is what a flapping symbol did
+        before the cadence (measured live 2026-11-05: twelve lines in nine and a half minutes, one
+        every 48 seconds). Each direction keeps its own clock in `dayclock:held:<account>` /
+        `dayclock:live:<account>`, because a shared one loses the second sentence: on a clock that
+        answers stale and live on alternating cycles, the line saying "the clock caught up" arrives
+        half a minute after the line saying "the day is held" and would be throttled away forever,
+        leaving the operator with an open hold the journal never closes.
         """
-        key = f"dayclock:{account.name}"
-        last_state, _, raw_epoch = (self._meta(key) or "").partition("|")
-        if state == last_state:
-            return
-        if state == "live" and last_state != "held":
+        if state == "live" and not self._meta(f"dayclock:held:{account.name}"):
             # Nothing was ever held on this account: there is no recovery to announce.
             return
+        key = f"dayclock:{state}:{account.name}"
         try:
-            last = float(raw_epoch)
+            written = float(self._meta(key) or "")
         except ValueError:
-            last = 0.0
+            written = 0.0
         now = time.time()
-        if now - last < DAY_CLOCK_REANNOUNCE_SECONDS:
+        if written and now - written < DAY_CLOCK_REANNOUNCE_SECONDS:
             return
-        if not self._note_meta(key, f"{state}|{now:.0f}"):
+        if not self._note_meta(key, f"{now:.3f}"):
             return
         if held_day:
             self._landed(account.name, "day_clock_regressed", key, day=held_day,
                          clock=clock_day,
                          detail="часы терминала отстали от замеренного дня: день держится, база и "
-                                "вооружённый дневный стоп не тронуты")
+                                "вооружённый дневной стоп не тронуты")
         else:
             self._landed(account.name, "day_clock_resumed", key, day=clock_day)
 

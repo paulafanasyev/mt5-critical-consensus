@@ -466,11 +466,12 @@ def server_timestamp() -> float:
     """The broker's clock: the newest tick among four liquid symbols, not the first one that answers.
 
     The first answer used to win. A symbol this terminal has not subscribed keeps a cached daily bar
-    of the last time it was synced, so the day could come from history rather than from the quote:
-    measured on the live park, the book said 2026-11-05 for the first cycles of a window and then
-    2026-11-03 — the same terminal, four minutes later, because the symbol that answered first had
-    changed. Four tick reads cost milliseconds; the daily-bar cache is consulted only when no tick
-    answers at all, which is what a weekend looks like.
+    of the last time it was synced, so the day could come from history rather than from the quote.
+    Measured on the live park 2026-11-05: three cycles of one terminal in a row answered
+    2026-11-03, 2026-11-05, 2026-11-03, 35-70 seconds apart, and the same terminal gave seven
+    regressions in twelve minutes — the day depended on which symbol answered first. Four tick reads
+    cost milliseconds; the daily-bar cache is consulted only when no tick answers at all, which is
+    what a weekend looks like.
     """
     best = 0.0
     for base in CLOCK_SYMBOLS:

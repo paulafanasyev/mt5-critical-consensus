@@ -2410,7 +2410,6 @@ def test_a_stale_quote_does_not_rewind_the_day_a_stop_was_armed_on(tmp_path,
     """
     from fleet import risk as risk_mod
 
-    monkeypatch.setattr(worker, "DAY_CLOCK_REANNOUNCE_SECONDS", 0.0)
     account, store, runner, clock, answering, read, judged = _day_clock(tmp_path, monkeypatch)
 
     clock["day"] = "2026-11-03"
@@ -2423,24 +2422,29 @@ def test_a_stale_quote_does_not_rewind_the_day_a_stop_was_armed_on(tmp_path,
     allowed, reason = risk_mod.can_open(account, answering[0], judged[-1], [])
     assert not allowed and reason == "дневной стоп счёта сработал"
     assert runner._cycle(account, allow_entries=True).status == "ok"
-    assert len(_of(store, "day_clock_regressed")) == 1  # the same stale answer is not a new fact
+    # The second stale cycle is the same fact: the hold is reported once per window, not per cycle.
+    assert len(_of(store, "day_clock_regressed")) == 1
 
     clock["day"] = "2026-11-05"
     answering[0] = read("2026-11-05", 985.0)
     assert runner._cycle(account, allow_entries=True).status == "ok"
     assert len(_of(store, "day_clock_resumed")) == 1
-    assert store.get_meta("dayclock:a").startswith("live|")
+    # Each direction keeps its own clock: the recovery line is not throttled away by the hold it
+    # ends. A shared one did exactly that — the journal opened a hold and never closed it.
+    assert float(store.get_meta("dayclock:live:a")) > 0.0
+    assert float(store.get_meta("dayclock:held:a")) > 0.0
     assert store.day("a")[3] is True  # and the day still ends stopped
 
 
-def test_a_flapping_clock_costs_the_journal_one_line_not_one_per_cycle(tmp_path,
-                                                                      monkeypatch) -> None:
-    """Held every cycle, said once: the same terminal answered live and stale by turns.
+def test_a_flapping_clock_costs_the_journal_two_lines_not_one_per_cycle(tmp_path,
+                                                                        monkeypatch) -> None:
+    """Held every cycle, said once per direction: the same terminal answered live and stale by turns.
 
     Measured on the live demo account on 2026-11-05, the regression and the recovery arrived on
-    nearly consecutive cycles. The hold is not news every thirty seconds, and a journal the operator
-    has to read cannot be filled with copies of one sentence: `dayclock:<account>` remembers the
-    state last reported, and the next line is written when the state changes and the window is over.
+    nearly consecutive cycles — twelve lines in nine and a half minutes. The hold is not news every
+    thirty seconds, and a journal the operator has to read cannot be filled with copies of one
+    sentence: `dayclock:held:<account>` and `dayclock:live:<account>` remember when each sentence
+    was last told, and the next one of the same direction waits out the window.
     """
     account, store, runner, clock, answering, read, _ = _day_clock(tmp_path, monkeypatch)
     for day in ("2026-11-03", "2026-11-05", "2026-11-03", "2026-11-03", "2026-11-05"):
@@ -2448,7 +2452,7 @@ def test_a_flapping_clock_costs_the_journal_one_line_not_one_per_cycle(tmp_path,
         answering[0] = read(day, 985.0)
         assert runner._cycle(account, allow_entries=True).status == "ok"
         assert store.day("a")[:2] == ("2026-11-05", 1000.0)  # held through every answer
-    lines = _of(store, "day_clock_regressed") + _of(store, "day_clock_resumed")
-    assert len(lines) == 1
-    assert lines[0]["day"] == "2026-11-05" and lines[0]["clock"] == "2026-11-03"
-    assert store.get_meta("dayclock:a").startswith("held|")
+    regressed = _of(store, "day_clock_regressed")
+    resumed = _of(store, "day_clock_resumed")
+    assert len(regressed) == 1 and len(resumed) == 1
+    assert regressed[0]["day"] == "2026-11-05" and regressed[0]["clock"] == "2026-11-03"
