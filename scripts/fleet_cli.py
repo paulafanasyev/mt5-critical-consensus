@@ -137,7 +137,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-_MONEY_KEYS = ("risk_usd", "risk_basis", "volume", "price", "symbol", "side", "ticket")
+_MONEY_KEYS = ("risk_usd", "profit_usd", "profit", "risk_basis", "volume", "price",
+               "symbol", "side", "ticket")
 
 
 def _event_word(kind: str, payload: str) -> str:

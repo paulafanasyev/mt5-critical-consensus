@@ -285,11 +285,13 @@ def test_an_instrument_neither_field_can_price_is_kept_out_of_the_entries() -> N
 def test_silence_from_the_calculator_costs_a_sane_broker_nothing() -> None:
     agree = make_gold_spec(tick_value=1.0)
     spec = broker.reconcile_tick_value(agree, "USD", probe=refusing())
-    assert spec.tick_value_source == "tick"
+    assert spec.tick_value == pytest.approx(1.0)  # the ruler is the tick, exactly as before
+    # ... and it is called what it is: a ruler nobody was able to check, not one the broker proved.
+    assert spec.tick_value_source == "tick-unchecked"
     # Half a percent of rounding is not a broken field either.
     almost = make_gold_spec(tick_value=0.995)
     assert broker.reconcile_tick_value(almost, "USD",
-                                       probe=refusing()).tick_value_source == "tick"
+                                       probe=refusing()).tick_value_source == "tick-unchecked"
 
 
 def test_a_pair_paying_in_another_currency_is_confirmed_not_guessed() -> None:
@@ -312,7 +314,9 @@ def test_the_calculator_is_asked_once_per_spec_and_never_of_a_missing_contract()
         return (100.0, "")
 
     blind = make_gold_spec(contract_size=0.0)
-    assert broker.reconcile_tick_value(blind, "USD", probe=spy).tick_value_source == "tick"
+    unchecked = broker.reconcile_tick_value(blind, "USD", probe=spy)
+    assert unchecked.tick_value_source == "tick-unchecked"
+    assert "не опубликовал контракт" in unchecked.cash_probe_error
     assert asked == []  # an unpublished contract is not an opinion about the tick
     spec = broker.reconcile_tick_value(make_gold_spec(), "USD", probe=spy)
     assert spec.tick_value == pytest.approx(1.0)
@@ -403,3 +407,61 @@ def test_the_journal_names_the_ruler_and_its_direction() -> None:
     silent = make_gold_spec(tick_value=1.0)
     assert worker._cash_ruler(broker.reconcile_tick_value(silent, "USD",
                                                           probe=calculating(100.0))) is None
+    # The other proof — the calculator repeated the tick while the published contract disagreed — is
+    # said out loud, and says which field it refused.
+    proven = broker.reconcile_tick_value(make_gold_spec(tick_value=1.0, contract_size=10.0),
+                                         "USD", probe=calculating(100.0))
+    assert proven.tick_value_source == "tick-proven"
+    finger, quiet_word = worker._cash_ruler(proven)
+    assert finger.startswith("tick-proven:")
+    assert "подтвердил тик-оценку" in quiet_word
+
+
+def test_a_ruler_nobody_checked_is_never_printed_as_a_checked_one() -> None:
+    """BLOCKER round 2: `risk_basis: "tick"` meant both "the calculator repeated the tick" and "the
+    calculator could not be asked at all". Only the first is a proof, and a lot is cut from it.
+
+    The ruler itself does not change in either case; what changes is whether the operator is allowed to
+    read the journal as though the broker had vouched for the number.
+    """
+    unchecked = broker.reconcile_tick_value(make_gold_spec(tick_value=1.0), "USD", probe=refusing())
+    assert unchecked.tick_value_source == "tick-unchecked"
+    finger, word = worker._cash_ruler(unchecked)
+    assert "не подтвердил" in word and finger.startswith("tick-unchecked:")
+    # The proof of the same tick by the same broker's calculator stays silent in the log.
+    proved = broker.reconcile_tick_value(make_gold_spec(tick_value=1.0), "USD",
+                                         probe=calculating(100.0))
+    assert proved.tick_value_source == "tick" and worker._cash_ruler(proved) is None
+
+
+def test_a_cent_account_named_in_its_own_currency_is_neither_frozen_nor_flattered() -> None:
+    """A cent account says `USCent` while the instrument pays in `USD`: different words, same money.
+
+    `comparable` is false for it, so an unanswered calculator must not freeze the symbol (that would
+    be a factor-of-100000 no-trade) — and must not be written up as a proved ruler either.
+    """
+    cents = make_gold_spec(tick_value=10.0)
+    spec = broker.reconcile_tick_value(cents, "USCent", probe=refusing())
+    assert spec.tick_value_source == "tick-unchecked"
+    assert spec.tick_value == pytest.approx(10.0)
+    assert spec.cash_divergence == 0.0
+    account = make_account(risk_per_trade_pct=0.25, max_lots=100.0, min_lots=0.01)
+    assert risk.size_for(account, spec, 48.16, 9921261.0) == pytest.approx(
+        risk.size_for(account, cents, 48.16, 9921261.0))
+
+
+def test_the_calculator_is_probed_at_the_lots_this_broker_accepts() -> None:
+    """A contract whose minimum lot is above one lot used to be unprobeable — and then blocked for good.
+
+    Clipping the probe at 1.0 answered 0.0 for a symbol with `volume_min: 5`, so the calculator was
+    never asked; on a symbol whose two fields disagree that silence is the very thing `unproven`
+    refuses to trade on, and the instrument would stay shut whatever the broker published.
+    """
+    big = make_gold_spec(volume_min=5.0, volume_step=1.0, volume_max=50.0)
+    assert broker._probe_volume(big) == pytest.approx(5.0)
+    assert broker._probe_volume(make_gold_spec()) == pytest.approx(1.0)
+    # A ceiling under one lot is still probed at the ceiling, and an inconsistent pair of limits
+    # (min above max) answers 0.0 — the calculator is not asked a question the broker bans.
+    assert broker._probe_volume(make_gold_spec(volume_min=0.01, volume_max=0.5)) == pytest.approx(0.5)
+    assert broker._probe_volume(make_gold_spec(volume_min=10.0, volume_max=5.0)) == 0.0
+

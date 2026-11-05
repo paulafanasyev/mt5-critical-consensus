@@ -399,6 +399,59 @@ def test_an_instrument_with_no_proven_cash_ruler_is_never_offered(tmp_path, monk
     assert not store.reserved_volume()  # refused before a slot was ever taken
 
 
+def test_a_refused_ruler_is_said_once_though_its_numbers_move(tmp_path, monkeypatch) -> None:
+    """The refusal quotes the three numbers it compared, and two of them are prices.
+
+    Fingerprint the sentence as written and one broker rule reads in the journal as a broker changing
+    its mind every tick — which is how a park that refused itself politely looks like an outage.
+    """
+    account, runner, store, sent, snapshot, day, spec = _entry_harness(tmp_path, monkeypatch,
+                                                                       (1, "S"))
+    spec.tick_value_source = "unproven"
+    spec.cash_probe_error = ("расчёт брокера 100 не похож ни на тик (10, разрыв 90.0%), "
+                             "ни на контракт (1000, разрыв 90.0%)")
+    runner._try_entries(account, snapshot, [], day, 1.0)
+    spec.cash_probe_error = ("расчёт брокера 103 не похож ни на тик (10, разрыв 91.2%), "
+                             "ни на контракт (1000, разрыв 92.7%)")
+    runner._try_entries(account, snapshot, [], day, 1.0)
+    refused = [payload for _, _, kind, payload in store.recent_events(40)
+               if kind == "cash_ruler_unproven"]
+    assert len(refused) == 1 and sent == []
+
+
+def test_an_unchecked_tick_trades_but_says_it_was_never_proved(tmp_path, monkeypatch) -> None:
+    """`tick-unchecked` is not a frozen instrument — it is a ruler the journal may not vouch for.
+
+    Nothing contradicted the tick, so the lot goes on; the operator still has to be able to tell
+    "the broker's calculator repeated the tick" from "its calculator never answered".
+    """
+    account, runner, store, sent, snapshot, day, spec = _entry_harness(tmp_path, monkeypatch,
+                                                                       (1, "S"))
+    spec.tick_value_source = "tick-unchecked"
+    spec.cash_probe_error = "order_calc_profit вернул None"
+    opened = runner._try_entries(account, snapshot, [], day, 1.0)
+    assert opened == 1 and sent == [1]
+    rows = [(kind, payload) for _, _, kind, payload in store.recent_events(30)]
+    assert any(kind == "cash_ruler" and "не подтвердил" in payload for kind, payload in rows)
+    assert any(kind == "opened" and '"risk_basis": "tick-unchecked"' in payload
+               for kind, payload in rows)
+
+
+def test_a_lot_the_broker_cannot_price_is_mirrored_as_unknown_not_as_cheap(
+        tmp_path, monkeypatch) -> None:
+    """An `unproven` symbol keeps the contradicted tick, and a standing lot priced by it understates
+    the portfolio's risk by that same factor. A mirror that cannot price a lot says it cannot."""
+    account, runner, store, sent, snapshot, day, spec = _entry_harness(tmp_path, monkeypatch,
+                                                                       (1, "S"))
+    position = types.SimpleNamespace(ticket=81, symbol="EURUSD", type=0, volume=0.1,
+                                     price_open=1.10, profit=0.0, sl=1.098, tp=1.104,
+                                     magic=7000001)
+    assert runner._mirror_risk_usd(account, [position], 1.0) == {81: pytest.approx(20.0)}
+    spec.tick_value_source = "unproven"
+    spec.cash_probe_error = "расчёт брокера молчал"
+    assert runner._mirror_risk_usd(account, [position], 1.0) == {}
+
+
 def test_the_ruler_a_lot_was_measured_with_reaches_the_operator(tmp_path, monkeypatch) -> None:
     """The journal row and the standing note both say which of the broker's numbers priced the lot."""
     account, runner, store, sent, snapshot, day, spec = _entry_harness(tmp_path, monkeypatch,

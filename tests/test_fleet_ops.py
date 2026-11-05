@@ -715,3 +715,25 @@ def test_a_merge_on_another_account_never_silences_this_one(
     book = candidates.ledger(store)
     assert book["merged_ticket"] == 1
     assert book["closed"] == 1 and book["profit_gross_usd"] == 5.0
+
+
+def test_a_status_line_keeps_the_money_of_a_close() -> None:
+    """The row is printed from JSON, and the tail it cuts off is where the dollars live.
+
+    Measured payloads from the live journal: an `opened` line spent its 110 characters on the
+    strategy's reason, and a `closed` line — which has no reason worth that much — lost the profit
+    the row was written to report.
+    """
+    opened = json.dumps({"symbol": "XAUUSD", "side": "buy", "volume": 0.05, "price": 4121.02,
+                         "requested": 4120.99, "reason": "H4+H1 тренд вверх, цена над EMA21",
+                         "risk_usd": 230.32, "risk_basis": "contract"}, ensure_ascii=False)
+    word = fleet_cli._event_word("opened", opened)
+    assert "risk_usd=230.32" in word and "risk_basis=contract" in word and "XAUUSD" in word
+    assert len(word) <= 110
+    closed = json.dumps({"symbol": "USDJPY", "ticket": 11252161967,
+                         "reason": "фиксация после отката от пика", "by": "парк", "profit": 0.06,
+                         "currency": "USD", "rate_to_usd": 1.0, "profit_usd": 0.06},
+                        ensure_ascii=False)
+    word = fleet_cli._event_word("closed", closed)
+    assert "profit_usd=0.06" in word and "11252161967" in word and "отката" in word
+    assert len(word) <= 110

@@ -367,11 +367,21 @@ def _cash_ruler(spec: broker.BrokerSymbol) -> tuple[str, str] | None:
     """(fingerprint, detail) for the ruler this lot's money was measured with — when it needs saying.
 
     None is the ordinary case: the terminal's own calculator repeated the tick field and nothing
-    contradicted it. Saying that every cycle would be noise; saying the other three is the operator's
+    contradicted it. Saying that every cycle would be noise; saying the other cases is the operator's
     only view of which number a dollar was cut from. The direction is written out of the two fields
     themselves, never out of a divergence ratio that loses its sign.
     """
-    if spec.tick_size <= 0 or spec.tick_value_source not in ("contract", "tick-proven"):
+    if spec.tick_size <= 0:
+        return None
+    if spec.tick_value_source == "tick-unchecked":
+        # The broker's calculator was never asked, or had nothing to arbitrate: the tick stands, but
+        # it stands unproved. `risk_basis` is the operator's only clue about which number a dollar was
+        # cut from, so "the calculator repeated the tick" and "nobody could ask it" must not print
+        # alike — the first is a proof, the second is only the absence of a contradiction.
+        return (_refusal_shape(f"tick-unchecked:{spec.cash_probe_error}"),
+                f"расчёт брокера молчал ({spec.cash_probe_error}): объём и риск меряны по тик-оценке, "
+                "которую брокер не подтвердил")
+    if spec.tick_value_source not in ("contract", "tick-proven"):
         return None
     tick_based = (spec.tick_value_raw or spec.tick_value) / spec.tick_size
     contract_based = spec.contract_size
@@ -1341,8 +1351,11 @@ class Worker:
                 # Two of the broker's own fields say different money and its calculator refused to
                 # settle it. That is not a reason to pick one: the lot would be sized by preference,
                 # and a preference in this branch is a factor of ten.
+                # Shaped, not raw: the refusal quotes the three numbers it compared, and two of them
+                # move with the price. A fingerprint of the sentence as written is a fresh event every
+                # cycle for one stable broker rule.
                 self._report_change(_host_key(f"cash_ruler:{account.name}:{spec.name}"),
-                                    f"unproven:{spec.cash_probe_error[:60]}",
+                                    _refusal_shape(f"unproven:{spec.cash_probe_error}")[:120],
                                     account.name, "cash_ruler_unproven", symbol=spec.name,
                                     contract_size=spec.contract_size,
                                     profit_currency=spec.profit_currency,
@@ -1581,6 +1594,12 @@ class Worker:
             spec = specs[name]
             if spec is None:
                 continue  # stays NULL in the mirror: a reader must not read it as no risk
+            if spec.tick_value_source == "unproven":
+                # The same 10x that closes this symbol's entries also corrupts a standing lot's price:
+                # `unproven` deliberately keeps the published tick, and a portfolio cap built from a
+                # tick the broker contradicted itself can understate the book by that same factor.
+                # NULL is the honest answer — a peer that cannot price a lot says it cannot price it.
+                continue
             money = risk.position_risk_money(position, spec, 0.0, account.risk.stop_atr)
             if not money > 0:
                 # A contract the broker described with a zero tick value, or a stop we could not

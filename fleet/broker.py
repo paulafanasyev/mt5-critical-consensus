@@ -152,7 +152,11 @@ def _probe_volume(spec: BrokerSymbol) -> float:
         return 0.0
     step = spec.volume_step
     top = spec.volume_max if spec.volume_max > 0 else spec.volume_min
-    volume = min(1.0, top)
+    # One lot is the cheapest probe; a contract whose minimum is above it (an index future at 5 lots)
+    # has to be probed at its own minimum. Clipping at 1.0 instead made `_probe_volume` answer 0.0 for
+    # such a symbol, the calculator was never asked, and an instrument whose two fields disagree was
+    # then blocked from entries for ever by the very rule meant to settle them.
+    volume = min(max(1.0, spec.volume_min), top)
     if step > 0:
         volume = math.floor(volume / step + 1e-9) * step
     if volume < spec.volume_min:
@@ -219,7 +223,10 @@ def reconcile_tick_value(spec: BrokerSymbol, currency: str,
 
     When the calculator will not answer and the two fields disagree, the instrument is marked
     `unproven` and the worker keeps its entries away from it — the park does not pick a ruler by
-    preference on the way into someone's money.
+    preference on the way into someone's money. When the calculator will not answer and the fields
+    agree (or there is no contract to compare with), the tick keeps sizing the lot under
+    `tick-unchecked`: it is the ruler nobody was able to dispute, not a ruler the broker proved, and
+    the journal has to be able to tell those two apart.
     """
     if spec.tick_size <= 0 or spec.tick_value <= 0:
         return spec
@@ -231,11 +238,20 @@ def reconcile_tick_value(spec: BrokerSymbol, currency: str,
                   and spec.profit_currency.upper() == currency.upper())
     divergence = (abs(contract_based - tick_based) / contract_based if comparable else 0.0)
     if contract_based <= 0:
-        return spec  # an unpublished contract is not an opinion about the tick
+        # An unpublished contract is not an opinion about the tick, and the calculator has nothing to
+        # arbitrate, so it is never asked. The tick still sizes the lot — but under a name that says it
+        # was never checked, so `risk_basis` cannot read like a verdict the broker gave.
+        return dataclasses.replace(
+            spec, tick_value_source="tick-unchecked",
+            cash_probe_error="брокер не опубликовал контракт — калькулятор не о чём спрашивать")
     per, why = (probe or calc_money_per_unit)(spec)
     if per <= 0:
         if not (comparable and divergence > CASH_DIVERGENCE_TOLERANCE):
-            return spec  # nothing was in question, so the calculator's silence changes nothing
+            # Nothing was in question, so the calculator's silence changes nothing — and it also
+            # proves nothing. Same ruler, honest name.
+            return dataclasses.replace(spec, tick_value_source="tick-unchecked",
+                                       cash_probe_error=why,
+                                       tick_value_raw=spec.tick_value)
         return dataclasses.replace(spec, tick_value_source="unproven",
                                    cash_divergence=round(divergence, 6),
                                    tick_value_raw=spec.tick_value,
