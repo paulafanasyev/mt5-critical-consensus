@@ -1101,14 +1101,17 @@ class Worker:
             try:
                 if not sending:
                     self.store.release(slot)
-                    self.store.event(account.name, "entry(gated)", symbol=spec.name,
+                    word = "entry(dry)" if self.dry_run else "entry(gated)"
+                    self.store.event(account.name, word, symbol=spec.name,
                                      side=signal.side, volume=volume, reason=signal.reason,
                                      risk_usd=round(risk_money * rate, 2))
-                    # The two halves of `not sending` are different facts. A paper cycle did see the
-                    # signal it would have traded, so it counts as an open; a real account the
-                    # operator has not spoken for has nothing in the market, and reporting it as one
-                    # lot opened per cycle is the status line lying about the book. `opened` is what
-                    # the conductor, the shard's JSON and the operator's screen read.
+                    # The two halves of `not sending` are different facts, and the journal says them
+                    # with different words: `entry(dry)` is a paper cycle that saw the signal it would
+                    # have traded, `entry(gated)` is a real account the operator has not spoken for,
+                    # with nothing in the market. They count apart too — the paper cycle's signal is
+                    # one lot opened, the refused one is none, and reporting it as opened per cycle is
+                    # the status line lying about the book. `opened` is what the conductor, the shard's
+                    # JSON and the operator's screen read.
                     return 1 if self.dry_run else 0
                 # The last look at the stand, one statement before the money moves. The check at the
                 # top of this method is behind a symbol probe, a portfolio read, a reservation and an

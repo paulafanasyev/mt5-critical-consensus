@@ -398,6 +398,85 @@ def test_a_parked_bridge_still_closes_the_lot_it_opened(tmp_path, monkeypatch) -
     assert state["halted"] is True
 
 
+def test_a_halted_day_ends_the_openings_and_not_the_closings(tmp_path, monkeypatch) -> None:
+    """A lot that outlived its own daily stop has to keep meeting a bridge that tries to free it.
+
+    The halt is the end of the day for NEW money. Read as a global stand-down it becomes the worst
+    outcome the stop can produce: the close the loop ordered is not confirmed by the next cycle (the
+    broker was busy, the EA was not awake), the day is marked halted, and every later cycle returns
+    early while the lot rides on a real account with nobody left to take it out.
+    """
+    real_bridge = _script("real_bridge", tmp_path, monkeypatch)
+    monkeypatch.setattr(real_bridge, "time", types.SimpleNamespace(sleep=lambda s: None,
+                                                                   time=lambda: 0.0))
+    ea = tmp_path / "dsh_real_state.json"
+
+    def state_file(tickets: list[dict]) -> None:
+        ea.write_text(json.dumps({"login": 276261159, "server": "Exness-MT5Real26",
+                                  "balance": 100.0, "equity": 99.0, "positions": tickets}),
+                      encoding="utf-8")
+
+    state_file([{"ticket": 5, "symbol": "EURUSD", "magic": real_bridge.REAL_MAGIC}])
+    cmd = tmp_path / "dsh_real_cmd.json"
+    halted = {"day": datetime.now(timezone.utc).date().isoformat(), "day_start_equity": 100.0,
+              "halted": True}
+    sentence = real_bridge.run_cycle(halted, lambda: "стоянка на месте", ea_path=ea, cmd_path=cmd,
+                                     registry=_registry(tmp_path))
+    assert "повторяю закрытие" in sentence, sentence
+    payload = json.loads(cmd.read_text(encoding="utf-8"))
+    assert payload["action"] == "close" and payload["ticket"] == 5
+
+    # The same state, once the witness agrees the lot is out: nothing left to write.
+    cmd.unlink()
+    state_file([])
+    assert real_bridge.run_cycle(halted, lambda: "стоянка на месте", ea_path=ea,
+                                 cmd_path=cmd, registry=_registry(tmp_path)) == "halted for the day"
+    assert not cmd.exists()
+
+
+def test_two_closes_written_without_a_gap_are_one_close_for_the_advisor(tmp_path,
+                                                                        monkeypatch) -> None:
+    """The EA polls this folder once a second, so the bridge's own pace is part of the order.
+
+    Two lots of ours leave the market in the same cycle. Written back to back, the second file
+    overwrites the first before the advisor has read either, and a loop that believes it closed both
+    has armed one and lost the other — with the real money of both still in. The wait between writes
+    is the only thing that makes one command file carry two commands.
+    """
+    real_bridge = _script("real_bridge", tmp_path, monkeypatch)
+    events: list[tuple] = []
+    origin = real_bridge.send_command
+
+    def watch(command: dict, gate, *args, **kwargs) -> bool:
+        sent = origin(command, gate, *args, **kwargs)
+        events.append(("emit", command["action"], command.get("ticket")))
+        return sent
+
+    def fake_sleep(seconds: float) -> None:
+        events.append(("wait", seconds))
+
+    monkeypatch.setattr(real_bridge, "send_command", watch)
+    monkeypatch.setattr(real_bridge, "time", types.SimpleNamespace(sleep=fake_sleep,
+                                                                   time=lambda: 0.0))
+    monkeypatch.setattr(real_bridge, "demo_book", lambda: [])  # the demo has let both go
+    ea = tmp_path / "dsh_real_state.json"
+    ea.write_text(json.dumps({"login": 276261159, "server": "Exness-MT5Real26", "balance": 100.0,
+                              "equity": 100.0,
+                              "positions": [{"ticket": 1, "symbol": "EURUSD",
+                                             "magic": real_bridge.REAL_MAGIC},
+                                            {"ticket": 2, "symbol": "GBPUSD",
+                                             "magic": real_bridge.REAL_MAGIC}]}),
+                  encoding="utf-8")
+    cmd = tmp_path / "dsh_real_cmd.json"
+    today = datetime.now(timezone.utc).date().isoformat()
+    real_bridge.run_cycle({"day": today, "day_start_equity": 100.0}, lambda: "", ea_path=ea,
+                          cmd_path=cmd, registry=_registry(tmp_path))
+    assert [kind for kind, *_ in events] == ["emit", "wait", "emit", "wait"], events
+    assert [item[2] for item in events if item[0] == "emit"] == [1, 2]
+    waits = [item[1] for item in events if item[0] == "wait"]
+    assert all(w >= 1 for w in waits), f"приказы пишутся вразнобой, советник увидит один: {waits}"
+
+
 def test_an_open_the_bridge_writes_carries_a_stop(tmp_path, monkeypatch) -> None:
     """An open whose only exit is this process's next cycle is a lot that survives a crash."""
     real_bridge = _script("real_bridge", tmp_path, monkeypatch)
@@ -539,6 +618,94 @@ def test_a_shard_with_no_config_flag_stops_when_its_registry_breaks(tmp_path, mo
 
 
 # --- the worker's own gates -----------------------------------------------------------------
+
+
+def test_a_real_lot_is_still_cared_for_when_the_live_word_is_missing(tmp_path,
+                                                                     monkeypatch) -> None:
+    """`--live` is the operator's word about money going IN; a lot already in the market still has to
+    be moved to break-even and closed. The same word used to freeze the closing half of the worker on
+    a real account: the address of the money was proved above, the lot was ours, and the only exit it
+    had left was the next cycle of a process that no longer ran. Closing is gated by `dry_run` —
+    paper stands down — and by nothing else.
+    """
+    account = _demo_account(name="real", login=5, server="S", mode="real")
+    store = _book(tmp_path, account)
+    runner = worker.Worker(config.FleetConfig(accounts=[account]), store, dry_run=False,
+                           allow_live=False)
+    touched: list[str] = []
+    _arm_management(monkeypatch, touched)
+    day = worker.risk.DayState(day="2026-11-03", start_balance=1000.0)
+    closed = runner._manage_positions(account, day, [_own_position(account, 91)])
+    assert touched == ["modify", "close"], \
+        f"закрыватель стоял из-за отсутствующего --live: {touched}"
+    assert closed == 1
+    assert "open" not in touched, "лот открыт на настоящие деньги без слова оператора"
+
+
+def test_a_dry_run_cycle_writes_nothing_to_the_broker(tmp_path, monkeypatch) -> None:
+    """The one mode that stands down from a close is the one that has no broker behind it."""
+    account = _demo_account()
+    store = _book(tmp_path, account)
+    runner = worker.Worker(config.FleetConfig(accounts=[account]), store, dry_run=True)
+    touched: list[str] = []
+    _arm_management(monkeypatch, touched)
+    day = worker.risk.DayState(day="2026-11-03", start_balance=1000.0)
+    assert runner._manage_positions(account, day, [_own_position(account, 92)]) == 0
+    assert touched == [], "бумажный цикл тронул брокера"
+    assert store.count_events("exit(dry run)") == 1
+
+
+def _arm_management(monkeypatch, touched: list[str]) -> None:
+    """Every write the park can make on a lot it owns, recorded under one name."""
+    monkeypatch.setattr(worker.broker, "symbol_exact", lambda name: _symbol())
+    monkeypatch.setattr(worker.broker, "atr", lambda *a, **k: 0.001)
+    monkeypatch.setattr(worker.broker, "modify_position", lambda *a, **k: touched.append("modify"))
+
+    def fake_close(position, spec, **kwargs):
+        touched.append("close")
+        return float(position.volume)  # a full close, not a partial one
+
+    monkeypatch.setattr(worker.broker, "close_position", fake_close)
+    monkeypatch.setattr(worker.broker, "market_order", lambda *a, **k: touched.append("open"))
+    monkeypatch.setattr(worker.strategy, "break_even_level", lambda *a, **k: 1.1000)
+    monkeypatch.setattr(worker.strategy, "exit_reason", lambda *a, **k: "тейк пробило")
+    monkeypatch.setattr(worker.mt5, "symbol_info_tick",
+                        lambda name: types.SimpleNamespace(bid=1.1010, ask=1.1010, time=1))
+
+
+def _own_position(account: config.Account, ticket: int) -> types.SimpleNamespace:
+    return types.SimpleNamespace(ticket=ticket, symbol="EURUSD", type=0, volume=0.01,
+                                 price_open=1.1000, profit=1.0, sl=1.0990, tp=0.0,
+                                 magic=account.magic, time=0)
+
+
+def test_a_gated_entry_is_not_counted_as_a_lot_opened(tmp_path, monkeypatch) -> None:
+    """Two halves of `not sending`, and only one of them belongs in `opened`.
+
+    `opened` is the number the conductor aggregates, the shard prints and the operator reads on
+    screen. A paper cycle did see the signal it would have traded, so counting it is honest; a real
+    account the operator has not spoken for has nothing in the market, and reporting one lot opened
+    every thirty seconds was the status line lying about the book.
+    """
+    real = _demo_account(name="real", login=5, server="S", mode="real")
+    store = _book(tmp_path, real)
+    runner = worker.Worker(config.FleetConfig(accounts=[real]), store, dry_run=False,
+                           allow_live=False)
+    _arm_entries(monkeypatch, _symbol())
+    monkeypatch.setattr(worker.broker, "market_order", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("открытие на настоящие деньги без --live")))
+    snapshot, day = _snapshot(real)
+    assert runner._try_entries(real, snapshot, [], day, 1.0) == 0
+    assert store.count_events("entry(gated)") == 1
+
+    paper = _demo_account(name="paper", login=6, server="S")
+    book = _book(tmp_path, paper)
+    paper_store = book
+    cycling = worker.Worker(config.FleetConfig(accounts=[paper]), paper_store, dry_run=True)
+    snapshot, day = _snapshot(paper)
+    assert cycling._try_entries(paper, snapshot, [], day, 1.0) == 1
+    assert paper_store.count_events("entry(dry)") == 1
+
 
 def _demo_account(**over) -> config.Account:
     fields = dict(name="a", login=1, server="S", mode="demo")

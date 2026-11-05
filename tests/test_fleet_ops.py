@@ -400,8 +400,19 @@ def test_pid_cache_does_not_pin_a_missing_process(tmp_path: pathlib.Path, monkey
 
 # --- real-account gate is real, not a tautology ---------------------------------------------
 
-def test_real_account_writes_no_orders_and_changes_no_stop_without_live(
+def test_a_lot_the_park_did_not_place_is_neither_moved_nor_closed(
         tmp_path: pathlib.Path, monkeypatch) -> None:
+    """Ownership, not the live gate — and the two are easy to confuse because this test is green
+    either way.
+
+    The position below carries `magic=0` while the account's magic defaults to 7000000, so
+    `risk.own_in` sets it aside before any gate is consulted: no open, no modify, no close. A real
+    account's own lot, by contrast, IS moved to break-even and closed without `--live` — that word
+    is the operator's permission for money going IN, and `tests/test_real_money_gates.py` pins both
+    halves (`test_a_real_lot_is_still_cared_for_when_the_live_word_is_missing` and
+    `test_a_gated_entry_is_not_counted_as_a_lot_opened`). Leaving this one under the old name meant a
+    future reader could believe the closing path was covered here.
+    """
     account = Account(name="real", login=5, server="Srv", mode="real")
     store = Store(tmp_path / "book.sqlite")
     runner = worker.Worker(FleetConfig(accounts=[account]), store, dry_run=False,
