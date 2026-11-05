@@ -55,9 +55,12 @@ ROSTER_SILENT_ERROR = "-10005"
 # reports algorithmic trading switched on comes first — among those the directory the registry names
 # for this account, otherwise the first path in the casefolded sort — and only when no window reports
 # itself enabled does the old order decide. Said next to the choice in the journal so the operator
-# does not have to read the code to learn why this window: measured 2026-11-05 the bare sort named
-# `c:\\mt5-exness`, whose ALGO TRADING button is off (retcode 10027 on every entry), while
-# `c:\\mt5-team` on the same demo login reports `terminal_info().trade_allowed = True`.
+# does not have to read the code to learn why this window: measured 2026-11-05 at 07:08Z the demo
+# login answers from `c:\\mt5-exness` with `terminal_info().trade_allowed = True` (login 114929502,
+# 99 212,61 USD), and the same morning that button was off — every entry died on retcode 10027,
+# which is why the rule prefers an enabled window at all. `c:\\mt5-team` and `c:\\mt5-real` answer
+# `(-10005, 'IPC timeout')`: a window nobody logged into is not a driver, and its flag reads as
+# "not seen enabled", not as "off".
 DRIVER_ORDER = ("окно с включённым алгоритмическим торговлением: сначала папка из реестра, иначе "
                 "первая по casefold-сортировке пути; если не включено нигде — прежний порядок")
 # Why this window was named, written into the `driver_chosen` event: the registry folder reports
@@ -306,14 +309,23 @@ def shared_demo_driver_choice(rows: list[dict], key: str,
     Only demo money gets a chosen session: a real account never has one window picked for it silently,
     so an account that is real, missing from the registry, or sharing its field with a window nobody
     could read answers with ("", [], "") and the caller keeps blocking. Which of the agreed windows
-    drives is `driver_window_choice`'s business: the one that can actually trade.
+    drives is `driver_window_choice`'s business: the one that can actually trade. One agreed window is
+    already a shared login — the census cannot see the park's own copy, see the note inside.
     """
     if account is None or account.is_real:
         return "", [], ""
     if blind_windows(rows):
         return "", [], ""
     group = windows_by_account(rows).get(key) or []
-    if len(group) < 2 or not shared_windows_agree(group):
+    # One window is enough, and on this machine it is all the census can ever see: it is taken before
+    # `attach()` opens anything (every probe ends with `shutdown()`), and a demo window lives one cycle
+    # and dies in `finally`, so our own folder is not in it. Measured 2026-11-05: after the operator
+    # logged out of `c:\\mt5-team` the group for `114929502@MetaQuotes-Demo` was one row
+    # (`c:\\mt5-exness`, `trade_allowed = True`) and a rule that demanded two rows kept the demo
+    # account's entries shut from 06:07Z — the door opened and closed on how many *foreign* windows
+    # happened to be up, which was never the question. The caller only asks when it already saw a
+    # window that is not ours; the answer it needs is whether those windows describe one demo pile.
+    if not group or not shared_windows_agree(group):
         return "", [], ""
     return driver_window_choice(group, window_dir(str(account.data_dir)))
 
@@ -805,10 +817,11 @@ class Worker:
         sizing to a fraction of the balance spend it twice; exits must keep running regardless,
         because an unmanaged position is worse than an unused signal.
 
-        Measured here on 2026-11-05: two operator windows (`c:\\mt5-exness`, `c:\\mt5-team`) answer the
-        same demo login, the same server, the same mode and the same 99 212,61 — one pile of money
-        seen twice, not two drivers of two piles. What that leaves ambiguous is only "through which
-        session do we act", and `attach()` settles that already by proving the registry's own copy
+        Measured here on 2026-11-05: two operator windows (`c:\\mt5-exness`, `c:\\mt5-team`) answered
+        the same demo login, the same server, the same mode and the same 99 212,61 — one pile of money
+        seen twice, not two drivers of two piles. Later the same morning one of them logged out and the
+        pile was seen once by the census plus once by us; what that leaves ambiguous is only "through
+        which session do we act", and `attach()` settles that already by proving the registry's own copy
         before a single order. So a DEMO login that every window describes identically gets one window
         named as its driver of record and keeps its entries; that window is the one whose terminal
         reports algorithmic trading enabled, because a driver that cannot send an order is only a

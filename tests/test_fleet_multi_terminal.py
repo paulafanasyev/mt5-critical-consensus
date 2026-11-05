@@ -1216,6 +1216,31 @@ def test_one_demo_login_in_two_windows_keeps_its_entries_and_names_the_driver(
     assert drivers[0]["login"] == 1 and drivers[0]["mode"] == "demo"
 
 
+def test_one_foreign_demo_window_is_still_one_pile_and_still_trades(tmp_path, monkeypatch) -> None:
+    """The live shape, measured 2026-11-05: the census cannot contain the park's own window.
+
+    It is taken before `attach()` opens anything (every probe ends with `shutdown()`) and a demo copy
+    lives one cycle, so a login held by one operator window answers with exactly one row on file. A
+    rule that asked for two rows shut that account's entries from 06:07Z — the door hinged on how many
+    foreign windows happened to be up, while the money sat in a window that named itself demo and had
+    algorithmic trading switched on.
+    """
+    account, runner, store, sent, snapshot, day, _spec = _entry_harness(tmp_path, monkeypatch, (1, "S"))
+    _census(store, [_row(r"C:\mt5-exness", 1, "S", trade_mode=_DEMO_MODE, trade_allowed=True)])
+    assert str(account.data_dir).lower() not in json.dumps(
+        [row["dir"] for row in worker.roster_rows(store)])  # our own folder really is absent
+    assert runner._second_window(account) == ""
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 1
+    assert sent == [1]
+    events = [(kind, payload) for _, _, kind, payload in store.recent_events(30)]
+    assert "account_second_window" not in [kind for kind, _ in events]
+    drivers = [json.loads(payload) for kind, payload in events if kind == "driver_chosen"]
+    assert len(drivers) == 1
+    assert drivers[0]["window"] == "c:\\mt5-exness"
+    assert drivers[0]["others"] == []
+    assert drivers[0]["reason"] == worker.DRIVER_ENABLED
+
+
 def test_the_driver_choice_is_the_same_window_whatever_order_the_census_answered() -> None:
     """Determinism is the whole rule: a choice that flipped per cycle would ping-pong the orders.
 
