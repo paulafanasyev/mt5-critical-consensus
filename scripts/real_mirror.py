@@ -339,7 +339,16 @@ def main(argv: list[str] | None = None) -> int:
                                                        server=str(getattr(who, "server", "") or ""),
                                                        config_path=registry)
                 lots = livegate.capped_lots(permitted, args.real_lots)
-                if lots <= 0:
+                if permitted is None:
+                    # Two different facts wear the same `lots == 0`. A row that caps the lot says the
+                    # operator set the ceiling; a window that stopped naming the account this process
+                    # was started for says the money in front of it is somebody else's. The second one
+                    # is the one that must be readable, because it is the one that arrives unannounced.
+                    log({"event": f"не зеркалит: перед этим запуском окно отвечает "
+                                  f"{getattr(who, 'login', None)}/"
+                                  f"{getattr(who, 'server', '') or 'без сервера'}, записи о котором "
+                                  f"в реестре нет; свои лоты при этом продолжает закрывать"})
+                elif lots <= 0:
                     log({"event": f"не зеркалит: потолок реестра для "
                                   f"{getattr(permitted, 'name', row.name)} — {lots} лота, "
                                   f"открытий не будет; свои лоты при этом продолжает закрывать"})

@@ -1061,3 +1061,186 @@ def test_a_parked_mirror_still_sells_the_copies_it_already_has(tmp_path, monkeyp
     assert "открытий нет" in text and "стоянка" in text
     # the same refusal, and the state remembers nothing it never did
     assert json.loads(real_mirror.STATE.read_text(encoding="utf-8")).get("halted") is False
+
+
+def _growing_demo_ticket(symbol: str, ticket: int, *, sl: float = 1990.0,
+                         tp: float = 0.0) -> types.SimpleNamespace:
+    """A demo lot the mirror is allowed to look at: the park's own magic, in profit, and rising."""
+    return types.SimpleNamespace(ticket=ticket, symbol=symbol, type=0, volume=0.01,
+                                 price_open=2000.0, profit=4.0, sl=sl, tp=tp,
+                                 magic=8180001)
+
+
+def _permitted_open_seam(real_mirror, tmp_path, monkeypatch):
+    """`--live`, an empty stand and a growing demo: the cycle reaches the opening door."""
+    who = types.SimpleNamespace(login=276261159, server="Exness-MT5Real26", trade_mode=2,
+                                balance=100.0, equity=100.0, currency="USD")
+    monkeypatch.setattr(real_mirror.livegate, "PAUSE_FILE", _no_stand(tmp_path))
+    monkeypatch.setattr(real_mirror, "demo_equity_trend", lambda *a, **k: 1.0)
+    monkeypatch.setattr(real_mirror, "hourly_uptrend", lambda *a, **k: True)
+    return who
+
+
+def test_one_demo_symbol_is_bought_once_per_cycle(tmp_path, monkeypatch) -> None:
+    """Two growing demo tickets of one symbol are one copy, not two.
+
+    The mirroring pass used to live inside the loop over the lots the demo had closed, so one closed
+    symbol re-ran it for every other closed symbol in the same cycle and the same growing ticket was
+    bought on real money several times at once. The dedup compares against the book as it was at the
+    start of the cycle, so the bound is one open per symbol per cycle, and it is this test that says
+    so.
+    """
+    real_mirror = _script("real_mirror", tmp_path, monkeypatch)
+    who = _permitted_open_seam(real_mirror, tmp_path, monkeypatch)
+    first = _growing_demo_ticket("XAUUSD", 11)
+    second = _growing_demo_ticket("XAUUSD", 12)
+    fake = _fake_terminal(monkeypatch, account=who, positions=[],
+                          demo=[first, second], real_path="r.exe")
+    code = real_mirror.main(["--real-path", "r.exe", "--live", "--once",
+                             "--config", str(_registry(tmp_path))])
+    assert code == 0
+    opens = [request for request in fake if request.get("comment") == "mirror demo"]
+    assert len(opens) == 1, f"два билета одного символа купились {len(opens)} раза"
+    assert opens[0]["symbol"] == "XAUUSD"
+    assert opens[0].get("sl") == 1990.0, "копия ушла в рынок без защитного уровня демо-билета"
+    assert "зеркалит" in _lines(real_mirror)
+
+
+def test_a_lot_without_a_stop_or_a_target_is_not_copied(tmp_path, monkeypatch) -> None:
+    """A demo ticket with neither level has no exit but this process's next cycle; real money does not."""
+    real_mirror = _script("real_mirror", tmp_path, monkeypatch)
+    who = _permitted_open_seam(real_mirror, tmp_path, monkeypatch)
+    naked = _growing_demo_ticket("XAUUSD", 21, sl=0.0, tp=0.0)
+    fake = _fake_terminal(monkeypatch, account=who, positions=[],
+                          demo=[naked], real_path="r.exe")
+    code = real_mirror.main(["--real-path", "r.exe", "--live", "--once",
+                             "--config", str(_registry(tmp_path))])
+    assert code == 0
+    assert [request for request in fake if request.get("comment") == "mirror demo"] == []
+    text = _lines(real_mirror)
+    assert "ни стопа, ни цели" in text, "отказ на голом билете не назван"
+    assert "зеркалит" not in text
+
+
+def test_the_lot_is_sized_for_the_login_the_terminal_names_at_the_open(tmp_path,
+                                                                       monkeypatch) -> None:
+    """`real_account` was read at the top of the cycle; a re-login mid-cycle must not buy on its ceiling.
+
+    Two permitted real rows, two different ceilings. The window names the 0.02 account when the cycle
+    starts and the 0.01 account by the time the lot is sized. Sizing from the row read at the top buys
+    0.02 of a lot against money that is no longer in this window — the same order the other account
+    never agreed to. Consent, the row and the ceiling are all asked of the window as it answers now.
+    """
+    real_mirror = _script("real_mirror", tmp_path, monkeypatch)
+    registry = _registry(tmp_path, _REAL_REGISTRY + """  - name: exness-real-2
+    login: 999000
+    server: Exness-MT5Real26
+    mode: real
+    enabled: true
+    risk:
+      max_lots: 0.01
+""")
+    wide = types.SimpleNamespace(login=276261159, server="Exness-MT5Real26", trade_mode=2,
+                                 balance=100.0, equity=100.0, currency="USD")
+    narrow = types.SimpleNamespace(login=999000, server="Exness-MT5Real26", trade_mode=2,
+                                   balance=50.0, equity=50.0, currency="USD")
+    monkeypatch.setattr(real_mirror.livegate, "PAUSE_FILE", _no_stand(tmp_path))
+    monkeypatch.setattr(real_mirror, "demo_equity_trend", lambda *a, **k: 1.0)
+    monkeypatch.setattr(real_mirror, "hourly_uptrend", lambda *a, **k: True)
+    answers = [wide, wide, narrow]
+
+    sent: list[dict] = []
+
+    class Shifting:
+        def __init__(self) -> None:
+            self.current = ""
+
+        def __getattr__(self, name):
+            return getattr(_MT5, name)
+
+        def initialize(self, **kwargs):
+            self.current = str(kwargs.get("path") or "")
+            return True
+
+        def shutdown(self) -> None:
+            return None
+
+        def account_info(self):
+            return answers.pop(0) if answers else narrow
+
+        def positions_get(self, **kwargs):
+            return list([] if self.current == "r.exe"
+                        else [_growing_demo_ticket("XAUUSD", 31)])
+
+        def symbol_info_tick(self, symbol):
+            return types.SimpleNamespace(bid=2000.0, ask=2000.5)
+
+        def order_send(self, request):
+            sent.append(request)
+            return types.SimpleNamespace(retcode=10009)
+
+    monkeypatch.setitem(sys.modules, "MetaTrader5", Shifting())
+    code = real_mirror.main(["--real-path", "r.exe", "--live", "--once", "--real-lots", "0.05",
+                             "--config", str(registry)])
+    assert code == 0
+    opens = [request for request in sent if request.get("comment") == "mirror demo"]
+    assert len(opens) == 1, "отказ на смене логина должен быть назван, а не промолчан открытием"
+    assert opens[0]["volume"] == 0.01, (f"лот {opens[0]['volume']} посчитан по потолку счёта, "
+                                        f"которого в этом окне уже нет")
+    assert not any(request.get("volume") == 0.02 for request in sent)
+
+
+def test_a_window_that_relogged_to_a_stranger_says_so_instead_of_blaming_the_ceiling(
+        tmp_path, monkeypatch) -> None:
+    """`lots == 0` has two causes, and the operator has to be able to tell them apart at a glance.
+
+    A row that caps the lot is the operator's own ceiling. A window that now answers a login the
+    registry does not carry is somebody else's money, and the old sentence printed
+    «потолок реестра для exness-real — 0.0 лота»: it named the account this process was started for
+    and called its ceiling zero, which is a fact that is not true and sends the operator to edit a
+    registry row that was never the problem.
+    """
+    real_mirror = _script("real_mirror", tmp_path, monkeypatch)
+    wide = types.SimpleNamespace(login=276261159, server="Exness-MT5Real26", trade_mode=2,
+                                 balance=100.0, equity=100.0, currency="USD")
+    stranger = types.SimpleNamespace(login=999000, server="Exness-Trial10", trade_mode=2,
+                                     balance=50.0, equity=50.0, currency="USD")
+    monkeypatch.setattr(real_mirror.livegate, "PAUSE_FILE", _no_stand(tmp_path))
+    monkeypatch.setattr(real_mirror, "demo_equity_trend", lambda *a, **k: 1.0)
+    monkeypatch.setattr(real_mirror, "hourly_uptrend", lambda *a, **k: True)
+    answers = [wide, wide, stranger]
+    sent: list[dict] = []
+
+    class Shifting:
+        def __getattr__(self, name):
+            return getattr(_MT5, name)
+
+        def initialize(self, **kwargs):
+            self.current = str(kwargs.get("path") or "")
+            return True
+
+        def shutdown(self) -> None:
+            return None
+
+        def account_info(self):
+            return answers.pop(0) if answers else stranger
+
+        def positions_get(self, **kwargs):
+            return list([] if self.current == "r.exe"
+                        else [_growing_demo_ticket("XAUUSD", 41)])
+
+        def symbol_info_tick(self, symbol):
+            return types.SimpleNamespace(bid=2000.0, ask=2000.5)
+
+        def order_send(self, request):
+            sent.append(request)
+            return types.SimpleNamespace(retcode=10009)
+
+    monkeypatch.setitem(sys.modules, "MetaTrader5", Shifting())
+    assert real_mirror.main(["--real-path", "r.exe", "--live", "--once",
+                             "--config", str(_registry(tmp_path))]) == 0
+    assert [request for request in sent if request.get("comment") == "mirror demo"] == []
+    text = _lines(real_mirror)
+    assert "окно отвечает 999000/Exness-Trial10" in text, "смена окна не названа причиной отказа"
+    assert "записи о котором в реестре нет" in text
+    assert "потолок реестра" not in text, "чужие деньги названы потолком своего счёта"
