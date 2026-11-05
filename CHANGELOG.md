@@ -205,6 +205,361 @@ true, which is exactly why the code was wrong and the suite was not.
   `3 cycle + 1 entry(dry)`, zero `opened`, zero `candidate`: the drift bill starts with the first
   real lot, and `entry(gated)`/`entry(dry)` deliberately never enter the book.
 
+### What this round closed: three gates that did not exist, and a book that stopped adding up what it cannot price
+
+Eighteen defects, each reproduced before being changed, and each cited by the test that is red on the
+tree before its fix. Two baselines, both measured on 2026-11-04 with this checkout's own interpreter:
+
+- against the pre-fix snapshot (`agent_data/pre_fix`), `tests/test_fleet_regressions.py` fails
+  **49 of 90** and `tests/test_fleet_ops.py` + `tests/test_fleet_multi_terminal.py` fail **12 of 100**;
+- against the commit this round's edits sit on top of (`HEAD` 1986f8f, exported with `git archive`
+  and handed only the new test files), `tests/test_bridge_ea_gates.py` is **12 failed, 4 passed**
+  (re-measured 2026-11-05; the earlier claim of 9 was written when that file held 13 tests) and the
+  four command-addressing tests are **4 failed**.
+
+The full red-proof of that tree, file by file, is in the next section: it turned out that one of
+these doors does not fail at `HEAD`, it never stops.
+
+- `fleet/store.py::_MIGRATIONS` (a book written by an older park refused its own new writes):
+  measured on the production journal before touching anything — `equity` had 7 columns (no
+  `currency`, no `rate_to_usd`) and `trades` still had the pre-contract split (`price`/`sl`/`tp`
+  instead of `requested_price`/`requested_volume`/`token`). The current `INSERT`s raised
+  `OperationalError` on that file: one inside the cycle **before** any entry, one **after** the broker
+  had already accepted the order. `CREATE TABLE IF NOT EXISTS` cannot help — it never touches a table
+  that exists. The missing columns are now added by `ALTER TABLE` on open, the same way `risk_usd`
+  already was. Test `test_a_book_written_before_the_contract_columns_gains_them` opens a book without
+  those columns, then runs both cycle writes — `equity(...)` and `trade(...)` — through it.
+- `fleet/store.py::prune` (the cooldown was deleted every 30 seconds): one rule covered two different
+  kinds of marker — `atr:<account>:<ticket>` and `entry:<account>:<symbol>` — and the ticket
+  membership test deleted `entry:` rows the moment their symbol had no open position. Reproduced on
+  the old code: with `cooldown_minutes: 45` a prune cycle erased the marker, so the park could
+  re-enter the same symbol on the very next cycle, forever. Ticket notes (`atr:`, `atrlock:`,
+  `lotunpriced:`, `bestops:`) now die with the position, and cooldown markers age out by the
+  timestamp in their own value (`COOLDOWN_KEEP_DAYS = 7`). One test holds both halves:
+  `test_the_prune_keeps_the_cooldown_and_loses_the_dead_ticket_note`.
+- `fleet/terminals.py::_detach` + `_seed_saved_session` (provisioning wrote through the operator's
+  install): the portable folders are assembled from **hardlinks**, and measured on this machine
+  `Config/common.ini`, `Config/terminal.ini` and six more files under
+  `C:\mt5-fleet\terminals\114929502-metaquotes-demo` each carried three links, one of them in
+  `C:\Program Files\MetaTrader 5\Config`. `open(path, "w")` truncates the inode, not the name, so
+  `init` was rewriting the settings of the terminal the operator trades in — his server list, his
+  window layout, his saved logins. Every write now detaches the name first. Second defect in the same
+  function, and worse in practice: the session files were cleared **before** checking the replacement
+  existed, so a registry entry with no `seed_config` (or one pointing at a folder without an
+  `accounts.dat`) deleted a working login and copied nothing back — the terminal then starts at a
+  password prompt the park cannot answer. Tests
+  `test_a_portable_config_on_a_shared_inode_is_detached_before_it_is_written`,
+  `test_a_second_provision_without_a_seed_keeps_the_login_that_already_works`.
+- `fleet/worker.py::_journal_broker_closes` + `fleet/store.py::mirrored_positions` (the exits that
+  were never billed): every close ordered by the park journalled its own profit, and a lot the
+  **broker** closed at its stop or target left no trace — the ticket simply vanished from the live
+  list. A candidate book joined by `(account, symbol, ticket)` therefore called a finished trade
+  `open` forever and kept counting its drift bill against a profit column that stayed empty. The
+  previous cycle's mirror is now the witness for two questions the live list cannot ask — which of
+  our lots are gone, and which lot grew volume nobody here ordered — and the closes are journalled
+  from the broker's own deals (`position_result`), with `by` naming who closed it. An unreadable
+  history journals the close **unpriced** (`priced=False` → `profit` NULL) rather than as a flat exit.
+  Tests `test_a_lot_the_broker_closed_is_journalled_with_its_own_profit`,
+  `test_a_broker_close_the_history_cannot_price_is_left_unpriced`.
+- `fleet/worker.py::_merged_lots` (the netting account folded his lot into ours): on a netting account
+  the operator's manual trade in the same direction merges into the position the park opened. The
+  magic still says `ours`, so the old ownership split happily trailed and closed a ticket that had
+  become two people's money — closing his lot along with ours without asking. Growth past the
+  mirrored volume stops `modify` and `close` for that ticket and announces `lot_merged_with_manual`;
+  a *shrunken* lot is not a merge (a partial close by either side, or the broker trimming it) and
+  stays under management. Test `test_a_manual_lot_merged_into_ours_is_not_modified_or_closed`, and the
+  book side of the same ticket is `test_a_ticket_merged_with_a_manual_lot_pays_nothing_into_the_sum`.
+- `fleet/worker.py::_atr_entry` (an authorship note that was being forged twice): `atr:<account>:<ticket>`
+  is what makes a lot carrying someone else's magic still ours. Two paths invented it. A journal locked
+  by another shard read as an **absent** note, and the value computed that cycle was then persisted as
+  the entry ATR of a lot sized from a different number — every later cycle believed the note it had
+  just poisoned. And a lot with no stop priced `abs(price_open − 0)`: gold near 2000 gave an "entry ATR"
+  of 2000, and break-even and trailing then moved a stop by a distance nobody had asked for. The
+  function now returns `None` while nobody can say, and `_manage_positions` substitutes `0.0` — the
+  value `strategy` already spells "no ATR" — so the ATR rules stand down while the broker's own
+  stop/target, the giveback from the peak and the time cap keep running. `_mirror_risk_usd` no longer
+  calls it at all: pricing other people's risk caps is not deciding who drives a lot, and the old call
+  stamped the operator's tickets with our entry ATR and then reported them as park lots nobody was
+  managing — the `park_lot_unattributed` alarm was crying wolf on every manual position. A lot with no
+  stop stays unpriced (`naked_tickets` in `portfolio_risk_unpriced`) rather than guessed. Tests
+  `test_a_locked_journal_does_not_get_a_forged_entry_atr`,
+  `test_a_lot_without_a_stop_costs_the_book_a_number_instead_of_a_guess`,
+  `test_a_manual_lot_counts_in_risk_but_is_never_touched`.
+- `fleet/conductor.py::_journal_recreation` (an empty journal is not an empty day): found while
+  investigating an outside hand that deleted the production book mid-session — restored byte-identically
+  from a read-only copy (`sha256 dcc3220c…`, 86016 bytes, verified again today) and disclosed. Taking
+  the day's baseline from today's equity after such a loss **re-arms the daily stop at the number the
+  loss produced**, which is the fail-open a restart is not supposed to have, and the lots opened before
+  it are still live at the broker. `Store` now records whether it opened a brand-new file while the
+  `.jsonl` trail beside it survived; the conductor then holds entries with one `journal_recreated`
+  event until the operator runs `reset-day`, which is an explicit answer to that recreation — the
+  release and the per-machine scope of that answer are two tests,
+  `test_a_journal_rebuilt_under_the_park_does_not_arm_the_day_stop` and
+  `test_a_reset_day_on_one_machine_leaves_the_other_one_measured`.
+- `fleet/candidates.py` + `fleet/worker.py` (the bill was in the wrong currency, and unpriced money was
+  being summed anyway): `drift_cost` is a bill in **the account's own currency** — the broker's
+  `tick_value` is quoted there, not in dollars — and only `drift_cost_usd` is a dollar figure, written
+  exactly where a real `rate_to_usd` was resolved. The old code multiplied by `rate or 1.0`, so a ruble
+  account's cost was printed as dollars and an account whose rate nobody resolved was priced at
+  `1.0`. Proven red on the previous `HEAD`: a `RUB` row with `rate_to_usd = 0.01` came out of the CLI as
+  `-12.50 USD` where the honest number is `-0.125`; the same row with no rate became a dollar figure out
+  of thin air. Closes now carry `currency`, `rate_to_usd` and `profit_usd`, and a row the journal cannot
+  price is **counted, not summed**: `settled_unpriced`, `drift_unpriced`, `guessed` (with `by_source`
+  naming how many tickets came from `only_position` or `unknown` rather than the order comment), and the
+  CLI says all of it under `оговорки:` — a closed-but-unpriced row prints `итог не в $`, never a number.
+  Tests `test_the_drift_bill_is_converted_and_never_relabelled`,
+  `test_a_row_the_journal_cannot_price_is_counted_not_summed`,
+  `test_a_book_the_journal_cannot_price_says_so_instead_of_summing_it`.
+- `fleet/broker.py::_find_by_token` (a token is a short string): positions were matched by the bare
+  token as a substring, and `12ab` is inside `fleet-12ab3c45` as surely as inside its own order, so one
+  fill could be joined to another lot's ticket and paid out of the wrong position's profit. The match is
+  now the whole `fleet-<token>` comment. Tests
+  `test_two_tokens_that_share_a_prefix_never_steal_each_others_lot`,
+  `test_a_fill_is_named_by_the_comment_token_not_by_an_id_the_api_does_not_return`.
+- `fleet/shard.py` (a registry nobody can read is the worst kind of stale): the cycle loop catches its
+  own exceptions, so a config that stopped parsing — bad YAML, an invalid field, the file deleted under
+  the process — left the shard trading the config it had loaded **before** the file broke: accounts,
+  caps and modes the disk no longer names. It now halts cycling entirely on that version, writes one
+  `config_rejected` per broken version, and announces `config_reloaded` with what it recovered from.
+  Red on the previous `HEAD` — unparseable, invalid, vanished. Tests
+  `test_a_registry_the_shard_cannot_read_stops_it_from_trading`,
+  `test_a_registry_that_fails_validation_is_a_halt_too`,
+  `test_a_vanished_registry_is_a_refusal_not_a_permission`,
+  `test_the_shard_trades_again_the_minute_the_registry_is_readable`.
+- `fleet/worker.py::_server_key` (the park refused its own account): `attach()` compared server names
+  stripped and case-folded, the census key folded case only, and the gate immediately before the send
+  compared the **raw** strings. A registry typing `MetaQuotes-Demo ` therefore passed attach and then
+  got `identity_lost` on every symbol, releasing its reservation each time — the account was attachable
+  and untradeable. Every identity comparison in the file now goes through one rule. Proven red on the
+  previous `HEAD`; the guard half is kept deliberately: a server that only *looks* similar
+  (`S` against `S-MT5Real26`) is still somebody else's money and the park still refuses it. Tests
+  `test_the_gate_before_the_send_reads_a_hand_typed_server_name_as_attach_does`,
+  `test_a_server_that_only_looks_similar_is_still_someone_else`.
+- `fleet/broker.py::stops_refusal` + `StopsRefused` (the server owns the geometry, and reads its own
+  contract before the money is in flight): `trade_stops_level` refuses a stop or target closer to the
+  live price than its minimum (retcode 10016), and `trade_freeze_level` locks a standing position while
+  the price is inside it of its stop or target. Learning either by sending means learning it while the
+  order is already moving, and for the break-even modify it means a rejected request that reads like a
+  broker outage. `market_order` now asks the spec first and raises `StopsRefused` — the entry path
+  releases the reservation, journals `entry_stops_refused` (not `entry_failed`, which would look like
+  the broker broke) and moves on; the break-even path reports `break_even_refused` once per change of
+  the refusal and leaves the protection where the broker has it, while the broker's own stop, the
+  giveback and the time cap keep running. Nothing is clamped, on purpose: a lot is sized for the stop
+  distance the strategy computed, so pushing the stop to the server's minimum overspends the
+  reservation the portfolio book made, and moving a target rewrites the geometry the candidate journal
+  bills. Proven red on the previous `HEAD` (four node IDs — including that the old code sent the order
+  and asked afterwards). Tests `test_a_geometry_the_broker_bans_is_named_before_anything_is_sent`,
+  `test_a_lot_inside_the_freeze_band_is_locked_and_says_so`,
+  `test_an_order_the_server_would_reject_is_never_sent`,
+  `test_a_break_even_the_server_would_reject_is_said_once_and_never_sent`,
+  `test_a_stop_the_broker_will_not_take_is_a_hold_and_the_money_goes_back`.
+- `scripts/real_bridge.py` + `mql5/DSHRealBridge.mq5` (an order that outlived the permission that
+  wrote it): the bridge wrote the command file and washed its hands. A stand put back between that
+  write and the advisor's next timer left a live order in `MQL5\Common\Files`, and a command that
+  named no account was addressed to every terminal attached to that folder — the one that woke up
+  first bought the real money. Each command now carries the login it is meant for and an expiry
+  (`CMD_TTL_SEC = 60`), is written compact because the advisor's `JsonStr` looks for `"action":"` and
+  reads a spaced `"action": ` as an empty field, and is taken back the moment the gate shuts — with
+  `НЕ СНЯЛ` in the log when Windows will not release the file the terminal still holds. The advisor
+  believes none of this and checks for itself: `AccountInfoInteger(ACCOUNT_LOGIN)` against the
+  command's login, `exp` against `TimeGMT()` and `MaxCommandTtlSec`, `MaxLots` before an open, and
+  `POSITION_MAGIC` before a close. Tests `test_send_command_writes_no_file_on_a_refusal`,
+  `test_a_command_without_an_account_in_it_is_not_written_at_all`,
+  `test_a_command_written_while_the_gate_was_open_is_taken_back_when_it_shuts`,
+  `test_withdraw_says_out_loud_when_a_command_cannot_be_taken_back`,
+  `test_the_real_bridge_reads_the_queue_python_writes`,
+  `test_the_real_bridge_refuses_a_command_it_cannot_verify`,
+  `test_the_real_bridge_will_not_execute_a_command_that_outlived_its_permission`,
+  `test_the_real_bridge_caps_the_lot_of_an_ordered_open`,
+  `test_the_real_bridge_closes_only_the_lots_it_stamped`.
+- `mql5/DSHBridge.mq5` (the demo window ate the real order): the demo bridge defaulted to
+  `dsh_real_cmd.json`, so a play-money script deleted the real bridge's command and opened it on the
+  demo account — a filled real order that the real bridge never learned about. The demo queue is its
+  own pair of files now, and both advisors take their magic from one `InpMagic` input that the parity
+  test pins to `real_bridge.REAL_MAGIC`. Tests
+  `test_the_demo_bridge_does_not_share_the_real_bridge_queue`,
+  `test_the_real_bridge_stamps_its_own_magic_on_every_request`,
+  `test_the_magic_the_ea_stamps_is_the_magic_python_reads`.
+- `fleet/livegate.py::stand_refusal` + `scripts/desk_watch.py` (a fourth door, and a stand that only
+  two of them honoured): the chain is one function now — stand, then `--live` in this invocation, then
+  a numeric login, then a registry row that says `mode: real` and `enabled: true` for the server the
+  terminal actually answered — and the desk watcher goes through it like every other process. A
+  watcher told which account to manage refuses a terminal that answers with a different server under
+  the same login, and a real row's `max_lots` is applied before the file's own default could multiply
+  it. Tests `test_a_real_account_needs_the_same_three_words_as_every_other_door`,
+  `test_the_stand_stops_the_desk_watcher_even_on_play_money`,
+  `test_a_terminal_that_did_not_name_its_login_is_managed_by_nobody`,
+  `test_another_server_under_the_same_login_is_a_different_money`,
+  `test_a_real_account_carries_the_ceiling_of_its_row_not_the_default_of_this_file`,
+  `test_the_desk_watcher_writes_no_order_the_gate_refuses`.
+- `fleet/worker.py` (gates that lived in the caller, and notes that outlived their proof): the stand
+  is checked by `_try_entries` itself, so a Worker built by hand no longer buys on a parked park; it
+  announces `entries_paused` / `entries_resumed` once per change of state and nothing else may pass.
+  A cooldown the journal refused to stamp is now a fact (`entry_mark_failed`) instead of a silent
+  second bite at the same symbol. An identity check that *raised* — a terminal object missing a
+  field, a broker call that throws instead of answering — used to unwind between the reservation and
+  the order, leaving the portfolio's money slot held for its full 600 s; it now releases, journals
+  `identity_check_failed` and returns. A `stopsrefused:` note is cleared by the fill that disproves
+  it, so the next time the same rule bites it is said again. Tests
+  `test_a_parked_stand_stops_a_worker_nobody_asked`,
+  `test_a_cooldown_that_cannot_be_written_is_said_out_loud`,
+  `test_an_identity_gate_that_cannot_answer_frees_its_reservation`,
+  `test_a_filled_lot_forgets_the_refusal_it_just_answered`.
+- `fleet/shard.py` + `fleet/config.py` (a stamp that misses an edit, and a registry caught
+  half-saved): the watched version is the sha256 of the file's bytes, not `st_mtime` — two saves
+  inside one clock tick left the second invisible, and the shard went on trading a registry the disk
+  no longer held. A shard whose registry cannot be read *at start* writes `config_rejected`, prints
+  why, and returns 2 instead of dying in a window nobody watches; an empty `--pause-file` means the
+  machine's stand, not the absence of one. On the parsing side a `yaml.YAMLError` is converted to
+  `ConfigError`, which every caller already treats as "refuse to trade". Tests
+  `test_a_registry_rewritten_inside_the_same_second_still_reloads`,
+  `test_a_shard_that_cannot_read_its_registry_never_trades_and_says_why`,
+  `test_an_empty_pause_file_means_the_machines_stand`,
+  `test_a_registry_caught_half_saved_refuses_instead_of_crashing`.
+- `scripts/real_mirror.py` (two doors in the loop): a terminal that does not answer is retried, and
+  under `--once` the run exits 1 having sent nothing; a gate that answered a second ago and a registry
+  that now returns no row is a stop, not a `NoneType` swallowed as "cycle error". Tests
+  `test_the_mirror_retries_a_terminal_that_is_not_there`,
+  `test_the_mirror_stops_when_the_registry_stops_answering`.
+- Tests: `tests/test_fleet_regressions.py` is now 90 tests, `tests/test_fleet_multi_terminal.py` 73,
+  and the real-money doors have three files of their own: `tests/test_real_money_gates.py` 39,
+  `tests/test_bridge_ea_gates.py` 13 and `tests/test_desk_watch_gates.py` 9 (both new this round).
+  Whole suite on this checkout, re-measured after the last edit on 2026-11-04: **1445 passed, 10
+  skipped in 137,05 s**; the five fleet files are 218 and the three gate files 61. The production
+  journal is untouched by the suite (`FLEET_STRICT_GUARD=1` compares hashes before and after) and
+  read, that same day, as `trades 0`, `positions 0`, `book 0`, `risk_slots 0`, four events —
+  `3 cycle + 1 entry(dry)`, zero `opened`, zero `candidate` — at 86016 bytes, `sha256 dcc3220c…`,
+  the same hash the restored copy was verified against. The next section carries the reading of
+  2026-11-05, which is different because the park itself wrote to it on 2026-11-04 evening.
+
+### What the last four critics found: three of the four doors asked, the fourth one did not
+
+Everything below was reproduced against `HEAD` (1986f8f) before being changed, and the whole set was
+then re-measured on 2026-11-05 by exporting that commit with `git archive` and handing it **only**
+this round's test files (`agent_data/red_thisround`). That tree is red exactly where the fixes are:
+
+| file | against `HEAD` | green here |
+| --- | --- | --- |
+| `tests/test_fleet.py` | 1 failed, 11 passed | 12 |
+| `tests/test_fleet_ops.py` | 5 failed, 24 passed | 29 |
+| `tests/test_fleet_regressions.py` | 12 failed, 88 passed | 100 |
+| `tests/test_fleet_multi_terminal.py` | 2 failed, 73 passed | 75 |
+| `tests/test_real_money_gates.py` | 32 failed, 23 passed, **1 does not terminate** | 56 |
+| `tests/test_bridge_ea_gates.py` | 12 failed, 4 passed | 16 |
+| `tests/test_desk_watch_gates.py` | **11 failed, 0 passed** | 11 |
+
+75 red and one that never returns, 223 green out of the same 299. Here: **299 passed** across those
+seven files, and the whole suite **1482 passed, 10 skipped in 123,90 s**.
+
+- `scripts/real_mirror.py` (the finding that hides as a hang, not a failure):
+  `test_the_mirror_retries_a_terminal_that_is_not_there` does not assert-fail against the old code —
+  it never ends. The `faulthandler` stack names it exactly: `scripts/real_mirror.py:163` inside
+  `main()`, retrying a terminal that was never there, forever. A mirror that cannot reach its
+  terminal does not stop, it just stops reporting. It now ends, and `--once` exits 1 having sent
+  nothing.
+- `scripts/desk_watch.py` (the fourth door, and it asked nobody): all 11 tests of
+  `tests/test_desk_watch_gates.py` are red at `HEAD` — the watcher read the book and sent orders
+  without the registry row, without `--live` in this invocation and without the stand being read.
+  It is gated like the other three, and the door is split the way the money needs: a refusal shuts
+  **openings**, while its own lots keep closing. `test_a_desk_run_nobody_permitted_opens_nothing_but_still_reads_its_own_lots`
+  replaced the earlier "does not even read the book" test, because a watcher that refuses to look at
+  its own open position is a watcher that leaves money under the broker's stop only.
+- `scripts/real_bridge.py` + `fleet/livegate.py` (a stand that costs money to put up): the demo book
+  is now read **before** the idle return, so a real copy whose demo twin already went flat still gets
+  closed — the block sat under the idle return, so arming the stand left a lot riding on real money
+  with nothing behind it but the broker's own stop. `withdraw()` takes back an armed *open* and
+  refuses to take back a *close* ("не снимает защиту"). Tests
+  `test_a_parked_bridge_still_closes_the_copy_whose_demo_lot_is_flat`,
+  `test_a_parked_bridge_takes_back_its_open_and_leaves_its_close`,
+  `test_the_stand_stops_openings_and_leaves_the_closing_door_alone`.
+- `fleet/livegate.py` (an answer that names no server is not a wildcard): `exit_refusal`,
+  `identity_refusal` and `permitted_account` now refuse a request that does not say which server it
+  means. The row that authorises `Exness-MT5Real26` was, for the closing door, authorising any
+  terminal that keeps quiet about where it is. Covered inside both files above.
+- `scripts/real_bridge.py` (a test that could reach the operator's queue): `run_cycle()` took the
+  production `EA_STATE` / `EA_CMD` paths as default arguments, so `withdraw()` called from a scratch
+  run deletes `…\Common\Files\dsh_real_cmd.json` — the live bridge's actual queue. The paths are now
+  named at the call site in `main()` and patched in every test; `test_a_bridge_brought_back_without_the_word_starts_and_sends_nothing`
+  drives the daemon far enough to prove it starts, refuses, and sleeps.
+- `fleet/worker.py` (the last look is one statement earlier): the stand was read at the top of the
+  cycle, and a cycle is long — between the read and `broker.market_order` the operator can put the
+  machine's stand up. `_try_entries` now re-reads it immediately before the send, frees the reserved
+  money slot and journals `entries_paused`. Tests
+  `test_the_stand_is_read_again_one_statement_before_the_order` (the stand is armed *inside*
+  `reserve`, so the send is reached with a fresh fact and no order) and
+  `test_a_cycle_started_under_an_armed_stand_never_reaches_the_send` (the symbol probe is patched to
+  fail, so a cycle that touched the market at all is caught).
+- `fleet/store.py` + `fleet/worker.py` (`lot_witness`: how much of a ticket is ours, durably): a
+  netting account merges our 0.01 into somebody's 0.05, and the park used to decide whose share that
+  was by looking at the merged volume each cycle — so a park that saw the merge late treated the whole
+  ticket as its own and closed a manual lot it never opened. The share is now written at the fill
+  (`add_lot_witness`), floored on observation (`note_lot_witness` uses `MIN`), dies with the ticket
+  and ages by the cycle that last saw it. Tests
+  `test_the_witness_is_written_at_the_fill_and_never_invented_by_looking`,
+  `test_a_second_lot_ordered_into_the_same_ticket_grows_our_share_of_it`,
+  `test_a_closed_ticket_takes_its_witness_and_its_peak_with_it`,
+  `test_the_prune_ages_a_witness_by_the_cycle_that_last_saw_it`,
+  `test_a_window_answering_for_another_account_closes_nothing`.
+- `fleet/conductor.py::_portfolio_stop` (a sum that leaves an account out is not this portfolio's
+  size): an account whose broker currency nobody can price in dollars contributes nothing to `equity`
+  while its losses keep happening, and the daily stop — one percentage of one sum — was measuring
+  that partial number and printing it as the portfolio. A non-zero `unpriced` now returns
+  «дневный стоп портфеля не измерим» *before* the percentage is computed, both on a calm book and on
+  one already down 30 %, because a calm day next to the invisible account is the case that matters.
+  Test `test_an_unpriced_account_makes_the_portfolio_stop_unmeasurable`.
+- `fleet/config.py` (an identity is a pair): a registry row with a blank, empty or whitespace-only
+  `server:` is refused at load — «сервер не назван» — because every identity check downstream
+  compares normalised strings, and a silent server matches a silent terminal.
+  Test `test_an_account_naming_no_server_is_an_error`.
+- `scripts/fleet_cli.py` (two commands that were not what they said): `reset-day` unlinked the
+  operator's kill switch as a side effect, so an operator who armed the stand after a losing day and
+  then accepted the reset had his money trading again without ever saying so — it now clears the
+  baselines, journals `reset_day_paused` with the stand's own text and says «стоянка на месте,
+  снимай её сам». And `terminals`, the window census, opened the journal and rewrote
+  `terminal_roster@<host>` — the evidence the shards decide entries on — from a command that only
+  meant to look; it now walks the process list and never constructs a `Store`. Tests
+  `test_a_reset_day_leaves_the_armed_stand_armed`, `test_the_window_census_never_opens_the_journal`.
+- `tests/test_mt5_churn_history.py` (a cleanup that broke someone else's suite): `del
+  sys.modules["MetaTrader5"]` deleted the **installed** broker module for every test that ran after
+  that file, so a later fake that borrowed `TRADE_ACTION_DEAL` and the rest borrowed nothing, and the
+  failure surfaced in an unrelated test. The helper now puts back exactly what was there.
+- Production journal, read on 2026-11-05 (`file:…?mode=ro`, nothing written): 86 016 bytes,
+  `sha256 b1ac9153…`, `trades 0`, `positions 0`, `risk_slots 0`, `book 1`, 37 events — 28 `cycle`,
+  one `entry(dry)`, and `started` / `running` / `spawned` / `new_day` / `baseline_rebased` /
+  `book_incomplete` + `book_complete` / `account_second_window`. Realized income over this whole
+  program is **0,00 USD**: the park has run cycles and refused, it has not been permitted to open.
+  `lot_witness` is not in that file yet — the table is created by the schema's `CREATE TABLE IF NOT
+  EXISTS` on the first open by this build, so it appears when the park restarts, not before.
+- **That reading is only true of the file pair, and the doc now says so.** The 37 events are not in the
+  86 016-byte base: the same database opened `mode=ro` (SQLite folds the journal in) gives 37 events /
+  26 `equity` rows / `book 1`, and opened `immutable=1` (base only, and it answers `journal_mode:
+  delete`) gives **4 events / 1 equity row / no `book` row**. `fleet.sqlite-wal` is 1 009 432 bytes and
+  has never been checkpointed — its mtime is the park's last write, `14:58:32Z`. So "copy the journal"
+  means copying both files, and `docs/FLEET.md` carries the two readings side by side instead of one
+  number, because the number a reader would get from a single-file backup is the 2026-11-03 snapshot.
+- The incident that snapshot is from, disclosed here rather than left in a scratch note: on 2026-11-04
+  a red-proof helper in `agent_data/` copied the production journal, and its own cleanup called
+  `p.unlink()` on the **source**, so `C:\mt5-fleet\fleet.sqlite` was deleted. It was restored from the
+  only surviving copy, `agent_data/live_copy.sqlite` (snapshot 09:40 UTC that day, 86 016 bytes,
+  `sha256 dcc3220c…`), byte for byte, hash verified. What cannot be recovered is anything the journal
+  accepted between that snapshot and the deletion. What *can* be measured is the other half:
+  `Store.event` writes every row to SQLite and to the `.jsonl` trail beside it, and on the 2026-11-05
+  reading the two agree exactly — 37 event lines in the trail, 37 in the book, **0 rows in the trail
+  missing from the book** — so nothing in the trail's coverage (from `2026-11-03T12:54:02Z`) was lost in
+  the gap. Rows the trail never received are the unfalsifiable part, which is why `event()` returns
+  whether the row landed and `_landed` only keeps an "already said" note when it did.
+- Live machine, census re-run 2026-11-05 read-only: **two** operator windows answer login 114929502, not
+  one — `C:\mt5-exness` (pid 8836) and `C:\mt5-team` (pid 8196), both `MetaQuotes-Demo`, balance
+  99 206,51 / equity 99 211,93. `docs/FLEET.md` said "close `c:\mt5-team`" and is corrected to "leave
+  exactly one window for this login", which today means closing both of the operator's; the park raises
+  its own from `C:\mt5-fleet\terminals\114929502-metaquotes-demo` and shuts it in `finally`. The census
+  took **0,76 s** against the 8,63 s measured on 2026-11-04, because the two blind windows that each
+  paid the full 4-second `ROSTER_PROBE_TIMEOUT_MS` are not running. And the no-write claim was checked
+  the way WAL mode actually requires: base `sha256`, WAL byte count **and** WAL mtime, event count,
+  `meta` row count and the `terminal_roster@admin` value hash all identical before and after the command
+  — a hash of the base file alone would not have proven it, since every write would have landed in the
+  `-wal`.
+
 ## Unreleased — the status line that reported a live chain over a dead transport
 
 - `agent_data/live_gold_ema_policy.yaml` (a claim this repo's own evidence refutes): its header said the gold EMA 50/200 variant was "the only family that was positive in the two-year replay over real broker bars". Both study files say the opposite — `docs/evidence/gold_study_development.txt` gives `ema n=618 win 31.9% meanR -0.368 CI [-0.525,-0.205]` on PAXG and `docs/evidence/gold_study_development_xauusd.txt` gives `ema n=124 win 41.9% meanR -0.261 [-0.635,+0.139]` on the broker's own XAUUSD, and **every rule row in both tables is negative at the point estimate**. So the live forward run has been testing a hypothesis the replay already refuted, and its header was the reason. The comment now carries both tables, the −31,13 realized on 2026-11-02, and the fact that all three closes came from outside the chain (magic 0, empty comment) so they measure nothing. No key was changed: the file still runs EMA 50/200 with `max_open_positions: 1`, and a running process would not see a policy edit anyway — `load_policy()` is called once, at `scripts/run_mt5_demo_trading.py:1384`, not per cycle.
