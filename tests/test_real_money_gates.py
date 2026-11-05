@@ -223,8 +223,95 @@ def test_a_stand_put_back_mid_cycle_stops_the_next_send_of_the_same_run(tmp_path
     assert [r["symbol"] for r in sent] == ["XAUUSD"]
 
 
-# --- scripts/real_bridge.py: one door, and only its own lots --------------------------------
+_DEMO_AND_REAL = """
+accounts:
+  - name: demo-metaquotes
+    login: 114929502
+    server: MetaQuotes-Demo
+    mode: demo
+    enabled: true
+    magic: 7000001
+    risk:
+      max_lots: 0.10
+  - name: exness-real
+    login: 276261159
+    server: Exness-MT5Real26
+    mode: real
+    enabled: true
+    magic: 7000002
+    risk:
+      max_lots: 0.02
+"""
 
+
+def test_the_mirrors_demo_side_is_the_parks_magic_not_a_number_from_the_old_lab(
+        tmp_path, monkeypatch) -> None:
+    """Measured 2026-11-05: three park lots including a gold ticket in profit read as a flat demo.
+
+    The park stamps the magic of its own registry row on its trades; the mirror only knew the lab EA
+    that came before it, so it stood in front of the growing book and saw nothing to copy.
+    """
+    real_mirror = _script("real_mirror", tmp_path, monkeypatch)
+    registry = _registry(tmp_path, _DEMO_AND_REAL)
+    assert real_mirror.park_magics(registry) == {7000001}
+    book = [types.SimpleNamespace(ticket=1, magic=7000001, symbol="XAUUSD", profit=16.55),
+            types.SimpleNamespace(ticket=2, magic=8184184, symbol="USDJPY", profit=2.24),
+            types.SimpleNamespace(ticket=3, magic=0, symbol="EURUSD", profit=5.0),
+            types.SimpleNamespace(ticket=4, magic=7000002, symbol="EURUSD", profit=5.0)]
+    seen = [p.ticket for p in book if real_mirror.is_demo_lot(p, real_mirror.park_magics(registry))]
+    assert seen == [1, 2]  # the park's gold lot and the old lab lot; the manual and real-row ones not
+
+
+def test_a_registry_that_answers_nothing_leaves_the_old_lab_range_alone(tmp_path,
+                                                                        monkeypatch) -> None:
+    """A broken registry must not turn unknown magics into trades worth copying onto real money."""
+    real_mirror = _script("real_mirror", tmp_path, monkeypatch)
+    broken = tmp_path / "accounts.yaml"
+    broken.write_text("accounts: [{name: x, login: 1}]\n", encoding="utf-8")
+    assert real_mirror.park_magics(broken) == set()
+    assert real_mirror.is_demo_lot(types.SimpleNamespace(magic=999999), set()) is False
+    assert real_mirror.is_demo_lot(types.SimpleNamespace(magic=8184184), set()) is True
+
+
+def _conductor_book(tmp_path: pathlib.Path, equity: float, start,
+                    *, age: float = 0.0) -> pathlib.Path:
+    """The conductor's day measurement as it stands on disk, with its own age."""
+    path = tmp_path / "conductor.json"
+    path.write_text(json.dumps({"book": {"equity": equity}, "day_start_equity": start}),
+                    encoding="utf-8")
+    now = time.time()
+    os.utime(path, (now - age, now - age))
+    return path
+
+
+def test_growth_is_the_days_measured_equity_not_the_last_process_that_died(tmp_path,
+                                                                           monkeypatch) -> None:
+    real_mirror = _script("real_mirror", tmp_path, monkeypatch)
+    path = _conductor_book(tmp_path, 10_010.0, 10_000.0)
+    assert real_mirror.demo_growth(path) == (10.0, "")
+    losing = _conductor_book(tmp_path, 9_990.0, 10_000.0)
+    delta, why = real_mirror.demo_growth(losing)
+    assert delta == -10.0 and why == ""
+
+
+def test_a_stale_or_unopened_conductor_book_is_no_growth_at_all(tmp_path, monkeypatch) -> None:
+    """The mirror bought on a heartbeat log whose writer had been dead for a day and a half.
+
+    An absent measurement is not zero growth and it is not yesterday's trend either: it is a reason
+    to buy nothing, and the reason has to be readable.
+    """
+    real_mirror = _script("real_mirror", tmp_path, monkeypatch)
+    stale = _conductor_book(tmp_path, 10_010.0, 10_000.0, age=real_mirror.BOOK_STALE_SEC + 600)
+    delta, why = real_mirror.demo_growth(stale)
+    assert delta == 0.0 and "не писал книгу" in why
+    unopened = _conductor_book(tmp_path, 10_010.0, None)
+    delta, why = real_mirror.demo_growth(unopened)
+    assert delta == 0.0 and "день не открыт" in why
+    delta, why = real_mirror.demo_growth(tmp_path / "absent-conductor.json")
+    assert delta == 0.0 and "книги дирижёра нет" in why
+
+
+# --- scripts/real_bridge.py: one door, and only its own lots --------------------------------
 def test_a_bridge_nobody_permitted_reads_the_demo_book_and_leaves_no_opening(
         tmp_path, monkeypatch) -> None:
     """The cycle that may not open still has to know what the demo let go.
@@ -1370,7 +1457,7 @@ def test_the_mirror_stops_when_the_registry_stops_answering(tmp_path, monkeypatc
     who = types.SimpleNamespace(login=276261159, server="Exness-MT5Real26", trade_mode=2,
                                 balance=100.0, equity=100.0, currency="USD")
     sent = _fake_terminal(monkeypatch, account=who)
-    monkeypatch.setattr(real_mirror, "demo_equity_trend", lambda *a, **k: 1.0)
+    monkeypatch.setattr(real_mirror, "demo_growth", lambda *a, **k: (1.0, ""))
     monkeypatch.setattr(real_mirror.livegate, "refusal", lambda *a, **k: "")
     monkeypatch.setattr(real_mirror.livegate, "permitted_account", lambda *a, **k: None)
     code = real_mirror.main(["--real-path", "r.exe", "--live", "--once",
@@ -1397,7 +1484,7 @@ def test_a_parked_mirror_still_sells_the_copies_it_already_has(tmp_path, monkeyp
     stand.write_text("", encoding="utf-8")
     monkeypatch.setattr(real_mirror.livegate, "PAUSE_FILE", stand)
     sent = _fake_terminal(monkeypatch, account=who, positions=[ours], demo=[], real_path="r.exe")
-    monkeypatch.setattr(real_mirror, "demo_equity_trend", lambda *a, **k: 1.0)
+    monkeypatch.setattr(real_mirror, "demo_growth", lambda *a, **k: (1.0, ""))
     code = real_mirror.main(["--real-path", "r.exe", "--once", "--config", str(_registry(tmp_path))])
     assert code == 0, "запрет открытия превращал цикл в аварийный выход"
     comments = [request.get("comment") for request in sent]
@@ -1470,7 +1557,7 @@ def test_a_demo_that_stopped_answering_sells_nothing_on_real_money(tmp_path,
                                  magic=real_mirror.REAL_MAGIC)
     sent = _blind_terminal(monkeypatch, which="demo", account=who, positions=[ours])
     monkeypatch.setattr(real_mirror.livegate, "PAUSE_FILE", _no_stand(tmp_path))
-    monkeypatch.setattr(real_mirror, "demo_equity_trend", lambda *a, **k: 1.0)
+    monkeypatch.setattr(real_mirror, "demo_growth", lambda *a, **k: (1.0, ""))
     code = real_mirror.main(["--real-path", "r.exe", "--live", "--once",
                              "--config", str(_registry(tmp_path))])
     assert code == 1
@@ -1495,7 +1582,7 @@ def test_a_real_side_that_stopped_answering_buys_nothing_on_real_money(tmp_path,
     sent = _blind_terminal(monkeypatch, which="real", account=who,
                            demo=[_growing_demo_ticket("XAUUSD", 51)])
     monkeypatch.setattr(real_mirror.livegate, "PAUSE_FILE", _no_stand(tmp_path))
-    monkeypatch.setattr(real_mirror, "demo_equity_trend", lambda *a, **k: 1.0)
+    monkeypatch.setattr(real_mirror, "demo_growth", lambda *a, **k: (1.0, ""))
     monkeypatch.setattr(real_mirror, "hourly_uptrend", lambda *a, **k: True)
     code = real_mirror.main(["--real-path", "r.exe", "--live", "--once",
                              "--config", str(_registry(tmp_path))])
@@ -1505,11 +1592,11 @@ def test_a_real_side_that_stopped_answering_buys_nothing_on_real_money(tmp_path,
 
 
 def _growing_demo_ticket(symbol: str, ticket: int, *, sl: float = 1990.0,
-                         tp: float = 0.0) -> types.SimpleNamespace:
+                         tp: float = 0.0, magic: int = 8180001) -> types.SimpleNamespace:
     """A demo lot the mirror is allowed to look at: the park's own magic, in profit, and rising."""
     return types.SimpleNamespace(ticket=ticket, symbol=symbol, type=0, volume=0.01,
                                  price_open=2000.0, profit=4.0, sl=sl, tp=tp,
-                                 magic=8180001)
+                                 magic=magic)
 
 
 def _permitted_open_seam(real_mirror, tmp_path, monkeypatch):
@@ -1517,7 +1604,7 @@ def _permitted_open_seam(real_mirror, tmp_path, monkeypatch):
     who = types.SimpleNamespace(login=276261159, server="Exness-MT5Real26", trade_mode=2,
                                 balance=100.0, equity=100.0, currency="USD")
     monkeypatch.setattr(real_mirror.livegate, "PAUSE_FILE", _no_stand(tmp_path))
-    monkeypatch.setattr(real_mirror, "demo_equity_trend", lambda *a, **k: 1.0)
+    monkeypatch.setattr(real_mirror, "demo_growth", lambda *a, **k: (1.0, ""))
     monkeypatch.setattr(real_mirror, "hourly_uptrend", lambda *a, **k: True)
     return who
 
@@ -1563,6 +1650,42 @@ def test_a_lot_without_a_stop_or_a_target_is_not_copied(tmp_path, monkeypatch) -
     assert "зеркалит" not in text
 
 
+def test_the_parks_own_lot_is_the_one_a_copy_is_bought_of(tmp_path, monkeypatch) -> None:
+    """End to end, with nothing patched but the terminal: a magic-7000001 lot reaches the real door.
+
+    Measured 2026-11-05 on the live demo book: the gold ticket 11252852400 was +16,55 $ and the mirror
+    reported nothing to copy, because the only demo magic it knew was the old lab's `>= 8180000`.
+    """
+    real_mirror = _script("real_mirror", tmp_path, monkeypatch)
+    who = _permitted_open_seam(real_mirror, tmp_path, monkeypatch)
+    park_lot = _growing_demo_ticket("XAUUSD", 11252852400, magic=7000001)
+    fake = _fake_terminal(monkeypatch, account=who, positions=[],
+                          demo=[park_lot], real_path="r.exe")
+    code = real_mirror.main(["--real-path", "r.exe", "--live", "--once",
+                             "--config", str(_registry(tmp_path, _DEMO_AND_REAL))])
+    assert code == 0
+    opens = [request for request in fake if request.get("comment") == "mirror demo"]
+    assert len(opens) == 1, "лот парка не дошёл до двери открытия"
+    assert opens[0]["volume"] <= 0.02
+
+
+def test_a_growth_that_was_never_measured_is_said_and_buys_nothing(tmp_path,
+                                                                   monkeypatch) -> None:
+    """The other half of the mandate: `only on the growth`. No measurement is not a small growth."""
+    real_mirror = _script("real_mirror", tmp_path, monkeypatch)
+    who = _permitted_open_seam(real_mirror, tmp_path, monkeypatch)
+    monkeypatch.setattr(real_mirror, "demo_growth",
+                        lambda *a, **k: (0.0, "книги дирижёра нет на диске: роста не измерено"))
+    park_lot = _growing_demo_ticket("XAUUSD", 11252852400, magic=7000001)
+    fake = _fake_terminal(monkeypatch, account=who, positions=[],
+                          demo=[park_lot], real_path="r.exe")
+    code = real_mirror.main(["--real-path", "r.exe", "--live", "--once",
+                             "--config", str(_registry(tmp_path, _DEMO_AND_REAL))])
+    assert code == 0
+    assert [request for request in fake if request.get("comment") == "mirror demo"] == []
+    assert "копий не добавляю: книги дирижёра нет" in _lines(real_mirror)
+
+
 def test_the_lot_is_sized_for_the_login_the_terminal_names_at_the_open(tmp_path,
                                                                        monkeypatch) -> None:
     """`real_account` was read at the top of the cycle; a re-login mid-cycle must not buy on its ceiling.
@@ -1586,7 +1709,7 @@ def test_the_lot_is_sized_for_the_login_the_terminal_names_at_the_open(tmp_path,
     narrow = types.SimpleNamespace(login=999000, server="Exness-MT5Real26", trade_mode=2,
                                    balance=50.0, equity=50.0, currency="USD")
     monkeypatch.setattr(real_mirror.livegate, "PAUSE_FILE", _no_stand(tmp_path))
-    monkeypatch.setattr(real_mirror, "demo_equity_trend", lambda *a, **k: 1.0)
+    monkeypatch.setattr(real_mirror, "demo_growth", lambda *a, **k: (1.0, ""))
     monkeypatch.setattr(real_mirror, "hourly_uptrend", lambda *a, **k: True)
     answers = [wide, wide, narrow]
 
@@ -1647,7 +1770,7 @@ def test_a_window_that_relogged_to_a_stranger_says_so_instead_of_blaming_the_cei
     stranger = types.SimpleNamespace(login=999000, server="Exness-Trial10", trade_mode=2,
                                      balance=50.0, equity=50.0, currency="USD")
     monkeypatch.setattr(real_mirror.livegate, "PAUSE_FILE", _no_stand(tmp_path))
-    monkeypatch.setattr(real_mirror, "demo_equity_trend", lambda *a, **k: 1.0)
+    monkeypatch.setattr(real_mirror, "demo_growth", lambda *a, **k: (1.0, ""))
     monkeypatch.setattr(real_mirror, "hourly_uptrend", lambda *a, **k: True)
     answers = [wide, wide, stranger]
     sent: list[dict] = []

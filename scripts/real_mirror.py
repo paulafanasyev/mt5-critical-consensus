@@ -29,6 +29,15 @@ stop nor target is not mirrored — the same rule the file bridge states as `NO 
 the mirror's own exits (`real_tp_usd`, `max_hold_min`) live in this loop, and a loop stops existing
 when the laptop closes or the machine is parked.
 
+Two words say what "the demo" is, and both are read from the park rather than remembered. A lot is the
+laboratory's trade when its magic belongs to a `mode: demo` row of the operator's registry (that is how
+the park stamps its tickets) or to the lab EA that came before it; a manual lot, magic 0, is the
+operator's money and is never copied. And "growing" is today's equity minus the day's opening equity
+as the conductor writes it into its book — a book the conductor has not rewritten this cycle is no
+measurement at all, and the mirror buys nothing on a stale number. Both of these used to be one
+hard-coded magic floor and a heartbeat log of a process that had died, which together could stand in
+front of a profitable gold lot and report a flat demo.
+
 It still refuses a terminal that is not logged into a real account — that check guards the money from
 a mis-wired path; the checks above guard the money from this script being run at all.
 """
@@ -44,6 +53,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from fleet import config as fleet_config  # noqa: E402
 from fleet import livegate  # noqa: E402
 
 LOG = ROOT / "agent_data" / "real_mirror.jsonl"
@@ -51,6 +61,7 @@ STATE = ROOT / "agent_data" / "real_mirror_state.json"
 DEMO_MAGIC_FLOOR = 8180000
 REAL_MAGIC = 8272026
 DEMO_TERMINAL = r"C:\mt5-exness\terminal64.exe"
+BOOK_STALE_SEC = 300
 
 
 def log(event: dict) -> None:
@@ -108,30 +119,68 @@ def hourly_uptrend(mt5, symbol: str) -> bool:
     return closes[-1] > fast > slow
 
 
-def demo_equity_trend(points: int = 6) -> float:
-    """Change in demo equity over the last few supervisor heartbeats."""
-    path = ROOT / "agent_data" / "supervisor.jsonl"
+def park_magics(config_path: pathlib.Path | None = None) -> set[int]:
+    """The magics the park stamps on this machine's demo accounts, read from the operator's registry.
+
+    A demo lot used to be recognised only as `magic >= 8180000`, which was the lab EA that predates
+    the park. The park stamps its own number on its lots (7000001 on today's demo row), so the mirror
+    stood in front of a growing book and read it as flat: the gold lot the operator points at was not
+    mirrored because nothing had ever told this script that those tickets are the laboratory's trades.
+    A registry that does not answer yields the empty set, and then only the old lab range counts as a
+    demo trade — an unknown magic is never bought by mistake.
+    """
+    try:
+        loaded = fleet_config.load(config_path if config_path is not None
+                                   else fleet_config.CONFIG_PATH)
+    except (fleet_config.ConfigError, OSError, ValueError):
+        return set()
+    return {int(account.magic) for account in loaded.accounts
+            if not account.is_real and int(account.magic) > 0}
+
+
+def is_demo_lot(position, magics: set[int]) -> bool:
+    """Whose trade this is on the laboratory side: the park's own magic, or the old lab range.
+
+    A manual lot carries magic 0 and is the operator's money; the mirror neither copies it nor closes
+    it. `is_real` rows are excluded in `park_magics`: a real account's magic appearing in the demo
+    book would mean the two windows are the same account, which is not a growth signal but a wiring
+    mistake, and the mirror must not double-buy on it.
+    """
+    magic = int(position.magic or 0)
+    return magic in magics or magic >= DEMO_MAGIC_FLOOR
+
+
+def demo_growth(book_path: pathlib.Path | None = None,
+                now: float | None = None) -> tuple[float, str]:
+    """Today's change in the demo book in dollars, and the reason there is no such measurement.
+
+    The operator's rule is that real money follows the demo only while the demo grows, so growth has
+    to be measured now, not remembered. This read `agent_data/supervisor.jsonl`, the log of a process
+    that stopped writing on 2026-11-04 16:35 UTC, and asked it on 2026-11-05: its last lines still
+    said "equity rose", about a day that had already closed. The conductor rewrites its book every
+    cycle, so a missing or stale book here is answered with "nothing measured" and no copy is bought —
+    never with somebody else's trend.
+    """
+    path = book_path if book_path is not None else fleet_config.FLEET_ROOT / "conductor.json"
     if not path.exists():
-        return 0.0
-    equities = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines()[-40:]:
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        text = event.get("event", "")
-        if not text.startswith("HEARTBEAT"):
-            continue
-        parts = text.split()
-        for index, word in enumerate(parts):
-            if word == "equity" and index + 1 < len(parts):
-                try:
-                    equities.append(float(parts[index + 1]))
-                except ValueError:
-                    pass
-    if len(equities) < points:
-        return 0.0
-    return equities[-1] - equities[-points]
+        return 0.0, f"книги дирижёра нет на диске ({path}): роста за день не измерено"
+    age = (time.time() if now is None else now) - path.stat().st_mtime
+    if age > BOOK_STALE_SEC:
+        return 0.0, (f"дирижёр не писал книгу {age:.0f} с ({path}): последнее измерение дня "
+                     "старше цикла — роста не измерено")
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        equity = float(state["book"]["equity"])
+        start = state["day_start_equity"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0.0, f"книга дирижёра ({path}) не отдаёт измерение дня"
+    if start is None:
+        # Not zero, and not a small number either: the conductor has not measured this day yet, which
+        # is what an upgrade or a `reset-day` leaves behind. Read as growth it buys on a guess.
+        return 0.0, f"день не открыт дирижёром ({path}): роста за день не измерено"
+    if float(start) <= 0:
+        return 0.0, f"день открыт с нулевым стартом ({start!r} в {path}): роста не посчитать"
+    return equity - float(start), ""
 
 
 def book_of(mt5) -> list | None:
@@ -201,15 +250,24 @@ def main(argv: list[str] | None = None) -> int:
                     return 1
                 time.sleep(args.interval_sec)
                 continue
-            demo_positions = [p for p in demo_book
-                              if p.magic >= DEMO_MAGIC_FLOOR]
+            magics = park_magics(registry)
+            demo_positions = [p for p in demo_book if is_demo_lot(p, magics)]
+            if not magics:
+                ignored = [p for p in demo_book
+                           if int(p.magic or 0) and not is_demo_lot(p, magics)]
+                if ignored:
+                    # The park's lots are in the market and this process cannot name the park: say it,
+                    # because the alternative reading of an empty candidate list is "the demo is flat".
+                    log({"event": f"реестр ({registry or fleet_config.CONFIG_PATH}) не отдал ни одной "
+                                  f"демо-записи: {len(ignored)} лота(ов) с неизвестным magic для этого "
+                                  "цикла не демо-сделки"})
             demo_positions = [{"ticket": p.ticket, "symbol": p.symbol, "type": p.type,
                                "volume": p.volume, "price_open": p.price_open,
                                "sl": p.sl, "tp": p.tp, "profit": p.profit}
                               for p in demo_positions]
             mt5.shutdown()
-            trend = demo_equity_trend()
-            growth = trend > 0
+            trend, growth_refusal = demo_growth()
+            growth = trend > 0 and not growth_refusal
 
             # --- 2. the real terminal ---
             if not mt5.initialize(path=args.real_path):
@@ -380,6 +438,11 @@ def main(argv: list[str] | None = None) -> int:
             candidates = [item for item in demo_positions
                           if item["symbol"] not in mirrored
                           and item["profit"] >= args.min_position_profit]
+            if entry_open and candidates and not growth:
+                # Said out loud, because "the demo has a growing lot and nothing was bought" is the
+                # sentence the operator asks about; the reason used to be a variable nobody printed.
+                why = growth_refusal or f"демо за день не выросло ({trend:+.2f} $)"
+                log({"event": f"копий не добавляю: {why}"})
             if entry_open and growth and candidates:
                 # The volume belongs to the account the terminal names at this moment, exactly like
                 # the consent does: a ceiling read from the account this cycle happened to ask first
