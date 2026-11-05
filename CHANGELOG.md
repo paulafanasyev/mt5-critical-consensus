@@ -607,8 +607,67 @@ seven regressions in twelve minutes (journal lines `02:20:05`-`02:32:11Z`).
   не свидетельство`); `tests/test_fleet*.py` 236 in 22,69 s, the three gate files 83 in 7,58 s. Money
   read-only at 02:51Z: `trades 0`, park realized **0,00 USD**, one `book` row `99 212,61`, day base
   `99 330,64`, the account's own day at `−118,00 USD` and all of it the operator's manual trading
-  (the same reading twenty minutes earlier said `−124,13`, because his closes were still settling);
+  (the same twenty minutes earlier said `−124,13`, because his closes were still settling);
   `mode=ro` sees 170 events where `immutable=1` sees 157.
+
+### The operator's word about new money, and what it never authorized standing down (2026-11-05)
+
+The critic read three rules as findings because nothing in the suite said them out loud; writing the
+tests then found one real defect and one stale paragraph. Nine tests over two code commits
+(`a5f86d4`, `9d499cb`), and every number below re-read rather than carried over.
+
+- `scripts/real_mirror.py` (a refusal sentence that named the wrong thing): `lots <= 0` was one
+  branch for two different facts — "the registry caps this row at zero lots" and "this window
+  re-logged to a login the registry does not carry at all". The sentence printed the first excuse with
+  the second account's name, sending the operator to edit a registry row that was never the problem.
+  `permitted_account is None` is now named as itself. The three opening rules it already obeyed are
+  pinned: one buy per symbol per cycle (dedup records **fills**, not attempts), no copy of a demo lot
+  that carries neither a stop nor a target, and the lot ceiling taken from the login the terminal
+  names at the moment of the open — `--real-lots 0.05` against a 0.01 row and a 0.02 row, re-logged
+  mid-cycle, opens 0.01.
+- `fleet/worker.py` (the journal said one word for two facts): `not sending` is "paper cycle, no broker
+  behind it" and "real account the operator has not spoken for" at once. They already counted apart
+  (`return 1 if self.dry_run else 0`, so a refused real entry never lands in `opened`), but both wrote
+  `entry(gated)`, and `docs/FLEET.md` had been describing `entry(dry)`/`entry(gated)` as two names all
+  along — the rename in `8aa8db1` collapsed them. The paper cycle says `entry(dry)` again.
+- `docs/FLEET.md`, «Четыре двери» (prose two days behind the code): it still claimed the park was the
+  one door that diverged — "a shard without `--live` does not touch a real account in either
+  direction". `8aa8db1` really did freeze the closer with the same word that locked the entry door,
+  `4027e77` removed that, and the paragraph survived it. The park now reads as what it does: exits are
+  watched by `dry_run` alone, a real lot the park placed is moved to break-even and closed without
+  `--live`, and the stand and the missing word stop openings only.
+- `tests/test_fleet_ops.py` (a test whose name claimed the gate and proved ownership): the position
+  arrived with `magic=0` against the account's default `7000000`, so `risk.own_in` set it aside before
+  any gate was reached and the assertions held with the gate present or absent. Renamed to
+  `test_a_lot_the_park_did_not_place_is_neither_moved_nor_closed`, with the docstring pointing at the
+  two tests that do check the closing path.
+- `scripts/real_bridge.py` (two legs the code already kept, now said): a day halted for opening is not
+  a ban on exits — a lot that outlived its own daily stop must keep meeting a bridge that tries to
+  free it; and between two command files the bridge sleeps, because the advisor polls the folder once a
+  second and two writes in the same millisecond are one write. The red copy prints the defect itself:
+  two `close` commands in the same second with the same `exp`.
+- Red proof, per file, on copies with the rules stripped (`agent_data/` scratch, never the production
+  journal): worker copy without the exit gate and without the `return 1` — **2 failed**
+  (`test_a_real_lot_is_still_cared_for_when_the_live_word_is_missing`,
+  `test_a_gated_entry_is_not_counted_as_a_lot_opened`); the shared word alone needed its own copy,
+  because in the first one the count assertion fails before the journal is read — restoring only
+  `entry(gated)` for both halves gives **1 failed** on `count_events("entry(dry)")`. The third worker
+  test stays green by construction: it pins the opposite half — paper is the one mode that may stand a
+  close down. Bridge copy without the halt-retry and the sleep — **2 failed**. Mirror copy without the
+  three rules — **4 failed**.
+- Measured after the work, whole suite **1494 passed, 10 skipped in 124,83 s** (park live,
+  `FLEET_STRICT_GUARD=1`); five `tests/test_fleet*.py` **236 passed in 23,69 s**; three gate files
+  **92 passed in 7,39 s** — `test_real_money_gates.py` went 56 → 65. Money read-only at 03:41Z:
+  `trades 0`, `positions 0`, `risk_slots 0`, park realized **0,00 USD**, one `book` row `99 212,61`
+  stamped 03:41:17Z, day base `99 330,64`, `dayflows` `0.00|-118.00|99212.61|1793850005` — the
+  `−118,00 USD` is the operator's own day and had not moved since 02:51Z. Journal: 248 events / 202
+  equity rows through `mode=ro` against 157 / 117 through `immutable=1`, with `-wal` at 2 488 512
+  bytes over a 147 456-byte base (same hash `21dc44e9…` as an hour earlier — the base has not moved
+  since the checkpoint; the WAL grew 25 KB between two reads of this one measurement). The day-clock
+  markers are the same two numbers as an hour ago (`1793846837,701` held / `1793846873,625` live) with
+  86 cycles since the last clock line. `C:\mt5-fleet\PAUSE` absent, memory 839,0 МБ free of 3974,0
+  (78 %), and the newest roster (03:38:11Z) still names both operator windows — so entries stay
+  blocked, which is the gate working, not the park broken.
 
 ## Unreleased — the status line that reported a live chain over a dead transport
 
