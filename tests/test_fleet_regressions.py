@@ -1893,6 +1893,56 @@ def test_a_lot_that_merged_while_this_shard_was_dark_is_still_two_people_money(t
         {"ticket": 31, "asked": 0.1, "now": 0.2}]
 
 
+def test_a_lot_the_broker_closed_while_the_park_was_blind_is_still_settled(tmp_path,
+                                                                          monkeypatch) -> None:
+    """An outage longer than the mirror's 900 s shelf used to swallow the exit it was made for.
+
+    Measured on this machine 2026-11-05: the shard could not attach from 09:29 to 10:11 UTC, lot
+    11252713259 (GBPUSD, 17.62 $ of risk) left at its stop inside that window, the balance fell
+    17.70 $, and the journal has no `closed` row for it — because only the photograph of last cycle
+    answered "which of our lots is gone", and a photograph older than its shelf is refused. The
+    witness is a claim about authorship rather than a picture, so the first cycle back asks it too.
+    """
+    account, store, runner = _managed(tmp_path, monkeypatch)
+    store.save_positions("a", [_position(41, account.magic)])
+    store.note_lot_witness("a", 41, 0.10, "EURUSD")  # written at the fill, name and all
+    with store._connect() as conn:  # noqa: SLF001 - same package, the clock is what is being moved
+        conn.execute("UPDATE positions SET updated_epoch=?", (time.time() - 900 - 1,))
+    assert store.mirrored_positions("a") == {}  # the photograph is gone, the claim is not
+    monkeypatch.setattr(worker.mt5, "history_deals_get", lambda **_k: [
+        types.SimpleNamespace(entry=0, profit=0.0, comment="fleet-1"),
+        types.SimpleNamespace(entry=1, profit=-17.7, comment="[SL]")])
+    day = worker.risk.DayState(day="2026-11-05", start_balance=1000.0)
+    assert runner._manage_positions(account, day, [], "USD", 1.0) == 0
+    assert _of(store, "closed") == [{"symbol": "EURUSD", "ticket": 41, "by": "брокер",
+                                     "reason": "закрыт брокером, пока парк не видел счёта ([SL])",
+                                     "profit": -17.7, "currency": "USD", "rate_to_usd": 1.0,
+                                     "profit_usd": -17.7}]
+    runner._manage_positions(account, day, [], "USD", 1.0)
+    assert len(_of(store, "closed")) == 1  # settled once, and the witness went with the lot
+    assert store.witnessed_lots("a") == {}
+
+
+def test_a_witness_keeps_the_instrument_the_photograph_lost(tmp_path) -> None:
+    """A ticket nobody can name is a close the candidate book cannot pay out.
+
+    The name used to live only in `positions`, which ages out first, so the witness carries it from
+    the fill and from every cycle that still sees the lot. A later cycle with nothing to say must not
+    erase it, and a legacy row that never had one is still readable.
+    """
+    store = Store(tmp_path / "book.sqlite")
+    store.note_lot_witness("a", 41, 0.10, "XAUUSD")
+    store.note_lot_witness("a", 41, 0.05, "")  # a cycle that knows the volume but not the name
+    assert store.witnessed_lots("a") == {41: (0.05, "XAUUSD")}
+    store.add_lot_witness("a", 41, 0.05, "XAUUSD")  # this park bought another lot into it
+    assert store.witnessed_lots("a") == {41: (0.10, "XAUUSD")}
+    store.note_lot_witness("a", 42, 0.10)  # a row written before the column existed
+    assert store.witnessed_lots("a")[42] == (0.10, "")
+    store.note_lot_witness("a", 42, 0.10, "EURUSD")  # and the first cycle that can name it fills in
+    assert store.witnessed_lots("a")[42] == (0.10, "EURUSD")
+    assert store.lot_witnesses("a") == {41: pytest.approx(0.10), 42: pytest.approx(0.10)}
+
+
 def test_a_lot_the_park_shrank_is_still_ours_to_manage(tmp_path, monkeypatch) -> None:
     """A ticket that got smaller is not a merge: the witness follows it down and the lot stays ours.
 

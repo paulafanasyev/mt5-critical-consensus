@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS peaks (
 );
 CREATE TABLE IF NOT EXISTS lot_witness (
     account TEXT NOT NULL, ticket INTEGER NOT NULL, volume REAL NOT NULL, updated_epoch REAL,
+    symbol TEXT,
     PRIMARY KEY (account, ticket)
 );
 CREATE TABLE IF NOT EXISTS health (
@@ -79,6 +80,9 @@ COOLDOWN_KEEP_DAYS = 7
 _MIGRATIONS: list[tuple[str, list[tuple[str, str]]]] = [
     ("equity", [("currency", "TEXT"), ("rate_to_usd", "REAL")]),
     ("trades", [("requested_price", "REAL"), ("requested_volume", "REAL"), ("token", "TEXT")]),
+    # A witness that cannot name its instrument cannot settle an exit: `positions`, the only other
+    # place the symbol lived, ages out 900 s before the first cycle back reads it.
+    ("lot_witness", [("symbol", "TEXT")]),
 ]
 
 # The portfolio day is measured over one machine's book, so its keys carry that machine: two boxes
@@ -272,24 +276,44 @@ class Store:
                                 (account,)).fetchall()
         return {int(ticket): float(volume or 0.0) for ticket, volume in rows}
 
-    def note_lot_witness(self, account: str, ticket: int, volume: float) -> None:
+    def witnessed_lots(self, account: str) -> dict[int, tuple[float, str]]:
+        """The same authorship claim, with the instrument it was made about: {ticket: (lots, symbol)}.
+
+        The symbol is what lets a witness settle an account on its own. `positions` carries the other
+        copy of that name and ages out at POSITIONS_TTL_SECONDS, so after an outage longer than the
+        mirror's shelf life the only record left of a lot this park paid for names a ticket nobody can
+        price or join to the candidate book.
+        """
+        with self._connect() as conn:
+            rows = conn.execute("SELECT ticket, volume, symbol FROM lot_witness WHERE account=?",
+                                (account,)).fetchall()
+        return {int(ticket): (float(volume or 0.0), str(symbol or ""))
+                for ticket, volume, symbol in rows}
+
+    def note_lot_witness(self, account: str, ticket: int, volume: float,
+                         symbol: str = "") -> None:
         """Record what this park saw or ordered, and never let the witness grow by looking.
 
         A ticket nobody has recorded yet gets its first number here: the lots a fill returned, or the
         volume on the book's first cycle with it. A ticket already witnessed keeps the smaller
         figure, because market volume growing around a lot we own is exactly the merge this record
         exists to catch — a witness that followed it upward would remember the merge for one cycle
-        and then close it.
+        and then close it. The name is written once and never overwritten: an instrument already
+        witnessed without one stays a claim about a ticket, and a later cycle that can see the
+        symbol fills it in.
         """
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO lot_witness (account, ticket, volume, updated_epoch)"
-                " VALUES (?,?,?,?) ON CONFLICT(account, ticket) DO UPDATE SET"
+                "INSERT INTO lot_witness (account, ticket, volume, updated_epoch, symbol)"
+                " VALUES (?,?,?,?,?) ON CONFLICT(account, ticket) DO UPDATE SET"
                 " volume=MIN(lot_witness.volume, excluded.volume),"
-                " updated_epoch=excluded.updated_epoch",
-                (account, ticket, max(0.0, float(volume)), time.time()))
+                " updated_epoch=excluded.updated_epoch,"
+                " symbol=CASE WHEN COALESCE(lot_witness.symbol,'')='' THEN excluded.symbol"
+                " ELSE lot_witness.symbol END",
+                (account, ticket, max(0.0, float(volume)), time.time(), str(symbol or "")))
 
-    def add_lot_witness(self, account: str, ticket: int, volume: float) -> None:
+    def add_lot_witness(self, account: str, ticket: int, volume: float,
+                        symbol: str = "") -> None:
         """These are lots this park ordered into a ticket it already holds.
 
         A second entry on a netting account folds into the same ticket, so our money in it grows by
@@ -299,12 +323,14 @@ class Store:
         """
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO lot_witness (account, ticket, volume, updated_epoch)"
-                " VALUES (?,?,?,?)"
+                "INSERT INTO lot_witness (account, ticket, volume, updated_epoch, symbol)"
+                " VALUES (?,?,?,?,?)"
                 " ON CONFLICT(account, ticket) DO UPDATE SET"
                 " volume=lot_witness.volume + excluded.volume,"
-                " updated_epoch=excluded.updated_epoch",
-                (account, ticket, float(volume), time.time()))
+                " updated_epoch=excluded.updated_epoch,"
+                " symbol=CASE WHEN COALESCE(lot_witness.symbol,'')='' THEN excluded.symbol"
+                " ELSE lot_witness.symbol END",
+                (account, ticket, float(volume), time.time(), str(symbol or "")))
 
     def peak(self, account: str, ticket: int) -> float:
         with self._connect() as conn:

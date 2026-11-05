@@ -950,8 +950,9 @@ class Worker:
         # live list cannot ask: which of our lots the broker has already closed. Whether a lot grew
         # volume nobody here ordered is asked of `lot_witness`, which is not a photograph.
         mirror = self.store.mirrored_positions(account.name)
-        self._journal_broker_closes(account, mirror, positions, currency, rate)
-        merged = self._merged_lots(account, self.store.lot_witnesses(account.name), positions)
+        witness = self.store.witnessed_lots(account.name)
+        self._journal_broker_closes(account, mirror, witness, positions, currency, rate)
+        merged = self._merged_lots(account, witness, positions)
         specs: dict[str, broker.BrokerSymbol | None] = {}
         for position in own:
             name = position.symbol
@@ -1076,8 +1077,8 @@ class Worker:
                          profit_usd=(round(profit * rate, 2)
                                      if priced and rate > 0 else None))
 
-    def _journal_broker_closes(self, account: Account, mirror: dict, positions: list,
-                               currency: str, rate: float) -> None:
+    def _journal_broker_closes(self, account: Account, mirror: dict, witness: dict,
+                               positions: list, currency: str, rate: float) -> None:
         """Write the exits the broker took without asking this park.
 
         Every close ordered here is journalled where it is ordered, so a ticket that stood in last
@@ -1085,21 +1086,43 @@ class Worker:
         the platform, or by a server rule. Missing those is what makes a candidate book that never
         pays out: the trade ran and finished, and the ledger is left calling it open forever while
         the drift bill keeps being counted against a profit column that stays empty.
+
+        Two books answer the same question, and only one of them is a photograph. The mirror is the
+        previous cycle, and a picture older than POSITIONS_TTL_SECONDS is refused by the reader: an
+        outage longer than that leaves the first cycle back with no previous book at all, and a lot
+        the broker closed during it goes unjournalled. Measured on this machine 2026-11-05: the park
+        could not attach between 09:29 and 10:11 UTC — 42 minutes, past the 900 s shelf — lot
+        11252713259 (GBPUSD, 17.62 $ of risk) left at its stop, the balance fell 17.70 $, and the
+        journal has no `closed` row for it — while `lot_witness`, which is a statement about
+        authorship and does not expire, still said this park paid for that ticket. So the witness is
+        asked second, for exactly the tickets the photograph can no longer name. A witness written
+        before the name was kept settles namelessly: the journal says the ticket left, and the
+        candidate book cannot join that to a trade.
+
+        Both passes stand on one word from the broker: `risk.positions_for` raises when the terminal
+        does not answer, so an empty list here is the account saying it is flat, not a dropped pipe.
         """
         live = {int(p.ticket) for p in positions}
         ours = int(account.magic)
-        gone = sorted((ticket, symbol) for ticket, (magic, _volume, symbol) in mirror.items()
-                      if magic == ours and ticket not in live)
-        for ticket, symbol in gone:
+        gone = [(ticket, symbol, "стоп/тейк брокера", False)
+                for ticket, (magic, _volume, symbol) in mirror.items()
+                if magic == ours and ticket not in live]
+        # Only a witnessed ticket the mirror cannot see: whatever it still lists is settled above,
+        # from a picture that also knows the magic, so the two passes never write the same exit.
+        gone += [(ticket, symbol, "закрыт брокером, пока парк не видел счёта", True)
+                 for ticket, (_volume, symbol) in witness.items()
+                 if ticket not in live and ticket not in mirror]
+        for ticket, symbol, why, blind in sorted(gone):
             result = broker.position_result(ticket)
             # An empty history is not a flat exit: the broker settled this lot somewhere we cannot
             # read today, so the close is journalled unpriced rather than as a zero.
             profit, comment = result if result else (0.0, "")
-            self._report_closed(account, ticket, symbol, comment or "стоп/тейк брокера",
+            reason = f"{why} ({comment})" if blind and comment else (comment or why)
+            self._report_closed(account, ticket, symbol, reason,
                                 profit, currency, rate, by="брокер", priced=result is not None)
             self.store.close_position_row(account.name, ticket)
 
-    def _merged_lots(self, account: Account, witness: dict[int, float],
+    def _merged_lots(self, account: Account, witness: dict[int, tuple[float, str]],
                      positions: list) -> set[int]:
         """Tickets of ours carrying volume we did not add, reported and left alone.
 
@@ -1125,7 +1148,8 @@ class Worker:
                 continue
             ticket = int(position.ticket)
             volume = float(position.volume)
-            asked = witness.get(ticket)
+            seen = witness.get(ticket)
+            asked = seen[0] if seen else None
             if asked is not None and volume > asked + 1e-9:
                 merged[ticket] = (asked, volume)
             # Written back whatever the answer is, and `note_lot_witness` keeps the smaller of the
@@ -1134,7 +1158,9 @@ class Worker:
             # A ticket nobody has recorded yet takes its first number here — it has no previous
             # volume it could have grown past, so the volume on the book today is all anybody here
             # owns for it, and from the next cycle the merge question has a witness of its own.
-            self.store.note_lot_witness(account.name, ticket, volume)
+            # The symbol travels with it: the photograph of the book is where the name used to live,
+            # and it is exactly the row that is missing when a lot leaves during an outage.
+            self.store.note_lot_witness(account.name, ticket, volume, str(position.symbol))
         if merged:
             self._report_change(
                 _host_key(f"lotmerged:{account.name}"),
@@ -1527,9 +1553,11 @@ class Worker:
                         # before the park looks at it again, and a witness seeded from the volume it
                         # then finds is his half carried by our trailing stop.
                         if ticket in already:
-                            self.store.add_lot_witness(account.name, ticket, execution.volume)
+                            self.store.add_lot_witness(account.name, ticket, execution.volume,
+                                                       position.symbol)
                         else:
-                            self.store.note_lot_witness(account.name, ticket, execution.volume)
+                            self.store.note_lot_witness(account.name, ticket, execution.volume,
+                                                        position.symbol)
                 except Exception as exc:  # noqa: BLE001 - the lot is already at the broker
                     # A witness this book cannot write is a lot this book cannot prove: the next
                     # cycle adopts the volume it finds, and the merge guard for that ticket is only
