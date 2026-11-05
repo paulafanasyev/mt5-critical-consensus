@@ -30,6 +30,10 @@ class BrokerSymbol:
     freeze_level: int
     spread: int
     filling: int
+    contract_size: float = 0.0
+    profit_currency: str = ""
+    tick_value_source: str = "tick"
+    cash_divergence: float = 0.0
 
     def money_per_point(self, volume: float) -> float:
         if self.tick_size <= 0:
@@ -122,6 +126,49 @@ def ensure_selected(name: str) -> bool:
     return True
 
 
+CASH_DIVERGENCE_TOLERANCE = 0.01
+
+
+def account_currency() -> str:
+    """The currency this terminal's account is kept in, or "" when the terminal will not say."""
+    try:
+        info = mt5.account_info()
+    except Exception:  # noqa: BLE001 - a field read must never be the reason a cycle dies
+        return ""
+    return str(getattr(info, "currency", "") or "")
+
+
+def reconcile_tick_value(spec: BrokerSymbol, currency: str) -> BrokerSymbol:
+    """Trust the broker's contract when its own tick field contradicts it, and carry the ratio.
+
+    Measured 2026-11-05 on MetaQuotes-Demo (login 114929502) with this terminal's own money math:
+    `order_calc_profit(BUY, XAUUSD, 1.0, bid, bid - 1.00)` answers -100 $, and the same 100 $ comes
+    out of `trade_contract_size` = 100 oz, while `trade_tick_value` 0.1 at `trade_tick_size` 0.01
+    describes 10 $ per price unit per lot — ten times too little. Silver repeats it (-500 $ for 1.0
+    lot over a 0.1 move against a 50 $ tick estimate). FX agrees with itself, which is why only
+    metals were ever mis-sized: a gold lot sized from the tick field risks ten times the percentage
+    the registry promises, and the journal quotes the ten-times-too-small number back.
+
+    The contract is definitional, but it is only the same money as the tick field when the
+    instrument pays its profit in the account's currency: 100 000 of a yen-denominated pair is not
+    100 000 dollars, so for those the two numbers disagreeing is arithmetic rather than a defect and
+    nothing is overridden. A real disagreement is never left quiet either: the spec carries the ratio
+    the broker showed, so the journal can name which of the two numbers an entry was sized from.
+    """
+    if spec.tick_size <= 0 or spec.contract_size <= 0 or spec.tick_value <= 0:
+        return spec
+    if not currency or spec.profit_currency.upper() != currency.upper():
+        return spec
+    tick_based = spec.tick_value / spec.tick_size
+    divergence = abs(spec.contract_size - tick_based) / spec.contract_size
+    if divergence <= CASH_DIVERGENCE_TOLERANCE:
+        return spec
+    return dataclasses.replace(spec,
+                               tick_value=round(spec.contract_size * spec.tick_size, 12),
+                               tick_value_source="contract",
+                               cash_divergence=round(divergence, 6))
+
+
 def symbol(base: str) -> BrokerSymbol | None:
     name = resolve(base)
     if name is None or not ensure_selected(name):
@@ -130,14 +177,17 @@ def symbol(base: str) -> BrokerSymbol | None:
     tick = mt5.symbol_info_tick(name)
     if info is None or tick is None:
         return None
-    return BrokerSymbol(
+    spec = BrokerSymbol(
         name=name, digits=info.digits, point=info.point,
         tick_size=info.trade_tick_size or info.point,
         tick_value=info.trade_tick_value or 0.0,
         volume_min=info.volume_min, volume_max=info.volume_max,
         volume_step=info.volume_step or 0.01,
         stops_level=info.trade_stops_level, freeze_level=info.trade_freeze_level,
-        spread=info.spread, filling=info.filling_mode)
+        spread=info.spread, filling=info.filling_mode,
+        contract_size=float(getattr(info, "trade_contract_size", 0.0) or 0.0),
+        profit_currency=str(getattr(info, "currency_profit", "") or ""))
+    return reconcile_tick_value(spec, account_currency())
 
 
 def symbol_exact(name: str) -> BrokerSymbol | None:

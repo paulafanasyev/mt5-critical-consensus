@@ -17,7 +17,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from fleet import risk, strategy  # noqa: E402
+from fleet import broker, risk, strategy  # noqa: E402
 from fleet.broker import BrokerSymbol  # noqa: E402
 from fleet.config import Account, PortfolioLimits  # noqa: E402
 
@@ -199,3 +199,73 @@ def test_time_exit() -> None:
                             when=_time.time() - 3600)
     patch_quotes(atr_value=0.0010, price=1.10010)
     assert "время вышло" in strategy.exit_reason(account, position, make_spec(), 0.0, 0.0010)
+
+
+# --- the broker's two money statements: contract vs tick field -------------------------------
+# Measured 2026-11-05 on MetaQuotes-Demo (login 114929502) with the terminal's own calculator:
+# order_calc_profit(BUY, XAUUSD, 1.0, bid, bid-1.00) = -100 $ and trade_contract_size = 100 oz,
+# while trade_tick_value 0.1 at trade_tick_size 0.01 says 10 $ per price unit per lot. Sizing from
+# the tick field therefore risked ten times the registry's percentage and reported the small number.
+
+def make_gold_spec(**overrides) -> BrokerSymbol:
+    data = dict(name="XAUUSD", digits=2, point=0.01, tick_size=0.01, tick_value=0.1,
+                volume_min=0.01, volume_max=100.0, volume_step=0.01, stops_level=0,
+                freeze_level=0, spread=13, filling=3,
+                contract_size=100.0, profit_currency="USD")
+    data.update(overrides)
+    return BrokerSymbol(**data)
+
+
+def test_a_tick_field_the_brokers_own_contract_denies_is_replaced() -> None:
+    spec = broker.reconcile_tick_value(make_gold_spec(), "USD")
+    assert spec.tick_value_source == "contract"
+    assert spec.tick_value == pytest.approx(1.0)
+    assert spec.cash_divergence == pytest.approx(0.9)
+    # The same lot priced by both statements: the corrected one is the broker's own answer.
+    assert spec.distance_money(1.0, 1.0) == pytest.approx(100.0)
+
+
+def test_a_gold_lot_is_now_sized_to_the_risk_the_registry_promises() -> None:
+    account = make_account(risk_per_trade_pct=0.25, max_lots=0.10, min_lots=0.01)
+    raw = make_gold_spec()
+    corrected = broker.reconcile_tick_value(raw, "USD")
+    stop = 48.16
+    balance = 99212.61
+    # The defect, in one line: the tick field sizes this lot ten times too big and the cap hides it.
+    assert risk.size_for(account, raw, stop, balance) == pytest.approx(0.1)
+    # The contract sizes it where the broker's own money math puts the loss at 0.25 % of the account.
+    volume = risk.size_for(account, corrected, stop, balance)
+    assert volume == pytest.approx(0.05)
+    loss = corrected.distance_money(stop, volume)
+    # Rounding down to the broker's step always gives a little of the budget back; what must never
+    # happen is the lot costing more than the 0.25 % the registry promised, which is the tick field's
+    # 0.1-lot answer: 10 x 48.16 = 481.6 $, or 0.49 % of this account.
+    assert balance * 0.25 / 100 - 48.16 < loss <= balance * 0.25 / 100
+
+
+def test_a_pair_paying_in_another_currency_is_left_alone() -> None:
+    # USDJPY: 100 000 of the contract is yen, 633 of the tick field is dollars. Comparing them as
+    # if they were the same money would call a correct broker broken and cut the lot by 158 times.
+    jpy = make_gold_spec(name="USDJPY", digits=3, point=0.001, tick_size=0.001,
+                         tick_value=0.633, contract_size=100000.0, profit_currency="JPY")
+    spec = broker.reconcile_tick_value(jpy, "USD")
+    assert spec.tick_value_source == "tick"
+    assert spec.tick_value == pytest.approx(0.633)
+    assert spec.cash_divergence == 0.0
+
+
+def test_a_broker_whose_fields_agree_hears_nothing() -> None:
+    agree = make_gold_spec(tick_value=1.0)
+    assert broker.reconcile_tick_value(agree, "USD").tick_value_source == "tick"
+    # Half a percent of rounding is not a broken field, and rewriting it would move real volume.
+    almost = make_gold_spec(tick_value=0.995)
+    assert broker.reconcile_tick_value(almost, "USD").tick_value_source == "tick"
+
+
+def test_an_unpublished_contract_is_not_an_opinion_about_the_tick() -> None:
+    blind = make_gold_spec(contract_size=0.0)
+    assert broker.reconcile_tick_value(blind, "USD").tick_value_source == "tick"
+    empty_currency = make_gold_spec(profit_currency="")
+    assert broker.reconcile_tick_value(empty_currency, "USD").tick_value_source == "tick"
+    # An account that never named its currency cannot be compared with a profit currency either.
+    assert broker.reconcile_tick_value(make_gold_spec(), "").tick_value_source == "tick"

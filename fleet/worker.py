@@ -1199,6 +1199,21 @@ class Worker:
                 continue
             risk_money = spec.distance_money(signal.stop_distance, volume)
             per_lot = spec.distance_money(signal.stop_distance, 1.0)
+            if spec.tick_value_source != "tick":
+                # The broker's own two statements about the same lot disagree: measured on
+                # MetaQuotes-Demo metals, `trade_tick_value` prices a gold lot at a tenth of what
+                # `trade_contract_size` and that same terminal's `order_calc_profit` pay. Sizing went
+                # to the contract, so every dollar number below — this lot's risk, the portfolio cap,
+                # the mirror — comes from the other field, and the operator has to know which.
+                self._announce_once(_host_key(f"cash_basis:{account.name}:{spec.name}:"
+                                              f"{spec.cash_divergence:.4f}"),
+                                    account.name, "sized_by_contract", symbol=spec.name,
+                                    contract_size=spec.contract_size,
+                                    profit_currency=spec.profit_currency,
+                                    divergence=round(spec.cash_divergence, 4),
+                                    detail="tick-оценка стоимости лота в "
+                                           f"{round(1.0 / (1.0 - min(spec.cash_divergence, 0.9999)), 2)}"
+                                           " раз меньше контракта: объём и риск считаны с контракта")
             if per_lot > 0 and volume >= account.risk.max_lots - 1e-9:
                 # The lot sits on the operator's ceiling, so the risk the config promises is not
                 # the risk being taken. Sizing quietly is how a 0.25% account trades 0.03% for
@@ -1308,7 +1323,9 @@ class Worker:
                                  signal.reason, execution.token)
                 self.store.event(account.name, "opened", symbol=spec.name, side=signal.side,
                                  volume=execution.volume, price=execution.price,
-                                 requested=signal.price, reason=signal.reason)
+                                 requested=signal.price, reason=signal.reason,
+                                 risk_usd=round(risk_money * rate, 2),
+                                 risk_basis=spec.tick_value_source)
                 fresh = broker.open_positions(spec.name, account.magic)
                 already = {int(p.ticket) for p in same_symbol}
                 try:
