@@ -243,15 +243,96 @@ def _source(tmp_path: pathlib.Path) -> pathlib.Path:
     return source
 
 
+def _startup_lines(account) -> list[str]:
+    """The start-up file the way MetaTrader 5 reads it: UTF-16 LE with a BOM, one key per line."""
+    raw = (account.data_dir / "config" / "common.ini").read_bytes()
+    assert raw[:2] == b"\xff\xfe", "MT5 writes and reads its ini as UTF-16 LE with a BOM"
+    body = raw[2:].decode("utf-16-le")
+    assert "\r\n" in body, "the lines have to be separated the way MT5 separates them"
+    assert "\n" not in body.replace("\r\n", ""), "a bare LF is a line MT5 does not end"
+    return body.split("\r\n")
+
+
 def test_startup_config_has_single_crlf_and_no_password(tmp_path: pathlib.Path) -> None:
     account = Account(name="a", login=123, server="Demo", mode="demo",
                       terminal_source=_source(tmp_path))
     terminals.provision(account)
     raw = (account.data_dir / "config" / "common.ini").read_bytes()
     assert b"\r\r\n" not in raw
-    assert b"Login=123" in raw
+    assert "Login=123" in _startup_lines(account)
     assert b"Password=" not in raw
-    assert b"AllowLiveTrading=0" in raw  # demo account: live trading is not enabled
+    assert "AllowLiveTrading=0" in _startup_lines(account)  # demo: live trading stays off
+
+
+def test_the_startup_file_puts_the_algo_switch_where_the_reader_can_see_it(
+        tmp_path: pathlib.Path) -> None:
+    """One `Key=Value` per line, because MT5 reads a glued section as a section with no keys.
+
+    Measured 2026-11-05 on the park's demo copy: `Config/common.ini` was UTF-16 in which the first
+    region carried no separators at all (`...[Experts]AllowDllImport=0Enabled=1Account=1...`). The
+    bytes said `Enabled=1`, the terminal came up connected and authorized, and ALGO TRADING was off —
+    every entry died on retcode 10027 until the same keys were written one per line, after which the
+    same window answered `trade_allowed = True` and opened its first lot. A test on the raw bytes
+    would have passed the whole time: the switch was in the file, just not readable.
+    """
+    account = Account(name="a", login=123, server="Demo", mode="demo",
+                      terminal_source=_source(tmp_path))
+    terminals.provision(account)
+    lines = _startup_lines(account)
+    assert "[Experts]" in lines
+    assert "Enabled=1" in lines, "the switch has to be a line of its own, not a substring of a key"
+    # nothing may carry a section header or a second assignment inside one line: that is the glued
+    # shape, in which MT5 reads `AllowDllImport` as the only key of `[Experts]`
+    glued = [line for line in lines
+             if line and not line.startswith("[") and ("[" in line or line.count("=") > 1
+                                                       and not line.endswith("="))]
+    assert glued == [], f"more than one key on a line: {glued}"
+
+
+def test_a_launch_rewrites_the_switch_because_mt5_rewrites_the_file(tmp_path: pathlib.Path,
+                                                                    monkeypatch) -> None:
+    """Closing a window re-serializes its own `common.ini`; the next start must re-assert the switch.
+
+    The demo copy is started and stopped by the census and the cycle, so whatever the terminal wrote
+    on its way out is what the next `initialize(path=...)` starts from. `launch()` is the only moment
+    the file is read, and the window is by definition down there.
+    """
+    account = Account(name="a", login=123, server="Demo", mode="demo",
+                      terminal_source=_source(tmp_path))
+    terminals.provision(account)
+    glued = ("\ufeff[Common]Login=123Server=Demo[Experts]AllowDllImport=0Enabled=1\r\n"
+             .encode("utf-16-le"))
+    (account.data_dir / "config" / "common.ini").write_bytes(glued)
+    monkeypatch.setattr(terminals.subprocess, "Popen",
+                        lambda *args, **kwargs: types.SimpleNamespace(pid=4242))
+
+    terminals.launch(account)
+
+    lines = _startup_lines(account)
+    assert "[Experts]" in lines and "Enabled=1" in lines
+    assert "Login=123Server=Demo[Experts]" not in "\r\n".join(lines)
+
+
+def test_the_machine_values_survive_a_rewrite(tmp_path: pathlib.Path) -> None:
+    """`Environment` and `PushID` belong to this terminal's session, not to the registry.
+
+    Rewriting the start-up file before every launch is only safe if it does not throw away what the
+    terminal derived for itself; the live repair carried both values over and MT5 accepted the file
+    and extended `[Charts]` around it.
+    """
+    account = Account(name="a", login=123, server="Demo", mode="demo",
+                      terminal_source=_source(tmp_path))
+    terminals.provision(account)
+    target = account.data_dir / "config" / "common.ini"
+    target.write_bytes(("\ufeff[Common]Environment=ABCDEF12345Login=1\r\n"
+                        "[Notification]PushID=abc+def=\r\n").encode("utf-16-le"))
+
+    terminals.write_startup_config(account)
+
+    lines = _startup_lines(account)
+    assert "Environment=ABCDEF12345" in lines
+    assert "PushID=abc+def=" in lines
+    assert "Login=123" in lines
 
 
 def test_a_portable_config_on_a_shared_inode_is_detached_before_it_is_written(
@@ -283,7 +364,8 @@ def test_a_portable_config_on_a_shared_inode_is_detached_before_it_is_written(
 
     assert os.stat(ours).st_nlink == 1
     assert install.read_bytes() == operator_bytes  # the install kept its own file
-    assert b"Login=123" in ours.read_bytes() and b"Operator-Own" not in ours.read_bytes()
+    assert "Login=123" in _startup_lines(account)
+    assert "Operator-Own" not in "".join(_startup_lines(account))
 
 
 def test_a_second_provision_without_a_seed_keeps_the_login_that_already_works(
@@ -321,8 +403,7 @@ def test_real_account_enables_live_trading_in_the_startup_file(tmp_path: pathlib
     account = Account(name="r", login=124, server="Live", mode="real",
                       terminal_source=_source(tmp_path))
     terminals.provision(account)
-    raw = (account.data_dir / "config" / "common.ini").read_bytes()
-    assert b"AllowLiveTrading=1" in raw
+    assert "AllowLiveTrading=1" in _startup_lines(account)
 
 
 def test_provision_refreshes_binaries_replaced_at_source(tmp_path: pathlib.Path,
@@ -368,7 +449,7 @@ def test_provision_rebuilds_the_same_account_once_its_window_is_down(
                         lambda: [(888, str(account.data_dir.parent / "999-Demo" /
                                            "terminal64.exe"))])
     terminals.provision(account, force=True)
-    assert b"Login=129" in (account.data_dir / "config" / "common.ini").read_bytes()
+    assert "Login=129" in _startup_lines(account)
 
 
 def test_seed_status_reports_a_missing_session(tmp_path: pathlib.Path) -> None:

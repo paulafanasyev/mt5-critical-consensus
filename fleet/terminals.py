@@ -170,35 +170,79 @@ def _seed_saved_session(account: Account) -> None:
             shutil.copy2(candidate, config_dir / pattern)
 
 
+_KEEP_ON_REWRITE = (("Environment", "Common"), ("PushID", "Notification"))
+# Values the terminal derived for this machine and this session; a rewrite that drops them makes the
+# terminal re-derive them at the next login, and there is nothing the park gains by making it.
+_VALUE_STOPS = ("[", "\r\n", "\n", "\r", "Login=", "Server=", "Enabled=", "ProxyEnable=")
+# Where a carried value ends. The file this reads can be the one that started the repair — keys run
+# together on a single line — so a value is cut at the first key that cannot belong to it.
+
+
+def _kept_ini_values(target: pathlib.Path) -> dict[str, str]:
+    """The values from the file already on disk that the new file has to carry over.
+
+    Read as UTF-16 with the line breaks allowed to be anywhere, because this runs on files MT5 wrote
+    itself and on files a previous writer left with the keys glued into a single line — the shape that
+    started this repair.
+    """
+    try:
+        body = target.read_bytes().decode("utf-16-le", errors="replace").lstrip("﻿")
+    except OSError:
+        return {}
+    kept: dict[str, str] = {}
+    for key, _section in _KEEP_ON_REWRITE:
+        at = body.find(f"{key}=")
+        if at < 0:
+            continue
+        value = body[at + len(key) + 1:]
+        cuts = [value.find(stop) for stop in _VALUE_STOPS if value.find(stop) >= 0]
+        value = value[:min(cuts)] if cuts else value
+        if value.strip():
+            kept[key] = value.rstrip()
+    return kept
+
+
 def write_startup_config(account: Account) -> None:
-    """Start-up file for exactly one account. Secrets never go to disk: the worker logs in."""
+    """Start-up file for exactly one account, in the shape MetaTrader 5 reads it.
+
+    Secrets never go to disk: the worker logs in.
+
+    Measured 2026-11-05 on the park's own demo copy. Its `Config/common.ini` was UTF-16 in which the
+    first region had no line breaks at all — `...PreloadCharts=1[Experts]AllowDllImport=0Enabled=1
+    Account=1...` — while `c:\\mt5-exness`, the operator's window that answers
+    `terminal_info().trade_allowed = True`, is one CRLF-separated region with `[Experts]` and
+    `Enabled=1` each on its own line. MT5's ini reader takes one `Key=Value` per line, so a section
+    whose keys are glued is a section that declares nothing: that window came up connected and
+    authorized, with `Enabled=1` present in the bytes and ALGO TRADING off, and every entry died on
+    `retcode 10027` while the journal read `opened=0` cycle after cycle. Rewriting those same keys as
+    UTF-16 LE with a BOM and CRLF — same directory, same login, nothing else touched — made the window
+    answer `trade_allowed = True`, and its log said `'114929502': trading has been enabled, demo
+    account - hedging mode`; the next cycle opened its first lot. MT5 then kept that file and extended
+    `[Charts]` around it rather than re-gluing it.
+    """
     config_dir = account.data_dir / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
-    lines = [
-        "[Common]",
-        f"Login={account.login}",
-        f"Server={account.server}",
-        "ProxyEnable=0",
-        "NewsEnable=1",
-        "CertInstall=0",
-        "",
-        "[Charts]",
-        "MaxBars=20000",
-        "",
-        "[Experts]",
-        "Enabled=1",
-        f"AllowLiveTrading={1 if account.is_real else 0}",
-        "AllowDllImport=0",
-        "",
-        "[StartUp]",
-        "Symbol=EURUSD",
-        "Period=H1",
-        "",
-    ]
     target = config_dir / "common.ini"
     _detach(target)  # this name may still be the operator's own install file
-    with target.open("w", encoding="utf-8", newline="\r\n") as handle:
-        handle.write("\n".join(lines))
+    kept = _kept_ini_values(target)
+    sections = {
+        "Common": [f"Login={account.login}", f"Server={account.server}", "ProxyEnable=0",
+                   "NewsEnable=1", "CertInstall=0"],
+        "Experts": ["Enabled=1", f"AllowLiveTrading={1 if account.is_real else 0}",
+                    "AllowDllImport=0"],
+        "Charts": ["MaxBars=20000"],
+        "Notification": [],
+        "StartUp": ["Symbol=EURUSD", "Period=H1"],
+    }
+    for key, section in _KEEP_ON_REWRITE:
+        if key in kept:
+            sections.setdefault(section, []).insert(0, f"{key}={kept[key]}")
+    lines: list[str] = []
+    for section, assignments in sections.items():
+        if not assignments:
+            continue
+        lines += [f"[{section}]", *assignments, ""]
+    target.write_bytes(b"\xff\xfe" + "\r\n".join(lines).encode("utf-16-le"))
 
 
 # --- process control ------------------------------------------------------------------------
@@ -206,6 +250,12 @@ def write_startup_config(account: Account) -> None:
 def launch(account: Account, extra_args: tuple[str, ...] = ()) -> subprocess.Popen:
     if not account.terminal_exe.exists():
         raise FileNotFoundError(f"терминал не подготовлен: {account.terminal_exe}")
+    # MT5 re-serializes its own `Config/common.ini` when a window closes — measured 2026-11-05: after
+    # the repair the file it left was 1064 bytes with `[Charts]` extended around the park's keys. What
+    # a shutdown can also leave behind is the glued shape that switched ALGO TRADING off, so the park
+    # re-asserts the switch at every start instead of trusting the last exit. The window is down here
+    # by definition, and this is the only moment its start-up file is read.
+    write_startup_config(account)
     _PID_CACHE.pop(str(account.data_dir).lower(), None)
     creation = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     return subprocess.Popen([str(account.terminal_exe), "/portable", *extra_args],
