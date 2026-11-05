@@ -2307,3 +2307,148 @@ def test_a_settled_token_close_without_a_price_is_counted_and_never_crashes(
     row = book["trades"][0]
     assert row["settled"] and row["attributable"] and row["profit_gross_usd"] is None
     assert row["guessed_profit_usd"] is None  # its dollars are unknown, not merely untrusted
+
+
+# --- the broker's day, and a clock that slips backwards ------------------------------------------
+
+class _Clock:
+    """Four quotes of different ages, plus a count of how often the terminal was asked for bars."""
+
+    TIMEFRAME_D1 = 8
+
+    def __init__(self, ticks: dict, bars: dict):
+        self.ticks = ticks
+        self.bars = bars
+        self.bars_read: list[str] = []
+
+    def symbol_info(self, name):
+        return types.SimpleNamespace(visible=True)
+
+    def symbols_get(self):
+        return []
+
+    def symbol_info_tick(self, name):
+        return self.ticks.get(name)
+
+    def copy_rates_from_pos(self, name, timeframe, start, count):  # noqa: ARG002
+        self.bars_read.append(name)
+        bar = self.bars.get(name)
+        return None if bar is None else [{"time": bar}]  # rates arrive as structured rows
+
+
+def test_the_clock_is_the_newest_quote_not_the_first_that_answers(monkeypatch) -> None:
+    """A freshly raised window answered with a day two days back, and the book believed it.
+
+    Measured on the live park on 2026-11-05: `book.server_day` was 2026-11-05 for the first cycles
+    of a window and 2026-11-03 four minutes later, with nothing about the account having changed.
+    The clock asked four symbols and took the first answer; EURUSD, not yet subscribed in that
+    terminal, had no live tick and answered from the cached daily bar of the last time it was
+    synced — history, two days old, in place of the quote the same terminal was already holding.
+    """
+    clock = _Clock({"EURUSD": types.SimpleNamespace(time=0),  # not subscribed: no quote yet
+                    "XAUUSD": types.SimpleNamespace(time=1793843760)},  # 2026-11-05T01:56Z
+                   {"EURUSD": 1793746800,  # 2026-11-03T23:00Z: the stale bar that used to win
+                    "GBPUSD": 1793826000})  # 2026-11-04T21:00Z
+    monkeypatch.setattr(broker, "mt5", clock)
+    assert broker.server_timestamp() == 1793843760
+    assert clock.bars_read == []  # a live tick answers the clock; history is never consulted
+
+    weekend = _Clock({}, {"EURUSD": 1793746800, "GBPUSD": 1793826000})
+    monkeypatch.setattr(broker, "mt5", weekend)
+    assert broker.server_timestamp() == 1793826000  # no tick anywhere: the newest bar is the day
+
+    mute = _Clock({}, {})
+    monkeypatch.setattr(broker, "mt5", mute)
+    assert broker.server_timestamp() == 0.0
+    # Only a terminal that says nothing at all hands the day over to the host clock.
+    assert worker.risk.server_day_now() == time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _day_clock(tmp_path, monkeypatch):
+    """A worker on a demo account whose day is measured and whose clock can be moved by hand."""
+    from fleet import risk as risk_mod
+    from fleet.config import Account, FleetConfig
+
+    account = Account(name="a", login=1, server="S", mode="demo")
+    store = Store(tmp_path / "book.sqlite")
+    runner = worker.Worker(FleetConfig(accounts=[account]), store, allow_live=True)
+    clock = {"day": "2026-11-05"}
+    monkeypatch.setattr(risk_mod, "server_day_now", lambda: clock["day"])
+    monkeypatch.setattr(risk_mod, "daily_net_flow", lambda _day_start: 0.0)
+    monkeypatch.setattr(risk_mod, "daily_realized", lambda _day_start: 0.0)
+    monkeypatch.setattr(risk_mod, "positions_for", lambda _acc: [])
+
+    snapshot_class = risk_mod.AccountSnapshot
+
+    def read(day: str, money: float):
+        return snapshot_class(login=1, server="S", currency="USD", balance=money,
+                              equity=money, margin_free=money, leverage=100,
+                              positions=0, floating=0.0, server_day=day)
+
+    answering = [read("2026-11-05", 1000.0)]
+    monkeypatch.setattr(risk_mod, "AccountSnapshot",
+                        types.SimpleNamespace(read=lambda *a, **k: answering[0]))
+    monkeypatch.setattr(worker.Worker, "_manage_positions", lambda self, *a, **k: 0)
+    judged: list = []
+    monkeypatch.setattr(worker.Worker, "_try_entries",
+                        lambda self, _a, _s, _p, day, _r: judged.append(day) or 0)
+    assert runner._cycle(account, allow_entries=True).status == "ok"
+    # The day closes fifteen dollars down: the stop is armed and new entries are denied the account.
+    store.save_day("a", "2026-11-05", 1000.0, -15.0, 1)
+    return account, store, runner, clock, answering, read, judged
+
+
+def test_a_stale_quote_does_not_rewind_the_day_a_stop_was_armed_on(tmp_path,
+                                                                   monkeypatch) -> None:
+    """The portfolio day already refuses to go back; the account's day must refuse too.
+
+    `DayState` compares days as strings, so a day that moved backwards is simply `not stored[0]` and
+    reads as a new one: the base moves under equity that has already lost, `realized` is forgotten
+    and `stopped` returns to False. An account denied entries at its daily stop takes them again the
+    same evening, and the book row it writes carries the old day into `live_server_day`, whose MIN
+    would drag the portfolio back with it.
+    """
+    from fleet import risk as risk_mod
+
+    monkeypatch.setattr(worker, "DAY_CLOCK_REANNOUNCE_SECONDS", 0.0)
+    account, store, runner, clock, answering, read, judged = _day_clock(tmp_path, monkeypatch)
+
+    clock["day"] = "2026-11-03"
+    answering[0] = read("2026-11-03", 985.0)
+    assert runner._cycle(account, allow_entries=True).status == "ok"
+    assert store.day("a")[:2] == ("2026-11-05", 1000.0)  # base and day held, not rebased
+    assert store.day("a")[3] is True  # the armed stop survived the clock
+    assert store.live_server_day(["a"]) == "2026-11-05"  # the book row did not regress either
+    assert judged[-1].stopped is True
+    allowed, reason = risk_mod.can_open(account, answering[0], judged[-1], [])
+    assert not allowed and reason == "дневной стоп счёта сработал"
+    assert runner._cycle(account, allow_entries=True).status == "ok"
+    assert len(_of(store, "day_clock_regressed")) == 1  # the same stale answer is not a new fact
+
+    clock["day"] = "2026-11-05"
+    answering[0] = read("2026-11-05", 985.0)
+    assert runner._cycle(account, allow_entries=True).status == "ok"
+    assert len(_of(store, "day_clock_resumed")) == 1
+    assert store.get_meta("dayclock:a").startswith("live|")
+    assert store.day("a")[3] is True  # and the day still ends stopped
+
+
+def test_a_flapping_clock_costs_the_journal_one_line_not_one_per_cycle(tmp_path,
+                                                                      monkeypatch) -> None:
+    """Held every cycle, said once: the same terminal answered live and stale by turns.
+
+    Measured on the live demo account on 2026-11-05, the regression and the recovery arrived on
+    nearly consecutive cycles. The hold is not news every thirty seconds, and a journal the operator
+    has to read cannot be filled with copies of one sentence: `dayclock:<account>` remembers the
+    state last reported, and the next line is written when the state changes and the window is over.
+    """
+    account, store, runner, clock, answering, read, _ = _day_clock(tmp_path, monkeypatch)
+    for day in ("2026-11-03", "2026-11-05", "2026-11-03", "2026-11-03", "2026-11-05"):
+        clock["day"] = day
+        answering[0] = read(day, 985.0)
+        assert runner._cycle(account, allow_entries=True).status == "ok"
+        assert store.day("a")[:2] == ("2026-11-05", 1000.0)  # held through every answer
+    lines = _of(store, "day_clock_regressed") + _of(store, "day_clock_resumed")
+    assert len(lines) == 1
+    assert lines[0]["day"] == "2026-11-05" and lines[0]["clock"] == "2026-11-03"
+    assert store.get_meta("dayclock:a").startswith("held|")

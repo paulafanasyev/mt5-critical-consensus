@@ -459,14 +459,30 @@ def ema(name: str, timeframe: int, period: int = 50, bars: int = 400) -> float:
     return value
 
 
+CLOCK_SYMBOLS = ("EURUSD", "XAUUSD", "GBPUSD", "USDJPY")
+
+
 def server_timestamp() -> float:
-    """The broker's clock from one liquid symbol: scanning every symbol would cost seconds."""
-    for base in ("EURUSD", "XAUUSD", "GBPUSD", "USDJPY"):
+    """The broker's clock: the newest tick among four liquid symbols, not the first one that answers.
+
+    The first answer used to win. A symbol this terminal has not subscribed keeps a cached daily bar
+    of the last time it was synced, so the day could come from history rather than from the quote:
+    measured on the live park, the book said 2026-11-05 for the first cycles of a window and then
+    2026-11-03 — the same terminal, four minutes later, because the symbol that answered first had
+    changed. Four tick reads cost milliseconds; the daily-bar cache is consulted only when no tick
+    answers at all, which is what a weekend looks like.
+    """
+    best = 0.0
+    for base in CLOCK_SYMBOLS:
         name = resolve(base) or base
         tick = mt5.symbol_info_tick(name)
         if tick is not None and getattr(tick, "time", 0):
-            return float(tick.time)
+            best = max(best, float(tick.time))
+    if best:
+        return best
+    for base in CLOCK_SYMBOLS:
+        name = resolve(base) or base
         rates = mt5.copy_rates_from_pos(name, mt5.TIMEFRAME_D1, 0, 1)
         if rates is not None and len(rates):
-            return float(rates[-1]["time"])
-    return 0.0
+            best = max(best, float(rates[-1]["time"]))
+    return best

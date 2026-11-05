@@ -67,7 +67,9 @@ if importlib.util.find_spec("MetaTrader5") is None:
 
 
 _FLEET_SNAPSHOT: dict[str, float] = {}
+_SHARD_SNAPSHOT: dict[str, str] = {}
 _FLEET_OWNED = ("fleet.sqlite", "fleet.jsonl", "conductor.json", "conductor.lock", "PAUSE")
+_BATTLE_STORE = r"C:\mt5-fleet\fleet.sqlite"
 
 
 def _fleet_state(root) -> dict[str, float]:
@@ -91,10 +93,31 @@ def _fleet_state(root) -> dict[str, float]:
     return state
 
 
+def _shards() -> dict[str, str]:
+    """pid -> command line, for every python on this machine that is running a fleet.shard."""
+    import subprocess
+
+    script = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+              "Where-Object { $_.CommandLine -like '*fleet.shard*' } | "
+              "ForEach-Object { \"{0}|{1}\" -f $_.ProcessId, $_.CommandLine }")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                             capture_output=True, text=True, timeout=30).stdout
+    except Exception:  # noqa: BLE001 - the guard must never break collection
+        return {}
+    rows: dict[str, str] = {}
+    for line in out.splitlines():
+        pid, _, command = line.partition("|")
+        if pid.strip():
+            rows[pid.strip()] = command.strip()
+    return rows
+
+
 def pytest_configure(config):
     import pathlib as _pathlib
 
     _FLEET_SNAPSHOT.update(_fleet_state(_pathlib.Path(r"C:\mt5-fleet")))
+    _SHARD_SNAPSHOT.update(_shards())
 
 
 @pytest.fixture(autouse=True)
@@ -126,27 +149,46 @@ def stand_is_a_temp_file(tmp_path, monkeypatch):
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """A green suite must not leave trading processes behind: fail loudly if it did."""
-    import subprocess
+    """A green suite must not leave trading processes behind, nor write into the battle journal.
 
-    try:
-        listing = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-             "Where-Object { $_.CommandLine -like '*fleet.shard*' } | "
-             "Select-Object -ExpandProperty ProcessId"],
-            capture_output=True, text=True, timeout=30).stdout.strip()
-    except Exception:  # noqa: BLE001 - the guard must never break collection
-        return
-    if listing:
-        raise AssertionError(f"живые fleet.shard процессы после suite: {listing}")
+    The park is now a resident of this machine, and that changes what each half of this guard can
+    claim. A shard whose command line names `C:\\mt5-fleet\\fleet.sqlite` is the live park trading —
+    not a leftover of this session — so a process counts against the suite only when it drives some
+    other store and was not already running when the session started. The directory is the same
+    problem one layer down: while the park runs, its journal's mtime moves every thirty seconds, so
+    mtime proves nothing; the reading that stays true is the composition of the directory, and the
+    journal files inside it. Losing `fleet.sqlite` or `fleet.jsonl` is fatal whatever else is running
+    — that is the 2026-11-04 incident, and it happened to a script that thought it was reading.
+    """
+    live = _shards()
+    ours = sorted(pid for pid, command in live.items()
+                  if _BATTLE_STORE not in command and pid not in _SHARD_SNAPSHOT)
+    if ours:
+        raise AssertionError(f"живые fleet.shard процессы после suite: {ours}")
+    park_live = any(_BATTLE_STORE in command for command in live.values())
+
     import pathlib as _pathlib
 
     after = _fleet_state(_pathlib.Path(r"C:\mt5-fleet"))
-    changed = sorted(k for k in set(after) | set(_FLEET_SNAPSHOT)
-                     if after.get(k) != _FLEET_SNAPSHOT.get(k))
-    if changed:
-        message = rf"suite изменил боевой C:\mt5-fleet: {changed}"
-        if os.environ.get("FLEET_STRICT_GUARD") == "1":
-            raise AssertionError(message)
-        print(f"\n[fleet guard] {message} (внешняя активность; strict-режим: FLEET_STRICT_GUARD=1)")
+    missing = sorted(set(_FLEET_SNAPSHOT) - set(after))
+    added = sorted(set(after) - set(_FLEET_SNAPSHOT))
+    gone_journal = [name for name in missing if name in ("fleet.sqlite", "fleet.jsonl")]
+    if gone_journal:
+        raise AssertionError(rf"боевой журнал пропал во время suite: {gone_journal}")
+    if (missing or added) and not park_live:
+        raise AssertionError(rf"suite изменила состав боевого C:\mt5-fleet: "
+                             f"нет {missing}, появилось {added}")
+
+    touched = sorted(key for key in after if after[key] != _FLEET_SNAPSHOT.get(key))
+    if not touched:
+        return
+    if missing or added:
+        print(rf"\n[fleet guard] пока шла suite, состав C:\mt5-fleet изменил парк: "
+              f"нет {missing}, появилось {added}")
+    if park_live:
+        print(rf"\n[fleet guard] живой парк ведёт журнал сам: {touched} — mtime не свидетельство")
+    elif os.environ.get("FLEET_STRICT_GUARD") == "1":
+        raise AssertionError(rf"suite изменила боевой C:\mt5-fleet: {touched}")
+    else:
+        print(rf"\n[fleet guard] suite изменила боевой C:\mt5-fleet: {touched} "
+              r"(внешняя активность; strict-режим: FLEET_STRICT_GUARD=1)")

@@ -27,6 +27,12 @@ from .config import Account, FleetConfig, PAUSE_FILE, local_host, server_key
 from .store import Store
 
 MAX_FAILURES = 5
+# How often one account may put its clock in the journal. The hold is automatic and runs every
+# cycle; the line is only its report. Measured on the live demo account on 2026-11-05, a terminal
+# whose symbol is not subscribed yet flapped between the live tick and its own cached daily bar on
+# nearly every cycle — an untimed report would write about thirty copies of one sentence an hour
+# into the single book the operator reads. The same shape as the conductor's held portfolio day.
+DAY_CLOCK_REANNOUNCE_SECONDS = 6 * 3600
 
 # How often a cycle re-asks the running windows who they are logged into, and how long an answer
 # stays evidence. Sizing is a fraction of the balance this terminal can see; a second window logged
@@ -405,8 +411,61 @@ class Worker:
             if not account.keep_running:
                 terminals.stop(account)
 
+    def _held_day(self, account: Account, server_day: str) -> str:
+        """The day this account is already being measured on, when its clock came back without it.
+
+        `risk.server_day_now()` reads the terminal's own quotes, and a quote can be a cached daily
+        bar from the last sync of a symbol nobody subscribed: measured on the live park, the same
+        window answered 2026-11-05 and, four minutes later, 2026-11-03. The conductor refuses that
+        for the portfolio — `Conductor._remember_baseline` holds the day, because rebasing onto
+        equity that already lost silently re-arms the daily stop. The account has the same hazard one
+        level down and nothing was standing in front of it: `DayState` compares the day as a string,
+        so a day that goes backwards is `not stored[0]`, which reads as a new day — the base moves,
+        `realized` is forgotten and `stopped` goes back to False, and an account that had just been
+        denied entries at minus one percent takes them again on the same losing day.
+
+        So the day a stop was armed on outranks the clock that lost it. The cost is that an account
+        moved to a broker whose clock really is behind resumes entries no earlier than the held day
+        catches up: a late day is a slower day, never a re-armed stop.
+        """
+        stored = self.store.day(account.name)
+        held = bool(stored and stored[0] and server_day and server_day < stored[0])
+        self._note_day_clock(account, "held" if held else "live", stored[0] if held else "",
+                              server_day)
+        return stored[0] if held else server_day
+
+    def _note_day_clock(self, account: Account, state: str, held_day: str, clock_day: str) -> None:
+        """Report a clock that slipped behind its measured day, once per change and per window.
+
+        `dayclock:<account>` holds the last state the journal was told about and when, so a clock
+        flapping between a live tick and its own cached bar costs one line, not one per cycle.
+        """
+        key = f"dayclock:{account.name}"
+        last_state, _, raw_epoch = (self._meta(key) or "").partition("|")
+        if state == last_state:
+            return
+        if state == "live" and last_state != "held":
+            # Nothing was ever held on this account: there is no recovery to announce.
+            return
+        try:
+            last = float(raw_epoch)
+        except ValueError:
+            last = 0.0
+        now = time.time()
+        if now - last < DAY_CLOCK_REANNOUNCE_SECONDS:
+            return
+        if not self._note_meta(key, f"{state}|{now:.0f}"):
+            return
+        if held_day:
+            self._landed(account.name, "day_clock_regressed", key, day=held_day,
+                         clock=clock_day,
+                         detail="часы терминала отстали от замеренного дня: день держится, база и "
+                                "вооружённый дневный стоп не тронуты")
+        else:
+            self._landed(account.name, "day_clock_resumed", key, day=clock_day)
+
     def _cycle(self, account: Account, allow_entries: bool) -> WorkerResult:
-        server_day = risk.server_day_now()
+        server_day = self._held_day(account, risk.server_day_now())
         snapshot = risk.AccountSnapshot.read(server_day)
         if snapshot is None:
             return WorkerResult(account.name, "error", "нет счёта")
