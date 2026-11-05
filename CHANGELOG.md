@@ -560,6 +560,56 @@ seven files, and the whole suite **1482 passed, 10 skipped in 123,90 s**.
   — a hash of the base file alone would not have proven it, since every write would have landed in the
   `-wal`.
 
+### The day a stop was armed on outranks the clock that lost it (2026-11-05, on the live park)
+
+Reproduced on the running account, not in a fixture: the same terminal answered a **day backwards** —
+`2026-11-05`, then `2026-11-03`, then `2026-11-05` again on three consecutive cycles 35-70 s apart,
+seven regressions in twelve minutes (journal lines `02:20:05`-`02:32:11Z`).
+
+- `fleet/broker.py::server_timestamp` (the day came from history, not from the quote): it returned the
+  **first** symbol that answered, and MT5 caches ticks and bars per symbol — a symbol nobody
+  subscribed keeps the daily bar of its last sync, so the answer depended on which of four names the
+  loop reached first. It now takes the **newest tick** among `CLOCK_SYMBOLS` and reads the daily-bar
+  cache only when no tick answers at all, which is what a weekend looks like. Four tick reads cost
+  milliseconds. This is the source improvement; it did **not** stop the flapping on its own — the
+  live park regressed seven more times after it — which is why the account-level hold is the fix.
+- `fleet/worker.py::_held_day` (the same hazard one level below the conductor's clamp): `DayState`
+  compares days as strings, so "not the stored day" means tomorrow and yesterday alike — a backward
+  day rebased the daily-stop baseline onto equity that had already lost and set `stopped` back to
+  `False`, which is an armed stop silently disarmed on the same losing day. An account whose clock
+  answers younger now keeps the day it is already measured on; only a forward step moves it. Proved by
+  three tests in `tests/test_fleet_regressions.py`: on `a8ce7a3` exactly those three are red (`3
+  failed`) and the first prints the defect as a number — the base moves to `('2026-11-03', 985.00)`
+  instead of holding `('2026-11-05', 1000.00)`. On the live park the hold ran through every real
+  regression: `daystate` stayed `('demo-metaquotes', '2026-11-05', 99330.64, 0.0, 0)` and the `book`
+  row kept `2026-11-05`.
+- `fleet/worker.py` journal noise (`DAY_CLOCK_REANNOUNCE_SECONDS = 6 * 3600`, per direction): untimed,
+  the flapping clock wrote twelve lines in nine and a half minutes — one every 48 s, about
+  seventy-five an hour, into the single book the operator reads. Each direction keeps its own clock
+  because a shared one throttled the recovery away: the line "the clock caught up" arrives half a
+  minute after "the day is held" and, on one window, was never written at all. Both markers store the
+  epoch with milliseconds — the first version rounded it to whole seconds (`f"{now:.0f}"`), so a
+  marker written at `t.4` read as `t+1` and the next cycle, 0,3 s later, computed a **negative**
+  elapsed time and answered "not yet". Disclosed plainly: that is how the fix commit shipped —
+  `bfc7e8b` ran green once (1485 passed) and red once (1484 passed, 1 failed on
+  `test_a_stale_quote_does_not_rewind_the_day_a_stop_was_armed_on`), because the assertion depended on
+  which side of a whole second the test happened to land on. A wall-clock-dependent test is a defect
+  twice over, which is why this round re-ran the whole suite instead of the touched files.
+- `tests/conftest.py` (the battle-folder guard assumed the park was a visitor): the suite could not
+  report a result at all, because the guard raised `живые fleet.shard процессы после suite:
+  4916/3088` on the **live park**. A shard now counts against the suite only when it does not drive
+  `C:\mt5-fleet\fleet.sqlite` and was not running when the session started; while the park is live,
+  its own writes make `mtime` worthless as evidence, so a content change is printed instead of
+  failing the run. Losing `fleet.sqlite` or `fleet.jsonl` stays fatal whatever else is running —
+  that is the 2026-11-04 incident, and no live state excuses it.
+- Measured on this machine: whole suite **1485 passed, 10 skipped in 127,19 s** with
+  `FLEET_STRICT_GUARD=1` and the park running (guard line: `живой парк ведёт журнал сам: […] — mtime
+  не свидетельство`); `tests/test_fleet*.py` 236 in 22,69 s, the three gate files 83 in 7,58 s. Money
+  read-only at 02:51Z: `trades 0`, park realized **0,00 USD**, one `book` row `99 212,61`, day base
+  `99 330,64`, the account's own day at `−118,00 USD` and all of it the operator's manual trading
+  (the same reading twenty minutes earlier said `−124,13`, because his closes were still settling);
+  `mode=ro` sees 170 events where `immutable=1` sees 157.
+
 ## Unreleased — the status line that reported a live chain over a dead transport
 
 - `agent_data/live_gold_ema_policy.yaml` (a claim this repo's own evidence refutes): its header said the gold EMA 50/200 variant was "the only family that was positive in the two-year replay over real broker bars". Both study files say the opposite — `docs/evidence/gold_study_development.txt` gives `ema n=618 win 31.9% meanR -0.368 CI [-0.525,-0.205]` on PAXG and `docs/evidence/gold_study_development_xauusd.txt` gives `ema n=124 win 41.9% meanR -0.261 [-0.635,+0.139]` on the broker's own XAUUSD, and **every rule row in both tables is negative at the point estimate**. So the live forward run has been testing a hypothesis the replay already refuted, and its header was the reason. The comment now carries both tables, the −31,13 realized on 2026-11-02, and the fact that all three closes came from outside the chain (magic 0, empty comment) so they measure nothing. No key was changed: the file still runs EMA 50/200 with `max_open_positions: 1`, and a running process would not see a policy edit anyway — `load_policy()` is called once, at `scripts/run_mt5_demo_trading.py:1384`, not per cycle.
