@@ -2246,8 +2246,81 @@ def test_a_geometry_the_broker_bans_is_named_before_anything_is_sent() -> None:
     assert "стоп" in broker.stops_refusal(tight, False, 1.10000, 1.10200, 1.096)
     assert broker.stops_refusal(tight, False, 1.10000, 1.10400, 1.096) == ""
     assert "стоп" in broker.stops_refusal(tight, True, 1.10002, 1.104, 1.106)
-    # A server that names no minimum takes the plan exactly as the model wrote it.
+    # A server that names no minimum still takes a plan whose levels are on their own sides.
     assert broker.stops_refusal(_spec(), True, 1.10002, 1.10001, 1.10003) == ""
+
+
+def test_a_level_that_crossed_the_price_is_refused_at_stops_level_zero() -> None:
+    """The named minimum is a distance, not the side rule — and this broker names no distance.
+
+    Measured 2026-11-05 on MetaQuotes-Demo, where all five park symbols answer
+    `trade_stops_level = 0` and `trade_freeze_level = 0`. Asked non-committing through
+    `order_check`, and once for real through a modify of our own 0.01 USDJPY lot: a long's stop one
+    point above the live bid is `invalid stops (10016)`, the same point below it is `done`, a level
+    sitting exactly at the bid is accepted, and a target under the bid is 10016 even though it is
+    still above the ask. The server measures both levels against the side the position closes at;
+    a zero minimum removes the distance and leaves the side.
+    """
+    free = _stops_spec()
+    bid, ask, point = 1.10000, 1.10002, 0.00001
+    assert "по ту сторону" in broker.stops_refusal(free, True, bid, bid + point, ask + 0.003)
+    assert "по ту сторону" in broker.stops_refusal(free, True, bid, bid - 0.003, bid - point)
+    assert "по ту сторону" in broker.stops_refusal(free, False, ask, ask - point, bid - 0.003)
+    assert "по ту сторону" in broker.stops_refusal(free, False, ask, ask + 0.003, ask + point)
+    # Equality is what the server took, so the guard may not invent a distance it was never given.
+    assert broker.stops_refusal(free, True, bid, bid, ask) == ""
+    assert broker.stops_refusal(free, True, bid, bid - point, ask + point) == ""
+    assert broker.stops_refusal(free, False, ask, ask, bid) == ""
+
+
+def test_a_stop_inside_the_spread_is_refused_before_the_send(monkeypatch) -> None:
+    """The entry fills on the far side of the spread, but the server judges that stop by the bid.
+
+    The guard used to measure the plan against the fill price, which is one spread too generous for
+    a stop and one spread too strict for a target: a level between the bid and the ask of a buy read
+    as clear space and went out to a market that answered 10016 for it.
+    """
+    fake = FakeMT5(results=[_reply()])
+    monkeypatch.setattr(broker, "mt5", fake)
+    with pytest.raises(broker.StopsRefused, match="по ту сторону"):
+        broker.market_order(7000000, _spec(), "buy", 0.02, 1.10001, 1.10400, 0.002, 2.0)
+    assert fake.sent == []
+    # The same level with the same distance on the far side of the bid is the plan the broker takes.
+    assert broker.market_order(7000000, _spec(), "buy", 0.02, 1.09999, 1.10400, 0.002, 2.0)
+    assert fake.sent[-1]["price"] == 1.10002, "order goes out at the ask; the guard measured the bid"
+
+
+def test_the_break_even_guard_sees_the_price_the_ask_will_meet(tmp_path, monkeypatch) -> None:
+    """The park asks with the freshest tick it can read, not with the one the cycle opened on.
+
+    Measured 2026-11-05: two cycles in a row sent a break-even stop into a market that had already
+    fallen through that level, and both answers were `invalid stops (retcode 10016)`. The pre-flight
+    guard stayed silent because it measured the level against a price read before the peak write and
+    before `break_even_level` re-read the book — and with `trade_stops_level = 0` on this broker the
+    side rule was the only one that could have seen it.
+    """
+    account, store, runner = _managed(tmp_path, monkeypatch)
+    monkeypatch.setattr(worker.broker, "symbol_exact", lambda name: _stops_spec())
+    book = {"bid": 1.101}
+    monkeypatch.setattr(worker.mt5, "symbol_info_tick",
+                        lambda name: types.SimpleNamespace(bid=book["bid"], ask=book["bid"]))
+
+    def break_even(*args, **kwargs) -> float:
+        book["bid"] = 1.099  # the market moves between the cycle's read and the ask
+        return 1.1005
+
+    monkeypatch.setattr(worker.strategy, "break_even_level", break_even)
+    sent: list[str] = []
+    monkeypatch.setattr(worker.broker, "modify_position", lambda *a, **k: sent.append("modify"))
+    monkeypatch.setattr(worker.broker, "close_position",
+                        lambda position, *a, **k: sent.append("close") or float(position.volume))
+    monkeypatch.setattr(worker.strategy, "exit_reason", lambda *a, **k: None)
+    day = worker.risk.DayState(day="2026-11-05", start_balance=1000.0)
+    positions = [_position(41, account.magic)]
+    assert runner._manage_positions(account, day, positions, "USD", 1.0) == 0
+    assert sent == [], "уровень уже пересечён ценой — просить нечего"
+    rows = _of(store, "break_even_refused")
+    assert len(rows) == 1 and "по ту сторону" in rows[0]["detail"]
 
 
 def test_a_lot_inside_the_freeze_band_is_locked_and_says_so() -> None:

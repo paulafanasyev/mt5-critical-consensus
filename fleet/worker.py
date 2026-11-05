@@ -984,7 +984,17 @@ class Worker:
                 # Asking with an order buys a rejected modify that reads like a broker outage; the
                 # refusal leaves the protection exactly where the broker has it now.
                 key = f"bestops:{account.name}:{ticket}"
-                refused = broker.stops_refusal(spec, is_buy, price, be_level, float(position.tp),
+                # The freshest look the park can get before it asks: `price` above was read before a
+                # sqlite peak-write and before `break_even_level` re-read the book, and the level it
+                # produced is only legal while the market is on its own side of it. Measured
+                # 2026-11-05 on USDJPY: two cycles sent a break-even stop into a market that had
+                # already fallen through that level, and the answer both times was
+                # `invalid stops (retcode 10016)` while the pre-flight guard stayed silent.
+                fresh = mt5.symbol_info_tick(name)
+                live_price = float(fresh.bid if is_buy else fresh.ask) if fresh is not None \
+                    else price
+                refused = broker.stops_refusal(spec, is_buy, live_price, be_level,
+                                               float(position.tp),
                                                current_sl=float(position.sl),
                                                current_tp=float(position.tp))
                 if refused:
@@ -1003,8 +1013,12 @@ class Worker:
                             # Cleared, not left: a refusal next week on the same level is a new fact.
                             self._note_meta(key, "")
                     except broker.BrokerError as exc:
+                        # The geometry the broker saw, not only the word it answered: without the
+                        # level and the price this event is undiagnosable after the fact, and the
+                        # market it describes is gone.
                         self.store.event(account.name, "break_even_failed", symbol=name,
-                                         error=str(exc))
+                                         ticket=ticket, error=str(exc), sl=be_level,
+                                         tp=float(position.tp), price=live_price)
 
             reason = strategy.exit_reason(account, position, spec, peak, atr_entry)
             if not reason:
@@ -1448,7 +1462,8 @@ class Worker:
             except broker.BrokerError as exc:
                 self.store.release(slot)
                 self.store.event(account.name, "entry_failed", symbol=spec.name,
-                                 error=str(exc))
+                                 error=str(exc), side=signal.side, volume=volume,
+                                 sl=signal.stop, tp=signal.target, requested=signal.price)
                 continue
             except Exception:
                 # Anything else unwinds the whole cycle. A slot left behind is a money reservation

@@ -418,6 +418,11 @@ def stops_refusal(spec: BrokerSymbol, is_buy: bool, market_price: float, sl: flo
                   current_sl: float = 0.0, current_tp: float = 0.0) -> str:
     """Why this broker's server would refuse the geometry we planned, or "" when it would take it.
 
+    `market_price` is the price the position would be closed at — the bid of a long, the ask of a
+    short — not the price the entry is filled at. The two differ by the spread, and the server
+    measures both levels of a long against the bid, so guarding with the ask hides a stop that has
+    already crossed the market and bans a target the market would have taken.
+
     `trade_stops_level` and `trade_freeze_level` are facts about the server, not about the model:
     a stop or target closer to the live price than the first is retcode 10016, and a position whose
     standing stop or target sits inside the second is locked against any change. Learning either by
@@ -439,16 +444,23 @@ def stops_refusal(spec: BrokerSymbol, is_buy: bool, market_price: float, sl: flo
                 return (f"брокер блокирует правку: до существующего {label} "
                         f"{abs(market_price - standing) / spec.point:.1f} п. при freeze_level "
                         f"{int(spec.freeze_level)}")
-    if gap <= 0:
-        return ""
     # A buy's stop hangs below its price and its target above it; for a sell both roles swap. The
     # distance is measured on the side the level belongs to, so a level on the wrong side of the
-    # price comes out negative and is refused by the same rule.
+    # price comes out negative and is refused by the same rule — and that part holds with
+    # `trade_stops_level` at zero, which is exactly what this broker names. Measured 2026-11-05 on
+    # MetaQuotes-Demo (USDJPY, EURUSD, XAUUSD — all three at `trade_stops_level = 0`, asked with the
+    # non-committing `order_check` and once with a real modify on our own 0.01 lot): a long's stop
+    # one point above the live bid answers `invalid stops (10016)`, the same point below it answers
+    # `done`, and a level sitting exactly at the bid is accepted. Equality is not a refusal, so the
+    # test stays `distance < gap`, which at gap 0 refuses only the levels that crossed the price.
     for label, value, above in (("стоп", sl, -1.0), ("тейк", tp, 1.0)):
         if value <= 0:
             continue
         side = above if is_buy else -above
         distance = (value - market_price) if side > 0 else (market_price - value)
+        if distance < 0:
+            return (f"{label} по ту сторону цены на {abs(distance) / spec.point:.1f} п.: план "
+                    f"пересекает рынок, и брокер такой геометрии не принимает")
         if distance < gap:
             return (f"{label} в {distance / spec.point:.1f} п. от цены; брокер требует не ближе "
                     f"{int(spec.stops_level)} п. (trade_stops_level)")
@@ -465,7 +477,11 @@ def market_order(magic: int, spec: BrokerSymbol, side: str, volume: float, sl: f
     token = uuid.uuid4().hex[:6]
     is_buy = side.lower() == "buy"
     price = float(tick.ask if is_buy else tick.bid)
-    refused = stops_refusal(spec, is_buy, price, sl, tp)
+    # The order is filled on the far side of the spread; the server judges its stops by the side the
+    # position closes at. Measured 2026-11-05 at stops_level=0: a long's stop above the bid, however
+    # far below the ask, is retcode 10016.
+    checked_price = float(tick.bid if is_buy else tick.ask)
+    refused = stops_refusal(spec, is_buy, checked_price, sl, tp)
     if refused:
         raise StopsRefused(f"{spec.name}: {refused} — вход не отправлен")
     request = {
