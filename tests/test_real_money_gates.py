@@ -15,9 +15,11 @@ import importlib
 import json
 import os
 import pathlib
+import sqlite3
 import sys
 import time
 import types
+from datetime import datetime, timezone
 
 import pytest
 
@@ -143,6 +145,43 @@ def test_the_ceiling_is_applied_before_the_mirrors_default_can_multiply_it(tmp_p
     assert livegate.capped_lots(None, 0.01) == 0.0
 
 
+# --- the two doors: opening is not closing --------------------------------------------------
+
+def test_the_stand_stops_openings_and_leaves_the_closing_door_alone(tmp_path) -> None:
+    """The hand on the machine stops new risk; it must not freeze the risk already in the market."""
+    registry = _registry(tmp_path)
+    stand = tmp_path / "PAUSE"
+    stand.write_text("", encoding="utf-8")
+    assert "стоянка" in livegate.refusal(276261159, live=True, server="Exness-MT5Real26",
+                                        config_path=registry, pause_file=stand)
+    # the same stand, the same account: taking our own lot out asks only who the lot belongs to
+    assert livegate.exit_refusal(276261159, server="Exness-MT5Real26") == ""
+    assert "не назвал свой сервер" in livegate.exit_refusal(276261159), (
+        "окно, которое не говорит, где оно сидит, не доказало, что этот билет его")
+    assert livegate.identity_refusal(276261159, server="Exness-MT5Real26",
+                                     config_path=registry) == ""
+    for login in (None, "", "не счёт"):
+        assert "не назвал" in livegate.exit_refusal(login, server="Exness-MT5Real26")
+    # a row the operator switched off stops new openings and still does not strand an open lot
+    switched_off = _registry(tmp_path, _REAL_REGISTRY.replace("enabled: true", "enabled: false"))
+    assert livegate.refusal(276261159, live=True, server="Exness-MT5Real26",
+                            config_path=switched_off,
+                            pause_file=_no_stand(tmp_path)) != ""
+    assert livegate.exit_refusal(276261159, server="Exness-MT5Real26") == ""
+
+
+def test_a_refusal_names_the_first_door_that_fired(tmp_path) -> None:
+    """Three words missing and the operator is told the one that decides, not the last to answer."""
+    registry = _registry(tmp_path)
+    stand = tmp_path / "PAUSE"
+    stand.write_text("", encoding="utf-8")
+    assert "стоянка" in livegate.refusal(276261159, live=False, server="Exness-MT5Real27",
+                                        config_path=registry, pause_file=stand)
+    both_wrong = livegate.refusal(276261159, live=False, server="Exness-MT5Real27",
+                                  config_path=registry, pause_file=_no_stand(tmp_path))
+    assert "--live" in both_wrong, "слово оператора называется раньше, чем с ним спорит реестр"
+
+
 # --- scripts/real_mirror.py: one door -------------------------------------------------------
 
 def test_the_mirror_writes_nothing_the_gate_refuses(tmp_path, monkeypatch) -> None:
@@ -186,16 +225,48 @@ def test_a_stand_put_back_mid_cycle_stops_the_next_send_of_the_same_run(tmp_path
 
 # --- scripts/real_bridge.py: one door, and only its own lots --------------------------------
 
-def test_a_bridge_nobody_permitted_does_not_even_open_the_demo_terminal(tmp_path, monkeypatch) -> None:
+def test_a_bridge_nobody_permitted_reads_the_demo_book_and_leaves_no_opening(
+        tmp_path, monkeypatch) -> None:
+    """The cycle that may not open still has to know what the demo let go.
+
+    Reading the demo book touches no order — the door that writes the command file is the one the
+    refusal closes — and this used to be the idle return's job: the book was never read, so a copy
+    already sitting on real money kept riding with nothing under it but the broker's own stop. What
+    the refusal does here is take back an OPEN an earlier, permitted cycle left armed.
+    """
     real_bridge = _script("real_bridge", tmp_path, monkeypatch)
-    monkeypatch.setattr(real_bridge, "demo_book",
-                        lambda: (_ for _ in ()).throw(AssertionError("demo terminal touched")))
+    reads: list[int] = []
+    monkeypatch.setattr(real_bridge, "demo_book", lambda: (reads.append(1), [])[1])
     ea = tmp_path / "dsh_real_state.json"
     ea.write_text(json.dumps({"login": 276261159, "server": "Exness-MT5Real26", "balance": 100.0,
                               "equity": 100.0, "positions": []}), encoding="utf-8")
     cmd = tmp_path / "dsh_real_cmd.json"
+    cmd.write_text(json.dumps({"action": "open", "symbol": "EURUSD"}), encoding="utf-8")
     sentence = real_bridge.run_cycle({}, lambda: "нет слова --live", ea_path=ea, cmd_path=cmd)
-    assert "bridge idle" in sentence and not cmd.exists()
+    assert reads == [1], "демонская книга не прочитана — закрывать нечем"
+    assert "bridge idle" in sentence
+    assert not cmd.exists(), "открытое прежде разрешение осталось в папке"
+
+
+def test_a_parked_bridge_still_closes_the_copy_whose_demo_lot_is_flat(tmp_path,
+                                                                     monkeypatch) -> None:
+    """The exit door answers to the lot, not to the operator's word about new money."""
+    real_bridge = _script("real_bridge", tmp_path, monkeypatch)
+    monkeypatch.setattr(real_bridge, "time", types.SimpleNamespace(sleep=lambda s: None,
+                                                                   time=lambda: 0.0))
+    monkeypatch.setattr(real_bridge, "demo_book", lambda: [])  # the demo has let this symbol go
+    ea = tmp_path / "dsh_real_state.json"
+    ea.write_text(json.dumps({"login": 276261159, "server": "Exness-MT5Real26", "balance": 100.0,
+                              "equity": 100.0,
+                              "positions": [{"ticket": 1, "symbol": "EURUSD",
+                                             "magic": real_bridge.REAL_MAGIC}]}), encoding="utf-8")
+    cmd = tmp_path / "dsh_real_cmd.json"
+    sentence = real_bridge.run_cycle({}, lambda: "нет слова --live", ea_path=ea, cmd_path=cmd)
+    assert "bridge idle" in sentence
+    payload = json.loads(cmd.read_text(encoding="utf-8"))
+    assert payload["action"] == "close" and payload["ticket"] == 1, (
+        "защитное закрытие снято вместе с разрешением на открытия")
+    assert payload["login"] == 276261159
 
 
 def test_the_bridge_closes_only_the_lots_it_can_prove_are_its_own(tmp_path, monkeypatch) -> None:
@@ -211,9 +282,18 @@ def test_the_bridge_closes_only_the_lots_it_can_prove_are_its_own(tmp_path, monk
                       {"ticket": 2, "symbol": "GBPUSD", "magic": 12345}]}), encoding="utf-8")
     cmd = tmp_path / "dsh_real_cmd.json"
     real_bridge.run_cycle({}, lambda: "", ea_path=ea, cmd_path=cmd)
-    assert json.loads(cmd.read_text(encoding="utf-8")) == {"action": "close", "ticket": 1}
+    text = cmd.read_text(encoding="utf-8")
+    payload = json.loads(text)
+    assert payload["action"] == "close" and payload["ticket"] == 1, "закрыт не тот билет"
+    # Два советника читают эту папку: приказ без адреса достанется первому
+    # проснувшемуся окну, то есть счёту, который никто не спрашивал.
+    assert payload["login"] == 276261159
+    assert time.time() < payload["exp"] <= time.time() + real_bridge.CMD_TTL_SEC + 5
+    # `JsonStr` ищет `"key":"`; `json.dumps` по умолчанию пишет `"key": "`,
+    # и тогда каждое поле невидимо исполнителю: ордер потерян,
+    # а журнал продолжает твердить, что он отправлен.
+    assert '": ' not in text, "растянутый json советник не читает"
     assert "не наши" in _lines(real_bridge)
-    assert "2" not in cmd.read_text(encoding="utf-8")
 
 
 def test_a_state_file_older_than_the_magic_field_closes_nothing(tmp_path, monkeypatch) -> None:
@@ -234,20 +314,181 @@ def test_send_command_writes_no_file_on_a_refusal(tmp_path, monkeypatch) -> None
     real_bridge = _script("real_bridge", tmp_path, monkeypatch)
     cmd = tmp_path / "dsh_real_cmd.json"
     assert real_bridge.send_command({"action": "open", "symbol": "EURUSD"}, lambda: "стоянка",
-                                    cmd_path=cmd) is False
+                                    cmd_path=cmd, login=276261159) is False
     assert not cmd.exists()
     assert real_bridge.send_command({"action": "open", "symbol": "EURUSD"}, lambda: "",
-                                    cmd_path=cmd) is True
-    assert json.loads(cmd.read_text(encoding="utf-8"))["symbol"] == "EURUSD"
+                                    cmd_path=cmd, login=276261159) is True
+    text = cmd.read_text(encoding="utf-8")
+    assert json.loads(text)["symbol"] == "EURUSD"
+    assert json.loads(text)["login"] == 276261159
 
 
-def test_a_bridge_started_without_the_word_exits_and_sends_nothing(tmp_path, monkeypatch) -> None:
+def test_a_command_without_an_account_in_it_is_not_written_at_all(tmp_path, monkeypatch) -> None:
+    """Two EAs read this folder; an order addressed to nobody is an order to whichever woke first."""
     real_bridge = _script("real_bridge", tmp_path, monkeypatch)
-    monkeypatch.setattr(real_bridge, "send_command",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("sent")))
+    cmd = tmp_path / "dsh_real_cmd.json"
+    for login in (None, "", "не счёт"):
+        assert real_bridge.send_command({"action": "open", "symbol": "EURUSD"}, lambda: "",
+                                        cmd_path=cmd, login=login) is False
+        assert not cmd.exists()
+    assert "без адреса" in _lines(real_bridge)
+
+
+def test_a_parked_bridge_takes_back_its_open_and_leaves_its_close(tmp_path, monkeypatch) -> None:
+    """The stand is the operator's hand on NEW money; a close is the way out of money already in.
+
+    Taking a `close` out of the folder is the mistake this test exists to keep: the bridge that
+    obeys the stand by disarming its own exits leaves a real lot with no stop and no process left
+    that remembers it. An armed OPEN is a different file — that one is a hand he did not lift.
+    """
+    real_bridge = _script("real_bridge", tmp_path, monkeypatch)
+    cmd = tmp_path / "dsh_real_cmd.json"
+    cmd.parent.mkdir(parents=True, exist_ok=True)
+    reason = {"text": ""}
+    assert real_bridge.send_command({"action": "open", "symbol": "EURUSD",
+                                     "stop_pct": real_bridge.REAL_STOP_PCT},
+                                    lambda: reason["text"], cmd_path=cmd, login=276261159) is True
+    reason["text"] = "стоянка на месте"
+    assert real_bridge.send_command({"action": "open", "symbol": "GBPUSD",
+                                     "stop_pct": real_bridge.REAL_STOP_PCT},
+                                    lambda: reason["text"], cmd_path=cmd, login=276261159) is False
+    assert not cmd.exists(), "отзыв разрешения оставил открытие в силе"
+    assert real_bridge.send_command({"action": "close", "ticket": 1},
+                                    lambda: reason["text"], cmd_path=cmd, login=276261159,
+                                    server="Exness-MT5Real26") is True
+    assert json.loads(cmd.read_text(encoding="utf-8"))["action"] == "close"
+    # And the same refusal asked of a close already sitting in the folder: `withdraw` is what the
+    # cycle calls when the door shuts, and it must not reach for the exit file.
+    assert real_bridge.withdraw(cmd) is True and cmd.exists()
+    assert "не снимает защиту" in _lines(real_bridge)
+    cmd.write_text(json.dumps({"action": "open", "symbol": "EURUSD"}), encoding="utf-8")
+    assert real_bridge.withdraw(cmd) is True and not cmd.exists()
+    # The one question a close still asks is whose account is answering: an unnamed terminal may be
+    # holding somebody else's lot, and this door does not open for a guess.
+    assert real_bridge.send_command({"action": "close", "ticket": 2},
+                                    lambda: reason["text"], cmd_path=cmd, login=None,
+                                    server="Exness-MT5Real26") is False
+    # The same login on a window that stopped saying where it sits is the same guess.
+    assert real_bridge.send_command({"action": "close", "ticket": 3},
+                                    lambda: reason["text"], cmd_path=cmd, login=276261159,
+                                    server="") is False
+
+
+def test_a_parked_bridge_still_closes_the_lot_it_opened(tmp_path, monkeypatch) -> None:
+    """A stand between cycles used to freeze the exit: the whole cycle returned before the closes."""
+    real_bridge = _script("real_bridge", tmp_path, monkeypatch)
+    ea = tmp_path / "dsh_real_state.json"
+    ea.write_text(json.dumps({"login": 276261159, "server": "Exness-MT5Real26", "balance": 100.0,
+                              "equity": 99.0,
+                              "positions": [{"ticket": 1, "symbol": "EURUSD",
+                                             "magic": real_bridge.REAL_MAGIC}]}), encoding="utf-8")
+    cmd = tmp_path / "dsh_real_cmd.json"
+    today = datetime.now(timezone.utc).date().isoformat()
+    state = {"day": today, "day_start_equity": 100.0}
+    sentence = real_bridge.run_cycle(state, lambda: "стоянка на месте", ea_path=ea, cmd_path=cmd)
+    assert "DAILY STOP UNPROVEN" in sentence, sentence
+    payload = json.loads(cmd.read_text(encoding="utf-8"))
+    assert payload["action"] == "close" and payload["ticket"] == 1
+    assert not state.get("halted"), "день объявлен остановленным без доказательства в рынке"
+    # Same cycle, now with the witness agreeing that the lot left: the halt may be written.
+    ea.write_text(json.dumps({"login": 276261159, "server": "Exness-MT5Real26", "balance": 100.0,
+                              "equity": 99.0, "positions": []}), encoding="utf-8")
+    sentence = real_bridge.run_cycle(state, lambda: "стоянка на месте", ea_path=ea, cmd_path=cmd)
+    assert "DAILY STOP" in sentence and "UNPROVEN" not in sentence, sentence
+    assert state["halted"] is True
+
+
+def test_an_open_the_bridge_writes_carries_a_stop(tmp_path, monkeypatch) -> None:
+    """An open whose only exit is this process's next cycle is a lot that survives a crash."""
+    real_bridge = _script("real_bridge", tmp_path, monkeypatch)
+    monkeypatch.setattr(real_bridge, "demo_book", lambda: [
+        {"symbol": "EURUSD", "type": 0, "profit": 5.0, "ticket": 11}])
+    monkeypatch.setattr(real_bridge, "hourly_uptrend", lambda symbol: True)
+    monkeypatch.setattr(real_bridge, "livegate", types.SimpleNamespace(
+        permitted_account=lambda *a, **k: types.SimpleNamespace(name="r", risk=types.SimpleNamespace(
+            max_lots=0.01)),
+        capped_lots=lambda row, asked: asked, exit_refusal=livegate.exit_refusal))
+    ea = tmp_path / "dsh_real_state.json"
+    ea.write_text(json.dumps({"login": 276261159, "server": "Exness-MT5Real26", "balance": 100.0,
+                              "equity": 100.0, "positions": []}), encoding="utf-8")
+    cmd = tmp_path / "dsh_real_cmd.json"
+    real_bridge.run_cycle({"day": "2000-01-01"}, lambda: "", ea_path=ea, cmd_path=cmd)
+    payload = json.loads(cmd.read_text(encoding="utf-8"))
+    assert payload["action"] == "open" and payload["stop_pct"] == real_bridge.REAL_STOP_PCT > 0
+
+
+def test_a_bridge_without_a_stop_level_does_not_open(tmp_path, monkeypatch) -> None:
+    real_bridge = _script("real_bridge", tmp_path, monkeypatch)
+    monkeypatch.setattr(real_bridge, "demo_book", lambda: [
+        {"symbol": "EURUSD", "type": 0, "profit": 5.0, "ticket": 11}])
+    monkeypatch.setattr(real_bridge, "hourly_uptrend", lambda symbol: True)
+    monkeypatch.setattr(real_bridge, "REAL_STOP_PCT", 0.0)
+    ea = tmp_path / "dsh_real_state.json"
+    ea.write_text(json.dumps({"login": 276261159, "server": "Exness-MT5Real26", "balance": 100.0,
+                              "equity": 100.0, "positions": []}), encoding="utf-8")
+    cmd = tmp_path / "dsh_real_cmd.json"
+    sentence = real_bridge.run_cycle({"day": datetime.now(timezone.utc).date().isoformat()},
+                                 lambda: "", ea_path=ea, cmd_path=cmd)
+    assert "NO STOP LEVEL" in sentence and not cmd.exists()
+
+
+def test_a_cycle_nobody_permitted_takes_back_the_command_of_the_cycle_before_it(tmp_path,
+                                                                              monkeypatch) -> None:
+    real_bridge = _script("real_bridge", tmp_path, monkeypatch)
+    monkeypatch.setattr(real_bridge, "demo_book", lambda: (_ for _ in ()).throw(
+        AssertionError("демо-терминал трогать не должен")))
+    cmd = tmp_path / "dsh_real_cmd.json"
+    cmd.write_text('{"action":"open","symbol":"EURUSD"}', encoding="utf-8")
+    sentence = real_bridge.run_cycle({}, lambda: "нет слова --live",
+                                     ea_path=tmp_path / "absent_state.json", cmd_path=cmd)
+    assert "bridge idle" in sentence and not cmd.exists()
+
+
+def test_withdraw_says_out_loud_when_a_command_cannot_be_taken_back(tmp_path,
+                                                                    monkeypatch) -> None:
+    """Windows will not delete a file the terminal still holds open, and that order is still live."""
+    real_bridge = _script("real_bridge", tmp_path, monkeypatch)
+    cmd = tmp_path / "dsh_real_cmd.json"
+    assert real_bridge.withdraw(cmd) is True, "пусто — снимать нечего, это не провал"
+    cmd.mkdir()  # на этом пути папка: unlink её не сотрёт как файл
+    assert real_bridge.withdraw(cmd) is False
+    assert "НЕ СНЯЛ" in _lines(real_bridge)
+
+
+def test_a_bridge_brought_back_without_the_word_starts_and_sends_nothing(
+        tmp_path, monkeypatch) -> None:
+    """A supervisor or a reboot that comes back without `--live` must not lose the closer.
+
+    `return 1` at startup looked safe and was not: the lots a previously permitted run left on the
+    real account are managed only by this process, so refusing to start them meant refusing to close
+    them — the worst moment to lose the protective loop is right after the operator touched the
+    machine. The refusal is a word about openings; it is said here, and every send asks it again.
+    """
+    real_bridge = _script("real_bridge", tmp_path, monkeypatch)
+    # The two EA files are bound to this machine's shared folder at import; a test that let the
+    # defaults through would withdraw a command from the terminal the park is really using.
     monkeypatch.setattr(real_bridge, "EA_STATE", tmp_path / "dsh_real_state.json")
-    assert real_bridge.main(["--config", str(_registry(tmp_path))]) == 1
-    assert "ничего не отправлено" in _lines(real_bridge)
+    monkeypatch.setattr(real_bridge, "EA_CMD", tmp_path / "dsh_real_cmd.json")
+    sent: list[tuple] = []
+    monkeypatch.setattr(real_bridge, "send_command",
+                        lambda *a, **k: sent.append(a) or True)
+    cycles: list[str] = []
+    monkeypatch.setattr(real_bridge, "run_cycle",
+                        lambda state, gate, **kwargs: (cycles.append("cycle"), "ok")[1])
+
+    class _FirstSleepIsTheEndOfTheRun(Exception):
+        pass
+
+    def stop_after_the_first_wait(_seconds):
+        raise _FirstSleepIsTheEndOfTheRun()
+
+    monkeypatch.setattr(real_bridge.time, "sleep", stop_after_the_first_wait)
+    with pytest.raises(_FirstSleepIsTheEndOfTheRun):
+        real_bridge.main(["--config", str(_registry(tmp_path))])
+    assert cycles == ["cycle"], "мост вышел до первого цикла: закрыватель потерялся"
+    assert sent == []
+    text = _lines(real_bridge)
+    assert "нужен явный флаг --live" in text and "закрыватель работает" in text
 
 
 # --- the shard inherits the stand and the registry it actually reads ------------------------
@@ -261,8 +502,10 @@ def test_a_shard_started_by_hand_watches_the_same_stand_as_the_conductor(tmp_pat
 
     monkeypatch.setattr(shard.worker, "run_shard", fake_run_shard)
     monkeypatch.setattr(shard, "CONFIG_PATH", _registry(tmp_path))
+    stand = tmp_path / "PAUSE"
+    monkeypatch.setattr(shard, "PAUSE_FILE", stand)
     assert shard.main(["--shard", "0", "--once", "--store", str(tmp_path / "b.sqlite")]) == 0
-    assert seen["pause_file"] == config.PAUSE_FILE
+    assert seen["pause_file"] == stand
 
 
 def test_a_shard_with_no_config_flag_stops_when_its_registry_breaks(tmp_path, monkeypatch) -> None:
@@ -384,6 +627,57 @@ def test_a_registry_that_typed_the_server_loosely_is_not_blind_to_its_own_accoun
     assert sent == [1] and store.count_events("identity_lost") == 0
 
 
+@pytest.mark.parametrize("answered_login,answered_server,allowed", [
+    (276261159, "Exness-MT5Real26", True),
+    ("276261159", "  exness-mt5real26 ", True),
+    (276261159, "Exness-MT5Real27", False),
+    (276261159, "", False),
+    (276261159, None, False),
+    (114929502, "MetaQuotes-Demo", False),
+    (None, "Exness-MT5Real26", False),
+    ("", "Exness-MT5Real26", False),
+])
+def test_the_two_implementations_of_the_identity_question_answer_it_once(
+        tmp_path, answered_login, answered_server, allowed) -> None:
+    """`worker._identity_matches` and `livegate.identity_refusal` are one question in two files.
+
+    The park asks it between the reservation and the send; the scripts ask it before the door. Drift
+    between the two is a lot that one of them thinks belongs to somebody else, so every answer a
+    terminal can give is put to both and their verdicts are compared here.
+    """
+    registry = _registry(tmp_path)
+    row = livegate.permitted_account(276261159, server="Exness-MT5Real26", config_path=registry)
+    assert row is not None, "реестр не пустил собственный тест: проверка стала пустой"
+    who = types.SimpleNamespace(login=answered_login, server=answered_server)
+    assert worker._identity_matches(who, row) is allowed
+    assert (livegate.identity_refusal(answered_login, server=answered_server,
+                                      config_path=registry) == "") is allowed
+
+
+def test_an_unpermitted_real_account_opens_nothing_in_the_park_either(tmp_path,
+                                                                     monkeypatch) -> None:
+    """The park's `--live` and the scripts' `live=` are the same word in the same consent."""
+    registry = _registry(tmp_path)
+    row = livegate.permitted_account(276261159, server="Exness-MT5Real26", config_path=registry)
+    store = _book(tmp_path, row)
+    runner = worker.Worker(config.FleetConfig(accounts=[row]), store, dry_run=False,
+                           allow_live=False)
+    _arm_entries(monkeypatch, _symbol())
+    monkeypatch.setattr(worker.mt5, "account_info",
+                        lambda: types.SimpleNamespace(login=row.login, server=row.server))
+    sent: list[int] = []
+    monkeypatch.setattr(worker.broker, "market_order", lambda *a, **k: sent.append(1))
+    snapshot, day = _snapshot(row)
+    runner._try_entries(row, snapshot, [], day, 1.0)
+    assert sent == [], "лот куплен на настоящие деньги без слова оператора"
+    assert store.count_events("entry(gated)") == 1
+    assert store.reserved_volume() == 0.0, "закрытая дверью сделка держит слот риска"
+    assert "--live" in livegate.refusal(row.login, live=False, server=row.server,
+                                       config_path=registry, pause_file=_no_stand(tmp_path))
+    assert livegate.refusal(row.login, live=True, server=row.server, config_path=registry,
+                            pause_file=_no_stand(tmp_path)) == ""
+
+
 def test_the_brokers_own_minimum_distance_is_said_once_per_rule(tmp_path, monkeypatch) -> None:
     spec = _symbol(stops_level=20)
     account = _demo_account()
@@ -464,3 +758,306 @@ def test_a_hand_typed_server_spelling_still_reads_the_login_as_authorized(tmp_pa
         "2026.11.03 00:00:01.000\tLogin\tauthorized on Exness-MT5Real26 (build 4620)\n",
         encoding="utf-8")
     assert not terminals.authorized(wrong)
+
+
+# --- the stand lives in the code that sends, not in the caller that remembered -----------------
+
+def test_a_parked_stand_stops_a_worker_nobody_asked(tmp_path, monkeypatch) -> None:
+    """The conductor looks at the stand before it calls here; a hand-built Worker skipped that."""
+    account = _demo_account()
+    store = _book(tmp_path, account)
+    stand = tmp_path / "PAUSE"
+    stand.write_text("", encoding="utf-8")
+    runner = worker.Worker(config.FleetConfig(accounts=[account]), store,
+                           pause_file=stand, dry_run=False)
+    _arm_entries(monkeypatch, _symbol())
+    monkeypatch.setattr(worker.mt5, "account_info",
+                        lambda: types.SimpleNamespace(login=1, server="S"))
+    sent: list[int] = []
+    monkeypatch.setattr(worker.broker, "market_order",
+                        lambda *a, **k: sent.append(1) or types.SimpleNamespace(
+                            volume=0.01, price=1.10, retcode=10009, token="t"))
+    snapshot, day = _snapshot(account)
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert sent == [], "лот куплен на припаркованной площадке"
+    assert store.count_events("entries_paused") == 1, "стоянка объявляла себя каждый такт"
+    stand.unlink()
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 1
+    assert store.count_events("entries_resumed") == 1
+    assert sent == [1]
+
+
+def test_the_stands_own_half_of_the_park_is_entries(tmp_path, monkeypatch) -> None:
+    """The park splits the same way livegate does: the stand stops buying, never selling.
+
+    An exit frozen behind the stand is a lot giving its profit back with nobody protecting it, and the
+    operator who put the stand up expects it to stop the machine from adding risk, not to hold his own
+    open trades hostage.
+    """
+    registry = _registry(tmp_path)
+    row = livegate.permitted_account(276261159, server="Exness-MT5Real26", config_path=registry)
+    store = _book(tmp_path, row)
+    stand = tmp_path / "PAUSE"
+    stand.write_text("", encoding="utf-8")
+    runner = worker.Worker(config.FleetConfig(accounts=[row]), store, pause_file=stand,
+                           dry_run=False, allow_live=True)
+    position = types.SimpleNamespace(ticket=7, symbol="EURUSD", type=0, volume=0.01,
+                                     price_open=1.10, profit=5.0, sl=1.09, tp=0.0,
+                                     magic=row.magic, time=0)
+    spec = _symbol()
+    monkeypatch.setattr(worker.broker, "symbol_exact", lambda name: spec)
+    monkeypatch.setattr(worker.mt5, "symbol_info_tick",
+                        lambda name: types.SimpleNamespace(bid=1.101, ask=1.101))
+    monkeypatch.setattr(worker.strategy, "break_even_level", lambda *a, **k: None)
+    monkeypatch.setattr(worker.strategy, "exit_reason", lambda *a, **k: "тейк")
+    closed: list[int] = []
+    monkeypatch.setattr(worker.broker, "close_position",
+                        lambda *a, **k: (closed.append(1) or 0.01))
+    store.save_positions(row.name, [position])
+    day = worker.risk.DayState(day="2026-11-03", start_balance=1000.0)
+    assert runner._manage_positions(row, day, [position]) == 1
+    assert closed == [1], "стоянка заморозила выход из лота, который парк открыл сам"
+    # and the same stand, the same run: nothing new is bought
+    _arm_entries(monkeypatch, spec)
+    monkeypatch.setattr(worker.mt5, "account_info",
+                        lambda: types.SimpleNamespace(login=row.login, server=row.server))
+    sent: list[int] = []
+    monkeypatch.setattr(worker.broker, "market_order", lambda *a, **k: sent.append(1))
+    snapshot, _ = _snapshot(row)
+    assert runner._try_entries(row, snapshot, [], day, 1.0) == 0
+    assert sent == []
+
+
+def test_a_cooldown_that_cannot_be_written_is_said_out_loud(tmp_path, monkeypatch) -> None:
+    """An entry the journal cannot stamp is a symbol that can be bought twice in a row."""
+    account = _demo_account()
+    store = _book(tmp_path, account)
+    runner = worker.Worker(config.FleetConfig(accounts=[account]), store, dry_run=False)
+    _arm_entries(monkeypatch, _symbol())
+    monkeypatch.setattr(worker.mt5, "account_info",
+                        lambda: types.SimpleNamespace(login=1, server="S"))
+    monkeypatch.setattr(worker.broker, "market_order",
+                        lambda *a, **k: types.SimpleNamespace(volume=0.01, price=1.10,
+                                                              retcode=10009, token="t"))
+    monkeypatch.setattr(store, "set_meta",
+                        lambda *a, **k: (_ for _ in ()).throw(sqlite3.Error("database is locked")))
+    snapshot, day = _snapshot(account)
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 1, "сам лот прошёл"
+    assert store.count_events("entry_mark_failed") == 1
+
+
+def test_an_identity_gate_that_cannot_answer_frees_its_reservation(tmp_path,
+                                                                    monkeypatch) -> None:
+    account = _demo_account()
+    store = _book(tmp_path, account)
+    runner = worker.Worker(config.FleetConfig(accounts=[account]), store, dry_run=False)
+    _arm_entries(monkeypatch, _symbol())
+    monkeypatch.setattr(worker.mt5, "account_info",
+                        lambda: (_ for _ in ()).throw(RuntimeError("окно отвечает мимо")))
+    sent: list[int] = []
+    monkeypatch.setattr(worker.broker, "market_order", lambda *a, **k: sent.append(1))
+    snapshot, day = _snapshot(account)
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert sent == []
+    assert store.reserved_volume() == 0.0, "упавшая проверка держала денежный слот 600 с"
+    assert store.count_events("identity_check_failed") == 1
+
+
+def test_a_filled_lot_forgets_the_refusal_it_just_answered(tmp_path, monkeypatch) -> None:
+    """A note that outlives its proof silences the next time the same broker rule bites."""
+    account = _demo_account()
+    store = _book(tmp_path, account)
+    runner = worker.Worker(config.FleetConfig(accounts=[account]), store, dry_run=False)
+    monkeypatch.setattr(runner, "_in_cooldown", lambda *a, **k: False)
+    monkeypatch.setattr(worker.mt5, "account_info",
+                        lambda: types.SimpleNamespace(login=1, server="S"))
+    spec = _symbol(stops_level=20)
+    _arm_entries(monkeypatch, spec, _signal(stop=1.09985, stop_distance=0.00015))
+    key = f"stopsrefused:{account.name}:{spec.name}"
+    refusal = broker.stops_refusal(spec, True, 1.10, 1.09985, 1.104)
+
+    def refuse(*a, **k):
+        raise broker.StopsRefused(refusal)
+
+    monkeypatch.setattr(worker.broker, "market_order", refuse)
+    snapshot, day = _snapshot(account)
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert store.count_events("entry_stops_refused") == 1
+    assert store.get_meta(key) == worker._refusal_shape(refusal)
+    monkeypatch.setattr(worker.broker, "market_order",
+                        lambda *a, **k: types.SimpleNamespace(volume=0.01, price=1.10,
+                                                              retcode=10009, token="t"))
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 1
+    assert store.get_meta(key) == "", "исполнение доказало, что геометрия больше не отказная"
+    monkeypatch.setattr(worker.broker, "market_order", refuse)
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert store.count_events("entry_stops_refused") == 2, "снятая заметка обязана заговорить"
+
+
+# --- the shard notices a registry it cannot see with a coarse clock -----------------------------
+
+def test_a_registry_rewritten_inside_the_same_second_still_reloads(tmp_path) -> None:
+    registry = _registry(tmp_path)
+    first = shard._digest(registry)
+    stamp = os.stat(registry).st_mtime
+    _registry(tmp_path, _REAL_REGISTRY.replace("max_lots: 0.02", "max_lots: 0.01"))
+    os.utime(registry, (stamp, stamp))
+    assert os.stat(registry).st_mtime == stamp, "перезапись попала в тот же такт часов"
+    assert shard._digest(registry) != first
+    assert shard._digest(tmp_path / "net-takogo-failla.yaml") is None
+
+
+def test_a_shard_that_cannot_read_its_registry_never_trades_and_says_why(tmp_path,
+                                                                         monkeypatch) -> None:
+    monkeypatch.setattr(shard.worker, "run_shard",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("торговал")))
+    registry = _registry(tmp_path, "accounts:\n\t- name: a\n")
+    book = Store(tmp_path / "b.sqlite")
+    code = shard.main(["--shard", "0", "--once", "--config", str(registry),
+                       "--store", str(book.path), "--pause-file", str(_no_stand(tmp_path))])
+    assert code == 2
+    assert book.count_events("config_rejected") == 1
+
+
+def test_an_empty_pause_file_means_the_machines_stand(tmp_path, monkeypatch) -> None:
+    seen: dict = {}
+
+    def fake_run_shard(cfg, store, shard_id, **kwargs):
+        seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr(shard.worker, "run_shard", fake_run_shard)
+    monkeypatch.setattr(shard, "CONFIG_PATH", _registry(tmp_path))
+    stand = tmp_path / "PAUSE_MINE"
+    monkeypatch.setattr(shard, "PAUSE_FILE", stand)
+    assert shard.main(["--shard", "0", "--once", "--pause-file", "",
+                       "--store", str(tmp_path / "b.sqlite")]) == 0
+    assert seen["pause_file"] == stand, "сбрасывать флаг — не значит сбрасывать стоянку"
+
+
+def test_a_registry_caught_half_saved_refuses_instead_of_crashing(tmp_path) -> None:
+    """A traceback out of the gate is not a refusal: the process dies without saying why it is idle."""
+    broken = tmp_path / "accounts.yaml"
+    broken.write_text("accounts:\n\t- name: a\n", encoding="utf-8")
+    with pytest.raises(config.ConfigError, match="не разобран как YAML"):
+        config.load(broken)
+
+
+# --- scripts/real_mirror.py: the loop, at its two doors ----------------------------------------
+
+def _mt5_constants():
+    """The broker's own numbers, taken now — not whatever a test that ran earlier left behind.
+
+    Reading `sys.modules["MetaTrader5"]` at send time looked reasonable while it was the only copy of
+    that dictionary: a test that installs its own terminal and then `del`etes the entry leaves the
+    suite with nothing to borrow `TRADE_ACTION_DEAL` from, and the mirror cycle dies as a `cycle
+    error` inside somebody else's run. Imported here, at collection, it is the installed module.
+    """
+    import MetaTrader5
+    return types.SimpleNamespace(**{name: value for name, value in vars(MetaTrader5).items()
+                                    if name.isupper()})
+
+
+_MT5 = _mt5_constants()
+
+
+def _fake_terminal(monkeypatch, *, answers: bool = True, account=None, positions=(),
+                   demo=None, real_path: str = "r.exe") -> list[dict]:
+    """`main` imports MetaTrader5 inside the function, so sys.modules is the honest seam.
+
+    One object answers for two terminals, so it remembers which executable was last opened: the demo
+    laboratory and the real account are read through the same calls in the same cycle. Names this fake
+    does not implement — `TRADE_ACTION_DEAL` and the rest — come from `_MT5`, so the test cannot
+    invent numbers a broker would not recognise and cannot be poisoned by a neighbour's fake.
+    """
+    sent: list[dict] = []
+    constants = _MT5
+
+    class Fake:
+        def __init__(self) -> None:
+            self.current = ""
+
+        def __getattr__(self, name):
+            return getattr(constants, name)
+
+        def initialize(self, **kwargs):
+            self.current = str(kwargs.get("path") or "")
+            return answers
+
+        def shutdown(self) -> None:
+            return None
+
+        def account_info(self):
+            return account
+
+        def positions_get(self, **kwargs):
+            return list(positions if self.current == real_path
+                        else (positions if demo is None else demo))
+
+        def symbol_info_tick(self, symbol):
+            return types.SimpleNamespace(bid=2000.0, ask=2000.5)
+
+        def order_send(self, request):
+            sent.append(request)
+            return types.SimpleNamespace(retcode=10009)
+
+    monkeypatch.setitem(sys.modules, "MetaTrader5", Fake())
+    return sent
+
+
+def test_the_mirror_retries_a_terminal_that_is_not_there(tmp_path, monkeypatch) -> None:
+    real_mirror = _script("real_mirror", tmp_path, monkeypatch)
+    sent = _fake_terminal(monkeypatch, answers=False)
+    code = real_mirror.main(["--real-path", "r.exe", "--live", "--once",
+                             "--config", str(_registry(tmp_path))])
+    assert code == 1
+    assert sent == []
+    assert "retry" in _lines(real_mirror)
+
+
+def test_the_mirror_stops_when_the_registry_stops_answering(tmp_path, monkeypatch) -> None:
+    """The gate answered a second ago; a registry handing back nothing now is not a licence."""
+    real_mirror = _script("real_mirror", tmp_path, monkeypatch)
+    who = types.SimpleNamespace(login=276261159, server="Exness-MT5Real26", trade_mode=2,
+                                balance=100.0, equity=100.0, currency="USD")
+    sent = _fake_terminal(monkeypatch, account=who)
+    monkeypatch.setattr(real_mirror, "demo_equity_trend", lambda *a, **k: 1.0)
+    monkeypatch.setattr(real_mirror.livegate, "refusal", lambda *a, **k: "")
+    monkeypatch.setattr(real_mirror.livegate, "permitted_account", lambda *a, **k: None)
+    code = real_mirror.main(["--real-path", "r.exe", "--live", "--once",
+                             "--config", str(_registry(tmp_path))])
+    assert code == 1
+    assert sent == []
+    assert "не отдаёт запись" in _lines(real_mirror)
+
+
+def test_a_parked_mirror_still_sells_the_copies_it_already_has(tmp_path, monkeypatch) -> None:
+    """The stand and `--live` are words about money going IN; our own lots still have to get out.
+
+    This cycle used to `return 1` on the first refusal, which made the kill switch hold a real account
+    open — the mirror stopped selling a copy the demo had already let go and a copy that had reached
+    its own target. Both exits now go through `exit_refusal`, and only the opening is refused.
+    """
+    real_mirror = _script("real_mirror", tmp_path, monkeypatch)
+    who = types.SimpleNamespace(login=276261159, server="Exness-MT5Real26", trade_mode=2,
+                                balance=100.0, equity=100.0, currency="USD")
+    ours = types.SimpleNamespace(ticket=41, symbol="XAUUSD", type=0, volume=0.01,
+                                 price_open=2000.0, profit=4.0, sl=0.0, tp=0.0,
+                                 magic=real_mirror.REAL_MAGIC)
+    stand = tmp_path / "PAUSE"
+    stand.write_text("", encoding="utf-8")
+    monkeypatch.setattr(real_mirror.livegate, "PAUSE_FILE", stand)
+    sent = _fake_terminal(monkeypatch, account=who, positions=[ours], demo=[], real_path="r.exe")
+    monkeypatch.setattr(real_mirror, "demo_equity_trend", lambda *a, **k: 1.0)
+    code = real_mirror.main(["--real-path", "r.exe", "--once", "--config", str(_registry(tmp_path))])
+    assert code == 0, "запрет открытия превращал цикл в аварийный выход"
+    comments = [request.get("comment") for request in sent]
+    assert "demo closed" in comments, "демо закрыл, а копия осталась в рынке на припаркованной машине"
+    assert "real early exit" in comments, "своя копия дошла до цели и не продана"
+    assert all(request.get("magic") == real_mirror.REAL_MAGIC for request in sent)
+    assert "mirror demo" not in comments, "стоянка, а открытие записано"
+    text = _lines(real_mirror)
+    assert "открытий нет" in text and "стоянка" in text
+    # the same refusal, and the state remembers nothing it never did
+    assert json.loads(real_mirror.STATE.read_text(encoding="utf-8")).get("halted") is False

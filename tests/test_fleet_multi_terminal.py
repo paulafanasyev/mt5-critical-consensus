@@ -409,6 +409,43 @@ def test_the_order_goes_through_when_no_peer_risk_is_outstanding(tmp_path, monke
     assert opened == 1 and sent == [1]  # 2 USD of new risk against a 2% cap of 1000 USD
 
 
+def test_a_filled_order_writes_how_many_lots_of_its_ticket_are_ours(tmp_path,
+                                                                   monkeypatch) -> None:
+    """The merge guard begins at the fill, not at the next cycle's photograph of the book.
+
+    On a netting account the operator's lot can fold into this ticket before the park looks at it
+    again, and a witness taken from the volume it then finds is his half carried by our trailing
+    stop. The number written here is the one this park ordered.
+    """
+    account, runner, store, sent, snapshot, day, _spec = _entry_harness(tmp_path, monkeypatch,
+                                                                        (1, "S"))
+    monkeypatch.setattr(worker.broker, "open_positions", lambda *a, **k: [
+        types.SimpleNamespace(ticket=77, symbol="EURUSD", type=0, volume=0.01)])
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 1 and sent == [1]
+    assert store.lot_witnesses(account.name) == {77: pytest.approx(0.01)}
+
+
+def test_a_second_lot_ordered_into_the_same_ticket_grows_our_share_of_it(tmp_path,
+                                                                         monkeypatch) -> None:
+    """Our own money entering a witnessed ticket adds to the witness; only watching never does.
+
+    A netting account folds a second entry into the position it already has, so the ticket that used
+    to hold 0.01 of ours holds 0.02 — and a guard that could not tell that from the operator's
+    growth would stand off from our own lot and call it two people's money.
+    """
+    account, runner, store, sent, snapshot, day, _spec = _entry_harness(tmp_path, monkeypatch,
+                                                                        (1, "S"))
+    account.strategy.max_positions_per_symbol = 2
+    store.note_lot_witness(account.name, 77, 0.01)
+    held = types.SimpleNamespace(ticket=77, symbol="EURUSD", type=0, volume=0.01,
+                                 price_open=1.10, profit=0.0, sl=1.098, tp=0.0,
+                                 magic=account.magic)
+    monkeypatch.setattr(worker.broker, "open_positions", lambda *a, **k: [
+        types.SimpleNamespace(ticket=77, symbol="EURUSD", type=0, volume=0.02)])
+    assert runner._try_entries(account, snapshot, [held], day, 1.0) == 1 and sent == [1]
+    assert store.lot_witnesses(account.name) == {77: pytest.approx(0.02)}
+
+
 def test_an_unpriced_peer_stop_refuses_entries_instead_of_counting_zero(tmp_path,
                                                                         monkeypatch) -> None:
     account, runner, store, sent, snapshot, day, spec = _entry_harness(tmp_path, monkeypatch,

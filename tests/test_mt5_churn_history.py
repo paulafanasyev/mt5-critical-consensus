@@ -162,13 +162,36 @@ def deal(*, symbol=SYMBOL, magic=OURS, entry=0, position_id=1, at=START):
                            time_msc=(at + timedelta(seconds=SERVER_OFFSET)).timestamp() * 1000)
 
 
+_ABSENT = object()
+
+
+def _install(terminal):
+    """Stand a terminal in where the broker's module sits, and put back exactly what was there.
+
+    `del sys.modules["MetaTrader5"]` used to be the cleanup. When MetaTrader5 is genuinely installed
+    that deletes the real module for every test that runs after this file, and a later fake that
+    borrows its constants — `TRADE_ACTION_DEAL` and the rest — borrows nothing. The failure then
+    lands in somebody else's suite as an unrelated exception.
+    """
+    previous = sys.modules.get("MetaTrader5", _ABSENT)
+    sys.modules["MetaTrader5"] = terminal
+
+    def restore() -> None:
+        if previous is _ABSENT:
+            del sys.modules["MetaTrader5"]
+        else:
+            sys.modules["MetaTrader5"] = previous
+
+    return restore
+
+
 def backend_for(rows):
     terminal = DealTerminal(rows)
-    sys.modules["MetaTrader5"] = terminal
+    restore = _install(terminal)
     try:
         return LiveMT5Backend(server_utc_offset_seconds=SERVER_OFFSET), terminal
     finally:
-        del sys.modules["MetaTrader5"]
+        restore()
 
 
 def test_the_counter_returns_the_positions_the_broker_saw_us_open():
@@ -228,11 +251,11 @@ def test_the_history_window_is_oversized_on_the_side_the_server_clock_clips():
 def test_a_silent_history_reader_raises_instead_of_reporting_an_empty_book():
     terminal = DealTerminal([])
     terminal.rows = None
-    sys.modules["MetaTrader5"] = terminal
+    restore = _install(terminal)
     try:
         backend = LiveMT5Backend(server_utc_offset_seconds=SERVER_OFFSET)
     finally:
-        del sys.modules["MetaTrader5"]
+        restore()
     with pytest.raises(RuntimeError, match="history"):
         backend.opened_leg_tickets(SYMBOL, OURS, START - timedelta(hours=2))
 

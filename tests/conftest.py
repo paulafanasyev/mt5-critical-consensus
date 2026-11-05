@@ -11,6 +11,8 @@ import os
 import sys
 import types
 
+import pytest
+
 
 def _stub_mt5() -> types.ModuleType:
     module = types.ModuleType("MetaTrader5")
@@ -95,6 +97,34 @@ def pytest_configure(config):
     _FLEET_SNAPSHOT.update(_fleet_state(_pathlib.Path(r"C:\mt5-fleet")))
 
 
+@pytest.fixture(autouse=True)
+def stand_is_a_temp_file(tmp_path, monkeypatch):
+    """No test inherits this machine's kill switch, its registry, or its trading state.
+
+    `Worker` reads the stand itself now, so a suite run on a parked machine would have refused every
+    entry — and a suite that silently stops testing entries is the failure a reviewer cannot see. The
+    same is true one layer down and one layer up: `livegate` answers about the stand and about the
+    registry, and a gate test that inherits `config/accounts.yaml` is reading the operator's live
+    account rows. `conductor.PAUSE_FILE` matters most of all, because `fleet_cli start` and `reset-day`
+    unlink that file — a test that runs them here would take the production stop off the machine.
+
+    Every one of these paths is bound at import, so each module is moved by its own name. The path
+    goes to a file that is not on disk; a test that wants a stand or a registry makes one of its own,
+    and its `monkeypatch` lands after this fixture and wins.
+    """
+    try:
+        from fleet import conductor, livegate, shard, worker as fleet_worker
+    except ImportError:  # a module that never puts the repo root on sys.path has no fleet to patch
+        return
+    stand = tmp_path / "STAND_NOT_ARMED"
+    registry = tmp_path / "REGISTRY_EMPTY.yaml"
+    monkeypatch.setattr(fleet_worker, "PAUSE_FILE", stand, raising=False)
+    monkeypatch.setattr(conductor, "PAUSE_FILE", stand, raising=False)
+    monkeypatch.setattr(shard, "PAUSE_FILE", stand, raising=False)
+    monkeypatch.setattr(livegate, "PAUSE_FILE", stand, raising=False)
+    monkeypatch.setattr(livegate, "CONFIG_PATH", registry, raising=False)
+
+
 def pytest_sessionfinish(session, exitstatus):
     """A green suite must not leave trading processes behind: fail loudly if it did."""
     import subprocess
@@ -116,7 +146,7 @@ def pytest_sessionfinish(session, exitstatus):
     changed = sorted(k for k in set(after) | set(_FLEET_SNAPSHOT)
                      if after.get(k) != _FLEET_SNAPSHOT.get(k))
     if changed:
-        message = f"suite изменил боевой C:\mt5-fleet: {changed}"
+        message = rf"suite изменил боевой C:\mt5-fleet: {changed}"
         if os.environ.get("FLEET_STRICT_GUARD") == "1":
             raise AssertionError(message)
         print(f"\n[fleet guard] {message} (внешняя активность; strict-режим: FLEET_STRICT_GUARD=1)")

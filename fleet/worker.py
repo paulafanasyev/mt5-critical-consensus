@@ -23,7 +23,7 @@ import types
 import MetaTrader5 as mt5
 
 from . import broker, candidates, network, risk, strategy, terminals
-from .config import Account, FleetConfig, local_host, server_key
+from .config import Account, FleetConfig, PAUSE_FILE, local_host, server_key
 from .store import Store
 
 MAX_FAILURES = 5
@@ -186,9 +186,13 @@ def _identity_matches(who, account: Account) -> bool:
         return False
     try:
         login = int(who.login)
-    except (TypeError, ValueError):
+        server = _server_key(who.server)
+    except (TypeError, ValueError, AttributeError):
+        # An object that has no `server` at all is not a terminal that answered with somebody else's
+        # login, and the caller cannot tell the two apart from outside: both mean "nobody here proved
+        # this money", and neither may be a crash that strands the reservation this check protects.
         return False
-    return (login, _server_key(who.server)) == (account.login, _server_key(account.server))
+    return (login, server) == (account.login, _server_key(account.server))
 
 
 def _host_key(name: str) -> str:
@@ -199,6 +203,20 @@ def _host_key(name: str) -> str:
     trade on the windows box B counted — and its own second driver would never appear.
     """
     return f"{name}@{local_host()}"
+
+
+def census() -> list[dict]:
+    """A fresh look at the windows of this machine, written nowhere.
+
+    `refresh_roster` does the same walk and files the answer as the evidence every shard trades on.
+    That is why a diagnostic must not call it: a forced scan taken while one window is mid-restart,
+    with its 4 s probe timeouts, replaces the row that decides who may open — and the park can go
+    from `account_single_window` to `roster_unknown` (or back) for a quarter of an hour because
+    somebody ran a command whose own help says it only looks.
+    """
+    processes = terminals.running_terminals()
+    live = terminals.pids_alive([pid for pid, _path in processes])
+    return scan_roster([path for pid, path in processes if pid in live])
 
 
 def refresh_roster(store: Store, *, force: bool = False, now: float | None = None) -> list[dict]:
@@ -212,9 +230,7 @@ def refresh_roster(store: Store, *, force: bool = False, now: float | None = Non
     if not force and rows is not None and taken is not None \
             and moment - taken < ROSTER_REFRESH_SECONDS:
         return rows
-    processes = terminals.running_terminals()
-    live = terminals.pids_alive([pid for pid, _path in processes])
-    scanned = scan_roster([path for pid, path in processes if pid in live])
+    scanned = census()
     store.set_meta(_host_key(ROSTER_META_KEY), json.dumps({"taken": moment, "rows": scanned}))
     return scanned
 
@@ -264,7 +280,9 @@ class Worker:
                  dry_run: bool = False, allow_live: bool = False) -> None:
         self.config = config
         self.store = store
-        self.pause_file = pause_file
+        # No stand means the machine's stand, not "no stand": a Worker built by hand is still a
+        # Worker on the operator's machine, and the kill switch is a fact about that machine.
+        self.pause_file = PAUSE_FILE if pause_file is None else pathlib.Path(pause_file)
         self.dry_run = dry_run
         self.allow_live = allow_live
 
@@ -392,6 +410,26 @@ class Worker:
         snapshot = risk.AccountSnapshot.read(server_day)
         if snapshot is None:
             return WorkerResult(account.name, "error", "нет счёта")
+        if not _identity_matches(snapshot, account):
+            # The word that used to stand in front of an exit was `--live` — the operator's sentence
+            # about money going IN, not about taking it out. A park restarted without it, which is
+            # the default of every restart path, dropped trailing, giveback and break-even off every
+            # lot it had been permitted to open and left only the broker's own stop. What belongs in
+            # front of a close is the address: the window proved itself at `attach`, and this is the
+            # same proof asked again after the connect, over the money the cycle is about to act on.
+            self._report_change(f"exitidentity:{account.name}",
+                                f"{snapshot.login}/{snapshot.server}",
+                                account.name, "exit_identity_lost",
+                                detail=f"отвечает {snapshot.login}/{snapshot.server}, а не "
+                                       f"{account.login}@{account.server} — свои лоты не тронуты")
+            return WorkerResult(account.name, "error",
+                                f"привязан чужой счёт {snapshot.login}/{snapshot.server}")
+        if self._meta(f"exitidentity:{account.name}"):
+            # Cleared, not left: the next window that answers wrong is a new fact, and a note still
+            # holding the old address would say it once per cycle as if nothing had changed.
+            self._note_meta(f"exitidentity:{account.name}", "")
+            self.store.event(account.name, "exit_identity_restored",
+                             login=snapshot.login, server=snapshot.server)
         if snapshot.equity <= 0:
             return WorkerResult(account.name, "flat", "нулевой баланс")
         if account.is_real and snapshot.balance <= 0:
@@ -463,7 +501,21 @@ class Worker:
             # because the same call site sits between this account and its exits; next cycle tries
             # again and the condition is still true either way.
             return
-        self.store.event(account_name, kind, **detail)
+        # An announcement that never reached the book is not an announcement: the note has to go back
+        # to "not said", or the refusal this account was denied by disappears with the lock that ate
+        # the row, and the next cycle reads the same condition and stays silent forever.
+        self._landed(account_name, kind, key, **detail)
+
+    def _landed(self, account_name: str, kind: str, note_key: str, **detail) -> bool:
+        """Journal one event, and undo a `note_key` marker when the book did not take the row.
+
+        `Store.event` writes the `.jsonl` trail whatever happens, so a rejected row leaves evidence
+        outside the database; the database is what every reader of this park queries.
+        """
+        if self.store.event(account_name, kind, **detail):
+            return True
+        self._note_meta(note_key, "")
+        return False
 
     def _second_window(self, account: Account) -> str:
         """Refuse new entries while this account is open in a window the park does not drive.
@@ -536,12 +588,12 @@ class Worker:
         # every order; anything else on the account is reported and left alone.
         own = risk.own_in(account, positions)
         foreign = [p for p in positions if risk.magic_of(p) != int(account.magic)]
-        # The book's picture of the previous cycle, which is the only witness for two questions the
-        # live list cannot ask: which of our lots the broker has already closed, and which lot grew
-        # volume nobody here ordered.
+        # The book's picture of the previous cycle, which is the only witness for the question the
+        # live list cannot ask: which of our lots the broker has already closed. Whether a lot grew
+        # volume nobody here ordered is asked of `lot_witness`, which is not a photograph.
         mirror = self.store.mirrored_positions(account.name)
         self._journal_broker_closes(account, mirror, positions, currency, rate)
-        merged = self._merged_lots(account, mirror, positions)
+        merged = self._merged_lots(account, self.store.lot_witnesses(account.name), positions)
         specs: dict[str, broker.BrokerSymbol | None] = {}
         for position in own:
             name = position.symbol
@@ -578,8 +630,7 @@ class Worker:
                 self.store.set_peak(account.name, position.ticket, peak)
 
             be_level = strategy.break_even_level(account, position, spec, atr_entry)
-            if (be_level is not None and not self.dry_run
-                    and not (account.is_real and not self.allow_live)):
+            if be_level is not None and not self.dry_run:
                 # The server owns the minimum distance it accepts, and for a standing lot it also
                 # locks the position while the price is inside `freeze_level` of its stop or target.
                 # Asking with an order buys a rejected modify that reads like a broker outage; the
@@ -610,8 +661,11 @@ class Worker:
             reason = strategy.exit_reason(account, position, spec, peak, atr_entry)
             if not reason:
                 continue
-            if self.dry_run or (account.is_real and not self.allow_live):
-                self.store.event(account.name, "exit(gated)", symbol=name, reason=reason,
+            if self.dry_run:
+                # Only the paper mode stands down from a close. A real account without `--live` is
+                # refused at the entry door, which is where that word belongs; here the address was
+                # proved above and the lot is already in the market.
+                self.store.event(account.name, "exit(dry run)", symbol=name, reason=reason,
                                  gain=round(gain, 5))
                 continue
             try:
@@ -673,25 +727,42 @@ class Worker:
                                 profit, currency, rate, by="брокер", priced=result is not None)
             self.store.close_position_row(account.name, ticket)
 
-    def _merged_lots(self, account: Account, mirror: dict, positions: list) -> set[int]:
+    def _merged_lots(self, account: Account, witness: dict[int, float],
+                     positions: list) -> set[int]:
         """Tickets of ours carrying volume we did not add, reported and left alone.
 
         On a netting account the operator's manual trade in the same direction folds into the
         position this park opened: the magic still says ours, but the ticket is now two people's
         money, and a trailing exit here would close his lot along with ours without ever asking.
-        The mirror holds the only record of how much of this ticket we asked for, so growth past it
-        stops modify and close for that ticket — a shrunken lot is not a merge: a partial close by
-        either of us, or the broker trimming it, is reported by the closes above and managed as is.
+        The witness holds how many lots of each ticket this park paid for, so growth past it stops
+        modify and close for that ticket.
+
+        It is a record of its own, not the mirror: the mirror goes stale after its own TTL, and a
+        lot that folded while this shard was dark came back as "new to the book" — no previous
+        volume it could have grown past — and was closed whole, the operator's half with it. And a
+        witness kept in the mirror would have been rewritten with the merged volume at the end of
+        the very cycle that spotted the merge, so the next cycle would have closed it anyway.
+
+        A witness is written where this park's own money enters a ticket, at the fill, and follows a
+        lot down when it shrinks: a shrunken ticket is not a merge — a partial close by either of
+        us, or the broker trimming it — and is reported by the closes and managed as it stands.
         """
         merged: dict[int, tuple[float, float]] = {}
         for position in positions:
+            if risk.magic_of(position) != int(account.magic):
+                continue
             ticket = int(position.ticket)
-            seen = mirror.get(ticket)
-            if seen is None or risk.magic_of(position) != int(account.magic):
-                continue  # a lot new to the book has no previous volume it could have grown past
             volume = float(position.volume)
-            if volume > seen[1] + 1e-9:
-                merged[ticket] = (seen[1], volume)
+            asked = witness.get(ticket)
+            if asked is not None and volume > asked + 1e-9:
+                merged[ticket] = (asked, volume)
+            # Written back whatever the answer is, and `note_lot_witness` keeps the smaller of the
+            # two numbers: a lot that shrank is followed down, a lot that grew is not adopted, and a
+            # ticket the park has been standing off from keeps its witness alive through the prune.
+            # A ticket nobody has recorded yet takes its first number here — it has no previous
+            # volume it could have grown past, so the volume on the book today is all anybody here
+            # owns for it, and from the next cycle the merge question has a witness of its own.
+            self.store.note_lot_witness(account.name, ticket, volume)
         if merged:
             self._report_change(
                 _host_key(f"lotmerged:{account.name}"),
@@ -750,7 +821,7 @@ class Worker:
             return
         if not self._note_meta(key, fingerprint):
             return
-        self.store.event(account_name, kind, **detail)
+        self._landed(account_name, kind, key, **detail)
 
     def _atr_entry(self, account: Account, position,
                    spec: broker.BrokerSymbol) -> float | None:
@@ -787,8 +858,29 @@ class Worker:
         return atr_value
 
     # --- entries ------------------------------------------------------------------------
+    def _stand_holds(self, account: Account) -> bool:
+        """Whether the operator's kill switch stops this process from opening a lot.
+
+        The conductor and `run_shard` both look at the stand before they call here, but they are not
+        the only ways into a Worker: a hand-built one used to buy lots on a parked park. The check
+        belongs to the code that sends, not to the caller that remembered to ask. Exits are
+        deliberately not gated — a kill switch that strands an open position without its stop is
+        worse than the entry it prevented.
+        """
+        key = f"stand:{account.name}"
+        if not self.pause_file.exists():
+            if self._meta(key) == "on":
+                self._report_change(key, "off", account.name, "entries_resumed",
+                                    stand=str(self.pause_file))
+            return False
+        self._report_change(key, "on", account.name, "entries_paused",
+                            stand=str(self.pause_file))
+        return True
+
     def _try_entries(self, account: Account, snapshot: risk.AccountSnapshot, positions: list,
                      day: risk.DayState, rate: float) -> int:
+        if self._stand_holds(account):
+            return 0
         if self._second_window(account):
             # Announced once per set of windows, inside _second_window: the trail does not need the
             # same warning every cycle. Position management already ran, so exits are not blocked.
@@ -920,8 +1012,19 @@ class Worker:
             # The portable directory proved which window answered; only a live login proves whose
             # money this order would move. A manual re-login in that window is otherwise invisible.
             sending = not (self.dry_run or (account.is_real and not self.allow_live))
-            who = mt5.account_info() if sending else None
-            if sending and not _identity_matches(who, account):
+            try:
+                who = mt5.account_info() if sending else None
+                refused = sending and not _identity_matches(who, account)
+            except Exception as exc:  # noqa: BLE001 - a gate that cannot answer is a refusal, not a crash
+                # This sits between the reservation and the order. Anything that raises here — a
+                # terminal object missing a field, a broker call that throws instead of answering —
+                # used to unwind the cycle with the slot still owned, and a slot nobody releases holds
+                # the portfolio's money cap for its whole 600 s.
+                self.store.release(slot)
+                self.store.event(account.name, "identity_check_failed", symbol=spec.name,
+                                 error=f"{type(exc).__name__}: {exc}"[:200])
+                return 0
+            if refused:
                 # Normalised exactly like attach(): a registry that types `Servername ` must not
                 # pass the attach gate and then be refused by this one on every symbol.
                 self.store.release(slot)
@@ -936,7 +1039,20 @@ class Worker:
                     self.store.event(account.name, "entry(gated)", symbol=spec.name,
                                      side=signal.side, volume=volume, reason=signal.reason,
                                      risk_usd=round(risk_money * rate, 2))
-                    return 1
+                    # The two halves of `not sending` are different facts. A paper cycle did see the
+                    # signal it would have traded, so it counts as an open; a real account the
+                    # operator has not spoken for has nothing in the market, and reporting it as one
+                    # lot opened per cycle is the status line lying about the book. `opened` is what
+                    # the conductor, the shard's JSON and the operator's screen read.
+                    return 1 if self.dry_run else 0
+                # The last look at the stand, one statement before the money moves. The check at the
+                # top of this method is behind a symbol probe, a portfolio read, a reservation and an
+                # identity proof; on a slow broker that is tens of seconds in which the operator can
+                # arm the file. A switch that only holds when the cycle happened to start armed is a
+                # switch that races with the person who reached for it.
+                if self._stand_holds(account):
+                    self.store.release(slot)
+                    return 0
                 execution = broker.market_order(
                     account.magic, spec, signal.side, volume, signal.stop, signal.target,
                     signal.stop_distance, risk_money)
@@ -973,9 +1089,25 @@ class Worker:
                                  volume=execution.volume, price=execution.price,
                                  requested=signal.price, reason=signal.reason)
                 fresh = broker.open_positions(spec.name, account.magic)
-                for position in fresh:
-                    self._note_meta(f"atr:{account.name}:{int(position.ticket)}",
-                                    f"{signal.atr:.8f}")
+                already = {int(p.ticket) for p in same_symbol}
+                try:
+                    for position in fresh:
+                        ticket = int(position.ticket)
+                        self._note_meta(f"atr:{account.name}:{ticket}", f"{signal.atr:.8f}")
+                        # The witness is written here, at the fill, not from next cycle's
+                        # photograph: on a netting account the operator can fold into this ticket
+                        # before the park looks at it again, and a witness seeded from the volume it
+                        # then finds is his half carried by our trailing stop.
+                        if ticket in already:
+                            self.store.add_lot_witness(account.name, ticket, execution.volume)
+                        else:
+                            self.store.note_lot_witness(account.name, ticket, execution.volume)
+                except Exception as exc:  # noqa: BLE001 - the lot is already at the broker
+                    # A witness this book cannot write is a lot this book cannot prove: the next
+                    # cycle adopts the volume it finds, and the merge guard for that ticket is only
+                    # as old as the mirror again. Said out loud rather than left silent.
+                    self.store.event(account.name, "lot_witness_failed", symbol=spec.name,
+                                     error=f"{type(exc).__name__}: {exc}"[:160])
                 try:
                     fresh_positions = risk.positions_for(account)
                     self.store.save_positions(account.name, fresh_positions,
@@ -988,6 +1120,11 @@ class Worker:
                                      error=f"{type(exc).__name__}: {exc}"[:160])
             finally:
                 self.store.release(slot)
+            # A lot that went through proves this symbol's geometry is no longer the one the server
+            # refused: the note is a claim about a rule that has stopped firing. Left set, it silences
+            # the next time the same rule bites — possibly weeks later, after the operator widened the
+            # stop distance and the broker started saying no again.
+            self._note_meta(f"stopsrefused:{account.name}:{spec.name}", "")
             self._mark_entry(account, spec.name)
             # Last, after the reservation is freed: bookkeeping must never be the reason a dollar
             # slot stays held. The lot is already at the broker and journalled as `opened`.
@@ -1016,8 +1153,15 @@ class Worker:
         return dt.datetime.now(dt.timezone.utc) - when < dt.timedelta(minutes=minutes)
 
     def _mark_entry(self, account: Account, symbol_name: str) -> None:
-        self.store.set_meta(f"entry:{account.name}:{symbol_name}",
-                            dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"))
+        # This runs after the fill, in the middle of the loop over the account's symbols. Letting a
+        # journal locked by a peer raise here would abort the cycle and take the candidate note with
+        # it, and the lot the broker already owns would be traded again next cycle on the same
+        # signal: an unrecorded cooldown is a symbol that can be bought twice in a row.
+        if self._note_meta(f"entry:{account.name}:{symbol_name}",
+                           dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")):
+            return
+        self.store.event(account.name, "entry_mark_failed", symbol=symbol_name,
+                         detail="кулдаун не записан: этот символ можно купить повторно")
 
     def _mirror_risk_usd(self, account: Account, positions: list, rate: float) -> dict[int, float]:
         """Price this account's stop risk in dollars, by the broker that holds it.
@@ -1141,10 +1285,11 @@ def run_shard(config: FleetConfig, store: Store, shard: int, dry_run: bool = Fal
     """Run one shard. A pause blocks new entries but never blocks exits."""
     worker = Worker(config, store, pause_file=pause_file, dry_run=dry_run,
                     allow_live=allow_live)
+    stand = worker.pause_file  # the path the Worker itself obeys: one answer, not two defaults
     results = []
     for account in config.by_shard(shard):
         # The pause file can appear mid-cycle: check it per account, not once per shard.
-        paused = bool(pause_file is not None and pause_file.exists())
+        paused = stand.exists()
         results.append(worker.run_account(account, allow_entries=not paused))
         time.sleep(0.3)
     return results

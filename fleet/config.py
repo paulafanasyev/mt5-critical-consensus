@@ -250,6 +250,13 @@ def account_from_dict(data: dict[str, Any]) -> Account:
         raise ConfigError(f"{where}: {exc}") from exc
     if account.mode not in ("demo", "real"):
         raise ConfigError(f"{where}: mode={account.mode!r}, допустимо demo|real")
+    if not server_key(account.server):
+        # An identity is a pair. A row that names a login but no server matches the silent window
+        # that answers `server=""` for the same login, and every identity check downstream compares
+        # normalised strings — the row written for `Exness-MT5Real26` would then authorise a terminal
+        # that refuses to say where it is.
+        raise ConfigError(f"{where}: сервер не назван — нужна строка вида Exness-MT5Real26 или "
+                          f"MetaQuotes-Demo; без него запись не отличает это окно от любого другого")
     if account.magic <= 0:
         # Magic is the only thing that separates the park's lots from the operator's on a shared
         # account, and a manual trade is marked with 0. A 0 here would make every manual lot an
@@ -337,7 +344,14 @@ def _parse_yaml(text: str) -> dict[str, Any]:
         import yaml  # type: ignore
     except ImportError as exc:  # pragma: no cover - the dependency is declared
         raise ConfigError("нужен PyYAML: pip install PyYAML") from exc
-    data = yaml.safe_load(text)
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        # A registry caught half-saved is one nobody can vouch for, and every caller already treats
+        # ConfigError as "refuse to trade". The parser's own error is not a ValueError, so left alone
+        # it walks out of `load()` as a traceback: the gate that was supposed to answer is the thing
+        # that crashed, and the process dies mid-message instead of saying why it is idle.
+        raise ConfigError(f"реестр не разобран как YAML: {exc}") from exc
     if not isinstance(data, dict):
         raise ConfigError("реестр должен быть отображением верхнего уровня")
     return data

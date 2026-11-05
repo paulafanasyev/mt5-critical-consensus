@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import pathlib
 import sys
@@ -17,6 +18,20 @@ import time
 from . import worker
 from .config import CONFIG_PATH, DEFAULT_STORE, PAUSE_FILE, load
 from .store import Store
+
+
+def _digest(path: pathlib.Path) -> str | None:
+    """The registry's bytes, hashed: a version stamp that cannot miss a same-second edit.
+
+    An mtime is a coarse clock. Two saves inside one tick leave the second one invisible, and the
+    shard then trades the config it loaded before the operator changed the caps, the modes or the
+    accounts — exactly the stale registry this module promises never to trade. The hash also says
+    what a touch does not: identical bytes are the same registry, so a reload is not an event.
+    """
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
 def _parent_alive(pid: int) -> bool:
@@ -50,18 +65,31 @@ def main(argv: list[str] | None = None) -> int:
     # would leave the halt inert while a live file was edited under the shard.
     config_path = (pathlib.Path(args.config).resolve() if args.config
                    else CONFIG_PATH.resolve())
-    pause = pathlib.Path(args.pause_file) if args.pause_file else None
+    # An empty `--pause-file` is the machine's stand, not the absence of one: a caller that clears the
+    # flag must not get a process that trades while `PAUSE` sits on disk.
+    pause = pathlib.Path(args.pause_file or PAUSE_FILE)
     store = Store(args.store)
-    config = load(config_path)
-    fingerprint = config_path.stat().st_mtime if config_path and config_path.exists() else 0.0
+    try:
+        config = load(config_path)
+    except Exception as exc:  # noqa: BLE001 - a shard that never started must say why out loud
+        # Nothing was trusted and nothing will be traded, so this is not the mid-run case where the
+        # process keeps cycling on a registry it can still prove: here the only honest answer is a
+        # journal row, a sentence on stdout and a non-zero exit the conductor can see. A traceback
+        # that dies in a window nobody watches is how a park goes quiet without saying so.
+        store.event("shard", "config_rejected", shard=args.shard, path=str(config_path),
+                    error=f"{type(exc).__name__}: {exc}"[:400])
+        print(f"shard {args.shard}: реестр {config_path} не читается — {exc}; "
+              "ни один счёт не торгован")
+        return 2
+    fingerprint = _digest(config_path)
     halted = ""  # why this shard will not trade; empty means the registry on disk is trusted
 
     while True:
         if args.parent_pid and not _parent_alive(args.parent_pid):
             store.event("shard", "parent_gone", shard=args.shard, parent=args.parent_pid)
             return 0
-        stamp = config_path.stat().st_mtime if config_path and config_path.exists() else None
-        if config_path and stamp != fingerprint:
+        stamp = _digest(config_path)
+        if stamp != fingerprint:
             # The file changed under this process. Until the new one is readable, the config in
             # memory is a registry we know to be wrong: the accounts, caps or modes on disk are not
             # the ones these numbers describe, and trading them is the stale registry this module

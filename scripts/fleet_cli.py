@@ -113,18 +113,20 @@ def _pinned_elsewhere(account, config: FleetConfig) -> str:
 def cmd_terminals(args: argparse.Namespace) -> int:
     """Census of the windows on this machine: which terminal is up, whose account it holds, how much money.
 
-    Read-only. Nothing here launches or stops a terminal: the census walks the process list, checks
-    each pid is still up, and asks only those windows to name their account — `initialize` starts a
-    terminal that is not running, so a path that is no longer alive is never probed. Cost is one
-    probe per window, and a window that is up but not logged in costs the full 4 s timeout.
+    Read-only, in the sense that nothing is written anywhere: the census walks the process list,
+    checks each pid is still up, and asks only those windows to name their account — `initialize`
+    starts a terminal that is not running, so a path that is no longer alive is never probed. It does
+    not open the journal either, and it deliberately does not file what it saw: the row
+    `terminal_roster@<host>` is the evidence the shards trade on, and a diagnostic that rewrote it
+    could shut or open entries park-wide from a command that only meant to look. Cost is one probe
+    per window, and a window that is up but not logged in costs the full 4 s timeout.
     """
-    store = Store(args.store)
     config = None
     try:
         config = _config(args)
     except Exception as exc:  # noqa: BLE001 - a broken registry must not hide the windows
         print(f"реестр не прочитан ({exc}); показываю только окна")
-    rows = worker.refresh_roster(store, force=True)
+    rows = worker.census()
     if not rows:
         print("ни одного запущенного терминала: парк пока ничего не видит")
         return 0
@@ -324,6 +326,9 @@ def cmd_candidates(args: argparse.Namespace) -> int:
     if book["shared_ticket"]:
         caveats.append(f"{book['shared_ticket']} строк делят один билет с другой сделкой: "
                        "его закрытие не присоединено ни к одной из них")
+    if book["merged_ticket"]:
+        caveats.append(f"билет слился с ручной сделкой оператора: {book['merged_ticket']} — "
+                       "итог брокера оплатил оба лота сразу, в сумму он не входит")
     if book["settled_unpriced"]:
         caveats.append(f"сделка закрыта, валюты записи нет: {book['settled_unpriced']} — "
                        "в прибыль в долларах не вошла")
@@ -345,7 +350,7 @@ def cmd_candidates(args: argparse.Namespace) -> int:
           f"свопа, в долларах только там, где журнал назвал курс): "
           f"{book['profit_gross_usd']:+.2f} USD | {drift_bill}")
     print(f"\n{'тикет':>10} {'счёт':>10} {'символ':>10} {'стор':>5} {'лот':>6} "
-          f"{'дрейф,п':>9} {'дрейф,$':>9} {'итог,$':>9} {'кто':>7} {'выход':>10}")
+          f"{'дрейф,п':>9} {'дрейф,$':>9} {'итог,$':>12} {'кто':>7} {'выход':>10}")
     for row in book["trades"]:
         drift = row["drift_points"]
         cost = row["drift_cost_usd"]
@@ -353,26 +358,28 @@ def cmd_candidates(args: argparse.Namespace) -> int:
         volume = row["volume"]
         lot = f"{volume:.2f}" if isinstance(volume, (int, float)) else "—"
         # A candidate with no ticket can never be joined to its own close, so «открыт» would be a
-        # lie about a trade that may well have finished long ago. A close the journal cannot price
-        # is said as such: it happened, and its money is in a currency nobody wrote down. A settled
-        # row whose ticket only was inferred finished, but its outcome is not this column's number.
+        # lie about a trade that may well have finished long ago. A settled row then says which of
+        # three things it is: a number this book may add up, a number that belongs to another
+        # driver's lot as much as to ours, or a close whose money the journal never priced.
         if row["ticket"] == 0:
             outcome = "нет билета"
         elif row["shared"]:
             outcome = "общий билет"
         elif not row["settled"]:
             outcome = "открыт"
-        elif row["guessed_profit_usd"] is None:
-            outcome = "итог не в $"
-        elif not row["attributable"]:
+        elif row["merged"]:
+            outcome = "с ручной"
+        elif row["attributable"]:
+            outcome = f"{profit:+.2f}" if profit is not None else "итог не в $"
+        elif row["guessed_profit_usd"] is not None:
             outcome = "не в сумме"
         else:
-            outcome = f"{profit:+.2f}"
+            outcome = "итог не в $"
         print(f"{row['ticket']:>10} {row['account'][:10]:>10} {row['symbol'][:10]:>10} "
               f"{row['side']:>5} {lot:>6} "
               f"{f'{drift:.1f}' if drift is not None else '—':>9} "
               f"{f'{cost:+.2f}' if cost is not None else '—':>9} "
-              f"{outcome:>10} "
+              f"{outcome:>12} "
               f"{(row['closed_by'] or '—')[:7]:>7} "
               f"{str(row['exit'])[:10]:>10}")
     print("\nчто это доказывает: сколько пункта и доллара стоит подтверждение сигнала."
@@ -440,9 +447,19 @@ def cmd_reset_day(args: argparse.Namespace) -> int:
     for key in (day_key, base_key, f"portfolio_day_held:{host}",
                 f"portfolio_day_held_since:{host}"):
         store.set_meta(key, "")
-    conductor.PAUSE_FILE.unlink(missing_ok=True)
+    # The stand is not part of the day. `reset-day` is a bookkeeping act — the loss the daily stop
+    # measured is being re-based — and the file on disk is the operator's sentence about this
+    # machine, armed by `start`/`pause` or by the conductor. Deleting it here would have the CLI
+    # take the money trading again under a person who just stopped it, without his word for it.
+    paused = conductor.PAUSE_FILE.exists()
+    if paused:
+        store.event("cli", "reset_day_paused", host=host,
+                    reason=conductor.PAUSE_FILE.read_text(encoding="utf-8")[:200])
     store.event("cli", "reset_day", host=host)
-    print(f"дневная база портфеля сброшена для машины {host}, пауза снята")
+    print(f"дневная база портфеля сброшена для машины {host}")
+    print(f"стоянка на месте ({conductor.PAUSE_FILE}): снимай её сам — `resume`, "
+          f"иначе парк продолжит стоять" if paused else
+          "стоянки нет: следующий тик дирижёра снова посмотрит на дневной стоп")
     return 0
 
 
@@ -510,7 +527,7 @@ def main(argv: list[str] | None = None) -> int:
     cand = sub.add_parser("candidates",
                           help="журнал сделок: что стоило ждать подтверждения входа")
     cand.add_argument("--limit", type=int, default=5000,
-                      help="сколько последних событий журнала разобрать")
+                      help="сколько последних событий журнала разобрать (0 или меньше — весь журнал)")
     cand.set_defaults(func=cmd_candidates)
     health = sub.add_parser("reset-health", help="разблокировать счёт после circuit breaker")
     health.add_argument("--account", default="")

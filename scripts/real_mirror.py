@@ -10,12 +10,24 @@ bridge. It runs two terminal sessions in one process, sequentially:
   4. close the real trade as soon as the demo counterpart is gone;
   5. stop everything for the day if the real account loses its daily allowance.
 
-Nothing is sent by default. Every order in this file leaves through `send_order`, and `send_order`
-asks `fleet.livegate` at the moment of sending: the stand (`C:\\mt5-fleet\\PAUSE`) must be gone, this
-invocation must carry `--live`, and the registry must hold this login as `mode: real` with
-`enabled: true`. The registry's own `max_lots` for that row is a hard ceiling on what gets mirrored:
-a script that mirrors at its default 0.05 onto an account the operator capped at 0.01 is not
-copying the demo, it is multiplying the risk.
+Nothing is opened by default. Every order in this file leaves through `send_order`, and `send_order`
+asks `fleet.livegate` at the moment of sending — of the account the terminal names at that moment,
+not of the one this cycle happened to read first, because a hand re-login in the middle of a run is
+otherwise answered with somebody else's permission. An opening needs the stand
+(`C:\\mt5-fleet\\PAUSE`) gone, `--live` on this invocation, and a registry row holding this login as
+`mode: real` with `enabled: true`. The registry's own `max_lots` for that row is a hard ceiling on
+what gets mirrored: a script that mirrors at its default 0.05 onto an account the operator capped at
+0.01 is not copying the demo, it is multiplying the risk.
+
+Those four words are the door to *opening*. Closing our own lot asks less (`livegate.exit_refusal`:
+only that the terminal names the account), because a mirror that stops selling when the operator
+parks the machine leaves real money whose only remaining exit is a process that is not running. A
+refused entry is said in the log and the cycle continues with its exits.
+
+And a copy is bought only with a level that survives this process. A demo ticket that carries neither
+stop nor target is not mirrored — the same rule the file bridge states as `NO STOP LEVEL` — because
+the mirror's own exits (`real_tp_usd`, `max_hold_min`) live in this loop, and a loop stops existing
+when the laptop closes or the machine is parked.
 
 It still refuses a terminal that is not logged into a real account — that check guards the money from
 a mis-wired path; the checks above guard the money from this script being run at all.
@@ -160,6 +172,8 @@ def main(argv: list[str] | None = None) -> int:
             # --- 1. the demo laboratory ---
             if not mt5.initialize(path=DEMO_TERMINAL):
                 log({"event": "demo terminal unavailable, retry"})
+                if args.once:
+                    return 1
                 time.sleep(args.interval_sec)
                 continue
             demo_positions = [p for p in (mt5.positions_get() or [])
@@ -175,6 +189,8 @@ def main(argv: list[str] | None = None) -> int:
             # --- 2. the real terminal ---
             if not mt5.initialize(path=args.real_path):
                 log({"event": "real terminal unavailable, retry"})
+                if args.once:
+                    return 1
                 time.sleep(args.interval_sec)
                 continue
             real_account = mt5.account_info()
@@ -193,22 +209,47 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(args.interval_sec)
                 continue
 
-            # --- 2b. the operator's permission, asked for this account and read again per send ---
+            # --- 2b. the operator's permission, asked of the account the terminal names right now ---
             def gate() -> str:
-                return livegate.refusal(real_account.login, live=args.live,
-                                        server=str(real_account.server or ""),
+                # Not `real_account`: that object was read once, at the top of this cycle. A manual
+                # re-login in the middle of a run used to be answered with the consent belonging to
+                # the account that is no longer there, and the order went to the money that is.
+                who = mt5.account_info()
+                return livegate.refusal(getattr(who, "login", None), live=args.live,
+                                        server=str(getattr(who, "server", "") or ""),
                                         config_path=registry)
+
+            def exit_gate() -> str:
+                # Closing is not the act the stand speaks about. The stand and `--live` are the
+                # operator's word about putting new money in; a mirror that stops closing when he
+                # parks the machine leaves real lots whose only exit is a process that is not running.
+                who = mt5.account_info()
+                return livegate.exit_refusal(getattr(who, "login", None),
+                                             server=str(getattr(who, "server", "") or ""))
 
             reason = gate()
             if reason:
-                log({"event": f"стоп, ничего не отправлено: {reason}"})
-                mt5.shutdown()
-                return 1
+                # Said, and then the cycle goes on to do the half of its job the refusal says nothing
+                # about: this used to be `return 1`, which turned the kill switch into a frozen book.
+                log({"event": f"открытий нет: {reason}; свои лоты продолжаю закрывать"})
             row = livegate.permitted_account(real_account.login,
                                              server=str(real_account.server or ""),
                                              config_path=registry)
-            lots = livegate.capped_lots(row, args.real_lots)
-            if lots < args.real_lots:
+            if row is None:
+                if not reason:
+                    # The gate answered a moment ago and this read answers nothing. A registry that
+                    # moved between the two is a registry nobody can trade on, and the `None` below
+                    # would reach for a name, raise, and be swallowed as "cycle error" — the loop
+                    # would do it again every interval with nothing in the log but a shrug.
+                    log({"event": "стоп: реестр не отдаёт запись этого счёта, ни один ордер не шлёт"})
+                    mt5.shutdown()
+                    return 1
+                # Already refused by the stand or by `--live`: there is nothing to open, so a missing
+                # row cannot cost anything here except the lot number this cycle will not use.
+                lots = 0.0
+            else:
+                lots = livegate.capped_lots(row, args.real_lots)
+            if row is not None and lots < args.real_lots:
                 log({"event": f"лот срезан по реестру: {args.real_lots} → {lots} "
                               f"(max_lots записи {row.name})"})
             if state.get("day_start_equity") is None:
@@ -227,11 +268,19 @@ def main(argv: list[str] | None = None) -> int:
                                      "price": tick.bid if position.type == 0 else tick.ask,
                                      "deviation": 30, "magic": REAL_MAGIC,
                                      "type_filling": mt5.ORDER_FILLING_FOK,
-                                     "comment": "daily stop"}, gate)
-                state["halted"] = True
-                save_state(state)
-                log({"event": f"DAILY STOP: real equity {real_account.equity:.2f} below "
-                              f"{limit:.2f}, всё своё закрыто"})
+                                     "comment": "daily stop"}, exit_gate)
+                # "Everything of ours is closed" is a claim about the broker, not about this loop:
+                # the send above only proves an order_send call, and a rejected one used to be enough
+                # to set the halt — after which every later cycle refused to try the exit again.
+                remaining = [p for p in (mt5.positions_get() or []) if p.magic == REAL_MAGIC]
+                if remaining:
+                    log({"event": f"дневный стоп не подтверждён: {len(remaining)} своего лота ещё "
+                                  "в рынке, повторю в следующем цикле"})
+                else:
+                    state["halted"] = True
+                    save_state(state)
+                    log({"event": f"DAILY STOP: real equity {real_account.equity:.2f} below "
+                                  f"{limit:.2f}, всё своё закрыто"})
 
             real_positions = [p for p in (mt5.positions_get() or []) if p.magic == REAL_MAGIC]
             other = len(mt5.positions_get() or []) - len(real_positions)
@@ -240,31 +289,64 @@ def main(argv: list[str] | None = None) -> int:
                               f"не тронуты"})
             mirrored = {position.symbol: position for position in real_positions}
 
-            if not state.get("halted"):
-                # --- 3. close what the demo has already closed ---
-                open_demo_symbols = {item["symbol"] for item in demo_positions}
-                for symbol, position in list(mirrored.items()):
-                    if symbol in open_demo_symbols:
-                        continue
-                    tick = mt5.symbol_info_tick(symbol)
-                    result = send_order(mt5, {
-                        "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol,
-                        "volume": position.volume,
-                        "type": mt5.ORDER_TYPE_SELL if position.type == 0
-                                else mt5.ORDER_TYPE_BUY,
-                        "position": position.ticket,
-                        "price": tick.bid if position.type == 0 else tick.ask,
-                        "deviation": 30, "magic": REAL_MAGIC,
-                        "type_filling": mt5.ORDER_FILLING_FOK,
-                        "comment": "demo closed"}, gate)
-                    log({"event": f"{symbol}: демо закрыл, реальная копия "
-                                  f"{'закрыта' if result else 'НЕ закрыта'} rtc "
-                                  f"{None if result is None else result.retcode}"})
+            # The two halves of a mirror cycle answer different questions. Getting out is asked
+            # of every cycle, whatever the entry door says: `halted`, the stand and a missing
+            # `--live` are all words about money going IN, and a lot the demo already let go is
+            # still ours to let go. `row.name` is only reachable when a row answered, so the
+            # ceiling message names the account instead of crashing on None.
+            entry_open = not state.get("halted") and not reason and row is not None
+            if not entry_open:
+                log({"event": "копий не добавляю: " + (
+                    "день остановлен" if state.get("halted") else
+                    reason or "реестр не отдаёт запись этого счёта")})
+            # --- 3. close what the demo has already closed ---
+            open_demo_symbols = {item["symbol"] for item in demo_positions}
+            for symbol, position in list(mirrored.items()):
+                if symbol in open_demo_symbols:
+                    continue
+                tick = mt5.symbol_info_tick(symbol)
+                result = send_order(mt5, {
+                    "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol,
+                    "volume": position.volume,
+                    "type": mt5.ORDER_TYPE_SELL if position.type == 0
+                            else mt5.ORDER_TYPE_BUY,
+                    "position": position.ticket,
+                    "price": tick.bid if position.type == 0 else tick.ask,
+                    "deviation": 30, "magic": REAL_MAGIC,
+                    "type_filling": mt5.ORDER_FILLING_FOK,
+                    "comment": "demo closed"}, exit_gate)
+                log({"event": f"{symbol}: демо закрыл, реальная копия "
+                              f"{'закрыта' if result else 'НЕ закрыта'} rtc "
+                              f"{None if result is None else result.retcode}"})
 
-                # --- 4. mirror what is growing ---
-                if growth:
-                    for item in demo_positions:
-                        if item["symbol"] in mirrored or item["profit"] < args.min_position_profit:
+            # --- 4. mirror what is growing ---
+            # This step used to sit inside the loop above, at its deepest indent, which broke the
+            # mirror in both directions at once. One demo close re-ran the whole mirroring pass, so
+            # the same growing demo ticket could be bought on real money once per closed symbol in one
+            # cycle — the dedup below compares against the book as it was at the start of the cycle,
+            # and a fill does not appear there until the next one. And a real account holding nothing
+            # never mirrored anything, because the loop it lived in had nothing to iterate over: every
+            # fresh day, before the first copy existed, was silently a day without mirroring.
+            candidates = [item for item in demo_positions
+                          if item["symbol"] not in mirrored
+                          and item["profit"] >= args.min_position_profit]
+            if entry_open and growth and candidates:
+                # The volume belongs to the account the terminal names at this moment, exactly like
+                # the consent does: a ceiling read from the account this cycle happened to ask first
+                # is a lot sized for money that may no longer be in this window.
+                who = mt5.account_info()
+                permitted = livegate.permitted_account(getattr(who, "login", None),
+                                                       server=str(getattr(who, "server", "") or ""),
+                                                       config_path=registry)
+                lots = livegate.capped_lots(permitted, args.real_lots)
+                if lots <= 0:
+                    log({"event": f"не зеркалит: потолок реестра для "
+                                  f"{getattr(permitted, 'name', row.name)} — {lots} лота, "
+                                  f"открытий не будет; свои лоты при этом продолжает закрывать"})
+                else:
+                    bought: set[str] = set()
+                    for item in candidates:
+                        if item["symbol"] in bought:
                             continue
                         if item["type"] == 1 or not hourly_uptrend(mt5, item["symbol"]):
                             log({"event": f"{item['symbol']}: не зеркалировано — реальный счёт "
@@ -272,6 +354,15 @@ def main(argv: list[str] | None = None) -> int:
                             continue
                         tick = mt5.symbol_info_tick(item["symbol"])
                         if not tick:
+                            continue
+                        if not item["sl"] and not item["tp"]:
+                            # The rule the file bridge already refuses an open with, in the other
+                            # script that opens on the same account: a copy with neither level has no
+                            # exit but this process's next cycle, and a process survives neither a
+                            # crash nor a closed laptop nor a machine the operator parked.
+                            log({"event": f"{item['symbol']}: не зеркалировано — у демо-билета нет "
+                                          f"ни стопа, ни цели; реальный лот без защитного уровня "
+                                          f"не покупаю"})
                             continue
                         side = mt5.ORDER_TYPE_BUY if item["type"] == 0 else mt5.ORDER_TYPE_SELL
                         price = tick.ask if item["type"] == 0 else tick.bid
@@ -287,8 +378,15 @@ def main(argv: list[str] | None = None) -> int:
                         result = send_order(mt5, request, gate)
                         if result is None:
                             continue
-                        log({"event": f"{item['symbol']}: зеркалит демо билет {item['ticket']} "
-                                      f"по {price:.5f} лот {lots} rtc {result.retcode}"})
+                        # `bought` records the fills, not the attempts: a copy the broker refused is
+                        # not in the market, so the next candidate of the same symbol may still be
+                        # bought, and the journal has to say which of the two happened.
+                        if result.retcode == 10009:
+                            bought.add(item["symbol"])
+                        log({"event": f"{item['symbol']}: "
+                                      f"{'зеркалит' if result.retcode == 10009 else 'НЕ отзеркалено'} "
+                                      f"демо билет {item['ticket']} по {price:.5f} лот {lots} "
+                                      f"rtc {result.retcode}"})
             # sell a little earlier than the demo: own small target, own time limit
             opened = state.setdefault("real_opened", {})
             for position in real_positions:
@@ -306,7 +404,7 @@ def main(argv: list[str] | None = None) -> int:
                         "price": tick.bid if position.type == 0 else tick.ask,
                         "deviation": 30, "magic": REAL_MAGIC,
                         "type_filling": mt5.ORDER_FILLING_FOK,
-                        "comment": "real early exit"}, gate)
+                        "comment": "real early exit"}, exit_gate)
                     if result is not None:
                         opened.pop(key, None)
                         log({"event": f"{position.symbol}: копия зафиксирована раньше демо на "

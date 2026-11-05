@@ -8,15 +8,26 @@ inside the real terminal and exchanges files through the common MQL5\\Files fold
     EA  <- dsh_real_cmd.json     (one command: open / close), read and deleted
 
 Nothing in this file sends by default. `send_command` is the only door, and it asks `fleet.livegate`
-on every knock: the stand (`C:\\mt5-fleet\\PAUSE`) must be gone, this invocation must carry `--live`,
-and the registry must hold this login as a real account with `enabled: true`. The account is not
+on every knock — two questions, depending on which way the money is going. An OPENING needs all
+three words: the stand (`C:\\mt5-fleet\\PAUSE`) gone, `--live` on this invocation, and a registry row
+holding this login as a real account with `enabled: true` on the server the terminal named. A CLOSING
+of a lot stamped with this bridge's magic asks only that the broker named the account it is closing
+(`livegate.exit_refusal`): the stand and `--live` are the operator's word about money going in, and a
+bridge that would not take money out while he holds the stand leaves a real position whose only exit is
+a broker stop. The account is not
 hardcoded here any more than the money is — an earlier version carried
 `276261159@Exness-MT5Real26` in the source, which made any copy of this file a loaded gun pointed at
 one specific live account.
 
+A written command is a trigger left in another process's hands: the EA reads the common folder at its
+own pace, after this process is gone, on whatever terminal it happens to be attached to. So every
+command carries the moment it stops being an order (`exp`), the EA refuses one that has passed, and a
+cycle that finds the gate shut takes the file back out of the folder instead of leaving it armed.
+
 And it closes only the lots it recognises as its own: the EA stamps `REAL_MAGIC` on what it opens,
 and a position with any other magic is the operator's money, which this process may count but must
-never close.
+never close. The lot it opens is capped by that same registry row: the script's own default is not a
+permission to trade more than the operator allowed this account.
 """
 from __future__ import annotations
 
@@ -43,6 +54,15 @@ DEMO_TERMINAL = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 REAL_MAGIC = 8272026
 DAILY_STOP_PCT = 0.5
 REAL_LOTS = 0.01
+# How far from the fill the EA must put the broker's stop, in percent of price. This is the bridge's
+# own number and not the registry's: the registry caps how MUCH of the account may be traded, and
+# nothing in it says where a lot stops being a loss. 0 disables openings altogether rather than
+# letting them go naked.
+REAL_STOP_PCT = 0.6
+# How long a command written into the common folder stays an order. The EA checks it against its own
+# clock: a file that sat there because nobody was attached is not something to trade when somebody
+# finally is.
+CMD_TTL_SEC = 60
 
 
 def log(event: dict) -> None:
@@ -85,15 +105,69 @@ def ours(ea: dict) -> list[dict]:
     return [p for p in (ea.get("positions") or []) if int(p.get("magic") or 0) == REAL_MAGIC]
 
 
-def send_command(command: dict, gate, cmd_path: pathlib.Path = EA_CMD) -> bool:
-    """The only door to a real account. `gate()` answers why it may not be walked right now."""
-    reason = gate()
+def withdraw(cmd_path: pathlib.Path) -> bool:
+    """Take an armed *opening* back out of the folder the EA reads.
+
+    Permission is not a property of a file. A command written while the gate was open stays on disk
+    after the stand comes back, and the next EA attach trades it as though the operator had just
+    said yes — which is how a script that refuses every cycle still spends money.
+
+    A close is not that file. `close` is the lot leaving the market, and the stand is the operator's
+    word about *new* money: taking a protective exit out of the folder would park a real position
+    with nobody left to get rid of it. So a close stays where it is and gets named in the log.
+    """
+    if not cmd_path.exists():
+        return True
+    pending = ""
+    try:
+        pending = str(json.loads(cmd_path.read_text(encoding="utf-8", errors="replace"))
+                      .get("action") or "")
+    except (OSError, ValueError):
+        pending = "не разобрано"
+    if pending == "close":
+        log({"event": f"стоянка не снимает защиту: close в {cmd_path} остаётся в силе"})
+        return True
+    try:
+        cmd_path.unlink()
+    except OSError as exc:
+        log({"event": f"НЕ СНЯЛ команду {cmd_path}: {type(exc).__name__}: {exc} — "
+                      "она ещё может быть исполнена"})
+        return False
+    log({"event": f"снял команду {cmd_path}: разрешения нет, ордер не отправлен"})
+    return True
+
+
+def send_command(command: dict, gate, cmd_path: pathlib.Path = EA_CMD, *, login=None,
+                 server: str = "", now=time.time) -> bool:
+    """The only door to a real account. `gate()` answers why it may not be walked right now.
+
+    Only for openings. A close asks `livegate.exit_refusal`, which asks where this lot is — the login
+    and the server the broker answered — but not the stand or `--live`, because those are the
+    operator's words about putting money IN, not about taking it out.
+    """
+    closing = str(command.get("action") or "") == "close"
+    reason = livegate.exit_refusal(login, server=server) if closing else gate()
     if reason:
         log({"event": f"NOT SENT {command}: {reason}"})
+        withdraw(cmd_path)
         return False
+    try:
+        named = int(login)
+    except (TypeError, ValueError):
+        # A command with no account named in it is a command any attached terminal may execute, and
+        # two of the EAs in this project read from one common folder. The EA checks this number
+        # against its own; writing it empty would hand the order to whichever window woke up first.
+        log({"event": f"NOT SENT {command}: брокер не назвал счёт — команда без адреса не пишется"})
+        withdraw(cmd_path)
+        return False
+    payload = dict(command, login=named, exp=int(now()) + CMD_TTL_SEC)
     cmd_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd_path.write_text(json.dumps(command), encoding="utf-8")
-    log({"event": f"command to EA: {command}"})
+    # Compact, exactly like every other file this project hands to MQL5: `JsonStr` looks for
+    # `"action":"`, and the default `json.dumps` spacing writes `"action": "`, which the EA reads as
+    # an empty field and drops. A file the executor cannot parse is not a refused order, it is a
+    # silently lost one, and the log here would still say it was sent.
+    cmd_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    log({"event": f"command to EA: {payload}"})
     return True
 
 
@@ -138,15 +212,36 @@ def hourly_uptrend(symbol: str) -> bool:
 
 
 def run_cycle(state: dict, gate, *, ea_path: pathlib.Path = EA_STATE,
-              cmd_path: pathlib.Path = EA_CMD) -> str:
-    """One pass over the two files; returns a sentence for the log."""
-    refusal = gate()
-    if refusal:
-        # Asked before anything else: a cycle nobody permitted must not even open the demo terminal.
-        return f"bridge idle: {refusal}"
+              cmd_path: pathlib.Path = EA_CMD,
+              registry: pathlib.Path | None = None) -> str:
+    """One pass over the two files; returns a sentence for the log.
+
+    The entry door and the protective door are walked separately, on purpose. `gate()` says whether
+    this cycle may put new money into the market; it never says anything about getting old money
+    out, and a bridge that stops closing when the machine is parked turns the kill switch into an
+    unmanaged real position. That is also why the demo book is read before the idle return: the
+    closer needs to know what the demo let go, and a copy the demo has already flattened is not new
+    money going in.
+    """
+    entry_refused = gate()
     ea = read_ea_state(ea_path)
     if ea is None:
+        if entry_refused:
+            # Nothing to protect: with no witness attached there is no lot of ours anywhere in the
+            # answer, and an unpermitted cycle still must not leave an open armed.
+            withdraw(cmd_path)
+            return f"bridge idle: {entry_refused}"
         return "no EA state yet — is DSHRealBridge attached in the real terminal?"
+
+    def emit(command: dict) -> bool:
+        """Every command this cycle writes is addressed to the account the EA reported."""
+        return send_command(command, gate, cmd_path, login=ea.get("login"),
+                            server=ea.get("server"))
+
+    def pending() -> list[dict]:
+        """Our lots as the EA last reported them: the state file is rewritten every second."""
+        return ours(read_ea_state(ea_path) or ea)
+
     if float(ea.get("balance") or 0) <= 0:
         return f"real balance {ea.get('balance')} — no funds, bridge idle"
 
@@ -160,12 +255,31 @@ def run_cycle(state: dict, gate, *, ea_path: pathlib.Path = EA_STATE,
     equity = float(ea.get("equity") or 0)
     if day_start and equity < day_start * (1 - DAILY_STOP_PCT / 100) and not state.get("halted"):
         for position in ours(ea):
-            send_command({"action": "close", "ticket": position["ticket"]}, gate, cmd_path)
+            emit({"action": "close", "ticket": position["ticket"]})
+            # One command file and an advisor that reads it once a second: two writes in the same
+            # millisecond are one write, and a protective loop that believes it closed three lots has
+            # armed the last one and lost the other two.
+            time.sleep(2)
+        left = pending()
+        if left:
+            # A halt is a claim that the money is out of the market. Writing it because a file was
+            # written — which is all `emit` proves — used to end the day with the lots still open and
+            # with every later cycle refusing to retry them. So the claim waits for the witness.
+            log({"event": f"дневный стоп не подтверждён: {len(left)} нашего лота ещё в рынке, "
+                          "следующий цикл повторит закрытие"})
+            return f"DAILY STOP UNPROVEN: equity {equity} below {day_start:.2f}, осталось {len(left)}"
         state["halted"] = True
         save_state(state)
         return f"DAILY STOP: equity {equity} below {day_start:.2f}"
     if state.get("halted"):
-        return "halted for the day"
+        # "Halted" is the end of opening, not a ban on exits: a lot that outlived its own daily stop
+        # has to keep meeting a bridge that tries to get it out.
+        still = ours(ea)
+        for position in still:
+            emit({"action": "close", "ticket": position["ticket"]})
+            time.sleep(2)
+        return ("halted for the day" if not still
+                else f"halted for the day: повторяю закрытие {len(still)} своего лота")
 
     book = demo_book()
     if book is None:
@@ -175,28 +289,56 @@ def run_cycle(state: dict, gate, *, ea_path: pathlib.Path = EA_STATE,
     if len(our_positions) < len(all_positions):
         log({"event": f"{len(all_positions) - len(our_positions)} лот(ов) на реальном счёте не наши "
                       f"(magic != {REAL_MAGIC}): не закрыты и не тронуты"})
-    held = {p["symbol"] for p in all_positions}
     demo_symbols = {item["symbol"] for item in book}
 
-    # close our own copy when the demo closed its own
+    # Close our own copy when the demo closed its own — above the entry door, on purpose.
+    # `gate()` is the operator's word about money going IN; a real lot whose demo twin is already flat
+    # is money that has to come out whether or not this cycle is allowed to open anything. This block
+    # sat under the idle return, so putting up the stand left a copy riding on real money with nothing
+    # but the broker's own stop.
     for position in our_positions:
         if position["symbol"] not in demo_symbols:
-            send_command({"action": "close", "ticket": position["ticket"]}, gate, cmd_path)
+            emit({"action": "close", "ticket": position["ticket"]})
             time.sleep(2)
 
+    if entry_refused:
+        # Asked before any open is written: a cycle nobody permitted does not copy the demo book, and
+        # it takes back any open an earlier permitted cycle left armed.
+        withdraw(cmd_path)
+        return f"bridge idle: {entry_refused}"
+
+    held = {p["symbol"] for p in all_positions}
     # mirror only profitable demo buys in a confirmed uptrend
+    # The row that lets this account trade is also the row that says how much of it may be traded.
+    # The script's own default is not a permission: 0.01 onto an account the operator capped at 0.005
+    # is a bigger position than the registry allows, and this file used to never ask `capped_lots`.
+    row = livegate.permitted_account(ea.get("login"), server=str(ea.get("server") or ""),
+                                     config_path=registry)
+    lots = livegate.capped_lots(row, REAL_LOTS)
+    if lots <= 0:
+        # A ceiling of zero stops opening, not closing: a lot the registry refuses to add is still a
+        # lot the daily stop has to be able to get rid of.
+        log({"event": f"открытий нет: реестр не даёт лота для {ea.get('login')} (потолок {lots})"})
+    if REAL_STOP_PCT <= 0:
+        log({"event": "открытий нет: REAL_STOP_PCT выключен, а рынок без стоп-уровня "
+                      "на настоящих деньгах — это лот, который закрывает только этот процесс"})
+        return f"NO STOP LEVEL: real {ea.get('login')} открытия запрещены, демо {len(book)}"
     opened = state.setdefault("opened", {})
-    for item in book:
+    for item in [] if lots <= 0 else book:
         if item["type"] != 0 or item["symbol"] in held or item["profit"] <= 0:
             continue
         if not hourly_uptrend(item["symbol"]):
             continue
-        if send_command({"action": "open", "symbol": item["symbol"], "side": 0,
-                         "lots": REAL_LOTS}, gate, cmd_path):
+        # The stop travels as a percentage because this process does not know the price the EA will
+        # fill at; the EA turns it into a broker-side level before it sends. An open command without
+        # it is deliberately unwritable: a mirrored real lot whose only exit is this script's next
+        # cycle is a lot that survives a crash, a closed laptop and a parked machine.
+        if emit({"action": "open", "symbol": item["symbol"], "side": 0, "lots": lots,
+                 "stop_pct": REAL_STOP_PCT}):
             opened[item["symbol"]] = time.time()
             save_state(state)
             time.sleep(2)
-    return f"HEARTBEAT real {ea.get('login')} equity {equity} демо {len(book)}"
+    return f"HEARTBEAT real {ea.get('login')} equity {equity} демо {len(book)} лот {lots}"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -211,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
     registry = pathlib.Path(args.config).resolve() if args.config else None
 
     def gate() -> str:
-        ea = read_ea_state() or {}
+        ea = read_ea_state(EA_STATE) or {}
         return livegate.refusal(ea.get("login"), live=args.live,
                                 server=str(ea.get("server") or ""), config_path=registry)
 
@@ -220,11 +362,19 @@ def main(argv: list[str] | None = None) -> int:
     if not args.once:
         reason = gate()
         if reason:
-            log({"event": f"стоп, ничего не отправлено: {reason}"})
-            return 1
+            # Said, and the bridge starts anyway. This used to `return 1`: a supervisor or a reboot
+            # that brought the bridge back while the stand was up, or without the word `--live`, gave
+            # up before its first cycle — and the lots a previously permitted run left in the market
+            # lost their only closer exactly when the operator touched the machine. The refusal is a
+            # word about openings; `run_cycle` asks it again at every send and still runs the exits.
+            log({"event": f"открытий нет: {reason}; закрыватель работает"})
     while True:
         try:
-            log({"event": run_cycle(state, gate)})
+            # Named here instead of left to the defaults, so that a caller who moves the two files
+            # (a test, or a second deployment) moves them for the whole run — the function defaults
+            # were bound to this machine's shared folder when the module was imported.
+            log({"event": run_cycle(state, gate, ea_path=EA_STATE, cmd_path=EA_CMD,
+                                    registry=registry)})
         except Exception as exc:  # noqa: BLE001 - the bridge must never die
             log({"event": f"cycle error {type(exc).__name__}: {exc}"})
         if args.once:

@@ -1,15 +1,19 @@
-﻿//+------------------------------------------------------------------+
-//|  DSHBridge â€” Ñ‚Ð¾Ñ‚ Ð¶Ðµ Ð¼Ð¾ÑÑ‚, Ð½Ð¾ ÐºÐ°Ðº ÑÐºÑ€Ð¸Ð¿Ñ‚: MT5 Ð·Ð°Ð¿ÑƒÑÐºÐ°ÐµÑ‚ ÑÐºÑ€Ð¸Ð¿Ñ‚Ñ‹    |
-//|  Ð¸Ð· ÑÑ‚Ð°Ñ€Ñ‚Ð¾Ð²Ð¾Ð³Ð¾ ÐºÐ¾Ð½Ñ„Ð¸Ð³Ð° Ð½Ð°Ð´Ñ‘Ð¶Ð½Ð¾. Ð¡ÐºÑ€Ð¸Ð¿Ñ‚ Ð´ÐµÑ€Ð¶Ð¸Ñ‚ Ñ†Ð¸ÐºÐ», Ñ‡Ð¸Ñ‚Ð°ÐµÑ‚ ÐºÐ¾Ð¼Ð°Ð½Ð´Ñ‹ |
-//|  Ð¸ Ð¿Ð¸ÑˆÐµÑ‚ ÑÐ¾ÑÑ‚Ð¾ÑÐ½Ð¸Ðµ Ð² Ð¾Ð±Ñ‰ÑƒÑŽ Ð¿Ð°Ð¿ÐºÑƒ MQL5\Files (FILE_COMMON).        |
-//+------------------------------------------------------------------+
+﻿//+--------------------------------------------------------------------+
+//|  DSHBridge — демо-мост: тот же обмен файлами,                      |
+//|  но очередь у демо — своя. Общий командный файл с реальным         |
+//|  мостом означал бы, что демо-скрипт съедает его команду            |
+//|  (FileDelete) и открывает её на демо-счёте — и реальный            |
+//|  мост бы о ней никогда не узнал.                                   |
+//+--------------------------------------------------------------------+
 #property copyright "DSH"
-#property version   "1.00"
+#property version   "1.01"
 #property strict
 
-input string CmdFile   = "dsh_real_cmd.json";
-input string StateFile = "dsh_real_state.json";
+input string CmdFile   = "dsh_demo_cmd.json";
+input string StateFile = "dsh_demo_state.json";
 input int    LoopMs    = 1000;
+// Тот же номер, что REAL_MAGIC в scripts/real_bridge.py.
+input long   InpMagic  = 8272026;
 
 string ReadAll(const string name)
 {
@@ -114,7 +118,7 @@ bool OpenTrade(const string symbol, const int side, const double lots)
    request.volume   = lots;
    request.type     = (side == 1) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
    request.deviation = 50;
-   request.magic    = 8272026;
+   request.magic    = InpMagic;
    request.comment  = "bridge open";
    request.type_filling = ORDER_FILLING_FOK;
    request.price = (side == 1) ? SymbolInfoDouble(symbol, SYMBOL_BID)
@@ -145,7 +149,7 @@ bool ClosePosition(const ulong ticket)
    request.volume   = volume;
    request.type     = (type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
    request.deviation = 50;
-   request.magic    = 8272026;
+   request.magic    = InpMagic;
    request.comment  = "bridge close";
    request.type_filling = ORDER_FILLING_FOK;
    request.price = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_BID)

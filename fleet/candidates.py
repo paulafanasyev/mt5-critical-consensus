@@ -17,6 +17,10 @@ import math
 
 KIND = "candidate"
 CLOSED = "closed"
+# The park's own witness that a ticket stopped being only its money: on a netting account the
+# operator's manual lot folds into the position this park opened, and the broker later closes the
+# two of them together under one number.
+MERGED = "lot_merged_with_manual"
 
 # The journal writes these itself, so a note carrying one would collide with its own row.
 RESERVED_KEYS = ("ts", "account", "kind")
@@ -108,25 +112,33 @@ def record(store, account, note: dict) -> None:
 def ledger(store, limit: int = 5000) -> dict:
     """Join candidates to their outcomes and add up what the drift cost.
 
-    An outcome is joined by account AND ticket: a ticket is unique on one server, not across the
-    book this file keeps for every broker, so a bare ticket join would pay one account's trade out
-    of another's profit. Only a ticket the broker's own comment named (`ticket_source == token`)
+    An outcome is joined by account, symbol AND ticket: a ticket is unique on one server, not across
+    the book this file keeps for every broker, so a bare ticket join would pay one account's trade
+    out of another's profit. Only a ticket the broker's own comment named (`ticket_source == token`)
     lends its outcome to the sums: an inferred ticket on a netting account carries the whole merged
     position — the operator's lots included — so its money is reported as `closed_guessed` and
     `guessed_profit_usd`, beside the totals rather than inside them. Rows sharing one ticket are
     `shared_ticket`: the close belongs to that ticket, not to either entry, so none of them is
     settled and none is called open. A candidate the broker never named at all stays `blind`.
 
+    A `lot_merged_with_manual` event is the park's own witness that one of its tickets stopped being
+    only its money: the operator's manual lot folded into it, and the broker later closes the two
+    together under one number. Such a row makes the ticket `merged_ticket` for as long as it is in
+    the window, and its close pays nothing anywhere — not into `profit_gross_usd`, not into
+    `guessed_profit_usd`, because no figure here separates the operator's half from ours.
+
     A dollar column is filled only from a row that says which currency its money was in. The broker
     quotes its tick value and reports its profit in the currency the account is kept in, so on a
     ruble account that number is rubles and on a cent account a hundredth of a dollar: `rate_to_usd`
     is the witness that the number was converted, and a row without it is counted — in
     `settled_unpriced` for a close, `drift_unpriced` for a bill — rather than added to a sum it does
-    not belong to.
+    not belong to. An attributable close whose dollars are simply not known yet (the history read
+    failed) is the same kind of row: counted, never summed.
     """
-    rows = store.events_of((KIND, CLOSED), limit=limit)
+    rows = store.events_of((KIND, CLOSED, MERGED), limit=limit)
     notes: list[dict] = []
     closed: dict[tuple, dict] = {}
+    merged_tickets: set[tuple[str, int]] = set()
     for ts, account, kind, payload in rows:
         try:
             data = json.loads(payload) if payload else {}
@@ -141,6 +153,17 @@ def ledger(store, limit: int = 5000) -> dict:
             if ticket > 0:
                 closed[(account, str(data.get("symbol") or "").casefold(), ticket)] = {
                     "ts": ts, "account": account, **data}
+        elif kind == MERGED:
+            # `lots` is the list the worker journalled: every ticket on this account that grew volume
+            # nobody here ordered. A ticket once folded is folded for the life of the position, so one
+            # row anywhere in the window is enough to take its money out of this book's sums.
+            for lot in data.get("lots") or []:
+                try:
+                    ticket = int(lot.get("ticket") or 0)
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if ticket > 0:
+                    merged_tickets.add((account, ticket))
     journal_rows = store.count_events(KIND)
     # One position can carry several candidate rows: on a netting account the park's own second entry
     # folds into the same ticket as the first, and a restart can write the same fill twice. The close
@@ -167,8 +190,11 @@ def ledger(store, limit: int = 5000) -> dict:
                       if settled and _num(result.get("rate_to_usd"), 6) is not None else None)
         # The ticket is what ties an outcome to this entry. `token` means the comment this park sent
         # named it; anything else means somebody inferred it, and on a netting account an inferred
-        # ticket carries the whole merged position — the operator's money included.
-        attributable = settled and note.get("ticket_source", "unknown") == "token"
+        # ticket carries the whole merged position — the operator's money included. The same witness
+        # that names a merged position is `merged`: the park itself said this ticket grew a lot nobody
+        # here ordered, so its close is that lot's money and no arithmetic here separates it.
+        merged = settled and (note["account"], ticket) in merged_tickets
+        attributable = settled and note.get("ticket_source", "unknown") == "token" and not merged
         trades.append({
             "ticket": ticket,
             "ticket_source": note.get("ticket_source", "unknown"),
@@ -185,14 +211,18 @@ def ledger(store, limit: int = 5000) -> dict:
             "risk_reward": note.get("risk_reward"),
             "settled": settled,
             "shared": shared,
+            "merged": merged,
             "attributable": attributable,
             "profit_gross_usd": profit_usd if attributable else None,
-            "guessed_profit_usd": (profit_usd if settled and not attributable else None),
+            # A merged ticket's dollars are not printed as a guess either: the number the broker
+            # closed is the operator's lot and this lot's, and no figure here separates them.
+            "guessed_profit_usd": (profit_usd if settled and not attributable and not merged
+                                   else None),
             "exit": result.get("reason") if settled else "",
             "closed_by": result.get("by", "") if settled else "",
         })
     # Only a ticket the broker's own comment named makes an outcome this book may add up.
-    done = [t for t in trades if t["attributable"]]
+    done = [t for t in trades if t["attributable"] and t["profit_gross_usd"] is not None]
     won = [t for t in done if float(t["profit_gross_usd"]) > 0]
     lost = [t for t in done if float(t["profit_gross_usd"]) < 0]
     flat = [t for t in done if float(t["profit_gross_usd"]) == 0]
@@ -213,9 +243,10 @@ def ledger(store, limit: int = 5000) -> dict:
     paid = [t for t in entries if isinstance(t["drift_cost_usd"], (int, float))]
     measured = [t for t in entries if isinstance(t["drift_points"], (int, float))]
     # A close that joined a candidate but arrived before the journal knew its currency: the trade
-    # finished, and its money is still a number in a currency nobody wrote down.
-    unpriced = [t for t in trades if t["settled"] and t["profit_gross_usd"] is None
-                and t["guessed_profit_usd"] is None]
+    # finished, and its money is still a number in a currency nobody wrote down. A merged ticket is
+    # not that: its number exists and belongs to two drivers, and `merged_ticket` says so separately.
+    unpriced = [t for t in trades if t["settled"] and not t["merged"]
+                and t["profit_gross_usd"] is None and t["guessed_profit_usd"] is None]
     return {
         "candidates": len(trades),
         # How many candidates the journal holds in total, and whether this read saw all of them:
@@ -240,6 +271,10 @@ def ledger(store, limit: int = 5000) -> dict:
         # Rows sharing one ticket with another entry: the close of that ticket is one lot's money and
         # this book cannot say whose, so none of them is settled and none is called open.
         "shared_ticket": len([t for t in trades if t["shared"]]),
+        # Settled rows on a ticket the park itself reported as merged with the operator's manual lot:
+        # the broker's number is real money and it is two drivers' money at once, so it is named here
+        # and kept out of every sum and every win rate in this book.
+        "merged_ticket": len([t for t in trades if t["merged"]]),
         "flat": len(flat),
         "by_source": {source: len([t for t in trades if t["ticket_source"] == source])
                       for source in sorted({t["ticket_source"] for t in trades})},

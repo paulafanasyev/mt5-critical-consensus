@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import os
 import pathlib
 import sys
 import time
@@ -529,6 +528,98 @@ def test_try_entries_places_one_order(tmp_path, monkeypatch) -> None:
     assert opened == 1 and sent == [1]
 
 
+def test_the_stand_is_read_again_one_statement_before_the_order(tmp_path, monkeypatch) -> None:
+    """An operator who arms the switch during a cycle stops the order that cycle is about to send.
+
+    The gate at the top of `_try_entries` is behind symbol probes, a portfolio read, a money
+    reservation and an identity proof — tens of seconds on a slow broker. A kill switch that only
+    holds when the cycle happened to start armed races with the person reaching for it, and the slot
+    it reserved has to come back with the refusal.
+    """
+    from fleet import risk as risk_mod
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    account = Account(name="a", login=1, server="S", mode="demo")
+    pause = tmp_path / "PAUSE"
+    store = StoreCls(tmp_path / "book.sqlite")
+    store.set_portfolio_baseline(worker.local_host(), "2026-11-03", 1000.0)
+    store.equity("a", 1, 1000.0, 1000.0, 0, 0.0, "USD", 1.0, "2026-11-03")
+    _own_window(store, account)
+    runner = worker.Worker(FleetConfig(accounts=[account]), store, dry_run=False,
+                           pause_file=pause)
+    spec = worker.broker.BrokerSymbol(name="EURUSD", digits=5, point=0.00001,
+                                      tick_size=0.00001, tick_value=1.0, volume_min=0.01,
+                                      volume_max=100.0, volume_step=0.01, stops_level=0,
+                                      freeze_level=0, spread=1, filling=3)
+    signal = types.SimpleNamespace(base_symbol="EURUSD", side="buy", reason="test",
+                                   price=1.10, stop=1.098, target=1.104, atr=0.001,
+                                   stop_distance=0.002)
+    sent: list[int] = []
+    released: list = []
+    monkeypatch.setattr(worker.strategy, "signals", lambda acc: [signal])
+    monkeypatch.setattr(worker.broker, "symbol", lambda base: spec)
+    monkeypatch.setattr(worker.broker, "symbol_exact", lambda name: spec)
+    monkeypatch.setattr(worker.broker, "market_order",
+                        lambda *a, **k: sent.append(1) or types.SimpleNamespace(
+                            volume=0.01, price=1.10, retcode=10009, token="t"))
+    monkeypatch.setattr(worker.broker, "open_positions", lambda *a, **k: [])
+    monkeypatch.setattr(worker.risk, "can_open", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(worker.mt5, "account_info",
+                        lambda: types.SimpleNamespace(login=1, server="S"))
+    real_reserve = store.reserve
+
+    def reserve_and_arm(*args, **kwargs):
+        # The last thing before the send: the money is reserved, and now the operator says stop.
+        pause.write_text("оператор встал", encoding="utf-8")
+        return real_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(store, "reserve", reserve_and_arm)
+    monkeypatch.setattr(store, "release",
+                        lambda slot: released.append(slot))
+    snapshot = risk_mod.AccountSnapshot(login=1, server="S", currency="USD", balance=1000.0,
+                                       equity=1000.0, margin_free=1000.0, leverage=100,
+                                       positions=0, floating=0.0, server_day="2026-11-03")
+    day = risk_mod.DayState(day="2026-11-03", start_balance=1000.0)
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert sent == []
+    assert len(released) == 1  # the reservation is not left to age out for 600 s
+    assert _of(store, "entries_paused")
+
+
+def test_a_cycle_started_under_an_armed_stand_never_reaches_the_send(tmp_path,
+                                                                    monkeypatch) -> None:
+    """The same door from the other side: on a parked machine nothing is probed, reserved or sent."""
+    from fleet import risk as risk_mod
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    pause = tmp_path / "PAUSE"
+    pause.write_text("оператор встал", encoding="utf-8")
+    account = Account(name="a", login=1, server="S", mode="demo")
+    store = StoreCls(tmp_path / "book.sqlite")
+    store.set_portfolio_baseline(worker.local_host(), "2026-11-03", 1000.0)
+    store.equity("a", 1, 1000.0, 1000.0, 0, 0.0, "USD", 1.0, "2026-11-03")
+    _own_window(store, account)
+    runner = worker.Worker(FleetConfig(accounts=[account]), store, dry_run=False,
+                           pause_file=pause)
+    monkeypatch.setattr(worker.strategy, "signals", lambda acc: [_signal()])
+    monkeypatch.setattr(worker.broker, "symbol", lambda base: pytest.fail("зонд символа на стоянке"))
+    monkeypatch.setattr(worker.broker, "market_order", lambda *a, **k: pytest.fail("отправлен ордер"))
+    monkeypatch.setattr(worker.risk, "can_open", lambda *a, **k: (True, ""))
+    snapshot = risk_mod.AccountSnapshot(login=1, server="S", currency="USD", balance=1000.0,
+                                        equity=1000.0, margin_free=1000.0, leverage=100,
+                                        positions=0, floating=0.0, server_day="2026-11-03")
+    assert runner._try_entries(account, snapshot, [], risk_mod.DayState(
+        day="2026-11-03", start_balance=1000.0), 1.0) == 0
+    assert _of(store, "entries_paused")
+
+
+def _signal() -> types.SimpleNamespace:
+    return types.SimpleNamespace(base_symbol="EURUSD", side="buy", reason="test", price=1.10,
+                                 stop=1.098, target=1.104, atr=0.001, stop_distance=0.002)
+
+
 def test_account_funded_today_is_still_allowed_to_trade(tmp_path, monkeypatch) -> None:
     from fleet import risk as risk_mod
     from fleet.config import Account, FleetConfig
@@ -623,6 +714,36 @@ def test_unpriced_account_flow_is_not_counted(tmp_path) -> None:
         Account(name="u", login=1, server="S", mode="demo")]), store, shards=[0])
     flow, _ = engine._book_flows()
     assert flow == 0.0
+
+
+def test_an_unpriced_account_makes_the_portfolio_stop_unmeasurable(tmp_path) -> None:
+    """A sum that leaves an account out is not this portfolio's size, so no percentage of it is a stop."""
+    from fleet.config import Account, FleetConfig
+    from fleet.store import Store as StoreCls
+
+    store = StoreCls(tmp_path / "book.sqlite")
+    store.equity("a", 1, 1000.0, 1000.0, 0, 0.0, "USD", 1.0, "2026-11-03")
+    store.equity("u", 2, 1000.0, 1000.0, 0, 0.0, "RUB", 0.0, "2026-11-03")  # no dollar price
+    engine = conductor.Conductor(FleetConfig(accounts=[
+        Account(name="a", login=1, server="S", mode="demo"),
+        Account(name="u", login=2, server="S", mode="demo")]), store, shards=[0])
+    engine.day_start_equity = 1000.0
+
+    # A calm day on the priced part is the dangerous case: the invisible account keeps losing while
+    # the last line of defence reports nothing to stop.
+    stop = engine._portfolio_stop(store.portfolio(["a", "u"], fresh_only=False))
+    assert "не измерим" in stop and "1 счёт" in stop, stop
+
+    # The veto comes before the percentage: a loss that would have fired the stop is reported as
+    # unmeasurable rather than as a number computed on part of the money.
+    store.equity("a", 1, 700.0, 700.0, 0, 0.0, "USD", 1.0, "2026-11-03")
+    assert "не измерим" in engine._portfolio_stop(store.portfolio(["a", "u"], fresh_only=False))
+
+    # Price the second account and the stop is a measurement again — and now it fires.
+    store.equity("u", 2, 1000.0, 1000.0, 0, 0.0, "RUB", 0.013, "2026-11-03")
+    priced = engine._portfolio_stop(store.portfolio(["a", "u"], fresh_only=False))
+    assert "не измерим" not in priced
+    assert "дневной стоп портфеля" in priced, priced
 
 
 def test_day_state_does_not_publish_flows(tmp_path, monkeypatch) -> None:
@@ -1109,6 +1230,21 @@ def test_a_fill_is_named_by_the_comment_token_not_by_an_id_the_api_does_not_retu
     assert result.position_ticket == 77
     assert result.ticket_source == "token"
     assert result.position_ticket != 555  # the deal number is a different id space
+
+
+def test_two_tokens_that_share_a_prefix_never_steal_each_others_lot(monkeypatch) -> None:
+    """The match is the whole comment `fleet-<token>`, and every token is six hex characters.
+
+    A bare token is a short string: `12ab` sits inside `fleet-12ab3c` as happily as inside its own
+    order, so one fill joined to another lot's ticket and the book paid that trade out of the wrong
+    position's profit. Equal-length needles make containment mean equality — this test is the reason
+    nobody may shorten a token without changing the match.
+    """
+    book = [_lot(11, "fleet-12ab3c", 7000000), _lot(22, "fleet-12ab99", 7000000)]
+    monkeypatch.setattr(broker.mt5, "positions_get", lambda *a, **k: book)
+    assert broker._find_by_token("12ab3c").ticket == 11
+    assert broker._find_by_token("12ab99").ticket == 22
+    assert broker._find_by_token("") is None
 
 
 def test_a_netting_account_that_merged_the_lot_is_still_named(monkeypatch) -> None:
@@ -1681,25 +1817,29 @@ def test_a_broker_close_the_history_cannot_price_is_left_unpriced(tmp_path, monk
     assert row["profit"] is None and row["profit_usd"] is None
 
 
+def _exits(store, monkeypatch):
+    """An order-sending broker and a strategy that always wants out: what a close test needs."""
+    sent: list[str] = []
+    monkeypatch.setattr(worker.broker, "modify_position", lambda *a, **k: sent.append("modify"))
+    monkeypatch.setattr(worker.broker, "close_position",
+                        lambda position, *a, **k: sent.append("close") or float(position.volume))
+    monkeypatch.setattr(worker.strategy, "break_even_level", lambda *a, **k: 1.1005)
+    monkeypatch.setattr(worker.strategy, "exit_reason", lambda *a, **k: "тейк")
+    return sent
+
+
 def test_a_manual_lot_merged_into_ours_is_not_modified_or_closed(tmp_path,
                                                                  monkeypatch) -> None:
     """On a netting account his trade folds into our ticket, so the magic alone no longer says whose.
 
-    The mirror remembers how much of this ticket we asked for, and volume beyond it stops every order
-    this park would send for that ticket: a trailing exit here would close his lot along with ours
-    without ever asking him.
+    The witness remembers how many lots of this ticket we bought, and volume beyond it stops every
+    order this park would send for that ticket: a trailing exit here would close his lot along with
+    ours without ever asking him.
     """
     account, store, runner = _managed(tmp_path, monkeypatch)
-    store.save_positions("a", [_position(31, account.magic)])
+    store.note_lot_witness("a", 31, 0.10)  # the park ordered these lots at the fill
     merged = _position(31, account.magic, volume=0.20)
-    sent: list[str] = []
-    monkeypatch.setattr(worker.broker, "modify_position",
-                        lambda *a, **k: sent.append("modify"))
-    monkeypatch.setattr(worker.broker, "close_position",
-                        lambda position, *a, **k: sent.append("close")
-                        or float(position.volume))
-    monkeypatch.setattr(worker.strategy, "break_even_level", lambda *a, **k: 1.1005)
-    monkeypatch.setattr(worker.strategy, "exit_reason", lambda *a, **k: "тейк")
+    sent = _exits(store, monkeypatch)
     day = worker.risk.DayState(day="2026-11-04", start_balance=1000.0)
     assert runner._manage_positions(account, day, [merged], "USD", 1.0) == 0
     assert sent == []  # not one order into a ticket that is two people's money
@@ -1707,6 +1847,156 @@ def test_a_manual_lot_merged_into_ours_is_not_modified_or_closed(tmp_path,
         {"ticket": 31, "asked": 0.1, "now": 0.2}]
     runner._manage_positions(account, day, [merged], "USD", 1.0)
     assert len(_of(store, "lot_merged_with_manual")) == 1  # the same fact is said once
+
+
+def test_a_merge_survives_the_cycle_that_spotted_it(tmp_path, monkeypatch) -> None:
+    """The end of the cycle rewrites the mirror with the merged volume; the witness must not follow.
+
+    A guard that only lasts until the book next photographs the lot is a guard for one cycle: the
+    trailing rule takes several cycles to fire, and by the cycle that closes the ticket the previous
+    picture says 0.20 — the operator's half, adopted as ours.
+    """
+    account, store, runner = _managed(tmp_path, monkeypatch)
+    store.note_lot_witness("a", 31, 0.10)
+    merged = _position(31, account.magic, volume=0.20)
+    sent = _exits(store, monkeypatch)
+    day = worker.risk.DayState(day="2026-11-04", start_balance=1000.0)
+    runner._manage_positions(account, day, [merged], "USD", 1.0)
+    store.save_positions("a", [merged])  # what `_cycle` writes after management
+    assert store.mirrored_positions("a")[31][1] == pytest.approx(0.20)
+    assert runner._manage_positions(account, day, [merged], "USD", 1.0) == 0
+    assert runner._manage_positions(account, day, [merged], "USD", 1.0) == 0
+    assert sent == []
+    assert store.lot_witnesses("a") == {31: pytest.approx(0.10)}
+
+
+def test_a_lot_that_merged_while_this_shard_was_dark_is_still_two_people_money(tmp_path,
+                                                                               monkeypatch) -> None:
+    """The mirror is a photograph with a 900 s shelf life; the fold-in does not end when it does.
+
+    After an outage longer than the mirror's TTL the first cycle back used to find no previous
+    picture at all, call the ticket new — a lot nobody ordered could not have grown — and sell the
+    whole merged lot, his half included, without asking.
+    """
+    account, store, runner = _managed(tmp_path, monkeypatch)
+    store.save_positions("a", [_position(31, account.magic)])
+    store.note_lot_witness("a", 31, 0.10)
+    with store._connect() as conn:  # noqa: SLF001 - same package, the clock is what is being moved
+        conn.execute("UPDATE positions SET updated_epoch=?", (time.time() - 900 - 1,))
+    assert store.mirrored_positions("a") == {}  # the photograph is gone
+    sent = _exits(store, monkeypatch)
+    day = worker.risk.DayState(day="2026-11-04", start_balance=1000.0)
+    assert runner._manage_positions(account, day,
+                                    [_position(31, account.magic, volume=0.20)], "USD", 1.0) == 0
+    assert sent == []
+    assert _of(store, "lot_merged_with_manual")[0]["lots"] == [
+        {"ticket": 31, "asked": 0.1, "now": 0.2}]
+
+
+def test_a_lot_the_park_shrank_is_still_ours_to_manage(tmp_path, monkeypatch) -> None:
+    """A ticket that got smaller is not a merge: the witness follows it down and the lot stays ours.
+
+    Half of it can have been a partial close ordered here, a close the operator made from the
+    platform, or the broker trimming it. Refusing to manage every shrink would strand our own money
+    with nothing but the broker's stop in front of it.
+    """
+    account, store, runner = _managed(tmp_path, monkeypatch)
+    store.note_lot_witness("a", 31, 0.10)
+    sent = _exits(store, monkeypatch)
+    day = worker.risk.DayState(day="2026-11-04", start_balance=1000.0)
+    assert runner._manage_positions(account, day,
+                                   [_position(31, account.magic, volume=0.05)], "USD", 1.0) == 1
+    assert sent == ["modify", "close"]
+    assert store.lot_witnesses("a") == {}  # the close settled it, and the record went with the lot
+    assert _of(store, "lot_merged_with_manual") == []
+
+
+def test_the_witness_is_written_at_the_fill_and_never_invented_by_looking(tmp_path) -> None:
+    """Two writers, two rules: what we ordered may add, what we see may only subtract.
+
+    `note_lot_witness` is called with the volume on the book every cycle. If it could raise the
+    number, the merge it is meant to catch would be adopted the moment it happened.
+    """
+    store = Store(tmp_path / "book.sqlite")
+    store.note_lot_witness("a", 41, 0.10)
+    store.note_lot_witness("a", 41, 0.20)  # the market grew around the lot
+    assert store.lot_witnesses("a") == {41: pytest.approx(0.10)}
+    store.add_lot_witness("a", 41, 0.10)  # and this park bought another lot into the same ticket
+    assert store.lot_witnesses("a") == {41: pytest.approx(0.20)}
+    store.note_lot_witness("a", 41, 0.20)
+    assert store.lot_witnesses("a") == {41: pytest.approx(0.20)}
+    store.note_lot_witness("a", 41, 0.15)  # a partial close by either of us
+    assert store.lot_witnesses("a") == {41: pytest.approx(0.15)}
+
+
+def test_a_closed_ticket_takes_its_witness_and_its_peak_with_it(tmp_path) -> None:
+    """The record of a lot that no longer exists is a row that never dies for a ticket to reuse."""
+    store = Store(tmp_path / "book.sqlite")
+    store.note_lot_witness("a", 41, 0.10)
+    store.set_peak("a", 41, 12.5)
+    store.close_position_row("a", 41)
+    assert store.lot_witnesses("a") == {}
+    assert store.peak("a", 41) == 0.0
+
+
+def test_the_prune_ages_a_witness_by_the_cycle_that_last_saw_it(tmp_path) -> None:
+    """A live lot keeps its proof through any outage; a month of nobody seeing it is a dead ticket.
+
+    Pruning the witness against the mirror's freshness window would delete it in exactly the case it
+    exists for, and pruning it against nothing at all leaves a row for every ticket the account ever
+    had.
+    """
+    store = Store(tmp_path / "book.sqlite")
+    store.note_lot_witness("a", 41, 0.10)
+    store.note_lot_witness("a", 42, 0.10)
+    with store._connect() as conn:  # noqa: SLF001 - same package, the clock is what is being moved
+        conn.execute("UPDATE lot_witness SET updated_epoch=? WHERE ticket=42",
+                     (time.time() - 31 * 86400,))
+    store.prune(["a"])
+    assert store.lot_witnesses("a") == {41: pytest.approx(0.10)}
+    store.prune(["b"])
+    assert store.lot_witnesses("a") == {}  # an account nobody here registers is not this book's
+
+
+def test_a_window_answering_for_another_account_closes_nothing(tmp_path, monkeypatch) -> None:
+    """What stands in front of an exit is the address, and `--live` is not an address.
+
+    The park restarted without `--live` — the default of every restart path — used to drop trailing,
+    giveback and break-even off every lot it had previously been permitted to open, leaving only the
+    broker's own stop in front of the money. A close still has to know whose account this is: `attach`
+    proves the window at connect time, and the cycle asks the same question of the account it is about
+    to act on, because a hand re-login between the two is invisible to everything else in the file.
+    """
+    from fleet import risk as risk_mod
+    from fleet.config import Account, FleetConfig
+
+    account = Account(name="a", login=1, server="S", mode="demo")
+    store = Store(tmp_path / "book.sqlite")
+    runner = worker.Worker(FleetConfig(accounts=[account]), store, allow_live=False)
+    stranger = risk_mod.AccountSnapshot(login=999, server="Someone-Else", currency="USD",
+                                        balance=1000.0, equity=1000.0, margin_free=1000.0,
+                                        leverage=100, positions=0, floating=0.0,
+                                        server_day="2026-11-03")
+    ours = risk_mod.AccountSnapshot(login=1, server="S", currency="USD", balance=1000.0,
+                                    equity=1000.0, margin_free=1000.0, leverage=100,
+                                    positions=0, floating=0.0, server_day="2026-11-03")
+    answering = [stranger]
+    monkeypatch.setattr(risk_mod, "AccountSnapshot", types.SimpleNamespace(
+        read=lambda *a, **k: answering[0]))
+    monkeypatch.setattr(risk_mod, "positions_for", lambda acc: [])
+    monkeypatch.setattr(risk_mod, "server_day_now", lambda: "2026-11-03")
+    managed: list[str] = []
+    monkeypatch.setattr(worker.Worker, "_manage_positions",
+                        lambda self, *a, **k: managed.append("managed") or 0)
+    monkeypatch.setattr(worker.Worker, "_try_entries", lambda self, *a, **k: 0)
+    result = runner._cycle(account, allow_entries=True)
+    assert result.status == "error" and managed == []
+    assert _of(store, "exit_identity_lost")[0]["detail"].startswith("отвечает 999")
+
+    answering[0] = ours
+    assert runner._cycle(account, allow_entries=True).status == "ok"
+    assert managed == ["managed"]  # no `--live` was ever asked, and no lot was left unmanaged
+    assert _of(store, "exit_identity_restored")  # the note went back to empty, not left behind
 
 
 def test_the_risk_mirror_prices_the_operators_lot_without_claiming_it(tmp_path,
@@ -1766,6 +2056,30 @@ def test_a_lot_with_nothing_to_price_keeps_the_rules_the_broker_holds(tmp_path,
     assert len(_of(store, "lot_atr_unpriced")) == 1
     runner._manage_positions(account, day, [naked], "USD", 1.0)
     assert len(_of(store, "lot_atr_unpriced")) == 1  # and it is not repeated every cycle
+
+
+def test_a_locked_journal_does_not_get_a_forged_entry_atr(tmp_path, monkeypatch) -> None:
+    """A note this process cannot read is a note it must not write.
+
+    The old code treated a locked read as an absent one, computed the ATR from the standing stop and
+    persisted it as the lot's entry ATR — the authorship note every later cycle believes. Under a real
+    lock nothing can be journalled at all (the announcement waits for the next readable cycle), but the
+    guarantee that holds in both is that no number is invented for a lot someone else sized.
+    """
+    import sqlite3
+
+    account, store, runner = _managed(tmp_path, monkeypatch)
+
+    def locked(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "get_meta", locked)
+    monkeypatch.setattr(store, "set_meta", locked)
+    naked = _position(44, account.magic)
+    assert runner._atr_entry(account, naked, _spec()) is None
+    with sqlite3.connect(store.path) as conn:
+        rows = conn.execute("SELECT key FROM meta WHERE key LIKE 'atr:%'").fetchall()
+    assert rows == []
 
 
 def test_an_emptied_manual_book_is_said_once(tmp_path, monkeypatch) -> None:
@@ -1838,10 +2152,6 @@ def _drive_shard(tmp_path, monkeypatch, steps, *, cycles: int):
         step = steps[len(slept) - 1] if len(slept) <= len(steps) else None
         if step is not None:
             step(registry)
-            if registry.exists():
-                # A rewrite inside one clock tick leaves st_mtime where it was, and a shard that
-                # saw no change would be right: the test has to change the file, not its contents.
-                os.utime(registry, (time.time() + 7 * len(slept),) * 2)
         if len(slept) >= cycles:
             raise SystemExit("end of the driven run")
 
@@ -1970,3 +2280,30 @@ def test_a_break_even_the_server_would_reject_is_said_once_and_never_sent(tmp_pa
     assert exits  # the lot is still managed: only the repair stands down
     runner._manage_positions(account, day, positions, "USD", 1.0)
     assert len(_of(store, "break_even_refused")) == 1  # the same fact is said once
+
+
+def test_a_settled_token_close_without_a_price_is_counted_and_never_crashes(
+        tmp_path) -> None:
+    """The row the worker writes today killed the reader that has to report it.
+
+    `priced=False` journalls `profit=None, profit_usd=None` beside a known rate (the history read
+    failed, so nobody has the broker's number). That row is settled and it is attributable, and the
+    old `done` asked for its dollars anyway: `float(None)` raised out of `ledger`, the CLI exited 1
+    and printed nothing at all — the one book the operator reads was unreadable because of a trade
+    whose outcome is simply not known yet.
+    """
+    from fleet import candidates
+
+    store = Store(tmp_path / "book.sqlite")
+    store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02, ticket=77,
+                ticket_source="token", currency="USD", rate_to_usd=1.0,
+                drift_points=25.0, drift_cost=0.5, drift_cost_usd=0.5, risk_usd=2.0)
+    store.event("a", candidates.CLOSED, symbol="EURUSD", ticket=77, reason="стоп/тейк брокера",
+                by="брокер", profit=None, currency="USD", rate_to_usd=1.0, profit_usd=None)
+    book = candidates.ledger(store)
+    assert book["closed"] == 0 and book["profit_gross_usd"] == 0.0
+    assert book["win_rate"] is None and book["flat"] == 0
+    assert book["settled_unpriced"] == 1
+    row = book["trades"][0]
+    assert row["settled"] and row["attributable"] and row["profit_gross_usd"] is None
+    assert row["guessed_profit_usd"] is None  # its dollars are unknown, not merely untrusted

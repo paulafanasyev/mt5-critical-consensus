@@ -70,6 +70,20 @@ accounts:
         config.load(target)
 
 
+def test_an_account_naming_no_server_is_an_error(tmp_path: pathlib.Path) -> None:
+    """An identity is a pair: a login without a server cannot tell this window from any other."""
+    for blank in ('server:', 'server: ""', 'server: "  "'):
+        target = _write(tmp_path, f"""
+accounts:
+  - name: a
+    login: 1
+    {blank}
+    mode: real
+""")
+        with pytest.raises(ConfigError, match="сервер не назван"):
+            config.load(target)
+
+
 def test_vpn_without_profile_is_an_error(tmp_path: pathlib.Path) -> None:
     target = _write(tmp_path, """
 accounts:

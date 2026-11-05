@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS risk_slots (
 CREATE TABLE IF NOT EXISTS peaks (
     account TEXT NOT NULL, ticket INTEGER NOT NULL, peak REAL, PRIMARY KEY (account, ticket)
 );
+CREATE TABLE IF NOT EXISTS lot_witness (
+    account TEXT NOT NULL, ticket INTEGER NOT NULL, volume REAL NOT NULL, updated_epoch REAL,
+    PRIMARY KEY (account, ticket)
+);
 CREATE TABLE IF NOT EXISTS health (
     account TEXT PRIMARY KEY, fail_count INTEGER DEFAULT 0, next_attempt_epoch REAL DEFAULT 0,
     last_error TEXT
@@ -229,20 +233,23 @@ class Store:
             conn.execute("DELETE FROM positions WHERE account=? AND ticket=?",
                          (account, ticket))
             conn.execute("DELETE FROM peaks WHERE account=? AND ticket=?", (account, ticket))
+            conn.execute("DELETE FROM lot_witness WHERE account=? AND ticket=?",
+                         (account, ticket))
 
     def mirrored_positions(
             self, account: str,
             max_age: float = POSITIONS_TTL_SECONDS) -> dict[int, tuple[int, float, str]]:
         """The book's last picture of one account: {ticket: (magic, volume, symbol)}.
 
-        Two questions can only be answered against the previous cycle. Which of our lots are gone
-        now — the broker closed them at their own stop and no code of ours was asked to do it. And
-        which lot carries volume we did not ask for — on a netting account the operator's manual
-        trade merges into our record, and the ticket that says "ours" is then a sum of two people's
-        money. The symbol travels with the row because a journalled close is joined to the
-        candidate book by account, symbol and ticket, and a close without a name cannot be paid out.
-        A stale mirror is not evidence of either, so rows older than the mirror's own TTL are left
-        out.
+        One question can only be answered against the previous cycle: which of our lots are gone
+        now — the broker closed them at their own stop and no code of ours was asked to do it. The
+        symbol travels with the row because a journalled close is joined to the candidate book by
+        account, symbol and ticket, and a close without a name cannot be paid out. A stale mirror is
+        not evidence even of that — a ticket it still lists from before an outage can be sitting in
+        the market untouched — so rows older than the mirror's own TTL are left out.
+
+        What the mirror can say about a merge dies with that TTL, which is why the merge question has
+        a record of its own in `lot_witness`.
         """
         with self._connect() as conn:
             rows = conn.execute(
@@ -251,6 +258,53 @@ class Store:
                 (account, time.time() - max_age)).fetchall()
         return {int(ticket): (int(magic or 0), float(volume or 0.0), str(symbol))
                 for ticket, magic, volume, symbol in rows}
+
+    def lot_witnesses(self, account: str) -> dict[int, float]:
+        """How many lots of each ticket this park says it owns: {ticket: lots}. No expiry.
+
+        The mirror is a photograph of last cycle and goes stale; this is a statement about
+        authorship, and it has to outlive an outage long enough for the shard to come back and still
+        know how much of a netting ticket it paid for. Volume that grew past the witness is somebody
+        else's trade folded into our ticket, and closing that lot sells his half too.
+        """
+        with self._connect() as conn:
+            rows = conn.execute("SELECT ticket, volume FROM lot_witness WHERE account=?",
+                                (account,)).fetchall()
+        return {int(ticket): float(volume or 0.0) for ticket, volume in rows}
+
+    def note_lot_witness(self, account: str, ticket: int, volume: float) -> None:
+        """Record what this park saw or ordered, and never let the witness grow by looking.
+
+        A ticket nobody has recorded yet gets its first number here: the lots a fill returned, or the
+        volume on the book's first cycle with it. A ticket already witnessed keeps the smaller
+        figure, because market volume growing around a lot we own is exactly the merge this record
+        exists to catch — a witness that followed it upward would remember the merge for one cycle
+        and then close it.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO lot_witness (account, ticket, volume, updated_epoch)"
+                " VALUES (?,?,?,?) ON CONFLICT(account, ticket) DO UPDATE SET"
+                " volume=MIN(lot_witness.volume, excluded.volume),"
+                " updated_epoch=excluded.updated_epoch",
+                (account, ticket, max(0.0, float(volume)), time.time()))
+
+    def add_lot_witness(self, account: str, ticket: int, volume: float) -> None:
+        """These are lots this park ordered into a ticket it already holds.
+
+        A second entry on a netting account folds into the same ticket, so our money in it grows by
+        what we ordered — growth a witness has to follow, unlike growth it merely observes. The first
+        number for a ticket nobody has recorded is written by `note_lot_witness`; reaching this one on
+        a fresh ticket only says the book lost the row while a lot we bought stayed open.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO lot_witness (account, ticket, volume, updated_epoch)"
+                " VALUES (?,?,?,?)"
+                " ON CONFLICT(account, ticket) DO UPDATE SET"
+                " volume=lot_witness.volume + excluded.volume,"
+                " updated_epoch=excluded.updated_epoch",
+                (account, ticket, float(volume), time.time()))
 
     def peak(self, account: str, ticket: int) -> float:
         with self._connect() as conn:
@@ -574,6 +628,12 @@ class Store:
         with self._connect() as conn:
             removed = conn.execute("DELETE FROM equity WHERE ts < ?", (cutoff,)).rowcount
             conn.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
+            # A witness is refreshed by every cycle that still sees its ticket, so one nobody has
+            # written for the whole retention window belongs to a lot that has been out of the
+            # market for a month. It is not the outage case the record exists for: that is measured
+            # in minutes, and this is the only thing that keeps the table from outliving the book.
+            conn.execute("DELETE FROM lot_witness WHERE updated_epoch < ?",
+                         (time.time() - retention_days * 86400,))
             if active:
                 marks = ",".join("?" for _ in active)
                 live = f"(SELECT account FROM book WHERE updated_epoch > {live_since!r})"
@@ -586,6 +646,11 @@ class Store:
                 conn.execute(f"DELETE FROM peaks WHERE account NOT IN ({marks})"
                              f" AND account NOT IN {live}", (*active,))
                 conn.execute(f"DELETE FROM health WHERE account NOT IN ({marks})"
+                             f" AND account NOT IN {live}", (*active,))
+                # The witness ages out with an account nobody writes, never with a ticket's
+                # freshness window: a lot the park paid for keeps its proof through an outage, and
+                # the first cycle back is exactly the cycle that has to know how much of it was ours.
+                conn.execute(f"DELETE FROM lot_witness WHERE account NOT IN ({marks})"
                              f" AND account NOT IN {live}", (*active,))
             else:
                 conn.execute("DELETE FROM positions WHERE updated_epoch < ?", (epoch_cutoff,))

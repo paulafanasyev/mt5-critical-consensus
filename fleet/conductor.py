@@ -401,6 +401,16 @@ class Conductor:
         elif self.store.get_meta("book_incomplete") == "1":
             self.store.set_meta("book_incomplete", "0")
             self.store.event("conductor", "book_complete", accounts=book["accounts"])
+        unpriced = int(book.get("unpriced", 0) or 0)
+        if unpriced > 0:
+            # The daily stop is one percentage of one sum, and a sum that leaves accounts out is not
+            # this portfolio's size. An account whose currency nobody can price contributes nothing to
+            # `equity` while its losses keep happening, so measuring on the priced part can report a
+            # calm day next to the only line of defence that has to fire — which is worse than a stop
+            # that fires early: the stand shuts openings, every closer keeps working, and the reason
+            # written into the file says what to fix.
+            return (f"дневный стоп портфеля не измерим: {unpriced} счёт(ов) без цены в долларах; "
+                    f"книга оценивается целиком, иначе процент просадки — не про эти деньги")
         if self.day_start_equity and self.day_start_equity > 0 and book["equity"] > 0:
             adjusted = self._adjusted_equity(book)
             change_pct = (adjusted - self.day_start_equity) / self.day_start_equity * 100

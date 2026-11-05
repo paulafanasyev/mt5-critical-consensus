@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import fleet_cli  # noqa: E402
+from fleet import conductor as fleet_conductor  # noqa: E402
 from fleet import config as fleet_config  # noqa: E402
 
 
@@ -166,6 +167,71 @@ def test_stopping_a_window_that_is_not_up_says_so_and_journals_nothing(
     assert code == 0
     assert "останавливать нечего" in capsys.readouterr().out
     assert Store(store_path).recent_events(limit=5) == []  # nothing happened, nothing journalled
+
+
+def test_a_reset_day_leaves_the_armed_stand_armed(tmp_path: pathlib.Path,
+                                                 monkeypatch, capsys) -> None:
+    """Re-basing the day is bookkeeping; the file that stops this machine is the operator's word.
+
+    `reset-day` used to unlink the kill switch as a side effect, so an operator who armed the stand
+    after a losing day and then accepted the reset had his money trading again without ever saying
+    so. The reset clears this machine's baselines and says, in the journal and on screen, that the
+    stand is still down.
+    """
+    store_path = tmp_path / "fleet.sqlite"
+    stand = tmp_path / "PAUSE"
+    stand.write_text("ручная пауза после дневного стопа", encoding="utf-8")
+    monkeypatch.setattr(fleet_conductor, "PAUSE_FILE", stand)
+    monkeypatch.setattr(fleet_cli, "local_host", lambda: "box-a")
+
+    code = fleet_cli.main(["--store", str(store_path), "reset-day"])
+
+    assert code == 0
+    assert stand.exists() and "ручная пауза" in stand.read_text(encoding="utf-8")
+    output = capsys.readouterr().out
+    assert "стоянка на месте" in output and "снимай её сам" in output
+    events = [(kind, payload) for _, _, kind, payload in Store(store_path).recent_events(limit=5)]
+    assert [kind for kind, _ in events] == ["reset_day", "reset_day_paused"]
+    assert "ручная пауза" in json.loads(events[1][1])["reason"]
+
+    # The other half: with no stand armed the reset is a quiet number change, and must not invent one.
+    stand.unlink()
+    capsys.readouterr()
+    assert fleet_cli.main(["--store", str(store_path), "reset-day"]) == 0
+    assert not stand.exists()
+    assert "стоянки нет" in capsys.readouterr().out
+    assert [kind for _, _, kind, _ in Store(store_path).recent_events(limit=5)] == [
+        "reset_day", "reset_day", "reset_day_paused"]  # newest first: the second run said nothing extra
+
+
+def test_the_window_census_never_opens_the_journal(tmp_path: pathlib.Path,
+                                                   monkeypatch, capsys) -> None:
+    """A command that only means to look must not rewrite the row the shards trade on.
+
+    `terminal_roster@<host>` is written by the cycles that put money in the market. A diagnostic that
+    refreshed it could open or shut entries park-wide, so the census reads the process list and prints
+    what it saw without touching the book at all.
+    """
+    config_path = _two_broker_registry(tmp_path)
+    store_path = tmp_path / "fleet.sqlite"
+
+    def no_store(*args, **kwargs):
+        raise AssertionError("перепись окон не должна открывать журнал")
+
+    monkeypatch.setattr(fleet_cli, "Store", no_store)
+    # `raising=False` on purpose: against the old command, which opened the journal before it looked
+    # at anything, the failure has to name the write rather than a missing attribute.
+    monkeypatch.setattr(fleet_cli.worker, "census", lambda: [
+        {"dir": r"C:\mt5-fleet\terminals\0", "exe": r"C:\mt5-fleet\terminals\0\terminal64.exe",
+         "login": 1, "server": "Exness-MT5Real26", "balance": 1000.0, "equity": 999.0}],
+        raising=False)
+
+    assert fleet_cli.main(["--config", str(config_path), "--store", str(store_path),
+                           "terminals"]) == 0
+    assert "Exness-MT5Real26" in capsys.readouterr().out
+    assert not store_path.exists()
+
+
 
 
 def _source(tmp_path: pathlib.Path) -> pathlib.Path:
@@ -485,3 +551,75 @@ def test_a_settled_guess_is_out_of_the_sum_and_says_where_it_went(
     assert "не в сумме" in out and "итог не в $" not in out
     assert "закрыто по билету брокера 0" in out and "посчитано отдельно: 1 на -12.50 USD" in out
     assert "+0.00 USD" in out  # the dollar column is empty because nothing was attributable
+
+
+def test_the_table_shows_the_dollars_the_header_sums(tmp_path: pathlib.Path, capsys) -> None:
+    """The critic's finding: every bucket printed except the one that is actually a number.
+
+    `итог,$` is the column the operator reads to check the header's sum against the rows, and the old
+    branch order answered its own proven rows with `итог не в $`: the header was unverifiable from the
+    table it sat above.
+    """
+    from fleet import candidates
+
+    store = Store(tmp_path / "fleet.sqlite")
+    store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02, ticket=7,
+                ticket_source="token", currency="USD", rate_to_usd=1.0,
+                drift_points=25.0, drift_cost=0.5, drift_cost_usd=0.5, risk_usd=2.0)
+    store.event("a", "closed", symbol="EURUSD", ticket=7, reason="тейк", profit=9.99,
+                by="брокер", currency="USD", rate_to_usd=1.0, profit_usd=9.99)
+    assert fleet_cli.main(["--store", str(tmp_path / "fleet.sqlite"), "candidates"]) == 0
+    out = capsys.readouterr().out
+    row = [line for line in out.splitlines() if line.strip().startswith("7")]
+    assert "+9.99" in row[0], out
+    assert "итог не в $" not in out
+    assert "закрыто по билету брокера 1" in out and "+9.99 USD" in out
+
+
+def test_a_ticket_merged_with_a_manual_lot_pays_nothing_into_the_sum(
+        tmp_path: pathlib.Path, capsys) -> None:
+    """The park's own witness beats the order comment: a merged ticket is two drivers' money.
+
+    `ticket_source == token` proves the broker filled OUR order on that ticket. It does not prove the
+    ticket stayed ours: on a netting account the operator's manual lot folds in, the worker stops
+    managing the position and journals `lot_merged_with_manual`, and the broker later closes the whole
+    thing under one profit number. Summing that number is the book paying the operator's trade out of
+    the park's statistics — which is exactly the argument that already excludes `only_position` rows.
+    """
+    from fleet import candidates
+
+    store = Store(tmp_path / "fleet.sqlite")
+    store.event("a", candidates.KIND, symbol="EURUSD", side="buy", volume=0.02, ticket=7,
+                ticket_source="token", currency="USD", rate_to_usd=1.0,
+                drift_points=4.0, drift_cost=0.08, drift_cost_usd=0.08, risk_usd=2.0)
+    store.event("a", candidates.MERGED, lots=[{"ticket": 7, "asked": 0.02, "now": 0.10}],
+                detail="ручной лот влился в наш")
+    store.event("a", "closed", symbol="EURUSD", ticket=7, reason="тейк", profit=500.0,
+                by="брокер", currency="USD", rate_to_usd=1.0, profit_usd=500.0)
+    assert fleet_cli.main(["--store", str(tmp_path / "fleet.sqlite"), "candidates"]) == 0
+    book = candidates.ledger(store)
+    assert book["closed"] == 0 and book["profit_gross_usd"] == 0.0
+    assert book["merged_ticket"] == 1 and book["win_rate"] is None
+    assert book["guessed_profit_usd"] == 0.0  # not even shown as a guess: nobody can split it
+    out = capsys.readouterr().out
+    assert "с ручной" in out and "слился с ручной сделкой" in out
+    assert "+500.00" not in out
+
+
+def test_a_merge_on_another_account_never_silences_this_one(
+        tmp_path: pathlib.Path) -> None:
+    """A ticket is unique on one server, not across the book: the witness is keyed by account."""
+    from fleet import candidates
+
+    store = Store(tmp_path / "fleet.sqlite")
+    for account in ("a", "b"):
+        store.event(account, candidates.KIND, symbol="EURUSD", side="buy", volume=0.02,
+                    ticket=7, ticket_source="token", currency="USD", rate_to_usd=1.0,
+                    drift_points=4.0, drift_cost=0.08, drift_cost_usd=0.08, risk_usd=2.0)
+    store.event("a", candidates.MERGED, lots=[{"ticket": 7, "asked": 0.02, "now": 0.10}])
+    for account in ("a", "b"):
+        store.event(account, "closed", symbol="EURUSD", ticket=7, reason="тейк", profit=5.0,
+                    by="брокер", currency="USD", rate_to_usd=1.0, profit_usd=5.0)
+    book = candidates.ledger(store)
+    assert book["merged_ticket"] == 1
+    assert book["closed"] == 1 and book["profit_gross_usd"] == 5.0
