@@ -134,6 +134,19 @@ def demo_equity_trend(points: int = 6) -> float:
     return equities[-1] - equities[-points]
 
 
+def book_of(mt5) -> list | None:
+    """The positions this terminal answered with, or None when it answered nothing at all.
+
+    `positions_get()` returns None on a dropped channel and an empty list when the account is flat.
+    Read as one value they say opposite sentences: an empty demo book tells the mirror "the demo let
+    this lot go", and the real copy is sold; an empty real book tells it "nothing is mirrored yet",
+    and a second lot is bought on every symbol the demo holds. This machine has measured the IPC
+    timeout that produces the first of those, so the difference is not hypothetical.
+    """
+    book = mt5.positions_get()
+    return None if book is None else list(book)
+
+
 def main(argv: list[str] | None = None) -> int:
     import MetaTrader5 as mt5
 
@@ -176,7 +189,19 @@ def main(argv: list[str] | None = None) -> int:
                     return 1
                 time.sleep(args.interval_sec)
                 continue
-            demo_positions = [p for p in (mt5.positions_get() or [])
+            demo_book = book_of(mt5)
+            if demo_book is None:
+                # Nothing is known about the demo this cycle, and both halves of the job below ask
+                # that question: the closes are keyed to what the demo still holds, the copies to what
+                # it is growing. A cycle that cannot read the laboratory sells real money on a ghost.
+                log({"event": "демо не ответил на вопрос о позициях: в этом цикле ни копий, ни "
+                              "выходов по «демо закрыл»"})
+                mt5.shutdown()
+                if args.once:
+                    return 1
+                time.sleep(args.interval_sec)
+                continue
+            demo_positions = [p for p in demo_book
                               if p.magic >= DEMO_MAGIC_FLOOR]
             demo_positions = [{"ticket": p.ticket, "symbol": p.symbol, "type": p.type,
                                "volume": p.volume, "price_open": p.price_open,
@@ -252,12 +277,25 @@ def main(argv: list[str] | None = None) -> int:
             if row is not None and lots < args.real_lots:
                 log({"event": f"лот срезан по реестру: {args.real_lots} → {lots} "
                               f"(max_lots записи {row.name})"})
+            real_book = book_of(mt5)
+            if real_book is None:
+                # Not a flat account: a question nobody answered. Read as `[]` it would say three
+                # things at once, and all three are wrong — that the daily stop has nothing left in
+                # the market to prove, that no symbol is mirrored yet so every growing demo leg is
+                # still buyable, and that there is no own lot to sell early.
+                log({"event": "реальный счёт не ответил на вопрос о позициях: в этом цикле ни "
+                              "копий, ни выходов, ни подтверждения дневного стопа"})
+                mt5.shutdown()
+                if args.once:
+                    return 1
+                time.sleep(args.interval_sec)
+                continue
             if state.get("day_start_equity") is None:
                 state["day_start_equity"] = real_account.equity
                 save_state(state)
             limit = state["day_start_equity"] * (1 - args.daily_stop_pct / 100)
             if real_account.equity < limit and not state.get("halted"):
-                for position in [p for p in (mt5.positions_get() or [])
+                for position in [p for p in real_book
                                  if p.magic == REAL_MAGIC]:
                     tick = mt5.symbol_info_tick(position.symbol)
                     send_order(mt5, {"action": mt5.TRADE_ACTION_DEAL,
@@ -271,19 +309,31 @@ def main(argv: list[str] | None = None) -> int:
                                      "comment": "daily stop"}, exit_gate)
                 # "Everything of ours is closed" is a claim about the broker, not about this loop:
                 # the send above only proves an order_send call, and a rejected one used to be enough
-                # to set the halt — after which every later cycle refused to try the exit again.
-                remaining = [p for p in (mt5.positions_get() or []) if p.magic == REAL_MAGIC]
-                if remaining:
-                    log({"event": f"дневный стоп не подтверждён: {len(remaining)} своего лота ещё "
-                                  "в рынке, повторю в следующем цикле"})
+                # to set the halt — after which every later cycle refused to try the exit again. The
+                # witness has to answer, too: an unanswered question is not a flat book, and marking
+                # the day halted on one would tell every later cycle that the exit it never made is
+                # already done.
+                witness = book_of(mt5)
+                if witness is None:
+                    # Deliberately not a `continue`: the rest of this cycle still has work the daily
+                    # stop does not own, and jumping out of it would also leak the terminal connection.
+                    log({"event": "дневный стоп не подтверждён: счёт не ответил на второй вопрос о "
+                                  "позициях, повторю в следующем цикле"})
                 else:
-                    state["halted"] = True
-                    save_state(state)
-                    log({"event": f"DAILY STOP: real equity {real_account.equity:.2f} below "
-                                  f"{limit:.2f}, всё своё закрыто"})
+                    remaining = [p for p in witness if p.magic == REAL_MAGIC]
+                    if remaining:
+                        log({"event": f"дневный стоп не подтверждён: {len(remaining)} своего лота "
+                                      "ещё в рынке, повторю в следующем цикле"})
+                    else:
+                        state["halted"] = True
+                        save_state(state)
+                        log({"event": f"DAILY STOP: real equity {real_account.equity:.2f} below "
+                                      f"{limit:.2f}, всё своё закрыто"})
 
-            real_positions = [p for p in (mt5.positions_get() or []) if p.magic == REAL_MAGIC]
-            other = len(mt5.positions_get() or []) - len(real_positions)
+            # The dedup below is only as good as this list: a book that did not answer would leave it
+            # empty and every growing demo leg would look unmirrored.
+            real_positions = [p for p in real_book if p.magic == REAL_MAGIC]
+            other = len(real_book) - len(real_positions)
             if other:
                 log({"event": f"{other} лот(ов) на реальном счёте не наши (magic != {REAL_MAGIC}): "
                               f"не тронуты"})

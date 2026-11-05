@@ -389,6 +389,17 @@ class Worker:
         if account.password_env and not terminals.password_for(account):
             return WorkerResult(account.name, "error",
                                 f"секрет не найден: переменная {account.password_env} пуста")
+        if self.dry_run and account.is_real:
+            # `--dry-run` promises that nothing of the operator's is touched, and a real account is the
+            # one place where a paper cycle cannot keep that promise: reaching it means logging into
+            # the broker that holds his money, while the cycle itself places no protective level and
+            # closes nothing. Refused here, before a terminal is started — so the book never reads a
+            # paper lot on a real login, which is the one thing a status line must not print.
+            self._announce_once(_host_key(f"dryrun_refused:{account.name}"), account.name,
+                                "dry_run_refused", login=account.login, server=account.server,
+                                detail="бумажный цикл не подключается к счёту с настоящими деньгами")
+            return WorkerResult(account.name, "error",
+                                f"{account.login}: dry-run на реальном счёте — не подключаемся")
         try:
             error = self.attach(account)
         except Exception as exc:  # noqa: BLE001 - a bad terminal must not kill the shard
@@ -495,18 +506,25 @@ class Worker:
             self._note_meta(f"exitidentity:{account.name}", "")
             self.store.event(account.name, "exit_identity_restored",
                              login=snapshot.login, server=snapshot.server)
-        if snapshot.equity <= 0:
-            return WorkerResult(account.name, "flat", "нулевой баланс")
-        if account.is_real and snapshot.balance <= 0:
-            return WorkerResult(account.name, "flat", "реальный счёт без денег")
-        if snapshot.rate_to_usd() <= 0 and not account.is_real:
-            return WorkerResult(account.name, "flat",
-                                f"нет курса {snapshot.currency}→USD: книга счёт не видит")
         rate = snapshot.rate_to_usd(account.currency_scale)
         day, flows_payload = self._day_state(account, snapshot, server_day)
         positions = risk.positions_for(account)  # includes manual positions: they move equity
 
         closed = self._manage_positions(account, day, positions, snapshot.currency, rate)
+        # These three money reads used to sit in front of the management call above, and each of them
+        # is a condition a lot survives: an account at zero equity, a real account whose balance the
+        # broker has already eaten, a demo priced in a currency the book cannot quote. In all three the
+        # lot is still in the market and the exit rule still has a price to work from — closing it does
+        # not need a rate, only the address proved above. What those readings do gate is the day's
+        # accounting and new openings, so that is where they stand now.
+        if snapshot.equity <= 0:
+            return WorkerResult(account.name, "flat", "нулевой баланс", closed=closed)
+        if account.is_real and snapshot.balance <= 0:
+            return WorkerResult(account.name, "flat", "реальный счёт без денег", closed=closed)
+        if snapshot.rate_to_usd() <= 0 and not account.is_real:
+            return WorkerResult(account.name, "flat",
+                                f"нет курса {snapshot.currency}→USD: книга счёт не видит",
+                                closed=closed)
         # Re-read after management so the gates judge the account as it is now, not as it was.
         snapshot = risk.AccountSnapshot.read(server_day) or snapshot
         positions = risk.positions_for(account)
@@ -1349,15 +1367,22 @@ class Worker:
 
 def run_shard(config: FleetConfig, store: Store, shard: int, dry_run: bool = False,
               pause_file: pathlib.Path | None = None, allow_live: bool = False,
+              allow_entries: bool = True,
               ) -> list[WorkerResult]:
-    """Run one shard. A pause blocks new entries but never blocks exits."""
+    """Run one shard. A pause blocks new entries but never blocks exits.
+
+    `allow_entries=False` is the same half-door for a reason the operator did not choose: a registry
+    this process can no longer read stops openings, because an opening is a promise about money made
+    in the numbers that file holds. Taking that money back out needs only the address, which the
+    cycle proves for itself.
+    """
     worker = Worker(config, store, pause_file=pause_file, dry_run=dry_run,
                     allow_live=allow_live)
     stand = worker.pause_file  # the path the Worker itself obeys: one answer, not two defaults
     results = []
     for account in config.by_shard(shard):
         # The pause file can appear mid-cycle: check it per account, not once per shard.
-        paused = stand.exists()
+        paused = stand.exists() or not allow_entries
         results.append(worker.run_account(account, allow_entries=not paused))
         time.sleep(0.3)
     return results

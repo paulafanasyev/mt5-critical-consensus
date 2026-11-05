@@ -102,7 +102,30 @@ def ours(ea: dict) -> list[dict]:
     A state file written by an EA that predates the `magic` field yields nothing here: no field, no
     close. Guessing that an unlabelled lot was ours would mean closing the operator's trade.
     """
-    return [p for p in (ea.get("positions") or []) if int(p.get("magic") or 0) == REAL_MAGIC]
+    lots = our_lots(ea)
+    return [] if lots is None else lots
+
+
+def our_lots(ea: dict) -> list[dict] | None:
+    """The same list for a caller that has to tell a flat book from an unanswered one."""
+    reported = reported_positions(ea)
+    if reported is None:
+        return None
+    return [p for p in reported if int(p.get("magic") or 0) == REAL_MAGIC]
+
+
+def reported_positions(ea: dict) -> list[dict] | None:
+    """Every lot the advisor published, or None when its file carries no list at all.
+
+    The advisor writes `"positions":[...]` on every pass, including the flat one, so a file without
+    that key is a torn write or a build from before the field — a question nobody answered. As an
+    empty list it answers the one question the daily stop waits for before it ends the day, and the
+    bridge then reports "all of ours are out" over lots still riding on real money; as an empty list
+    for the openings it says "nothing is mirrored yet" and the next cycle buys a second lot on a
+    symbol that already has one.
+    """
+    positions = ea.get("positions")
+    return None if positions is None else list(positions)
 
 
 def withdraw(cmd_path: pathlib.Path) -> bool:
@@ -180,7 +203,11 @@ def demo_book() -> list[dict] | None:
         account = mt5.account_info()
         if account is None or account.trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO:
             return None
-        positions = mt5.positions_get() or []
+        positions = mt5.positions_get()
+        if positions is None:
+            # A dropped channel is not a flat demo account. Read as `[]` it tells the cycle below that
+            # the demo let every symbol go, and every real copy is sold on an answer nobody gave.
+            return None
         return [{"ticket": p.ticket, "symbol": p.symbol, "type": p.type,
                  "volume": p.volume, "profit": p.profit, "sl": p.sl, "tp": p.tp}
                 for p in positions]
@@ -238,9 +265,15 @@ def run_cycle(state: dict, gate, *, ea_path: pathlib.Path = EA_STATE,
         return send_command(command, gate, cmd_path, login=ea.get("login"),
                             server=ea.get("server"))
 
-    def pending() -> list[dict]:
-        """Our lots as the EA last reported them: the state file is rewritten every second."""
-        return ours(read_ea_state(ea_path) or ea)
+    def pending() -> list[dict] | None:
+        """Our lots as the advisor last reported them: the state file is rewritten every second.
+
+        None means the second question went unanswered — the file is gone, torn, or written by a build
+        that publishes no positions. It used to fall back to the answer this cycle had already read,
+        which is the book from before the closes it is now confirming.
+        """
+        fresh = read_ea_state(ea_path)
+        return None if fresh is None else our_lots(fresh)
 
     if float(ea.get("balance") or 0) <= 0:
         return f"real balance {ea.get('balance')} — no funds, bridge idle"
@@ -261,6 +294,14 @@ def run_cycle(state: dict, gate, *, ea_path: pathlib.Path = EA_STATE,
             # armed the last one and lost the other two.
             time.sleep(2)
         left = pending()
+        if left is None:
+            # The end of the day is a claim about the broker, and the broker has not answered. Read as
+            # an empty book, a torn or pre-`positions` file would let the bridge halt the day and stop
+            # trying while our lots were still riding on real money.
+            log({"event": "дневный стоп не подтверждён: советник не прислал список лотов — "
+                          "день не объявлен остановленным, следующий цикл повторит"})
+            return (f"DAILY STOP UNPROVEN: equity {equity} below {day_start:.2f}, "
+                    "книга реальных лотов не получена")
         if left:
             # A halt is a claim that the money is out of the market. Writing it because a file was
             # written — which is all `emit` proves — used to end the day with the lots still open and
@@ -278,6 +319,9 @@ def run_cycle(state: dict, gate, *, ea_path: pathlib.Path = EA_STATE,
         for position in still:
             emit({"action": "close", "ticket": position["ticket"]})
             time.sleep(2)
+        if reported_positions(ea) is None:
+            return ("halted for the day: советник не прислал список лотов, свой лот мог остаться "
+                    "в рынке — повторю в следующем цикле")
         return ("halted for the day" if not still
                 else f"halted for the day: повторяю закрытие {len(still)} своего лота")
 
@@ -285,9 +329,9 @@ def run_cycle(state: dict, gate, *, ea_path: pathlib.Path = EA_STATE,
     if book is None:
         return "demo book unavailable this cycle"
     our_positions = ours(ea)
-    all_positions = ea.get("positions") or []
-    if len(our_positions) < len(all_positions):
-        log({"event": f"{len(all_positions) - len(our_positions)} лот(ов) на реальном счёте не наши "
+    reported = reported_positions(ea)
+    if reported is not None and len(our_positions) < len(reported):
+        log({"event": f"{len(reported) - len(our_positions)} лот(ов) на реальном счёте не наши "
                       f"(magic != {REAL_MAGIC}): не закрыты и не тронуты"})
     demo_symbols = {item["symbol"] for item in book}
 
@@ -307,7 +351,22 @@ def run_cycle(state: dict, gate, *, ea_path: pathlib.Path = EA_STATE,
         withdraw(cmd_path)
         return f"bridge idle: {entry_refused}"
 
-    held = {p["symbol"] for p in all_positions}
+    if reported is None:
+        # An empty `held` read off an unanswered book is "nothing is mirrored yet", and this loop
+        # copies the demo book symbol by symbol: the next cycle would buy a second real lot on top of
+        # the first. Openings wait for the answer; exits above never did.
+        log({"event": "открытий нет: советник не прислал список реальных лотов — не зная, что уже "
+                      "держится, легко открыть второй лот на тот же символ"})
+        return (f"NO BOOK: real {ea.get('login')} позиции не сообщены, "
+                f"открытия запрещены, демо {len(book)}")
+    if not day_start:
+        # The daily stop measures this cycle's equity against the equity the day started with. With
+        # no starting number there is no reference, and a mirrored lot nobody can watch for a drawdown
+        # is a lot whose only exit is the broker's own stop.
+        log({"event": "открытий нет: дневный капитал не измерен — за лотом не следил бы ни один "
+                      "дневный стоп"})
+        return f"NO DAY MEASURE: real {ea.get('login')} открытия запрещены, демо {len(book)}"
+    held = {p["symbol"] for p in reported}
     # mirror only profitable demo buys in a confirmed uptrend
     # The row that lets this account trade is also the row that says how much of it may be traded.
     # The script's own default is not a permission: 0.01 onto an account the operator capped at 0.005

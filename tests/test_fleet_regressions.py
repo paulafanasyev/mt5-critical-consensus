@@ -2131,10 +2131,15 @@ def _registry_yaml(name: str = "exness", login: int = 777001) -> str:
 
 
 def _drive_shard(tmp_path, monkeypatch, steps, *, cycles: int):
-    """Run the shard loop with trading counted, mutating the registry between cycles.
+    """Run the shard loop with its entry door counted, mutating the registry between cycles.
 
     A shard cycles until it is killed, so `time.sleep` is the only seam: step k runs after cycle k,
     and the driver ends the run by raising out of a later sleep.
+
+    Two of the three things returned are lists, because the shard has two jobs. `traded` counts the
+    cycles that were allowed to open; `runs` counts every cycle that ran, with the entry door written
+    next to it. A registry the process can no longer read closes the first and must never close the
+    second: the lots the last good registry put into the market still have to meet a cycle.
     """
     from fleet import shard
 
@@ -2142,10 +2147,17 @@ def _drive_shard(tmp_path, monkeypatch, steps, *, cycles: int):
     registry.write_text(_registry_yaml(), encoding="utf-8")
     store_path = tmp_path / "book.sqlite"
     traded: list[str] = []
+    runs: list[bool] = []
     slept: list[int] = []
-    monkeypatch.setattr(shard.worker, "run_shard",
-                        lambda config, store, index, **kwargs: (
-                            traded.append(config.accounts[0].name) or []))
+
+    def fake_run_shard(config, store, index, **kwargs):
+        allowed = bool(kwargs.get("allow_entries", True))
+        runs.append(allowed)
+        if allowed:
+            traded.append(config.accounts[0].name)
+        return []
+
+    monkeypatch.setattr(shard.worker, "run_shard", fake_run_shard)
 
     def fake_sleep(seconds):
         slept.append(len(slept) + 1)
@@ -2158,7 +2170,7 @@ def _drive_shard(tmp_path, monkeypatch, steps, *, cycles: int):
     monkeypatch.setattr(shard.time, "sleep", fake_sleep)
     with pytest.raises(SystemExit):
         shard.main(["--shard", "0", "--config", str(registry), "--store", str(store_path)])
-    return traded, Store(store_path)
+    return traded, runs, Store(store_path)
 
 
 def test_a_registry_the_shard_cannot_read_stops_it_from_trading(tmp_path, monkeypatch) -> None:
@@ -2171,8 +2183,9 @@ def test_a_registry_the_shard_cannot_read_stops_it_from_trading(tmp_path, monkey
     def break_it(path: pathlib.Path) -> None:
         path.write_text("accounts: [\n", encoding="utf-8")
 
-    traded, store = _drive_shard(tmp_path, monkeypatch, [break_it], cycles=3)
+    traded, runs, store = _drive_shard(tmp_path, monkeypatch, [break_it], cycles=3)
     assert traded == ["exness"]
+    assert runs == [True, False, False], "осколочный цикл замёрз вместе с реестром"
     rejected = _of(store, "config_rejected")
     assert len(rejected) == 1 and rejected[0]["error"] and rejected[0]["shard"] == 0
     assert _of(store, "config_reloaded") == []
@@ -2183,8 +2196,9 @@ def test_a_registry_that_fails_validation_is_a_halt_too(tmp_path, monkeypatch) -
     def break_it(path: pathlib.Path) -> None:
         path.write_text("accounts: []\nphantom: 1\n", encoding="utf-8")
 
-    traded, store = _drive_shard(tmp_path, monkeypatch, [break_it], cycles=3)
-    assert traded == ["exness"] and len(_of(store, "config_rejected")) == 1
+    traded, runs, store = _drive_shard(tmp_path, monkeypatch, [break_it], cycles=3)
+    assert traded == ["exness"] and runs == [True, False, False]
+    assert len(_of(store, "config_rejected")) == 1
 
 
 def test_a_vanished_registry_is_a_refusal_not_a_permission(tmp_path, monkeypatch) -> None:
@@ -2194,8 +2208,9 @@ def test_a_vanished_registry_is_a_refusal_not_a_permission(tmp_path, monkeypatch
     promises not to trade — and the guard made the silence permanent, because a missing file never
     changes its stamp.
     """
-    traded, store = _drive_shard(tmp_path, monkeypatch, [lambda path: path.unlink()], cycles=3)
-    assert traded == ["exness"]
+    traded, runs, store = _drive_shard(tmp_path, monkeypatch, [lambda path: path.unlink()],
+                                       cycles=3)
+    assert traded == ["exness"] and runs == [True, False, False]
     assert len(_of(store, "config_rejected")) == 1
 
 
@@ -2207,8 +2222,9 @@ def test_the_shard_trades_again_the_minute_the_registry_is_readable(tmp_path, mo
     def fix_it(path: pathlib.Path) -> None:
         path.write_text(_registry_yaml(), encoding="utf-8")
 
-    traded, store = _drive_shard(tmp_path, monkeypatch, [break_it, fix_it], cycles=4)
+    traded, runs, store = _drive_shard(tmp_path, monkeypatch, [break_it, fix_it], cycles=4)
     assert traded == ["exness"] * 3
+    assert runs == [True, False, True, True], runs
     reloaded = _of(store, "config_reloaded")
     assert len(reloaded) == 1 and reloaded[0]["recovered_from"]
 

@@ -93,23 +93,27 @@ def main(argv: list[str] | None = None) -> int:
             # The file changed under this process. Until the new one is readable, the config in
             # memory is a registry we know to be wrong: the accounts, caps or modes on disk are not
             # the ones these numbers describe, and trading them is the stale registry this module
-            # promises never to trade. Halt, say it once per broken version, wait for a good one.
+            # promises never to trade. So: no openings from a registry nobody can vouch for.
             try:
                 config = load(config_path)
             except Exception as exc:  # noqa: BLE001 - a bad registry stops entries, not the shard
                 halted = f"{type(exc).__name__}: {exc}"[:400]
                 store.event("shard", "config_rejected", shard=args.shard, path=str(config_path),
-                            error=halted)
+                            error=halted, entries="blocked",
+                            exits="the last registry this process could read still manages its own "
+                                  "lots: a file nobody can parse is not an order to leave a lot in "
+                                  "the market")
             else:
                 store.event("shard", "config_reloaded", shard=args.shard, recovered_from=halted)
                 halted = ""
             fingerprint = stamp
-        if halted:
-            time.sleep(args.interval)
-            continue
         try:
+            # `halted` closes the entry door only. Freezing the closer with it is the defect this
+            # project removed from `worker.py` in 4027e77 after 8aa8db1 put it there: the lot does not
+            # care that the file changed, and it is still the park's own money at risk.
             results = worker.run_shard(config, store, args.shard, dry_run=args.dry_run,
-                                       pause_file=pause, allow_live=args.live)
+                                       pause_file=pause, allow_live=args.live,
+                                       allow_entries=not halted)
             for result in results:
                 store.event(result.account, "cycle", status=result.status,
                             detail=result.detail, opened=result.opened, closed=result.closed)

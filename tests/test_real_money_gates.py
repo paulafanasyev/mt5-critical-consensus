@@ -310,6 +310,83 @@ def test_a_state_file_older_than_the_magic_field_closes_nothing(tmp_path, monkey
     assert not cmd.exists()
 
 
+def test_a_real_book_that_never_answered_is_not_the_same_as_a_flat_one(tmp_path,
+                                                                       monkeypatch) -> None:
+    """`positions_get()` has two failures, and the bridge used to hear them as one sentence.
+
+    The advisor writes `"positions":[...]` on every pass, the flat one included. A state file without
+    that key is a torn write or a build from before the field — nobody answered — and read as `[]` it
+    tells the daily stop that everything of ours left the market (the day gets marked halted and no
+    later cycle ever retries the exit) and tells the mirroring pass that nothing is held yet, so the
+    next cycle buys a second real lot on a symbol that already carries one. `None` is the answer this
+    file does not have, and here it is refused in both places.
+    """
+    real_bridge = _script("real_bridge", tmp_path, monkeypatch)
+    monkeypatch.setattr(real_bridge, "time", types.SimpleNamespace(sleep=lambda s: None,
+                                                                   time=lambda: 0.0))
+    ea = tmp_path / "dsh_real_state.json"
+    cmd = tmp_path / "dsh_real_cmd.json"
+    answered = {"login": 276261159, "server": "Exness-MT5Real26", "balance": 100.0, "equity": 99.0,
+                "positions": [{"ticket": 5, "symbol": "EURUSD", "magic": real_bridge.REAL_MAGIC}]}
+    torn = {key: value for key, value in answered.items() if key != "positions"}
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    # The daily stop ordered the close, then asked the witness whether the lot is still in the market.
+    ea.write_text(json.dumps(answered), encoding="utf-8")
+    reads: list[int] = []
+
+    def second_read(path):
+        # The advisor dies between the cycle's first read and the one that confirms the exits.
+        reads.append(1)
+        return answered if len(reads) == 1 else torn
+
+    monkeypatch.setattr(real_bridge, "read_ea_state", second_read)
+    state = {"day": today, "day_start_equity": 100.0}
+    sentence = real_bridge.run_cycle(state, lambda: "стоянка на месте", ea_path=ea, cmd_path=cmd)
+    assert "UNPROVEN" in sentence and "книга реальных лотов не получена" in sentence, sentence
+    assert not state.get("halted"), "день объявлен остановленным по файлу без ответа"
+    assert reads, "свидетель не опрошен"
+
+    # The same file on a normal cycle: openings wait for the answer, and say so.
+    cmd.unlink()  # the close leg 1 armed stays in the folder: a stand is not a reason to disarm an exit
+    monkeypatch.setattr(real_bridge, "read_ea_state", lambda path: dict(torn, equity=100.0))
+    monkeypatch.setattr(real_bridge, "demo_book", lambda: [
+        {"symbol": "EURUSD", "type": 0, "profit": 5.0, "ticket": 11}])
+    monkeypatch.setattr(real_bridge, "hourly_uptrend", lambda symbol: True)
+    monkeypatch.setattr(real_bridge, "livegate", types.SimpleNamespace(
+        permitted_account=lambda *a, **k: types.SimpleNamespace(
+            name="r", risk=types.SimpleNamespace(max_lots=0.01)),
+        capped_lots=lambda row, asked: asked, exit_refusal=livegate.exit_refusal))
+    sentence = real_bridge.run_cycle({"day": today, "day_start_equity": 100.0}, lambda: "",
+                                     ea_path=ea, cmd_path=cmd)
+    assert "NO BOOK" in sentence, sentence
+    assert not cmd.exists(), "лот куплен на реальном счёте, когда книга не ответила"
+    assert "не зная, что уже держится" in _lines(real_bridge)
+
+
+def test_a_halted_day_that_lost_the_book_says_the_lots_may_still_be_there(
+        tmp_path, monkeypatch) -> None:
+    """"Halted for the day" is a report about the market, and a torn file cannot issue it.
+
+    After a confirmed halt the bridge keeps trying to get its own lots out. When the advisor stops
+    publishing the list, the honest sentence is "a lot of ours may still be in the market"; the old
+    one said the day was halted and nothing more, which is how a stopped process reads as a finished
+    one to the operator looking at the log.
+    """
+    real_bridge = _script("real_bridge", tmp_path, monkeypatch)
+    monkeypatch.setattr(real_bridge, "time", types.SimpleNamespace(sleep=lambda s: None,
+                                                                   time=lambda: 0.0))
+    ea = tmp_path / "dsh_real_state.json"
+    ea.write_text(json.dumps({"login": 276261159, "server": "Exness-MT5Real26", "balance": 100.0,
+                              "equity": 99.0}), encoding="utf-8")
+    cmd = tmp_path / "dsh_real_cmd.json"
+    halted = {"day": datetime.now(timezone.utc).date().isoformat(), "day_start_equity": 100.0,
+              "halted": True}
+    sentence = real_bridge.run_cycle(halted, lambda: "стоянка на месте", ea_path=ea, cmd_path=cmd)
+    assert "не прислал список лотов" in sentence, sentence
+    assert sentence != "halted for the day"
+
+
 def test_send_command_writes_no_file_on_a_refusal(tmp_path, monkeypatch) -> None:
     real_bridge = _script("real_bridge", tmp_path, monkeypatch)
     cmd = tmp_path / "dsh_real_cmd.json"
@@ -587,14 +664,21 @@ def test_a_shard_started_by_hand_watches_the_same_stand_as_the_conductor(tmp_pat
     assert seen["pause_file"] == stand
 
 
-def test_a_shard_with_no_config_flag_stops_when_its_registry_breaks(tmp_path, monkeypatch) -> None:
-    """`run --shards 0` passes no `--config`, so the default path is the file that must be watched."""
+def test_a_shard_that_lost_its_registry_blocks_entries_and_keeps_closing(tmp_path, monkeypatch) -> None:
+    """`run --shards 0` passes no `--config`, so the default path is the file that must be watched.
+
+    A registry this process can no longer read is a reason not to open: the accounts, caps and modes
+    its numbers promised are gone, and an opening is a statement made in those numbers. It is not a
+    reason to stop the cycle, and that used to be exactly what happened — the shard `continue`d, so
+    the lots the last good registry had let into the market met nobody. This is `8aa8db1`'s freeze
+    moved one file up, and the shard still says the loss once per broken version.
+    """
     registry = _registry(tmp_path)
     monkeypatch.setattr(shard, "CONFIG_PATH", registry)
-    calls: list[int] = []
+    seen: list[dict] = []
 
     def fake_run_shard(cfg, store, shard_id, **kwargs):
-        calls.append(1)
+        seen.append(kwargs)
         registry.write_text("accounts:\n- name: a\n  login: 1\n  server: S\n  mode: demo\n"
                             "  oops: 1\n", encoding="utf-8")
         later = time.time() + 5
@@ -613,8 +697,9 @@ def test_a_shard_with_no_config_flag_stops_when_its_registry_breaks(tmp_path, mo
     book = Store(tmp_path / "b.sqlite")
     with pytest.raises(SystemExit):
         shard.main(["--shard", "0", "--store", str(book.path), "--interval", "1"])
-    assert len(calls) == 1, "the shard cycled on a registry it knew was broken"
-    assert book.count_events("config_rejected") == 1
+    assert len(seen) == 3, "осколочный цикл замёрз вместе с реестром"
+    assert [row["allow_entries"] for row in seen] == [True, False, False], seen
+    assert book.count_events("config_rejected") == 1, "сломанный реестр нужно сказать один раз"
 
 
 # --- the worker's own gates -----------------------------------------------------------------
@@ -639,7 +724,6 @@ def test_a_real_lot_is_still_cared_for_when_the_live_word_is_missing(tmp_path,
     assert touched == ["modify", "close"], \
         f"закрыватель стоял из-за отсутствующего --live: {touched}"
     assert closed == 1
-    assert "open" not in touched, "лот открыт на настоящие деньги без слова оператора"
 
 
 def test_a_dry_run_cycle_writes_nothing_to_the_broker(tmp_path, monkeypatch) -> None:
@@ -655,8 +739,104 @@ def test_a_dry_run_cycle_writes_nothing_to_the_broker(tmp_path, monkeypatch) -> 
     assert store.count_events("exit(dry run)") == 1
 
 
+def test_a_paper_cycle_never_connects_to_a_real_account(tmp_path, monkeypatch) -> None:
+    """`--dry-run` says nothing of the operator's is touched; a real login is where that breaks.
+
+    A paper cycle on a live account is the worst of both: reaching it means logging into the broker
+    that holds his money, and the cycle itself then places no protective level and closes nothing, so
+    the journal can print a lot on a real login that was never guarded. The refusal belongs in front
+    of `attach` — before a window is started — and it is said once, not once per thirty seconds.
+    """
+    real = _demo_account(name="real", login=5, server="S", mode="real")
+    store = _book(tmp_path, real)
+    runner = worker.Worker(config.FleetConfig(accounts=[real]), store, dry_run=True)
+    monkeypatch.setattr(runner, "prepare_cycle", lambda: None)
+    monkeypatch.setattr(runner, "attach", lambda account: (_ for _ in ()).throw(
+        AssertionError("бумажный цикл подключился к счёту с настоящими деньгами")))
+    result = runner.run_account(real, allow_entries=True)
+    assert result.status == "error" and "dry-run" in result.detail
+    assert store.count_events("dry_run_refused") == 1
+    runner.run_account(real, allow_entries=True)
+    assert store.count_events("dry_run_refused") == 1, "отказ пишет по строке за цикл"
+
+    demo = _demo_account(name="paper", login=6, server="S")
+    book = _book(tmp_path, demo)
+    paper = worker.Worker(config.FleetConfig(accounts=[demo]), book, dry_run=True)
+    monkeypatch.setattr(paper, "prepare_cycle", lambda: None)
+    attached: list[str] = []
+    monkeypatch.setattr(paper, "attach", lambda account: attached.append(account.name) or "")
+    monkeypatch.setattr(paper, "_cycle", lambda account, allow_entries: (
+        attached.append("cycle"), worker.WorkerResult(account.name, "ok", "бумага"))[1])
+    paper.detach = lambda: None
+    assert paper.run_account(demo).status == "ok"
+    assert attached == ["paper", "cycle"], "бумажный цикл перестал играть на демо"
+
+
+@pytest.mark.parametrize("mode,currency,equity,balance,why", [
+    ("demo", "USD", 0.0, 1000.0, "нулевой баланс"),
+    ("real", "USD", 1000.0, 0.0, "реальный счёт без денег"),
+    ("demo", "RUR", 1000.0, 1000.0, "нет курса"),
+])
+def test_a_lot_is_still_closed_on_an_account_whose_money_cannot_be_read(
+        tmp_path, monkeypatch, mode: str, currency: str, equity: float, balance: float,
+        why: str) -> None:
+    """Three sentences about the account's money, and none of them is a reason to stop closing.
+
+    A lot survives all three readings: an account at zero equity, a real account whose balance the
+    broker has already eaten, a demo priced in a currency the book cannot quote. Each of those numbers
+    is a condition for the day's accounting and for new openings — and each used to `return` in front
+    of the management call, which left the park's own lot in the market with no trailing rule, no
+    break-even and no close while the process that opened it was still alive and still attached.
+    """
+    account = _demo_account(name=mode, login=5, server="S", mode=mode)
+    store = _book(tmp_path, account)
+    runner = worker.Worker(config.FleetConfig(accounts=[account]), store, dry_run=False,
+                           allow_live=mode == "demo")
+    touched: list[str] = []
+    _arm_management(monkeypatch, touched)
+    broke = worker.risk.AccountSnapshot(login=account.login, server=account.server,
+                                        currency=currency, balance=balance, equity=equity,
+                                        margin_free=balance, leverage=100, positions=1,
+                                        floating=0.0, server_day="2026-11-03")
+    monkeypatch.setattr(worker.risk.AccountSnapshot, "read", staticmethod(lambda day: broke))
+    monkeypatch.setattr(worker.risk, "server_day_now", lambda: "2026-11-03")
+    monkeypatch.setattr(worker.risk, "positions_for",
+                        lambda acc: [_own_position(account, 93)])
+    monkeypatch.setattr(worker.broker, "resolve", lambda base: None)  # ни RURUSD, ни USDURR
+    result = runner._cycle(account, True)
+    assert touched == ["modify", "close"], f"выход стоял за чтением «{why}»: {touched}"
+    assert result.status == "flat" and why in result.detail, result.detail
+    assert result.closed == 1, "закрытый лот не дошёл до оператора в статусе цикла"
+
+
+def test_a_shard_told_to_stop_opening_still_runs_the_account(tmp_path, monkeypatch) -> None:
+    """`allow_entries=False` is the entry door and nothing else, so it has to reach the cycle.
+
+    The shard has one reason the operator did not choose for closing that door — a registry it can no
+    longer read — and the half-door is only honest if the account's own cycle still runs: the exits,
+    the break-even and the journal are the parts that do not need the file.
+    """
+    account = _demo_account()
+    store = _book(tmp_path, account)
+    seen: list[tuple] = []
+
+    def spy(self, acc, allow_entries=True):
+        seen.append((acc.name, allow_entries))
+        return worker.WorkerResult(acc.name, "ok", "проверено")
+
+    monkeypatch.setattr(worker.Worker, "run_account", spy)
+    results = worker.run_shard(config.FleetConfig(accounts=[account]), store, 0,
+                               pause_file=_no_stand(tmp_path), allow_entries=False)
+    assert seen == [(account.name, False)], seen
+    assert [r.status for r in results] == ["ok"], "полудверь съела весь цикл"
+
+
 def _arm_management(monkeypatch, touched: list[str]) -> None:
-    """Every write the park can make on a lot it owns, recorded under one name."""
+    """Every write the park can make on a lot it owns, recorded under one name.
+
+    `market_order` is armed to raise rather than to record: the closing half of a cycle never opens a
+    lot, and an assertion that watches a list nobody appends to would pass whether it did or not.
+    """
     monkeypatch.setattr(worker.broker, "symbol_exact", lambda name: _symbol())
     monkeypatch.setattr(worker.broker, "atr", lambda *a, **k: 0.001)
     monkeypatch.setattr(worker.broker, "modify_position", lambda *a, **k: touched.append("modify"))
@@ -666,7 +846,8 @@ def _arm_management(monkeypatch, touched: list[str]) -> None:
         return float(position.volume)  # a full close, not a partial one
 
     monkeypatch.setattr(worker.broker, "close_position", fake_close)
-    monkeypatch.setattr(worker.broker, "market_order", lambda *a, **k: touched.append("open"))
+    monkeypatch.setattr(worker.broker, "market_order", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("закрыватель открыл лот")))
     monkeypatch.setattr(worker.strategy, "break_even_level", lambda *a, **k: 1.1000)
     monkeypatch.setattr(worker.strategy, "exit_reason", lambda *a, **k: "тейк пробило")
     monkeypatch.setattr(worker.mt5, "symbol_info_tick",
@@ -1228,6 +1409,99 @@ def test_a_parked_mirror_still_sells_the_copies_it_already_has(tmp_path, monkeyp
     assert "открытий нет" in text and "стоянка" in text
     # the same refusal, and the state remembers nothing it never did
     assert json.loads(real_mirror.STATE.read_text(encoding="utf-8")).get("halted") is False
+
+
+def _blind_terminal(monkeypatch, *, which: str, account, positions=(),
+                    demo=()) -> list[dict]:
+    """One terminal's `positions_get()` answers None: a dropped channel, not a flat account.
+
+    `which` names the side that lost the channel ("demo" or "real"); the other answers like
+    `_fake_terminal` does, so the cycle reads a real book from a laboratory that said nothing.
+    """
+    sent: list[dict] = []
+
+    class Blind:
+        def __init__(self) -> None:
+            self.current = ""
+
+        def __getattr__(self, name):
+            return getattr(_MT5, name)
+
+        def initialize(self, **kwargs):
+            self.current = str(kwargs.get("path") or "")
+            return True
+
+        def shutdown(self) -> None:
+            return None
+
+        def account_info(self):
+            return account
+
+        def positions_get(self, **kwargs):
+            on_real_side = self.current == "r.exe"
+            if (which == "real") == on_real_side:
+                return None
+            return list(positions if on_real_side else demo)
+
+        def symbol_info_tick(self, symbol):
+            return types.SimpleNamespace(bid=2000.0, ask=2000.5)
+
+        def order_send(self, request):
+            sent.append(request)
+            return types.SimpleNamespace(retcode=10009)
+
+    monkeypatch.setitem(sys.modules, "MetaTrader5", Blind())
+    return sent
+
+
+def test_a_demo_that_stopped_answering_sells_nothing_on_real_money(tmp_path,
+                                                                   monkeypatch) -> None:
+    """An empty demo book means the laboratory let the symbol go, and the mirror sells the copy.
+
+    That sentence is true when the demo answers with an empty list and false when it does not answer
+    at all — `positions_get()` returns None on a dropped IPC channel, which this machine has measured.
+    Collapsing the two sold a real lot because a terminal forgot to reply.
+    """
+    real_mirror = _script("real_mirror", tmp_path, monkeypatch)
+    who = types.SimpleNamespace(login=276261159, server="Exness-MT5Real26", trade_mode=2,
+                                balance=100.0, equity=100.0, currency="USD")
+    ours = types.SimpleNamespace(ticket=41, symbol="XAUUSD", type=0, volume=0.01,
+                                 price_open=2000.0, profit=4.0, sl=0.0, tp=0.0,
+                                 magic=real_mirror.REAL_MAGIC)
+    sent = _blind_terminal(monkeypatch, which="demo", account=who, positions=[ours])
+    monkeypatch.setattr(real_mirror.livegate, "PAUSE_FILE", _no_stand(tmp_path))
+    monkeypatch.setattr(real_mirror, "demo_equity_trend", lambda *a, **k: 1.0)
+    code = real_mirror.main(["--real-path", "r.exe", "--live", "--once",
+                             "--config", str(_registry(tmp_path))])
+    assert code == 1
+    assert sent == [], "реальный лот продан потому, что демо не ответил"
+    assert "демо не ответил" in _lines(real_mirror)
+
+
+def test_a_real_side_that_stopped_answering_buys_nothing_on_real_money(tmp_path,
+                                                                       monkeypatch) -> None:
+    """The mirror's dedup reads the real book, so None read as `[]` says "nothing is mirrored yet".
+
+    Every growing demo leg then looks unmirrored, and the cycle buys a second real lot on a symbol
+    that already carries one — twice over, since the next cycle cannot see the lot it just placed
+    either. The same None also removes the early exits, which are enumerated off that book.
+    """
+    real_mirror = _script("real_mirror", tmp_path, monkeypatch)
+    who = types.SimpleNamespace(login=276261159, server="Exness-MT5Real26", trade_mode=2,
+                                balance=100.0, equity=100.0, currency="USD")
+    ours = types.SimpleNamespace(ticket=41, symbol="XAUUSD", type=0, volume=0.01,
+                                 price_open=2000.0, profit=1.0, sl=0.0, tp=0.0,
+                                 magic=real_mirror.REAL_MAGIC)
+    sent = _blind_terminal(monkeypatch, which="real", account=who,
+                           demo=[_growing_demo_ticket("XAUUSD", 51)])
+    monkeypatch.setattr(real_mirror.livegate, "PAUSE_FILE", _no_stand(tmp_path))
+    monkeypatch.setattr(real_mirror, "demo_equity_trend", lambda *a, **k: 1.0)
+    monkeypatch.setattr(real_mirror, "hourly_uptrend", lambda *a, **k: True)
+    code = real_mirror.main(["--real-path", "r.exe", "--live", "--once",
+                             "--config", str(_registry(tmp_path))])
+    assert code == 1
+    assert sent == [], "копия куплена, когда реальный счёт не сказал, что уже держится"
+    assert "реальный счёт не ответил" in _lines(real_mirror)
 
 
 def _growing_demo_ticket(symbol: str, ticket: int, *, sl: float = 1990.0,
