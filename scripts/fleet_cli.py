@@ -140,6 +140,34 @@ def cmd_status(args: argparse.Namespace) -> int:
 _MONEY_KEYS = ("risk_usd", "profit_usd", "profit", "risk_basis", "volume", "price",
                "symbol", "side", "ticket")
 
+# The three numbers a ruler row is about, in the order the argument is read: what the broker's tick
+# field said, what its contract field said, what its own calculator answered.
+_RULER_NUMBERS = (("tick_value", "тик"), ("contract_size", "контракт"), ("calc_per_unit", "расчёт"))
+# A ruler row gets a longer line than the rest. Measured against the live journal's own XAGUSD row:
+# at the 110 characters an `opened` row needs it ended mid-word — «лот по контрак» — which is exactly
+# where «объём и риск меряны по контракту», the sentence the operator came to read, used to be cut.
+# With the numbers printed as fields the same row fits 156 characters.
+_RULER_BUDGET = 160
+
+
+def _ruler_word(data: dict) -> str:
+    """A cash-ruler row: the three numbers, and the verdict that follows them.
+
+    The payload's own sentence begins by naming the three numbers in prose — «расчёт брокера
+    подтвердил контракт (тик 100, контракт 100, расчёт брокера 100): …» — and the budget then ended
+    mid-sentence, cutting the part that says which ruler priced the lot. The numbers are printed here
+    instead, once, and the sentence keeps only what is left after them.
+    """
+    parts = [f"{key}={data[key]}" for key in ("symbol", "risk_basis") if data.get(key)]
+    for key, label in _RULER_NUMBERS:
+        value = data.get(key)
+        if isinstance(value, (int, float)) and value:
+            parts.append(f"{label}={value:g}")
+    text = str(data.get("detail") or data.get("reason") or "")
+    if "): " in text:
+        text = text.split("): ", 1)[1]
+    return " ".join([*parts, text])[:_RULER_BUDGET]
+
 
 def _event_word(kind: str, payload: str) -> str:
     """The money of an event inside the 110 characters the status line gives it.
@@ -156,6 +184,8 @@ def _event_word(kind: str, payload: str) -> str:
         return payload[:110]
     if not isinstance(data, dict):
         return payload[:110]
+    if kind in ("cash_ruler", "cash_ruler_unproven"):
+        return _ruler_word(data)
     head = [f"{key}={data.pop(key)}" for key in _MONEY_KEYS if key in data]
     detail = str(data.pop("detail", "") or data.pop("reason", "") or "")
     return " ".join([*head, detail])[:110]

@@ -465,3 +465,66 @@ def test_the_calculator_is_probed_at_the_lots_this_broker_accepts() -> None:
     assert broker._probe_volume(make_gold_spec(volume_min=0.01, volume_max=0.5)) == pytest.approx(0.5)
     assert broker._probe_volume(make_gold_spec(volume_min=10.0, volume_max=5.0)) == 0.0
 
+
+class _Calc:
+    """A terminal whose calculator answers from a script, one entry per call.
+
+    `None` is the broker's own way of saying nothing, so a list of replies is the whole difference
+    between a flake and a silence — and the cost of the second call is what makes retrying right:
+    measured 2026-11-05 on login 114929502, 200 probes of this shape cost 0.009–0.121 ms apiece and
+    none of them was dropped.
+    """
+
+    ORDER_TYPE_BUY = 0
+
+    def __init__(self, replies: list) -> None:
+        self.replies = replies
+        self.asked: list[float] = []
+
+    @staticmethod
+    def symbol_info_tick(name):
+        return types.SimpleNamespace(bid=4000.00, ask=4000.13)
+
+    def order_calc_profit(self, action, symbol, volume, price_open, price_close):
+        self.asked.append(volume)
+        reply = self.replies[min(len(self.asked), len(self.replies)) - 1]
+        if reply is None:
+            return None
+        return (price_close - price_open) * reply * volume
+
+
+def _probed(spec: BrokerSymbol, replies: list) -> tuple[float, str, list]:
+    real = broker.mt5
+    terminal = _Calc(replies)
+    broker.mt5 = terminal
+    try:
+        money, why = broker.calc_money_per_unit(spec)
+    finally:
+        broker.mt5 = real
+    return money, why, terminal.asked
+
+
+def test_a_calculator_that_drops_one_answer_is_asked_a_second_time() -> None:
+    """One lost reply is not a verdict, and writing it as one would flip the ruler in the journal.
+
+    The flip is what the retry is bought against: `tick-proven` one cycle and `never checked` the next
+    is two rows for one instrument, and the second tells the operator the calculator was never asked.
+    Measured 2026-11-05 on login 114929502 this terminal answered 200 of 200 probes, 0.009–0.121 ms
+    each, so asking twice is free where the answer came and buys the verdict where it did not.
+    """
+    money, why, asked = _probed(make_gold_spec(), [None, 100.0])
+    assert why == "" and money == pytest.approx(100.0)
+    assert len(asked) == 2, "проба не повторена"
+
+
+def test_a_calculator_that_stays_silent_is_called_twice_and_reported_in_its_own_words() -> None:
+    """The retry does not invent an answer: two silences are the silence the caller has to say."""
+    money, why, asked = _probed(make_gold_spec(), [None, None])
+    assert money == 0.0 and len(asked) == 2
+    assert why == "order_calc_profit вернул None"
+    # The probe volume comes from the broker's own limits, and a symbol that offers none is refused
+    # before the calculator is asked at all — one call, not two.
+    money, why, asked = _probed(make_gold_spec(volume_min=0.0), [100.0])
+    assert money == 0.0 and asked == [] and "нет лота" in why
+
+

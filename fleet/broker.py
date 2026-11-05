@@ -169,10 +169,27 @@ def calc_money_per_unit(spec: BrokerSymbol) -> tuple[float, str]:
 
     `(value, "")` when it answers. `(0.0, why)` when it will not — and no why is ever a number the
     park sizes with, so the caller has to say what it did instead.
+
+    Asked twice before it is called silent. A dropped answer is the expensive failure here: the ruler
+    alternates between `proved by the calculator` and `never checked`, and every flip writes another
+    row into the journal the operator reads. Measured 2026-11-05 on login 114929502 this terminal
+    answered 200 of 200 probes in 0.009–0.121 ms, so the second call costs nothing where the first
+    already answered, and buys the verdict where it did not. The reason reported is the last
+    attempt's, in its own words.
     """
     volume = _probe_volume(spec)
     if volume <= 0:
         return 0.0, f"нет лота, который брокер принял бы для пробы (min {spec.volume_min})"
+    why = "проба не сделана"
+    for _attempt in range(2):
+        money, why = _calc_once(spec, volume)
+        if money > 0:
+            return money, ""
+    return 0.0, why
+
+
+def _calc_once(spec: BrokerSymbol, volume: float) -> tuple[float, str]:
+    """One read of the ticker and one call of the calculator, in the broker's own account currency."""
     try:
         tick = mt5.symbol_info_tick(spec.name)
     except Exception as exc:  # noqa: BLE001 - a probe that throws is a probe that did not answer

@@ -737,3 +737,46 @@ def test_a_status_line_keeps_the_money_of_a_close() -> None:
     word = fleet_cli._event_word("closed", closed)
     assert "profit_usd=0.06" in word and "11252161967" in word and "отката" in word
     assert len(word) <= 110
+
+
+def test_a_ruler_line_says_which_of_the_brokers_two_fields_priced_the_lots() -> None:
+    """The whole point of the row is the sentence that used to fall off the end of the line.
+
+    Payload copied from the live journal (login 114929502, 2026-11-05). Its own prose quotes the three
+    numbers it compared, and at the budget an `opened` row needs the line stopped at «тикер»: the
+    operator read a broker changing its mind and no verdict at all. The numbers are now printed once,
+    as fields, and the sentence keeps the part after them.
+    """
+    row = json.dumps({"symbol": "XAGUSD", "contract_size": 5000.0, "profit_currency": "USD",
+                      "tick_value": 0.5, "calc_per_unit": 5000.0,
+                      "detail": "расчёт брокера подтвердил контракт (тик 500, контракт 5000, "
+                                "расчёт брокера 5000): лот по контракту в 10.00 раз меньше лота "
+                                "по тик-оценке; объём и риск меряны по контракту"},
+                     ensure_ascii=False)
+    word = fleet_cli._event_word("cash_ruler", row)
+    assert "меряны по контракту" in word, "вердикт линейки снова обрезан"
+    assert "тик=0.5" in word and "контракт=5000" in word and "расчёт=5000" in word
+    assert "тик 500," not in word, "одни и те же числа напечатаны дважды"
+    assert len(word) <= 160
+
+
+def test_a_ruler_line_names_the_ruler_the_lot_was_measured_with() -> None:
+    """`risk_basis` is what tells `tick-proven` from `tick-unchecked` in the journal.
+
+    Rows written by the park that was already running when this field was added do not carry it, so
+    the line must still print their verdict — the field is added to the head, never required by it.
+    """
+    proved = json.dumps({"symbol": "USDJPY", "risk_basis": "tick", "tick_value": 633.24,
+                         "contract_size": 100000.0, "calc_per_unit": 634.53,
+                         "detail": "расчёт брокера подтвердил тик (тик 633.24, контракт 100000, "
+                                   "расчёт брокера 634.53): объём и риск меряны по тик-оценке"},
+                        ensure_ascii=False)
+    word = fleet_cli._event_word("cash_ruler", proved)
+    assert "risk_basis=tick" in word and "объём и риск меряны по тик-оценке" in word
+    unproven = json.dumps({"symbol": "XAUUSD", "risk_basis": "unproven", "contract_size": 100.0,
+                           "profit_currency": "USD", "tick_value": 0.1,
+                           "detail": "входы по инструменту закрыты: order_calc_profit вернул None"},
+                          ensure_ascii=False)
+    refused = fleet_cli._event_word("cash_ruler_unproven", unproven)
+    assert "risk_basis=unproven" in refused and "входы по инструменту закрыты" in refused
+    assert "order_calc_profit" in refused

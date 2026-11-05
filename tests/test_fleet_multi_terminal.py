@@ -394,6 +394,8 @@ def test_an_instrument_with_no_proven_cash_ruler_is_never_offered(tmp_path, monk
     assert opened == 0 and sent == []
     rows = [(kind, payload) for _, _, kind, payload in store.recent_events(20)]
     assert any(kind == "cash_ruler_unproven" for kind, _ in rows)
+    assert any(kind == "cash_ruler_unproven" and '"risk_basis": "unproven"' in payload
+               for kind, payload in rows)
     assert any(kind == "skip" and "не доказана" in payload for kind, payload in rows)
     assert store.get_meta(worker._host_key(f"cash_ruler:{account.name}:{spec.name}"))
     assert not store.reserved_volume()  # refused before a slot was ever taken
@@ -467,6 +469,8 @@ def test_the_ruler_a_lot_was_measured_with_reaches_the_operator(tmp_path, monkey
     assert note.startswith("contract:")
     rows = [(kind, payload) for _, _, kind, payload in store.recent_events(30)]
     assert any(kind == "cash_ruler" and "раз меньше" in payload for kind, payload in rows)
+    assert any(kind == "cash_ruler" and '"risk_basis": "contract"' in payload
+               for kind, payload in rows), "строка линейки не названа той линейкой, что меряла лот"
     assert any(kind == "opened" and '"risk_basis": "contract"' in payload for kind, payload in rows)
 
 
@@ -647,6 +651,63 @@ def test_this_accounts_own_row_is_still_priced_by_its_own_terminal(tmp_path,
     store.save_positions("a", [position], {})  # written before this shard had a rate: NULL
     opened = runner._try_entries(account, snapshot, [], day, 1.0)
     assert opened == 1 and sent == [1]  # 1 USD of own risk against a 2% cap of 1000 USD
+
+
+def test_a_stop_the_park_cannot_price_is_never_priced_by_a_contradicted_ruler(tmp_path,
+                                                                              monkeypatch) -> None:
+    """BLOCKER, measured 2026-11-05: ticket 11252852400 stood in this account's own book at 228.55 $
+    of stop risk by the ruler the broker's calculator settled, and 22.86 $ by the `tick` field that
+    same calculator refused — because the row was ours, this terminal thought it was allowed to price it.
+
+    Owning the row says which terminal may measure it. It does not say that a number the broker's own
+    calculator refused to settle is a measurement: a cap that believes it admits ten times the risk it
+    was written to hold. `unproven` holds entries, exactly as it holds the opening.
+    """
+    account, runner, store, sent, snapshot, day, spec = _entry_harness(tmp_path, monkeypatch,
+                                                                       (1, "S"))
+    store.equity("a", 1, 1000.0, 1000.0, 0, 0.0, "USD", 1.0, "2026-11-03")
+    position = types.SimpleNamespace(ticket=5, symbol="EURUSD", type=0, volume=0.05,
+                                     price_open=1.10, profit=0.0, sl=1.098, tp=0.0, magic=1)
+    store.save_positions("a", [position], {})
+    spec.tick_value_source = "unproven"
+    spec.cash_probe_error = "расчёт брокера 100 не похож ни на тик (10, разрыв 90.0%)," \
+                            " ни на контракт (1000, разрыв 90.0%)"
+    opened = runner._try_entries(account, snapshot, [], day, 1.0)
+    assert opened == 0 and sent == []
+    assert any(kind == "portfolio_risk_unpriced" for _, _, kind, _ in store.recent_events(20))
+    # The same lot under a ruler the calculator did settle is priced and counted, not held back.
+    spec.tick_value_source = "contract"
+    assert runner._mirror_risk_usd(account, [position], 1.0) == {5: pytest.approx(10.0)}
+
+
+def test_a_book_that_cannot_be_priced_is_said_once_and_then_said_as_priced(tmp_path,
+                                                                          monkeypatch) -> None:
+    """One unpriced lot is one sentence, not one per cycle for the hours that lot stands.
+
+    Measured 2026-11-05 on the live park: its cycles are 34–40 s apart, so a refusal written every
+    cycle while one unpriced lot stands is some two thousand identical lines a day inside the file the
+    operator reads to find what is new. The resolution row is what makes the marker safe to keep:
+    without it, the second lot that ever loses its ruler would be silent behind the first one's note.
+    """
+    account, runner, store, sent, snapshot, day, _spec = _entry_harness(tmp_path, monkeypatch,
+                                                                        (1, "S"))
+    store.equity("a", 1, 1000.0, 1000.0, 0, 0.0, "USD", 1.0, "2026-11-03")
+
+    def unpriced_rows() -> list[str]:
+        return [payload for _, _, kind, payload in store.recent_events(60)
+                if kind == "portfolio_risk_unpriced"]
+
+    _peer_row(store, "GOLD.a", None)
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert len(unpriced_rows()) == 1 and sent == []
+    _peer_row(store, "GOLD.a", 1.0)  # the shard that holds this contract has now measured the stop
+    runner._try_entries(account, snapshot, [], day, 1.0)
+    kinds = [kind for _, _, kind, _ in store.recent_events(60)]
+    assert "portfolio_risk_priced" in kinds
+    _peer_row(store, "GOLD.a", None)  # and the next lot that cannot be priced says so again
+    runner._try_entries(account, snapshot, [], day, 1.0)
+    assert len(unpriced_rows()) == 2
 
 
 def test_a_zero_dollar_stop_price_stays_unknown(tmp_path, monkeypatch) -> None:

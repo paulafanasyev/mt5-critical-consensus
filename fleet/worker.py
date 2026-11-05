@@ -1295,6 +1295,15 @@ class Worker:
             if spec is None:
                 unpriced_risk += 1
                 continue
+            if spec.tick_value_source == "unproven":
+                # This terminal holds the lot but has no ruler for it: the broker's two money fields
+                # disagree and its own calculator refused to settle them. Re-pricing the stop with the
+                # tick field would feed the contradicted number into the portfolio cap — the same
+                # factor-of-ten lie the mirror refuses to write down, and a cap that believes it lets
+                # ten times the intended risk in. An unknown ruler holds entries; a guessed one does
+                # not, which is the whole difference this branch is for.
+                unpriced_risk += 1
+                continue
             money = risk.position_risk_money(position, spec, 0.0, account.risk.stop_atr)
             if not money > 0:
                 # A lot with no stop on this account is the operator's, and its risk is a distance
@@ -1313,12 +1322,22 @@ class Worker:
         if self.store.get_meta(f"unpriced_warned:{account.name}") == "1":
             self.store.set_meta(f"unpriced_warned:{account.name}", "0")
             self.store.event(account.name, "unpriced_book_resolved")
+        unpriced_key = f"risk_unpriced:{account.name}"
         if unpriced_risk:
             # Counting an unmeasurable stop as zero would let the portfolio risk cap pass a book
-            # whose real risk nobody has added up yet.
-            self.store.event(account.name, "portfolio_risk_unpriced", count=unpriced_risk,
-                             naked_tickets=naked[:10])
+            # whose real risk nobody has added up yet. Said once while the condition stands: an
+            # unpriced lot is a fact about a position that stays in the market for hours, and this
+            # row used to be written every cycle per account. Measured 2026-11-05 on the live park:
+            # its cycles are 34–40 s apart, so one standing condition is some two thousand identical
+            # lines a day inside the journal the operator reads to find the line that is new.
+            self._announce_once(unpriced_key, account.name, "portfolio_risk_unpriced",
+                                count=unpriced_risk, naked_tickets=naked[:10])
             return 0
+        if self._meta(unpriced_key) == "1":
+            # The book is priced again: say so, and let the next lot that cannot be priced start a
+            # fresh sentence instead of hiding behind the marker of the last one.
+            self._note_meta(unpriced_key, "")
+            self.store.event(account.name, "portfolio_risk_priced")
         day_pct = self._portfolio_day_pct(book_stop["equity"])
         unmeasured_key = f"day_unmeasured:{account.name}"
         if day_pct is None:
@@ -1357,6 +1376,7 @@ class Worker:
                 self._report_change(_host_key(f"cash_ruler:{account.name}:{spec.name}"),
                                     _refusal_shape(f"unproven:{spec.cash_probe_error}")[:120],
                                     account.name, "cash_ruler_unproven", symbol=spec.name,
+                                    risk_basis=spec.tick_value_source,
                                     contract_size=spec.contract_size,
                                     profit_currency=spec.profit_currency,
                                     detail=f"входы по инструменту закрыты: {spec.cash_probe_error}")
@@ -1376,6 +1396,7 @@ class Worker:
                 # verdict stand forever next to the new one.
                 self._report_change(_host_key(f"cash_ruler:{account.name}:{spec.name}"), ruler[0],
                                     account.name, "cash_ruler", symbol=spec.name,
+                                    risk_basis=spec.tick_value_source,
                                     contract_size=spec.contract_size,
                                     profit_currency=spec.profit_currency,
                                     tick_value=spec.tick_value_raw or spec.tick_value,
