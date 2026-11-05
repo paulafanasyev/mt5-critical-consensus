@@ -133,8 +133,31 @@ def cmd_status(args: argparse.Namespace) -> int:
               " Перепись снимает сам цикл; `terminals` — вручную.")
     print("\nпоследние события:")
     for stamp, account, kind, payload in store.recent_events(args.events):
-        print(f"  {stamp} {account:20} {kind:16} {payload[:110]}")
+        print(f"  {stamp} {account:20} {kind:16} {_event_word(kind, payload)}")
     return 0
+
+
+_MONEY_KEYS = ("risk_usd", "risk_basis", "volume", "price", "symbol", "side", "ticket")
+
+
+def _event_word(kind: str, payload: str) -> str:
+    """The money of an event inside the 110 characters the status line gives it.
+
+    A row is printed as JSON, so an `opened` line spends its budget on the strategy's reason and cuts
+    off the tail — which is exactly where the dollar risk and the ruler it was measured with live.
+    Those two are the reason the row was written.
+    """
+    if kind not in ("opened", "cash_ruler", "cash_ruler_unproven", "closed"):
+        return payload[:110]
+    try:
+        data = json.loads(payload)
+    except (TypeError, ValueError):
+        return payload[:110]
+    if not isinstance(data, dict):
+        return payload[:110]
+    head = [f"{key}={data.pop(key)}" for key in _MONEY_KEYS if key in data]
+    detail = str(data.pop("detail", "") or data.pop("reason", "") or "")
+    return " ".join([*head, detail])[:110]
 
 
 def _local(config: FleetConfig, accounts: list) -> list:

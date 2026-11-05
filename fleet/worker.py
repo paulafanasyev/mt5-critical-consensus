@@ -351,6 +351,35 @@ def _refusal_shape(text: str) -> str:
     return _NUMBERS.sub("#", str(text or ""))
 
 
+def _cash_ruler(spec: broker.BrokerSymbol) -> tuple[str, str] | None:
+    """(fingerprint, detail) for the ruler this lot's money was measured with — when it needs saying.
+
+    None is the ordinary case: the terminal's own calculator repeated the tick field and nothing
+    contradicted it. Saying that every cycle would be noise; saying the other three is the operator's
+    only view of which number a dollar was cut from. The direction is written out of the two fields
+    themselves, never out of a divergence ratio that loses its sign.
+    """
+    if spec.tick_size <= 0 or spec.tick_value_source not in ("contract", "tick-proven"):
+        return None
+    tick_based = (spec.tick_value_raw or spec.tick_value) / spec.tick_size
+    contract_based = spec.contract_size
+    if tick_based <= 0 or contract_based <= 0:
+        return None
+    shown = (f"тик {tick_based:.6g}, контракт {contract_based:.6g}, "
+             f"расчёт брокера {spec.calc_per_unit:.6g}")
+    fingerprint = f"{spec.tick_value_source}:{tick_based:.6g}:{contract_based:.6g}"
+    if spec.tick_value_source == "tick-proven":
+        return fingerprint, (f"расчёт брокера подтвердил тик-оценку ({shown}): контракт с ней "
+                             "расходится, но это не те деньги — объём и риск меряны по тику")
+    ratio = contract_based / tick_based
+    if ratio > 1:
+        words = f"лот по контракту в {ratio:.2f} раз меньше лота по тик-оценке"
+    else:
+        words = f"лот по контракту в {1.0 / ratio:.2f} раз больше лота по тик-оценке"
+    return fingerprint, (f"расчёт брокера подтвердил контракт ({shown}): {words}; объём и риск "
+                         "меряны по контракту")
+
+
 def _identity_matches(who, account: Account) -> bool:
     """Whether the terminal answering right now is the account this risk slot was reserved for.
 
@@ -1281,27 +1310,38 @@ class Worker:
                 continue
             if self._in_cooldown(account, spec.name):
                 continue
+            if spec.tick_value_source == "unproven":
+                # Two of the broker's own fields say different money and its calculator refused to
+                # settle it. That is not a reason to pick one: the lot would be sized by preference,
+                # and a preference in this branch is a factor of ten.
+                self._report_change(_host_key(f"cash_ruler:{account.name}:{spec.name}"),
+                                    f"unproven:{spec.cash_probe_error[:60]}",
+                                    account.name, "cash_ruler_unproven", symbol=spec.name,
+                                    contract_size=spec.contract_size,
+                                    profit_currency=spec.profit_currency,
+                                    detail=f"входы по инструменту закрыты: {spec.cash_probe_error}")
+                self.store.event(account.name, "skip", symbol=spec.name,
+                                 reason="стоимость лота не доказана брокером")
+                continue
             volume = risk.size_for(account, spec, signal.stop_distance, snapshot.balance)
             if volume <= 0:
                 self.store.event(account.name, "skip", symbol=spec.name, reason="объём 0")
                 continue
             risk_money = spec.distance_money(signal.stop_distance, volume)
             per_lot = spec.distance_money(signal.stop_distance, 1.0)
-            if spec.tick_value_source != "tick":
-                # The broker's own two statements about the same lot disagree: measured on
-                # MetaQuotes-Demo metals, `trade_tick_value` prices a gold lot at a tenth of what
-                # `trade_contract_size` and that same terminal's `order_calc_profit` pay. Sizing went
-                # to the contract, so every dollar number below — this lot's risk, the portfolio cap,
-                # the mirror — comes from the other field, and the operator has to know which.
-                self._announce_once(_host_key(f"cash_basis:{account.name}:{spec.name}:"
-                                              f"{spec.cash_divergence:.4f}"),
-                                    account.name, "sized_by_contract", symbol=spec.name,
+            ruler = _cash_ruler(spec)
+            if ruler:
+                # Fingered, not announced once: a broker that republishes a field has changed the
+                # money this account is risking, and a note that never clears would let the old
+                # verdict stand forever next to the new one.
+                self._report_change(_host_key(f"cash_ruler:{account.name}:{spec.name}"), ruler[0],
+                                    account.name, "cash_ruler", symbol=spec.name,
                                     contract_size=spec.contract_size,
                                     profit_currency=spec.profit_currency,
-                                    divergence=round(spec.cash_divergence, 4),
-                                    detail="tick-оценка стоимости лота в "
-                                           f"{round(1.0 / (1.0 - min(spec.cash_divergence, 0.9999)), 2)}"
-                                           " раз меньше контракта: объём и риск считаны с контракта")
+                                    tick_value=spec.tick_value_raw or spec.tick_value,
+                                    calc_per_unit=spec.calc_per_unit, detail=ruler[1])
+            elif spec.tick_value_source == "tick":
+                self._note_meta(_host_key(f"cash_ruler:{account.name}:{spec.name}"), "")
             if per_lot > 0 and volume >= account.risk.max_lots - 1e-9:
                 # The lot sits on the operator's ceiling, so the risk the config promises is not
                 # the risk being taken. Sizing quietly is how a 0.25% account trades 0.03% for

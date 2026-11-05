@@ -34,6 +34,9 @@ class BrokerSymbol:
     profit_currency: str = ""
     tick_value_source: str = "tick"
     cash_divergence: float = 0.0
+    calc_per_unit: float = 0.0
+    cash_probe_error: str = ""
+    tick_value_raw: float = 0.0
 
     def money_per_point(self, volume: float) -> float:
         if self.tick_size <= 0:
@@ -127,6 +130,11 @@ def ensure_selected(name: str) -> bool:
 
 
 CASH_DIVERGENCE_TOLERANCE = 0.01
+# How far the terminal's own calculator has to sit from a published field for that field to lose.
+# Measured 2026-11-05 on login 114929502: USDJPY's `trade_tick_value` is priced at yesterday's yen and
+# the calculator at today's — 0.20% apart on the same ruler. Anything inside that drift is the same
+# number wearing a different coat; the metal fields were 900% apart.
+CASH_CALC_TOLERANCE = 0.02
 
 
 def account_currency() -> str:
@@ -138,35 +146,125 @@ def account_currency() -> str:
     return str(getattr(info, "currency", "") or "")
 
 
-def reconcile_tick_value(spec: BrokerSymbol, currency: str) -> BrokerSymbol:
-    """Trust the broker's contract when its own tick field contradicts it, and carry the ratio.
+def _probe_volume(spec: BrokerSymbol) -> float:
+    """A lot size this broker would accept for a calculator probe, or 0.0 when it would accept none."""
+    if spec.volume_min <= 0:
+        return 0.0
+    step = spec.volume_step
+    top = spec.volume_max if spec.volume_max > 0 else spec.volume_min
+    volume = min(1.0, top)
+    if step > 0:
+        volume = math.floor(volume / step + 1e-9) * step
+    if volume < spec.volume_min:
+        return 0.0
+    return round(volume, 12)
 
-    Measured 2026-11-05 on MetaQuotes-Demo (login 114929502) with this terminal's own money math:
-    `order_calc_profit(BUY, XAUUSD, 1.0, bid, bid - 1.00)` answers -100 $, and the same 100 $ comes
-    out of `trade_contract_size` = 100 oz, while `trade_tick_value` 0.1 at `trade_tick_size` 0.01
-    describes 10 $ per price unit per lot — ten times too little. Silver repeats it (-500 $ for 1.0
-    lot over a 0.1 move against a 50 $ tick estimate). FX agrees with itself, which is why only
-    metals were ever mis-sized: a gold lot sized from the tick field risks ten times the percentage
-    the registry promises, and the journal quotes the ten-times-too-small number back.
 
-    The contract is definitional, but it is only the same money as the tick field when the
-    instrument pays its profit in the account's currency: 100 000 of a yen-denominated pair is not
-    100 000 dollars, so for those the two numbers disagreeing is arithmetic rather than a defect and
-    nothing is overridden. A real disagreement is never left quiet either: the spec carries the ratio
-    the broker showed, so the journal can name which of the two numbers an entry was sized from.
+def calc_money_per_unit(spec: BrokerSymbol) -> tuple[float, str]:
+    """What the terminal's own calculator charges for one lot over one price unit.
+
+    `(value, "")` when it answers. `(0.0, why)` when it will not — and no why is ever a number the
+    park sizes with, so the caller has to say what it did instead.
     """
-    if spec.tick_size <= 0 or spec.contract_size <= 0 or spec.tick_value <= 0:
-        return spec
-    if not currency or spec.profit_currency.upper() != currency.upper():
+    volume = _probe_volume(spec)
+    if volume <= 0:
+        return 0.0, f"нет лота, который брокер принял бы для пробы (min {spec.volume_min})"
+    try:
+        tick = mt5.symbol_info_tick(spec.name)
+    except Exception as exc:  # noqa: BLE001 - a probe that throws is a probe that did not answer
+        return 0.0, f"тикер не отвечен: {exc}"
+    if tick is None:
+        return 0.0, "тикер не отвечен"
+    price = float(getattr(tick, "bid", 0.0) or 0.0) or float(getattr(tick, "ask", 0.0) or 0.0)
+    if price <= 0 or spec.tick_size <= 0:
+        return 0.0, "цена для пробы нулевая"
+    open_price = round_price(price, spec.digits)
+    ticks = max(10, int(round(open_price * 0.002 / spec.tick_size)))
+    close_price = round_price(open_price - ticks * spec.tick_size, spec.digits)
+    distance = round(open_price - close_price, max(spec.digits, 8))
+    if distance <= 0:
+        return 0.0, "расстояние пробы схлопнулось в ноль на этих цифрах"
+    try:
+        raw = mt5.order_calc_profit(mt5.ORDER_TYPE_BUY, spec.name, volume, open_price, close_price)
+    except Exception as exc:  # noqa: BLE001 - see above
+        return 0.0, f"order_calc_profit бросил исключение: {exc}"
+    if raw is None:
+        return 0.0, "order_calc_profit вернул None"
+    money = abs(float(raw))
+    if money <= 0:
+        return 0.0, "order_calc_profit говорит, что лот ничего не теряет"
+    return money / (volume * distance), ""
+
+
+def reconcile_tick_value(spec: BrokerSymbol, currency: str,
+                         probe: callable | None = None) -> BrokerSymbol:
+    """Let the broker's own calculator pick which of its two published fields is money.
+
+    Measured 2026-11-05 on MetaQuotes-Demo (login 114929502, USD) — `order_calc_profit(BUY, sym,
+    1.0 лот, p, p - d)` per price unit per lot against each field's prediction:
+
+    | символ | tick-предсказание | контракт | расчёт брокера | кто побеждает |
+    |--------|-------------------|----------|----------------|---------------|
+    | XAUUSD | 10 | 100 | 100 | контракт (в 10 раз) |
+    | XAGUSD | 500 | 5000 | 5000 | контракт (в 10 раз) |
+    | EURUSD | 100000 | 100000 | 100000 | оба, тихо |
+    | USDJPY | 633.24 | 100000 (в иенах) | 634.53 | тик, контракт — не те деньги |
+
+    So neither field is trusted on its own and the calculator is not compared with a guess: it answers
+    in the account's own money, which is why it also survives a cent account (`currency_scale` 0.01,
+    where `trade_tick_value` is in cents and `trade_contract_size` is still in dollars — the two
+    disagree by exactly 100 and the tick is the right one) and a broker that publishes a corrupt
+    contract beside a correct tick. Getting this wrong does not lose a rounding error: sizing read the
+    tick, so a gold lot carried ten times the risk percentage the registry promises.
+
+    When the calculator will not answer and the two fields disagree, the instrument is marked
+    `unproven` and the worker keeps its entries away from it — the park does not pick a ruler by
+    preference on the way into someone's money.
+    """
+    if spec.tick_size <= 0 or spec.tick_value <= 0:
         return spec
     tick_based = spec.tick_value / spec.tick_size
-    divergence = abs(spec.contract_size - tick_based) / spec.contract_size
-    if divergence <= CASH_DIVERGENCE_TOLERANCE:
-        return spec
-    return dataclasses.replace(spec,
-                               tick_value=round(spec.contract_size * spec.tick_size, 12),
-                               tick_value_source="contract",
-                               cash_divergence=round(divergence, 6))
+    contract_based = spec.contract_size if spec.contract_size > 0 else 0.0
+    # Two fields are only in conflict when they claim the same currency: 100 000 of a yen-quoted pair
+    # is not 100 000 dollars, and saying so is not a defect report.
+    comparable = (contract_based > 0 and bool(currency)
+                  and spec.profit_currency.upper() == currency.upper())
+    divergence = (abs(contract_based - tick_based) / contract_based if comparable else 0.0)
+    if contract_based <= 0:
+        return spec  # an unpublished contract is not an opinion about the tick
+    per, why = (probe or calc_money_per_unit)(spec)
+    if per <= 0:
+        if not (comparable and divergence > CASH_DIVERGENCE_TOLERANCE):
+            return spec  # nothing was in question, so the calculator's silence changes nothing
+        return dataclasses.replace(spec, tick_value_source="unproven",
+                                   cash_divergence=round(divergence, 6),
+                                   tick_value_raw=spec.tick_value,
+                                   cash_probe_error=why)
+    tick_error = abs(per - tick_based) / per
+    contract_error = abs(per - contract_based) / per
+    if tick_error <= CASH_CALC_TOLERANCE:
+        # The tick is the ruler the broker's own money math repeats. "tick-proven" is said out loud
+        # only where a published contract contradicted it; elsewhere nothing was in dispute.
+        return dataclasses.replace(
+            spec, tick_value_source=("tick-proven" if divergence > CASH_DIVERGENCE_TOLERANCE
+                                     else "tick"),
+            cash_divergence=round(divergence, 6), calc_per_unit=round(per, 8),
+            tick_value_raw=spec.tick_value)
+    if contract_error <= CASH_CALC_TOLERANCE:
+        return dataclasses.replace(spec,
+                                   tick_value=round(contract_based * spec.tick_size, 12),
+                                   tick_value_source="contract",
+                                   cash_divergence=round(divergence, 6),
+                                   calc_per_unit=round(per, 8),
+                                   tick_value_raw=spec.tick_value)
+    return dataclasses.replace(spec, tick_value_source="unproven",
+                               cash_divergence=round(divergence, 6),
+                               calc_per_unit=round(per, 8),
+                               tick_value_raw=spec.tick_value,
+                               cash_probe_error=(f"расчёт брокера {per:.6g} не похож ни на тик "
+                                                 f"({tick_based:.6g}, разрыв {tick_error:.1%}), ни на "
+                                                 f"контракт ({contract_based:.6g}, разрыв "
+                                                 f"{contract_error:.1%})"))
 
 
 def symbol(base: str) -> BrokerSymbol | None:

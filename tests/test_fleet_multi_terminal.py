@@ -381,6 +381,42 @@ def test_the_same_order_is_placed_when_the_login_is_ours(tmp_path, monkeypatch) 
     assert opened == 1 and sent == [1]
 
 
+def test_an_instrument_with_no_proven_cash_ruler_is_never_offered(tmp_path, monkeypatch) -> None:
+    """Two of the broker's fields disagree and its calculator refused to settle it: no lot, in words.
+
+    The choice here is between a factor of ten and no trade. The park takes no trade.
+    """
+    account, runner, store, sent, snapshot, day, spec = _entry_harness(tmp_path, monkeypatch,
+                                                                       (1, "S"))
+    spec.tick_value_source = "unproven"
+    spec.cash_probe_error = "order_calc_profit вернул None"
+    opened = runner._try_entries(account, snapshot, [], day, 1.0)
+    assert opened == 0 and sent == []
+    rows = [(kind, payload) for _, _, kind, payload in store.recent_events(20)]
+    assert any(kind == "cash_ruler_unproven" for kind, _ in rows)
+    assert any(kind == "skip" and "не доказана" in payload for kind, payload in rows)
+    assert store.get_meta(worker._host_key(f"cash_ruler:{account.name}:{spec.name}"))
+    assert not store.reserved_volume()  # refused before a slot was ever taken
+
+
+def test_the_ruler_a_lot_was_measured_with_reaches_the_operator(tmp_path, monkeypatch) -> None:
+    """The journal row and the standing note both say which of the broker's numbers priced the lot."""
+    account, runner, store, sent, snapshot, day, spec = _entry_harness(tmp_path, monkeypatch,
+                                                                       (1, "S"))
+    spec.tick_value_source = "contract"
+    spec.contract_size = 100000.0
+    spec.calc_per_unit = 100000.0
+    spec.tick_value_raw = 0.1
+    spec.cash_divergence = 0.9
+    opened = runner._try_entries(account, snapshot, [], day, 1.0)
+    assert opened == 1 and sent == [1]
+    note = store.get_meta(worker._host_key(f"cash_ruler:{account.name}:{spec.name}"))
+    assert note.startswith("contract:")
+    rows = [(kind, payload) for _, _, kind, payload in store.recent_events(30)]
+    assert any(kind == "cash_ruler" and "раз меньше" in payload for kind, payload in rows)
+    assert any(kind == "opened" and '"risk_basis": "contract"' in payload for kind, payload in rows)
+
+
 def _seed_day(store: Store, engine, day: str, base: float) -> None:
     """This machine's measured day, the way the conductor itself writes it."""
     host = conductor.local_host()
