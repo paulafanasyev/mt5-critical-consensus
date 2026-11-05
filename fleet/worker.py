@@ -51,6 +51,14 @@ ROSTER_PROBE_TIMEOUT_MS = 4000
 # somebody logs in. It holds no margin, so it is not a second driver. Anything else that cannot be
 # read — a silent process whose path the OS would not name, a probe that threw — is a blind spot.
 ROSTER_SILENT_ERROR = "-10005"
+# How a login that answers from several windows gets one named driver: the directory the registry
+# names for this account, and otherwise the first path in the casefolded sort. Said next to the
+# choice in the journal so the operator does not have to read the code to learn why this window.
+DRIVER_ORDER = "папка из реестра, иначе первая по casefold-сортировке пути"
+# The choice is announced once per process, not once per cycle: it is a fact about the census, and the
+# book the operator reads does not need the same sentence every 36 seconds. Deliberately not a note in
+# the book — a park that restarted would then make the choice again and stay silent about it.
+_DRIVERS_ANNOUNCED: dict[tuple[str, str], str] = {}
 
 
 @dataclasses.dataclass(slots=True)
@@ -95,7 +103,7 @@ def scan_roster(paths: list[str] | None = None) -> list[dict]:
     rows: list[dict] = []
     for exe in sorted(paths, key=str.lower):
         row = {"exe": exe, "dir": window_dir(exe), "login": None, "server": "",
-               "currency": "", "balance": None, "equity": None, "error": ""}
+               "currency": "", "balance": None, "equity": None, "trade_mode": None, "error": ""}
         if not str(exe).strip():
             # Win32_Process hides ExecutablePath from another user's or an elevated session. An
             # empty path is not "no terminal": initialize(path="") means the default registered
@@ -117,6 +125,10 @@ def scan_roster(paths: list[str] | None = None) -> list[dict]:
                 row["server"] = str(getattr(account, "server", "") or "")
                 row["balance"] = getattr(account, "balance", None)
                 row["equity"] = getattr(account, "equity", None)
+                # Which money this is, in the broker's own words: demo, contest or real. Two windows
+                # that name the same login but disagree about this are not one account answered
+                # twice, and the gate below compares modes rather than trusting the registry label.
+                row["trade_mode"] = getattr(account, "trade_mode", None)
                 row["currency"] = str(getattr(account, "currency", "") or "")
                 if row["login"] is None:
                     row["error"] = "терминал открыл канал, но не назвал счёт"
@@ -142,20 +154,98 @@ def blind_windows(rows: list[dict]) -> list[dict]:
     return [row for row in rows if row.get("login") is None and not is_silent(row)]
 
 
-def duplicated_accounts(rows: list[dict]) -> dict[str, list[str]]:
-    """Which accounts answer from more than one window on this machine.
+def account_key(login, server) -> str:
+    """The identity the census groups windows by: `login@server`, server normalised.
 
-    Key is `login@server` lowercased, value one entry per window that says so — two windows of the
-    same folder count twice, because it is the count of drivers that spends the margin, not the
-    count of spellings.
+    One spelling for the gate, the `status` line and the `terminals` warning: what the operator reads
+    as a duplicated account has to be the same pair the entry door counted.
     """
-    by: dict[str, list[str]] = {}
+    return f"{login}@{_server_key(server)}"
+
+
+def windows_by_account(rows: list[dict]) -> dict[str, list[dict]]:
+    """Every window that named its account, grouped by `account_key`, one entry per window.
+
+    The rows are kept whole and not deduplicated by folder: two windows out of the same folder count
+    twice, because it is the count of drivers that spends the margin, not the count of spellings.
+    """
+    by: dict[str, list[dict]] = {}
     for row in rows:
         if row.get("login") is None:
             continue
-        key = f"{row['login']}@{_server_key(row.get('server'))}"
-        by.setdefault(key, []).append(str(row.get("dir") or row.get("exe") or ""))
-    return {key: sorted(dirs) for key, dirs in by.items() if len(dirs) > 1}
+        by.setdefault(account_key(row["login"], row.get("server")), []).append(dict(row))
+    return by
+
+
+def duplicated_accounts(rows: list[dict]) -> dict[str, list[str]]:
+    """Which accounts answer from more than one window on this machine.
+
+    Key is `login@server` lowercased, value one folder per window that says so.
+    """
+    return {key: sorted(str(row.get("dir") or row.get("exe") or "") for row in group)
+            for key, group in windows_by_account(rows).items() if len(group) > 1}
+
+
+def window_trade_mode(row: dict) -> int | None:
+    """The mode this window's own `account_info` named, or None when it named nothing readable.
+
+    None is not an agreement. A census written before the field existed, or a window that answered
+    without it, leaves the park unable to say that both drivers sit on the same pile of demo money,
+    and an unmeasured pair keeps the entry door shut exactly like an unmeasured day does.
+    """
+    try:
+        return int(row.get("trade_mode"))
+    except (TypeError, ValueError):
+        return None
+
+
+def shared_windows_agree(group: list[dict]) -> bool:
+    """Whether several windows naming one login really describe one and the same account.
+
+    Login and server are already the group key, so what can still differ is the broker's mode — a
+    window that answers this `login@server` as REAL is not the same money twice, it is a mystery —
+    and the folder: a window that hides its path cannot be called anyone's driver.
+    """
+    if not group:
+        return False
+    modes = [window_trade_mode(row) for row in group]
+    if any(mode is None for mode in modes) or len(set(modes)) != 1:
+        return False
+    if modes[0] == int(mt5.ACCOUNT_TRADE_MODE_REAL):
+        return False
+    return all(window_dir(str(row.get("dir") or row.get("exe") or "")) for row in group)
+
+
+def choose_driver_window(group: list[dict], registry_dir: str = "") -> tuple[str, list[str]]:
+    """Name the driver of record among windows that share one account, and the rest.
+
+    Deterministic by construction, because a choice that flipped between cycles would move the orders
+    between two API sessions on one balance: the directory the registry names for this account wins —
+    that is the copy `attach()` proves before anything is sent — and otherwise the casefolded path
+    sort decides, first wins, same answer every cycle for the same field.
+    """
+    dirs = sorted({window_dir(str(row.get("dir") or row.get("exe") or "")) for row in group})
+    dirs = [directory for directory in dirs if directory]
+    named = window_dir(registry_dir)
+    owner = named if named in dirs else (dirs[0] if dirs else "")
+    return owner, [directory for directory in dirs if directory != owner]
+
+
+def shared_demo_driver(rows: list[dict], key: str, account: Account | None) -> tuple[str, list[str]]:
+    """The window that drives a login several windows name, or ("", []) to keep the door shut.
+
+    Only demo money gets a chosen session: a real account never has one window picked for it silently,
+    so an account that is real, missing from the registry, or sharing its field with a window nobody
+    could read answers with ("", []) and the caller keeps blocking.
+    """
+    if account is None or account.is_real:
+        return "", []
+    if blind_windows(rows):
+        return "", []
+    group = windows_by_account(rows).get(key) or []
+    if len(group) < 2 or not shared_windows_agree(group):
+        return "", []
+    return choose_driver_window(group, window_dir(str(account.data_dir)))
 
 
 def _server_key(text) -> str:
@@ -609,6 +699,19 @@ class Worker:
         sizing to a fraction of the balance spend it twice; exits must keep running regardless,
         because an unmanaged position is worse than an unused signal.
 
+        Measured here on 2026-11-05: two operator windows (`c:\\mt5-exness`, `c:\\mt5-team`) answer the
+        same demo login, the same server, the same mode and the same 99 212,61 — one pile of money
+        seen twice, not two drivers of two piles. What that leaves ambiguous is only "through which
+        session do we act", and `attach()` settles that already by proving the registry's own copy
+        before a single order. So a DEMO login that every window describes identically gets one window
+        named as its driver of record and keeps its entries; the operator reads the choice in the
+        journal (`driver_chosen`) instead of inferring it from a book that traded anyway.
+
+        What still stands, with its wording unchanged: a real account — real money is never given a
+        silently chosen session —, windows that disagree about the broker's mode or hide their folder,
+        a window the census could neither read nor measure silent, and a census that is missing or out
+        of date.
+
         The gate fails closed on a field it cannot see: no census of this machine, or a window that
         neither named its account nor measured-silent, is not evidence that nobody else drives this
         money. It is the same rule the park already applies to an unmeasured day and an unpriced
@@ -619,6 +722,7 @@ class Worker:
         others: list[str] = []
         blind: list[str] = []
         reason = ""
+        driver = ""
         if rows is None:
             fingerprint = "no-census"
             reason = ("переписи окон этой машины нет (или она старше часа): непонятно, кто ещё "
@@ -632,7 +736,10 @@ class Worker:
                             and str(row.get("dir") or "") != mine)
             blind = sorted(str(row.get("dir") or row.get("exe") or "") or "<окно без пути>"
                            for row in blind_windows(rows))
-            if others:
+            if others and not blind:
+                driver = shared_demo_driver(rows, account_key(account.login, account.server),
+                                            account)[0]
+            if others and not driver:
                 fingerprint = "|".join(others)
                 reason = (f"счёт {account.login}@{account.server} открыт ещё в {len(others)} окне "
                           f"({', '.join(others)}): свободные деньги общего счёта тратятся дважды, "
@@ -652,6 +759,13 @@ class Worker:
                                  windows=others or blind,
                                  census="absent" if rows is None else "on_file")
             return reason
+        if driver:
+            # The block is over, but the field is not one window: saying `account_single_window` here
+            # would file two drivers as one. The driver sentence above is what lifts the door.
+            if self.store.get_meta(key):
+                self.store.set_meta(key, "")
+            self._announce_driver(account, driver, others)
+            return ""
         if self.store.get_meta(key):
             # Only a census that actually saw the field can lift the block, so the all-clear always
             # means what its name says: this machine was counted and holds one window for this money.
@@ -659,6 +773,27 @@ class Worker:
             self.store.event(account.name, "account_single_window", login=account.login,
                              server=account.server, census="fresh")
         return ""
+
+    def _announce_driver(self, account: Account, owner: str, others: list[str]) -> None:
+        """Write which window the park chose for a login that answers from several, once per process.
+
+        Deliberately not a `meta` note: a note in the book would let the next start of this park make
+        the same choice and say nothing about it, and the point of choosing is that the operator reads
+        the decision rather than inferring it from a book that traded anyway. Keyed by the book as well
+        as the account, so two stores in one process each get their own sentence, and re-announced
+        within one process when the windows move and the choice moves with them.
+        """
+        rest = sorted(d for d in others if d != owner)
+        fingerprint = "|".join([owner, *rest])
+        note = (account.name, str(self.store.path))
+        if _DRIVERS_ANNOUNCED.get(note) == fingerprint:
+            return
+        _DRIVERS_ANNOUNCED[note] = fingerprint
+        self.store.event(account.name, "driver_chosen", window=owner, login=account.login,
+                         server=account.server, others=rest, order=DRIVER_ORDER, mode="demo",
+                         detail="тот же демо-счёт отвечает ещё из одного окна: окно-водитель названо "
+                                "раз на процесс; ордера идут через копию из реестра, которую доказал "
+                                "attach(), и второе окно по-прежнему тратит ту же маржу")
 
     # --- position management ------------------------------------------------------------
     def _manage_positions(self, account: Account, day: risk.DayState, positions: list,

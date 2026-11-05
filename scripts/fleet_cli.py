@@ -54,11 +54,34 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0 if failures == 0 else 1
 
 
+def _registry_by_key(config) -> dict:
+    """The registry's accounts, keyed the way the census keys its windows: `login@server`.
+
+    Two readers of one census — `status` and `terminals` — have to answer the same question with the
+    same words, and the answer needs the account's own mode and folder. A login the registry does not
+    name is not a demo account, it is an unknown, and an unknown keeps the entry door shut.
+    """
+    if config is None:
+        return {}
+    return {worker.account_key(a.login, a.server): a for a in config.accounts}
+
+
+def _shared_login_word(census_rows: list[dict], key: str, account) -> str:
+    """One sentence for a login that answers from several windows: the chosen driver, or the block."""
+    owner = worker.shared_demo_driver(census_rows, key, account)[0]
+    if owner:
+        return (f"тот же демо-счёт, окно-водитель {owner} ({worker.DRIVER_ORDER}) — "
+                "входы идут; выбор записан событием `driver_chosen`")
+    return "входы по этому счёту закрыты"
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     store = Store(args.store)
     try:
-        mine = {a.name for a in _config(args).local()}
+        config = _config(args)
+        mine = {a.name for a in config.local()}
     except ConfigError:
+        config = None
         mine = None  # no readable registry: the file is all this command knows
     rows = store.latest_equity()
     if not rows:
@@ -87,8 +110,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         blind = worker.blind_windows(census)
         print(f"\nокна на этой машине: {len(census)}, с логином {len(logged)},"
               f" не назвали счёт: {len(blind)}")
+        by_key = _registry_by_key(config)
         for key, dirs in sorted(worker.duplicated_accounts(census).items()):
-            print(f"  {key}: {len(dirs)} окна ({', '.join(dirs)}) — входы по этому счёту закрыты")
+            print(f"  {key}: {len(dirs)} окна ({', '.join(dirs)}) — "
+                  f"{_shared_login_word(census, key, by_key.get(key))}")
         if blind:
             print(f"  {len(blind)} окно не ответили по существу — парк не считает поле чистым,"
                   " входы закрыты (команда `terminals` покажет каждое)")
@@ -141,9 +166,13 @@ def cmd_terminals(args: argparse.Namespace) -> int:
         print(f"{row['dir']:38} {row['login']:>10} {str(row['server'])[:22]:22}"
               f" {balance:>12.2f} {equity:>12.2f}")
     duplicates = worker.duplicated_accounts(rows)
+    by_key = _registry_by_key(config)
     for key, dirs in sorted(duplicates.items()):
+        owner = worker.shared_demo_driver(rows, key, by_key.get(key))[0]
+        word = ("входы по этому счёту парк закрывает" if not owner else
+                f"окно-водитель названо ({worker.DRIVER_ORDER}): {owner}, входы идут")
         print(f"\nВНИМАНИЕ: счёт {key} открыт в {len(dirs)} окнах: {', '.join(dirs)}."
-              " Свободные деньги у них общие: входы по этому счёту парк закрывает.")
+              f" Свободные деньги у них общие: {word}.")
     blind = worker.blind_windows(rows)
     if blind:
         print(f"\nВНИМАНИЕ: {len(blind)} окно не назвали счёт и не молчат измеренно"

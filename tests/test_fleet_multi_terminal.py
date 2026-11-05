@@ -30,6 +30,12 @@ from fleet import config as fleet_config  # noqa: E402
 from fleet.config import Account, FleetConfig, PortfolioLimits, load  # noqa: E402
 from fleet.store import Store, host_keys  # noqa: E402
 
+# The broker mode a census row carries, taken from the library the worker compares against: the real
+# MetaTrader5 package names DEMO 2 and REAL 0, the CI stub in `tests/conftest.py` names them the other
+# way round, so a test that wrote one of these as a number would mean the opposite on the other box.
+_DEMO_MODE = int(worker.mt5.ACCOUNT_TRADE_MODE_DEMO)
+_REAL_MODE = int(worker.mt5.ACCOUNT_TRADE_MODE_REAL)
+
 
 def make_account(name: str, login: int, server: str, **overrides) -> Account:
     fields = {"name": name, "login": login, "server": server, "mode": "demo", "network": "direct"}
@@ -919,10 +925,12 @@ def _forget_census(store: Store) -> None:
     store.set_meta(f"{worker.ROSTER_META_KEY}@{fleet_config.local_host()}", "")
 
 
-def _row(directory: str, login: int | None, server: str = "S") -> dict:
+def _row(directory: str, login: int | None, server: str = "S", trade_mode=None) -> dict:
+    """One census row. `trade_mode` stays None unless a test says it: that is what a census written
+    before the field existed looks like, and the gate reads an unnamed mode as no agreement."""
     return {"exe": f"{directory}\\terminal64.exe", "dir": worker.window_dir(directory),
             "login": login, "server": server, "currency": "USD", "balance": 1000.0,
-            "equity": 1000.0, "error": ""}
+            "equity": 1000.0, "trade_mode": trade_mode, "error": ""}
 
 
 class CensusMT5:
@@ -930,7 +938,8 @@ class CensusMT5:
 
     A window is given as `path: (login, server)` and may add a third element — the folder it
     actually reports. That crossing (we ask A, B answers) is measured behaviour of the API and the
-    one thing the census must not paper over, so the fake cannot echo the requested path back.
+    one thing the census must not paper over, so the fake cannot echo the requested path back. A
+    fourth element is the mode the broker names for that window.
     """
 
     ACCOUNT_TRADE_MODE_REAL = 2
@@ -939,7 +948,9 @@ class CensusMT5:
         self.windows: dict[str, tuple] = {}
         for path, value in windows.items():
             reported = value[2] if len(value) > 2 else path
-            self.windows[worker.window_dir(path)] = (value[0], value[1], worker.window_dir(reported))
+            mode = value[3] if len(value) > 3 else None
+            self.windows[worker.window_dir(path)] = (value[0], value[1],
+                                                     worker.window_dir(reported), mode)
         self.initialize_calls: list[dict] = []
         self.shutdowns = 0
         self.current: tuple | None = None
@@ -957,8 +968,9 @@ class CensusMT5:
 
     def account_info(self):
         login, server = (self.current[0], self.current[1]) if self.current else (None, "")
+        mode = self.current[3] if self.current else None
         return types.SimpleNamespace(login=login, server=server, currency="USD",
-                                     balance=1000.0, equity=1000.0)
+                                     balance=1000.0, equity=1000.0, trade_mode=mode)
 
     def shutdown(self) -> None:
         self.shutdowns += 1
@@ -1128,6 +1140,188 @@ def test_the_second_window_is_announced_once_while_it_last(tmp_path, monkeypatch
         runner._try_entries(account, snapshot, [], day, 1.0)
     kinds = [kind for _, _, kind, _ in store.recent_events(30)]
     assert kinds.count("account_second_window") == 1
+
+
+# --- one demo login answered by several windows ------------------------------------------------
+#
+# Measured on this machine 2026-11-05: `c:\mt5-exness` and `c:\mt5-team` both answer
+# `114929502@MetaQuotes-Demo`, 99 212,61 USD, trade_mode 2 (demo). One pile of money seen twice is not
+# two drivers of two piles, and the ambiguity it leaves — through which API session do we act — is the
+# one `attach()` already settles by proving the registry's own copy before any order. So the park names
+# one window the driver of record, says so out loud, and trades. Every case that genuinely must stay
+# shut is pinned below, with its old wording.
+
+def _demo_windows(*directories: str) -> list[dict]:
+    """Windows that name one login, one server and one demo mode — the shape measured on this box."""
+    return [_row(directory, 1, "S", trade_mode=_DEMO_MODE) for directory in directories]
+
+
+def test_one_demo_login_in_two_windows_keeps_its_entries_and_names_the_driver(
+        tmp_path, monkeypatch) -> None:
+    account, runner, store, sent, snapshot, day, _spec = _gate(tmp_path, monkeypatch, [])
+    _census(store, _demo_windows(r"C:\mt5-exness", r"C:\mt5-team"))
+    assert runner._second_window(account) == ""  # the door is open
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 1
+    assert sent == [1]
+    events = [(kind, payload) for _, _, kind, payload in store.recent_events(30)]
+    assert "account_second_window" not in [kind for kind, _ in events]
+    drivers = [json.loads(payload) for kind, payload in events if kind == "driver_chosen"]
+    assert len(drivers) == 1
+    # The sentence names the window it chose and says the other window is there: an operator reads the
+    # decision, instead of inferring it from a book that traded anyway.
+    assert drivers[0]["window"] == "c:\\mt5-exness"
+    assert drivers[0]["others"] == ["c:\\mt5-team"]
+    assert drivers[0]["login"] == 1 and drivers[0]["mode"] == "demo"
+
+
+def test_the_driver_choice_is_the_same_window_whatever_order_the_census_answered() -> None:
+    """Determinism is the whole rule: a choice that flipped per cycle would ping-pong the orders.
+
+    Two cycles on one field have to send through the session the first cycle named, so the order the
+    process list happened to answer in cannot be what decides.
+    """
+    rows = _demo_windows(r"C:\mt5-exness", r"C:\mt5-team")
+    assert (worker.choose_driver_window(rows, "")
+            == worker.choose_driver_window(list(reversed(rows)), "")
+            == ("c:\\mt5-exness", ["c:\\mt5-team"]))
+
+
+def test_the_registry_window_wins_over_the_sort_order(tmp_path) -> None:
+    """The directory the registry names is the copy `attach()` proves, so it drives when it is up.
+
+    Picked so the sort would NOT have answered it: `c:\\mt5-a-team` sorts before the fleet folder, so a
+    rule of bare sort order would name an operator window the park never trades through.
+    """
+    account = make_account("a", 1, "S")
+    mine = worker.window_dir(str(account.data_dir))
+    rows = [_row(r"C:\mt5-a-team", 1, "S", trade_mode=_DEMO_MODE),
+            _row(str(account.data_dir), 1, "S", trade_mode=_DEMO_MODE)]
+    assert mine not in sorted(worker.window_dir(row["dir"]) for row in rows)[:1]
+    owner, rest = worker.choose_driver_window(rows, mine)
+    assert owner == mine
+    assert rest == ["c:\\mt5-a-team"]
+
+
+def test_the_driver_is_announced_once_per_process_even_for_a_fresh_worker(
+        tmp_path, monkeypatch) -> None:
+    """One sentence per start, not one per cycle.
+
+    `run_shard` builds a new Worker every cycle, so an instance note would re-announce the same choice
+    a hundred times a day; a note in the book would let the next start of this park make the choice
+    again and stay silent about it. Both directions are pinned here: the same field is said once, and
+    a field that moved is said again.
+    """
+    account, runner, store, _sent, _snapshot, _day, _spec = _gate(tmp_path, monkeypatch, [])
+    _census(store, _demo_windows(r"C:\mt5-exness", r"C:\mt5-team"))
+    for _ in range(3):
+        assert runner._second_window(account) == ""
+    next_cycle = worker.Worker(runner.config, store)  # a different Worker, the same process
+    assert next_cycle._second_window(account) == ""
+    kinds = [kind for _, _, kind, _ in store.recent_events(30)]
+    assert kinds.count("driver_chosen") == 1
+    _census(store, _demo_windows(r"C:\mt5-exness", r"C:\mt5-team", r"C:\mt5-third"))
+    assert runner._second_window(account) == ""
+    kinds = [kind for _, _, kind, _ in store.recent_events(30)]
+    assert kinds.count("driver_chosen") == 2  # three windows is a different fact, and is said again
+
+
+def test_windows_that_disagree_about_the_mode_still_close_the_entries(tmp_path, monkeypatch) -> None:
+    """One login at two broker modes is not the same account twice: it is a mystery, and it is shut."""
+    account, runner, store, sent, snapshot, day, _spec = _gate(tmp_path, monkeypatch, [])
+    _census(store, [_row(r"C:\mt5-exness", 1, "S", trade_mode=_DEMO_MODE),
+                    _row(r"C:\mt5-team", 1, "S", trade_mode=_REAL_MODE)])
+    reason = runner._second_window(account)
+    assert "открыт ещё в 2 окне" in reason and "входы закрыты" in reason
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert sent == []
+    assert any(kind == "account_second_window" for _, _, kind, _ in store.recent_events(30))
+    assert not any(kind == "driver_chosen" for _, _, kind, _ in store.recent_events(30))
+
+
+def test_a_window_that_named_no_mode_is_not_an_agreement(tmp_path, monkeypatch) -> None:
+    """A census row written before the field existed says nothing about which money this is.
+
+    The old rows stay evidence for ROSTER_EVIDENCE_SECONDS after an upgrade, and an unmeasured pair has
+    never been allowed to read as an agreed one anywhere else in this park.
+    """
+    account, runner, store, _sent, snapshot, day, _spec = _gate(tmp_path, monkeypatch, [])
+    _census(store, _demo_windows(r"C:\mt5-exness") + [_row(r"C:\mt5-team", 1, "S")])
+    assert "входы закрыты" in runner._second_window(account)
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert _sent == []
+
+
+def test_a_window_that_hides_its_path_is_never_made_the_driver(tmp_path, monkeypatch) -> None:
+    """No folder, no driver: the park cannot name a session it cannot address."""
+    hidden = {"exe": "", "dir": "", "login": 1, "server": "S", "currency": "USD",
+              "balance": 1000.0, "equity": 1000.0, "trade_mode": _DEMO_MODE, "error": ""}
+    account, runner, store, _sent, snapshot, day, _spec = _gate(tmp_path, monkeypatch, [])
+    _census(store, _demo_windows(r"C:\mt5-exness") + [hidden])
+    assert "входы закрыты" in runner._second_window(account)
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert _sent == []
+    # and the candidate list drops the window it cannot address rather than naming it
+    assert worker.choose_driver_window([hidden] + _demo_windows(r"C:\mt5-team"), "") == (
+        "c:\\mt5-team", [])
+
+
+def test_a_shared_demo_login_with_a_window_nobody_read_stays_blocked(tmp_path, monkeypatch) -> None:
+    """The field is clean only when every window in it was read: a blind copy closes the door."""
+    account, runner, store, sent, snapshot, day, _spec = _gate(tmp_path, monkeypatch, [])
+    _census(store, _demo_windows(r"C:\mt5-exness", r"C:\mt5-team")
+            + [_row(r"C:\mt5-unknown", None, "")])
+    assert runner._second_window(account) != ""
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert sent == []
+    assert not any(kind == "driver_chosen" for _, _, kind, _ in store.recent_events(30))
+
+
+def test_a_real_account_sharing_its_login_is_blocked_exactly_as_before(
+        tmp_path, monkeypatch) -> None:
+    """Real money is never handed a silently chosen session: that door did not move.
+
+    The sentence is the one the operator has always read, word for word, the block keeps its event
+    name and its once-per-set-of-windows cadence, and no driver is ever named for a real login.
+    """
+    _account, runner, store, _sent, _snapshot, _day, _spec = _gate(tmp_path, monkeypatch, [])
+    real = make_account("a", 1, "S", mode="real")
+    _census(store, [_row(r"C:\mt5-exness", 1, "S", trade_mode=_REAL_MODE),
+                    _row(r"C:\mt5-team", 1, "S", trade_mode=_REAL_MODE)])
+    assert runner._second_window(real) == (
+        "счёт 1@S открыт ещё в 2 окне (c:\\mt5-exness, c:\\mt5-team): свободные деньги общего "
+        "счёта тратятся дважды, входы закрыты")
+    events = [(kind, payload) for _, _, kind, payload in store.recent_events(30)]
+    assert any(kind == "account_second_window" for kind, _ in events)
+    assert not any(kind == "driver_chosen" for kind, _ in events)
+    rows = worker.roster_rows(store)
+    assert worker.shared_demo_driver(rows, worker.account_key(1, "S"), real) == ("", [])
+
+
+def test_a_demo_account_whose_windows_both_answer_real_is_blocked(tmp_path, monkeypatch) -> None:
+    """The registry calling a login demo does not turn two REAL windows into demo money."""
+    account, runner, store, _sent, snapshot, day, _spec = _gate(tmp_path, monkeypatch, [])
+    assert account.is_real is False
+    _census(store, [_row(r"C:\mt5-exness", 1, "S", trade_mode=_REAL_MODE),
+                    _row(r"C:\mt5-team", 1, "S", trade_mode=_REAL_MODE)])
+    assert "входы закрыты" in runner._second_window(account)
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 0
+    assert _sent == []
+
+
+def test_the_census_records_the_mode_of_every_window_it_reads(tmp_path, monkeypatch) -> None:
+    """The gate compares what the broker calls this money, so the census has to carry it per window."""
+    store = Store(tmp_path / "book.sqlite")
+    fake = CensusMT5({r"C:\mt5-exness": (114929502, "MetaQuotes-Demo", r"C:\mt5-exness", _DEMO_MODE),
+                      r"C:\mt5-team": (114929502, "MetaQuotes-Demo", r"C:\mt5-team", _REAL_MODE)})
+    monkeypatch.setattr(worker, "mt5", fake)
+    monkeypatch.setattr(terminals, "running_terminals",
+                        lambda: [(1, r"C:\mt5-team\terminal64.exe"),
+                                 (2, r"C:\mt5-exness\terminal64.exe")])
+    rows = worker.refresh_roster(store)
+    assert {row["dir"]: row["trade_mode"] for row in rows} == {
+        "c:\\mt5-team": _REAL_MODE, "c:\\mt5-exness": _DEMO_MODE}
+    assert not worker.shared_windows_agree(rows)  # one login, two modes: nobody chooses a session
+
 
 
 def test_a_blocked_account_still_manages_every_position_it_holds(tmp_path, monkeypatch) -> None:
@@ -1333,6 +1527,42 @@ def test_status_shows_the_census_without_probing_a_terminal(tmp_path, monkeypatc
     out = capsys.readouterr().out
     assert "окна на этой машине: 2" in out
     assert "входы по этому счёту закрыты" in out
+
+
+def test_status_names_the_driver_when_the_shared_login_is_demo(tmp_path, monkeypatch, capsys) -> None:
+    """`status` must not promise a closed door about the one the gate just opened.
+
+    The census and the registry are read the same way here as in the cycle; the line the operator sees
+    is the decision, with the window it chose, and it still says nothing about the money path.
+    """
+    store = Store(tmp_path / "book.sqlite")
+    registry = tmp_path / "accounts.yaml"
+    registry.write_text(_TWO_WINDOWS, encoding="utf-8")
+    _census(store, [_row(r"C:\mt5-exness", 114929502, "MetaQuotes-Demo", trade_mode=_DEMO_MODE),
+                    _row(r"C:\mt5-team", 114929502, "MetaQuotes-Demo", trade_mode=_DEMO_MODE)])
+    monkeypatch.setattr(worker, "scan_roster",
+                        lambda paths=None: pytest.fail("status must not probe terminals"))
+    fleet_cli.main(["--config", str(registry), "--store", str(tmp_path / "book.sqlite"), "status"])
+    out = capsys.readouterr().out
+    assert "окна на этой машине: 2" in out
+    assert "входы по этому счёту закрыты" not in out
+    assert "окно-водитель c:\\mt5-exness" in out
+    assert "driver_chosen" in out  # and where to read the decision in the book
+
+
+def test_terminals_names_the_driver_instead_of_promising_a_closed_door(tmp_path, monkeypatch,
+                                                                      capsys) -> None:
+    registry = tmp_path / "accounts.yaml"
+    registry.write_text(_TWO_WINDOWS, encoding="utf-8")
+    rows = [_row(r"C:\mt5-exness", 114929502, "MetaQuotes-Demo", trade_mode=_DEMO_MODE),
+            _row(r"C:\mt5-team", 114929502, "MetaQuotes-Demo", trade_mode=_DEMO_MODE)]
+    monkeypatch.setattr(worker, "scan_roster", lambda paths=None: rows)
+    assert fleet_cli.main(["--config", str(registry), "--store", str(tmp_path / "b.sqlite"),
+                           "terminals"]) == 0
+    out = capsys.readouterr().out
+    assert "114929502@metaquotes-demo открыт в 2 окнах" in out
+    assert "парк закрывает" not in out
+    assert "окно-водитель названо" in out and "c:\\mt5-exness" in out
 
 
 def test_the_cli_reads_aloud_on_a_legacy_console(tmp_path, monkeypatch) -> None:
