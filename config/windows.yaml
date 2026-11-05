@@ -1,0 +1,2366 @@
+# Расписание торговых окон — «предсказывай окна заранее».
+#
+# Один источник истины для всех масштабов: день / неделя / месяц. Окна бывают двух
+# ПРИРОД, и они больше не описываются одной формулой, потому что это была ошибка:
+#
+#   1) utc_fixed — окно как ПОЛОСА UTC-СУТОК (азиатская сессия). Граница не двигается
+#      никогда, это осознанно.
+#   2) local_anchored — окно как СОБЫТИЕ НА ЧЬИХ-ТО ЧАСАХ: релиз в 08:30 по Нью-Йорку,
+#      кэш-открытие в 09:30, стейтмент FOMC в 14:00, аукцион Treasury в 13:00. Держать
+#      для такого фиксированную UTC-скобку нельзя: после 2026-11-01 релиз 08:30 ET
+#      приходит в 13:30 UTC, и скобка 12:30–14:00 тратит первый час на ДО-релизную
+#      тишину и забирает только половину реакции. Такие окна несут ОБЕ скобки
+#      (utc_seasons.dst / utc_seasons.std), и движок выбирает их по дате.
+#
+# Правила перехода — календарная арифметика, а не библиотека и не оценка: в США это
+# второе воскресенье марта и первое воскресенье ноября, в ЕС — последнее воскресенье
+# марта и октября. Они известны на годы вперёд, поэтому их можно выводить, а не помнить.
+# Пара скобок проверяется на одинаковую ЛОКАЛЬНУЮ геометрию (зимняя стартует ровно на
+# 60 минут позже летней, длительность совпадает): окно не может незаметно поменять
+# утверждение, пока следует за часами.
+#
+# Числа в expected/criterion — либо измерены на записанных барах (тогда в measured лежат
+# файл, дата снятия и выборка, причём РАЗДЕЛЬНО по сезонам: скобка, ни разу не
+# сработавшая зимой, не имеет зимнего доказательства), либо помечены как гипотеза.
+# Ни одно число сюда не перенесено из старой заметки или из «статей про сессии».
+#
+# ДВЕ ОСИ, а не одна. Раньше их не различали, и от этого ломалось всё: «тихо» и «не
+# доказано» печатались одним словом, а «статистически заметно» читалось как «можно торговать».
+#
+# ОСЬ 1. ВЕРДИКТ — чистая статистика предзарегистрированного критерия диапазона:
+#   PASS        — критерий этого окна выполнен на этой выборке;
+#   FAIL        — не выполнен (для окон-тишунов с `<=` высокое отношение — это именно FAIL,
+#                 и он напечатан, а не спрятан);
+#   HYPOTHESIS  — ТОЛЬКО тонкая выборка: n_event_days <= 5 (THIN_SAMPLE_EVENT_DAYS). При
+#                 таком числе срабатываний арифметика есть, а права называть её
+#                 доказательством нет;
+#   NOT_MEASURED— метрика по барам неотделима или событий в записи нет (n < 2 — окно
+#                 не отчитывается вовсе, это правило неизменно).
+# Всё прочее — неизмеренная зимняя половина скобки, порог внутри шумового коридора,
+# закрытая или тонкая книга, растянутый спред — печатается ОГОВОРКАМИ к вердикту
+# (verdict_reasons) и живёт на оси 2. Окно с 91 срабатыванием не имеет права прятаться за
+# HYPOTHESIS: в прошлой ревизии именно так и было — 15 окон из 20 имели вердикт HYPOTHESIS,
+# включая new_york_open с отношением 1.982 на 90 срабатываниях, и лестница переставала
+# различать измерение и анекдот.
+# Про сезон (оговорка, не вердикт): запись обрывается на 2026-11-02 12:00 UTC, то есть в ней
+# нет ни одного послеполуденного бара после перевода американских часов. Любая скобка на
+# нью-йоркских или чикагских часах сегодня (5 ноября — EST/CST) торгует геометрией, которую
+# эта запись не видела ни разу (dst=90, std=0): PASS по летней половине — это PASS по
+# летней половине, и артефакт обязан говорить это вслух.
+#
+# ОСЬ 2. ACTION — исполнимость: enter | avoid | neutral. Отвечает на вопрос «можно ли это
+# торговать» и выводится из измерения (scripts/windows_evidence.py --apply переписывает его
+# по замеру, валидатор не даёт рукописному значению расходиться с выводом):
+#   avoid — тихая или закрытая книга, тонкая книга по покрытию слотов, спред внутри окна
+#           >= 1.5 x его же базы, провал ВТОРОЙ критериальной линии окна (по спреду), спред,
+#           съедающий >= 25 % часового диапазона, и календарно опасные часы (`hazard`:
+#           открытие недели после выходных, первый бар понедельника, среда тройного свепа,
+#           ролловер на серверной полночи). ГЛАВНОЕ ПРАВИЛО: PASS по критерию ТИШИНЫ (`<=`)
+#           никогда не рендерится enter — «книга измерена спокойной» означает отсутствие
+#           движения, а не сигнал; rollover (0.27) и пятничное закрытие тихи именно потому,
+#           что в эти часы записи нет (XAUUSD: 0 из 91 слота в 21:00 UTC, 4 из 91 в 22:00).
+#   enter — только PASS по критерию АКТИВНОСТИ (`>=`) при EXECUTABLE-книге, измеренном и
+#           выполненном спреде, не тонкой выборке и видимой в записи действующей сезонной
+#           половине скобки;
+#   neutral — всё остальное: FAIL, HYPOTHESIS, неизмеренный спред, неизмеренная геометрия.
+#
+# Что измеримо, а что нет, на этой машине (2026-11-05):
+#   агентские sqlite (agent_data/*.db) — это только аудит событий, баров там нет;
+#   bars есть в agent_data/forward_bars/*.json с явными UTC-метками (EURUSD, GBPUSD,
+#   XAUUSD, XAGUSD, 2000 часовых баров на инструмент, 26 июн – 2 ноя 2026);
+#   AUDUSD и NZDUSD-файлы в той же папке лежат, но в классы инструментов не включены,
+#   потому что ни одна гипотеза этого раунда под них не предзарегистрирована — включать
+#   их в выборку задним числом значит подгонять базу под ответ.
+#   USDJPY записанных часовых баров на этой машине нет -> ВСЕ окна для USDJPY остаются
+#   неизмеренными гипотезами; в списках инструментов он помечен кинжалом (†).
+#   D1-корзина (agent_data/daily) годится только для календарных дат (брокерская дата
+#   бара, без смещения сервера), не для внутридневных часов.
+#
+# Никаких тиковых полей брокера: метрика измеряется только по барам
+# (open/high/low/close), потому что metal tick-поля на этом фиде ошибочны ~в 10 раз.
+# Поле `spread` ИЗ ФАЙЛОВ БАРОВ — вторая критериальная линия каждого окна, но сначала
+# аудируется сама колонка (покрытие, число значений, доля мода и РАЗЛИЧИЕ ЧАСОВЫХ МЕДИАН):
+#   XAGUSD — покрытие ~90 %, 39 значений, часовые медианы ходят 18..34 пунктов (1.89x):
+#            колонка годится, и именно она держит ось avoid (азиатские часы дороже почти
+#            вдвое);
+#   XAUUSD — покрытие ~92 %, но часовая медиана 8.0 стоит в 21 часу из 22 (различие 1.0x):
+#            колонка ВЫРОЖДЕНА, по ней окна не различимы, и отношение золота НЕ печатается
+#            измерением, хотя значений в файле больше двух;
+#   EURUSD/GBPUSD — покрытие ~2 % при моде 19/23 пунктов: форекс-спред печатается
+#            НЕ ИЗМЕРЕННЫМ вместе с покрытием, а не нулём, и enter по нему не выдаётся.
+# Пороги второй линии (1.5x и 25 % часового диапазона) — общие константы движка
+# (SPREAD_THIN_MULTIPLE, SPREAD_COST_KILL), а не подобранная под ответ величина; окна с
+# короткой реакцией (релизы, аукционы, экспирации, первый час месяца) держат предел 1.3x,
+# потому что у них и издержка, и горизонт короче.
+
+version: 2
+generated: "2026-11-05"
+timezone_policy: "hybrid: utc_fixed для полос суток, local_anchored для событий"
+timezone_note: >
+  start_minute/end_minute — минуты от полуночи UTC. Окно с end_minute < start_minute
+  считается переходящим через полночь. Окна с utc_seasons несут две скобки, и choice
+  делает windows_schedule.resolve_bracket по дате. Серверное время брокера (известен
+  сдвиг +7200 c на MetaQuotes-Demo) нигде не принимается за UTC; измерение опирается
+  только на файлы с явными UTC-метками.
+
+# ---------------------------------------------------------------------------
+# РЕЕСТР ИНСТРУМЕНТОВ: что на этой машине реально записано, а что только торгуется.
+# Класс инструмента может включать символ без баров — тогда окно для него гипотеза,
+# и ни один замер не вправе притворяться, что он про этот инструмент.
+# ---------------------------------------------------------------------------
+symbols:
+  XAUUSD: {recorded: true, bars: agent_data/forward_bars/XAUUSD.json, digits: 2}
+  XAGUSD: {recorded: true, bars: agent_data/forward_bars/XAGUSD.json, digits: 3}
+  EURUSD: {recorded: true, bars: agent_data/forward_bars/EURUSD.json, digits: 5}
+  GBPUSD: {recorded: true, bars: agent_data/forward_bars/GBPUSD.json, digits: 5}
+  USDJPY: {recorded: false, bars: null, digits: 3}
+  AUDUSD: {recorded: true, bars: agent_data/forward_bars/AUDUSD.json, digits: 5,
+           in_use: false, note: "файл есть; в классы не включён — под него нет
+                                 предзарегистрированной гипотезы этого раунда"}
+  NZDUSD: {recorded: true, bars: agent_data/forward_bars/NZDUSD.json, digits: 5,
+           in_use: false, note: "то же"}
+
+instrument_classes:
+  gold:
+    label: "Золото"
+    symbols: [XAUUSD]
+  silver:
+    label: "Серебро"
+    symbols: [XAGUSD]
+  fx:
+    label: "Форекс-мажоры (USD-счёт)"
+    symbols: [EURUSD, GBPUSD, USDJPY]
+
+evidence_sources:
+  forward_bars:
+    path: agent_data/forward_bars
+    symbols: [EURUSD, GBPUSD, XAUUSD, XAGUSD]
+    timeframe: H1
+    stamping: "явный UTC ISO в поле time"
+    fields: [time, o, h, l, c, spread]
+  daily_basket:
+    path: agent_data/daily
+    symbols: [XAUUSD, XAGUSD, EURUSD, AUDUSD, NZDUSD]
+    timeframe: D1
+    stamping: "брокерская дата бара (d); смещение сервера не применяется"
+  usdjpy_bars: null   # записанных баров USDJPY на этой машине нет
+
+# ---------------------------------------------------------------------------
+# ПРАЗДНИЧНЫЙ КАЛЕНДАРЬ.
+#
+# Без него расписание предсказывало торговое окно на день, где книги нет. Единственный
+# провал, который виден прямо в этой записи: XAUUSD замолкает 2026-07-03 в 18:00 UTC и
+# возвращается только 2026-07-05 в 23:00 — это закрытие по Дню независимости (4 июля
+# 2026 приходится на субботу, биржи переносят наблюдение на пятницу). Всё остальное
+# ниже — календарные правила (NYSE/US bank holidays), а не память о записи; они
+# пересчитываются из правила дня, а не переписываются из чьего-то обзора.
+#
+# kind: closed      — окно ВЫЧИТАЕТСЬ из расписания (производные правила daily/weekly/
+#                     monthly_*); торговаться там не с чем.
+# kind: early_close — окно остаётся, но печатается пометка: сокращённая сессия, часть
+#                     скобки приходится на закрытую книгу (исполнимость measure это и
+#                     покажет покрытием баров).
+# Буквальные даты релизов (BLS/Фед) из календаря НЕ вычищаются: ведомства сами
+# переносят релиз вокруг праздника; столкновение помечается в выводе.
+# ---------------------------------------------------------------------------
+market_holidays:
+  - {date: "2026-11-26", name: "Thanksgiving (США)", kind: closed}
+  - {date: "2026-11-27", name: "Black Friday, NYSE 13:00 ET", kind: early_close}
+  - {date: "2026-12-24", name: "Канун Рождества, NYSE 13:00 ET", kind: early_close}
+  - {date: "2026-12-25", name: "Рождество", kind: closed}
+  - {date: "2026-12-31", name: "Канун Нового года, NYSE 13:00 ET", kind: early_close}
+  - {date: "2027-01-01", name: "Новый год", kind: closed}
+  - {date: "2027-01-18", name: "День Мартина Лютера Кинга", kind: closed}
+  - {date: "2027-02-15", name: "День президентов", kind: closed}
+  - {date: "2027-03-26", name: "Великая пятница (Strand Holiday)", kind: closed}
+  - {date: "2027-05-31", name: "Memorial Day", kind: closed}
+  - {date: "2027-06-18", name: "Juneteenth (перенос с субботы 19.06)", kind: closed}
+  - {date: "2027-07-05", name: "День независимости (перенос с воскресенья 04.07)",
+     kind: closed}
+  - {date: "2027-09-06", name: "Labor Day", kind: closed}
+  - {date: "2027-11-25", name: "Thanksgiving (США)", kind: closed}
+  - {date: "2027-12-24", name: "Канун Рождества, NYSE 13:00 ET", kind: early_close}
+
+# ---------------------------------------------------------------------------
+# РИСК-СОСТОЯНИЯ, У КОТОРЫХ НЕТ КАЛЕНДАРЯ.
+# Это не окна: они не срабатывают по дате, и заводить для них строку в windows значило
+# бы выдать календарь за то, чего у него нет.
+# ---------------------------------------------------------------------------
+risk_states:
+  - id: jpy_intervention
+    label: "Валютная интервенция MoF по иене"
+    applies_to: [fx]
+    status: "не имеет расписания — это состояние, а не событие"
+    why: >
+      Интервенцию не анонсируют заранее: Министерство финансов Японии действует, когда
+      сочтёт курс «крайне несбалансированным», и объявляет о ней постфактум (или за
+      минуты). Любая скобка здесь — не прогноз, а дежурство: окно, в котором MoF ФИЗИЧЕСКИ
+      может действовать, потому что расчёт идёт через японские банки в рабочие часы
+      Токио. Исторические эпизоды концентрируются в первой половине дня Токио и в
+      пересменку Токио–Нью-Йорк; это наблюдение из открытой прессы, а не измерение этой
+      машины, и потому оно стоит гипотезой, а не числом.
+    watch_local_band: "09:00–21:00 Токио (JST не переходит на летнее время)"
+    watch_utc_band: "00:00–12:00 UTC"
+    guardrail: >
+      Практическое следствие для исполнителя: в этом коридоре по USDJPY стоп-лоссы
+      держатся вдвое дальше обычного, а новый вход в иене-ноге не планируется вовсе.
+      Проверить постфактум можно по записям MoF/FTSY; на этой машине записанных баров
+      USDJPY нет, поэтому и состояния по нему не измеримы.
+  - id: blint_intervention_escalation
+    label: "Реакция G7/Минфина США на уровень иены"
+    applies_to: [fx]
+    status: "не имеет расписания"
+    why: >
+      Вероятность интервенции растёт не по календарю, а по уровню и по риторике; это
+      состояние портфеля, а не окно. Помечено здесь, чтобы расписание не создавало
+      впечатления, что все риски США/Японии уже разложены по строкам.
+
+# ---------------------------------------------------------------------------
+# ОКНА
+# ---------------------------------------------------------------------------
+windows:
+
+  # ---------------- ДНЕВНОЙ МАСШТАБ ----------------
+
+  - id: asia_session
+    local_name: "Азиатская сессия (Сидней/Токио)"
+    scale: daily
+    timezone_kind: utc_fixed
+    applies_to: [gold, silver, fx]
+    utc: {start_minute: 0, end_minute: 300}
+    rule: {kind: daily, weekdays: [0, 1, 2, 3, 4]}
+    why: >
+      Физический спрос на золото живёт в Азии: Shanghai Gold Exchange (SGE, спотовый и
+      ночной рынок Шанхая) и японская площадка (бывший TOCOM, после слияния — OSE) —
+      там импортные премии и основной объём по металлу. книго держания в паре
+      EURUSD/GBPUSD в эти часы тонкая: европейских и американских дилеров нет,
+      маркетмейкеры торгуют узкие лимиты. (Название «Shanghai ICE» в прошлой ревизии
+      было ошибкой: ICE — Intercontinental Exchange, к шанхайскому золоту отношения не
+      имеет; шанхайская площадка — SGE.)
+    expected: >
+      Предзарегистрированная гипотеза — тонкая ликвидность и малые смещения; медианный
+      относительный диапазон H1 ниже суточного фона.
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_outside
+      op: "<="
+      value: 0.85
+      text: >
+        медиана |high-low|/mid внутри окна <= 0.85 x медианы вне окна, на записанных
+        H1-барах, по каждому инструменту класса отдельно.
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_outside
+      op: "<="
+      value: 1.5
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.5 x медиана общего фона
+        суток. Это линия про ИСПОЛНИМОСТЬ, а не про гипотезу: 0.01 лота металла стоит вход только
+        если проход не дороже обещанного движения. Предел 1.5 — общий константный порог движка
+        (SPREAD_THIN_MULTIPLE), не подобранное под ответ число.
+    action: avoid
+    action_basis: >
+      avoid как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured:
+      source: ["agent_data/forward_bars/XAUUSD.json", "agent_data/forward_bars/XAGUSD.json", "agent_data/forward_bars/EURUSD.json", "agent_data/forward_bars/GBPUSD.json"]
+      generated_at: "2026-11-05"
+      timeframe: H1
+      metric: median_abs_rel_range_ratio_inside_vs_outside
+      baseline: pooled_day_background
+      symbols_measured: ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD"]
+      symbols_without_bars: ["USDJPY"]
+      n_inside_bars: 1740
+      n_baseline_bars: 6260
+      n_event_days: 91
+      n_event_days_by_season: {fixed: 91}
+      season_in_effect_at_measurement: fixed
+      median_rel_range_inside: 0.002085
+      median_rel_range_baseline: 0.001975
+      ratio: 1.056
+      ratio_noise_band_p10_p90: [0.917, 1.193]
+      ratio_within_symbol_median: 0.89
+      ratio_within_symbol_note: "объединённая медиана смешивает металлы и валюту; по-символьные отношения — вот здесь, критерий при этом остаётся на предзарегистрированном объединённом числе"
+      ratio_within_symbol_span: [0.652, 1.11]
+      criterion: "<= 0.85"
+      criterion_holds: FAIL
+      # вторая критериальная линия: СПРЕД, а не только диапазон
+      spread_metric: median_spread_points_ratio_inside_vs_outside
+      spread_baseline: pooled_day_background
+      spread_criterion: "<= 1.5"
+      spread_ratio: 1.889
+      spread_ratio_driver: "XAGUSD"
+      median_spread_points_inside: 34.0
+      median_spread_points_outside: 18.0
+      n_spread_bars_inside: 411
+      n_spread_bars_outside: 1381
+      spread_coverage_inside: 0.9033
+      spread_measurable_symbols: ["XAGUSD"]
+      spread_unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAUUSD"]
+      spread_column_audit: {EURUSD: {coverage: 0.0245, distinct_values: 4, modal_share: 0.9388, hour_median_spread: null, usable: false}, GBPUSD: {coverage: 0.0245, distinct_values: 5, modal_share: 0.898, hour_median_spread: null, usable: false}, XAGUSD: {coverage: 0.896, distinct_values: 39, modal_share: 0.3008, hour_median_spread: 1.889, usable: true}, XAUUSD: {coverage: 0.9175, distinct_values: 22, modal_share: 0.6038, hour_median_spread: 1.0, usable: false}}
+      spread_column_audit_note: "coverage — доля баров файла с записанным спредом; distinct/modal_share — вырожденность колонки; hour_median_spread — во сколько раз различаются часовые медианы (без этого колонка не различает окна, даже если значений много); usable — годится ли ею пользоваться"
+      spread_criterion_holds: FAIL
+      spread_criterion_note: "спред внутри 1.889x фона при пределе 1.5x по символу XAGUSD — книга в этом окне дороже, чем обещает гипотеза"
+      crossing_cost_fraction_of_hour_range: 0.08076
+      crossing_cost_driver: "XAGUSD"
+      verdict: FAIL
+      verdict_reasons:
+        - "оговорка (вердикта не снижает): книга в окне THIN_BOOK: спред внутри окна в 1.889 раз(а) шире фона (порог 1.5)"
+      action: avoid
+      action_reasons:
+        - "книга в окне THIN_BOOK (покрытие 0.989, редкие часы [])"
+        - "спред внутри окна в 1.889 раз(а) шире фона по символу XAGUSD (порог 1.5)"
+        - "вторая критериальная линия (спред <= 1.5) не выполнена: измерено 1.889"
+      action_note: "verdict — статистика (держится ли предзарегистрированный критерий диапазона на этой выборке); action — исполнимость (можно ли это торговать). PASS по тишине никогда не бывает enter"
+      per_symbol: {XAUUSD: {n_inside_bars: 455, n_base_bars: 1545, ratio: 1.071}, XAGUSD: {n_inside_bars: 455, n_base_bars: 1545, ratio: 1.11}, EURUSD: {n_inside_bars: 415, n_base_bars: 1585, ratio: 0.71}, GBPUSD: {n_inside_bars: 415, n_base_bars: 1585, ratio: 0.652}}
+      executability:
+        verdict: THIN_BOOK
+        bar_coverage_inside: 0.9886
+        n_expected_slots: 1760
+        n_present_bars: 1740
+        n_occurrence_days_without_any_bars: 0
+        coverage_note: "доля слотов часа, которые окно требует, имеющих запись; в знаменателе только те дни срабатывания окна, по которым у символа есть хоть один бар (выходные и closures не размывают показатель, но учтены строкой n_occurrence_days_without_any_bars)"
+        dead_hour_slots_utc: []
+        sparse_hour_slots_utc: []
+        per_slot_fill: {00:00: {XAUUSD: "91/92", XAGUSD: "91/92", EURUSD: "83/84", GBPUSD: "83/84"}, 01:00: {XAUUSD: "91/92", XAGUSD: "91/92", EURUSD: "83/84", GBPUSD: "83/84"}, 02:00: {XAUUSD: "91/92", XAGUSD: "91/92", EURUSD: "83/84", GBPUSD: "83/84"}, 03:00: {XAUUSD: "91/92", XAGUSD: "91/92", EURUSD: "83/84", GBPUSD: "83/84"}, 04:00: {XAUUSD: "91/92", XAGUSD: "91/92", EURUSD: "83/84", GBPUSD: "83/84"}}
+        spread:
+          unit_note: "spread лента пишет в точках; точка — из digits реестра символов (XAUUSD: digits=2 из реестра символов; XAGUSD: digits=3 из реестра символов; EURUSD: digits=5 из реестра символов; GBPUSD: digits=5 из реестра символов); перевод в цены нужен только тем, чтобы сравнить спред с шириной бара"
+          baseline: pooled_day_background
+          coverage_threshold: 0.5
+          min_spread_bars: 20
+          by_symbol: {EURUSD: {n_inside_bars: 415, n_background_bars: 1585, spread_recorded: 10, spread_recorded_background: 39, spread_coverage_inside: 0.0241, spread_coverage_background: 0.0246, median_points_inside: 19.0, median_points_background: 19.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 4, modal_value: 19.0, modal_share: 0.9388, median_points: 19.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; лишь 4 различных значений; мод 19.0 занимает 94% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 2.4% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, GBPUSD: {n_inside_bars: 415, n_background_bars: 1585, spread_recorded: 10, spread_recorded_background: 39, spread_coverage_inside: 0.0241, spread_coverage_background: 0.0246, median_points_inside: 23.0, median_points_background: 23.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 5, modal_value: 23.0, modal_share: 0.898, median_points: 23.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; мод 23.0 занимает 90% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 2.4% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, XAGUSD: {n_inside_bars: 455, n_background_bars: 1545, spread_recorded: 411, spread_recorded_background: 1381, spread_coverage_inside: 0.9033, spread_coverage_background: 0.8939, median_points_inside: 34.0, median_points_background: 18.0, point_size: 0.001, ratio_inside_vs_background: 1.889, crossing_cost_fraction_of_hour_range: 0.08076, spread_column: {coverage: 0.896, distinct_values: 39, modal_value: 18.0, modal_share: 0.3008, median_points: 19.0, hour_median_spread: 1.889, usable: true, note: "колонка пригодна для сравнения окон"}, usable_column: true}, XAUUSD: {n_inside_bars: 455, n_background_bars: 1545, spread_recorded: 415, spread_recorded_background: 1420, spread_coverage_inside: 0.9121, spread_coverage_background: 0.9191, median_points_inside: 8.0, median_points_background: 8.0, point_size: 0.01, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.9175, distinct_values: 22, modal_value: 8.0, modal_share: 0.6038, median_points: 8.0, hour_median_spread: 1.0, usable: false, note: "колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы"}, usable_column: false, note: "колонка spread у этого символа вырождена (колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы) — отношением пользоваться нельзя, печатается только аудит колонки"}}
+          measurable_symbols: ["XAGUSD"]
+          unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAUUSD"]
+          ratio_inside_vs_background: 1.889
+          ratio_driver: "XAGUSD"
+          crossing_cost_fraction_of_hour_range: 0.08076
+          crossing_cost_driver: "XAGUSD"
+    measured_note: "перемерено scripts/windows_evidence.py на записи 2026-11-05; вердикт FAIL (статистика) при n=91 срабатываний {'fixed': 91}; исполнимость THIN_BOOK, спред FAIL (ratio=1.889, база pooled_day_background) -> action avoid"
+
+  - id: london_open
+    local_name: "Открытие Лондона"
+    scale: daily
+    timezone_kind: local_anchored
+    season_region: europe_london
+    anchor_local: "08:00–10:00 Лондон"
+    applies_to: [gold, silver, fx]
+    utc: {start_minute: 420, end_minute: 540}
+    utc_seasons:
+      dst: {start_minute: 420, end_minute: 540}   # BST = UTC+1 -> 07:00–09:00 UTC
+      std: {start_minute: 480, end_minute: 600}   # GMT = UTC+0 -> 08:00–10:00 UTC
+    rule: {kind: daily, weekdays: [0, 1, 2, 3, 4]}
+    rule_note: >
+      Якорь — лондонская булльон-открытие 08:00 по местному. Прежняя ревизия держала
+      фиксированную скобку 07:00–09:00 UTC и звала зимний сдвиг «платой за UTC-кронштейн»;
+      на самом деле это была неверная скобка: в GMT первые два часа окна — ДО открытия.
+    why: >
+      С открытием лондонского стола включается основной объём дня по золоту (LBMA-фиксинг
+      идёт позже, 10:30 и 15:00 по Лондону) и европейский офс-форовый поток по мажорам.
+    expected: >
+      Предзарегистрированная гипотеза: медианный относительный диапазон H1 внутри окна
+      выше суточного фона.
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_outside
+      op: ">="
+      value: 1.15
+      text: "медиана |high-low|/mid внутри >= 1.15 x медиана вне окна (записанные H1)."
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_outside
+      op: "<="
+      value: 1.5
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.5 x медиана общего фона
+        суток. Это линия про ИСПОЛНИМОСТЬ, а не про гипотезу: 0.01 лота металла стоит вход только
+        если проход не дороже обещанного движения. Предел 1.5 — общий константный порог движка
+        (SPREAD_THIN_MULTIPLE), не подобранное под ответ число.
+    action: neutral
+    action_basis: >
+      neutral как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured:
+      source: ["agent_data/forward_bars/XAUUSD.json", "agent_data/forward_bars/XAGUSD.json", "agent_data/forward_bars/EURUSD.json", "agent_data/forward_bars/GBPUSD.json"]
+      generated_at: "2026-11-05"
+      timeframe: H1
+      metric: median_abs_rel_range_ratio_inside_vs_outside
+      baseline: pooled_day_background
+      symbols_measured: ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD"]
+      symbols_without_bars: ["USDJPY"]
+      n_inside_bars: 699
+      n_baseline_bars: 7301
+      n_event_days: 91
+      n_event_days_by_season: {dst: 85, std: 6}
+      season_in_effect_at_measurement: std
+      median_rel_range_inside: 0.002246
+      median_rel_range_baseline: 0.001956
+      ratio: 1.148
+      ratio_noise_band_p10_p90: [0.995, 1.365]
+      ratio_within_symbol_median: 1.204
+      ratio_within_symbol_note: "объединённая медиана смешивает металлы и валюту; по-символьные отношения — вот здесь, критерий при этом остаётся на предзарегистрированном объединённом числе"
+      ratio_within_symbol_span: [0.904, 1.404]
+      criterion: ">= 1.15"
+      criterion_holds: FAIL
+      # вторая критериальная линия: СПРЕД, а не только диапазон
+      spread_metric: median_spread_points_ratio_inside_vs_outside
+      spread_baseline: pooled_day_background
+      spread_criterion: "<= 1.5"
+      spread_ratio: 0.947
+      spread_ratio_driver: "XAGUSD"
+      median_spread_points_inside: 18.0
+      median_spread_points_outside: 19.0
+      n_spread_bars_inside: 161
+      n_spread_bars_outside: 1631
+      spread_coverage_inside: 0.8895
+      spread_measurable_symbols: ["XAGUSD"]
+      spread_unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAUUSD"]
+      spread_column_audit: {EURUSD: {coverage: 0.0245, distinct_values: 4, modal_share: 0.9388, hour_median_spread: null, usable: false}, GBPUSD: {coverage: 0.0245, distinct_values: 5, modal_share: 0.898, hour_median_spread: null, usable: false}, XAGUSD: {coverage: 0.896, distinct_values: 39, modal_share: 0.3008, hour_median_spread: 1.889, usable: true}, XAUUSD: {coverage: 0.9175, distinct_values: 22, modal_share: 0.6038, hour_median_spread: 1.0, usable: false}}
+      spread_column_audit_note: "coverage — доля баров файла с записанным спредом; distinct/modal_share — вырожденность колонки; hour_median_spread — во сколько раз различаются часовые медианы (без этого колонка не различает окна, даже если значений много); usable — годится ли ею пользоваться"
+      spread_criterion_holds: PASS
+      crossing_cost_fraction_of_hour_range: 0.04467
+      crossing_cost_driver: "XAGUSD"
+      verdict: FAIL
+      verdict_reasons:
+        - "оговорка (вердикта не снижает): окно привязано к чужим часам, сегодня действует зимняя (std) половина скобки, а её геометрия (dst=85, std=6) — это измерена всего 6 раз(а) — тонкая выборка: расписание на эти недели торгует расчётным сдвигом, а не измеренным"
+        - "оговорка (вердикта не снижает): порог 1.15 лежит внутри шумового коридора [0.995, 1.365] — вердикт зависит от порога, а не опирается на него"
+      action: neutral
+      action_reasons:
+        - "критерий диапазона >= 1.15 не выполнен (измерено 1.148): окно не отличается от фона"
+      action_note: "verdict — статистика (держится ли предзарегистрированный критерий диапазона на этой выборке); action — исполнимость (можно ли это торговать). PASS по тишине никогда не бывает enter"
+      per_symbol: {XAUUSD: {n_inside_bars: 182, n_base_bars: 1818, ratio: 0.904}, XAGUSD: {n_inside_bars: 181, n_base_bars: 1819, ratio: 1.022}, EURUSD: {n_inside_bars: 168, n_base_bars: 1832, ratio: 1.387}, GBPUSD: {n_inside_bars: 168, n_base_bars: 1832, ratio: 1.404}}
+      executability:
+        verdict: EXECUTABLE
+        bar_coverage_inside: 0.9929
+        n_expected_slots: 704
+        n_present_bars: 699
+        n_occurrence_days_without_any_bars: 0
+        coverage_note: "доля слотов часа, которые окно требует, имеющих запись; в знаменателе только те дни срабатывания окна, по которым у символа есть хоть один бар (выходные и closures не размывают показатель, но учтены строкой n_occurrence_days_without_any_bars)"
+        dead_hour_slots_utc: []
+        sparse_hour_slots_utc: []
+        per_slot_fill: {07:00: {XAUUSD: "85/86", XAGUSD: "84/86", EURUSD: "78/78", GBPUSD: "78/78"}, 08:00: {XAUUSD: "91/92", XAGUSD: "91/92", EURUSD: "84/84", GBPUSD: "84/84"}, 09:00: {XAUUSD: "6/6", XAGUSD: "6/6", EURUSD: "6/6", GBPUSD: "6/6"}}
+        spread:
+          unit_note: "spread лента пишет в точках; точка — из digits реестра символов (XAUUSD: digits=2 из реестра символов; XAGUSD: digits=3 из реестра символов; EURUSD: digits=5 из реестра символов; GBPUSD: digits=5 из реестра символов); перевод в цены нужен только тем, чтобы сравнить спред с шириной бара"
+          baseline: pooled_day_background
+          coverage_threshold: 0.5
+          min_spread_bars: 20
+          by_symbol: {EURUSD: {n_inside_bars: 168, n_background_bars: 1832, spread_recorded: 4, spread_recorded_background: 45, spread_coverage_inside: 0.0238, spread_coverage_background: 0.0246, median_points_inside: 19.0, median_points_background: 19.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 4, modal_value: 19.0, modal_share: 0.9388, median_points: 19.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; лишь 4 различных значений; мод 19.0 занимает 94% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 2.4% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, GBPUSD: {n_inside_bars: 168, n_background_bars: 1832, spread_recorded: 4, spread_recorded_background: 45, spread_coverage_inside: 0.0238, spread_coverage_background: 0.0246, median_points_inside: 23.0, median_points_background: 23.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 5, modal_value: 23.0, modal_share: 0.898, median_points: 23.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; мод 23.0 занимает 90% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 2.4% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, XAGUSD: {n_inside_bars: 181, n_background_bars: 1819, spread_recorded: 161, spread_recorded_background: 1631, spread_coverage_inside: 0.8895, spread_coverage_background: 0.8966, median_points_inside: 18.0, median_points_background: 19.0, point_size: 0.001, ratio_inside_vs_background: 0.947, crossing_cost_fraction_of_hour_range: 0.04467, spread_column: {coverage: 0.896, distinct_values: 39, modal_value: 18.0, modal_share: 0.3008, median_points: 19.0, hour_median_spread: 1.889, usable: true, note: "колонка пригодна для сравнения окон"}, usable_column: true}, XAUUSD: {n_inside_bars: 182, n_background_bars: 1818, spread_recorded: 166, spread_recorded_background: 1669, spread_coverage_inside: 0.9121, spread_coverage_background: 0.918, median_points_inside: 8.0, median_points_background: 8.0, point_size: 0.01, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.9175, distinct_values: 22, modal_value: 8.0, modal_share: 0.6038, median_points: 8.0, hour_median_spread: 1.0, usable: false, note: "колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы"}, usable_column: false, note: "колонка spread у этого символа вырождена (колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы) — отношением пользоваться нельзя, печатается только аудит колонки"}}
+          measurable_symbols: ["XAGUSD"]
+          unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAUUSD"]
+          ratio_inside_vs_background: 0.947
+          ratio_driver: "XAGUSD"
+          crossing_cost_fraction_of_hour_range: 0.04467
+          crossing_cost_driver: "XAGUSD"
+    measured_note: "перемерено scripts/windows_evidence.py на записи 2026-11-05; вердикт FAIL (статистика) при n=91 срабатываний {'dst': 85, 'std': 6}; исполнимость EXECUTABLE, спред PASS (ratio=0.947, база pooled_day_background) -> action neutral"
+
+  - id: new_york_open
+    local_name: "Открытие Нью-Йорка (09:30 ET кэш)"
+    scale: daily
+    timezone_kind: local_anchored
+    season_region: us_eastern
+    anchor_local: "09:30–11:00 Нью-Йорк"
+    applies_to: [gold, silver, fx]
+    utc: {start_minute: 810, end_minute: 900}
+    utc_seasons:
+      dst: {start_minute: 810, end_minute: 900}   # EDT = UTC-4 -> 13:30–15:00 UTC
+      std: {start_minute: 870, end_minute: 960}   # EST = UTC-5 -> 14:30–16:00 UTC
+    rule: {kind: daily, weekdays: [0, 1, 2, 3, 4]}
+    rule_note: >
+      Прежняя скобка 13:30–15:00 UTC была летней и зимой открывала окно за час ДО кэша:
+      при EST рынок открывается в 14:30 UTC, то есть половина фиксированной скобки — это
+      до-аукционный лондонский день, а не американское открытие.
+    why: >
+      Аукцион открытия американского фондового рынка задаёт риск-аппетит и поток в USD;
+      золото переценивается через DXY и реальные ставки вместе с ним.
+    expected: >
+      Предзарегистрированная гипотеза — волатильностный пик первой части US-сессии;
+      измеряется соотношением медиан диапазона.
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_outside
+      op: ">="
+      value: 1.3
+      text: "медиана |high-low|/mid внутри >= 1.3 x медиана вне окна (записанные H1)."
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_outside
+      op: "<="
+      value: 1.5
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.5 x медиана общего фона
+        суток. Это линия про ИСПОЛНИМОСТЬ, а не про гипотезу: 0.01 лота металла стоит вход только
+        если проход не дороже обещанного движения. Предел 1.5 — общий константный порог движка
+        (SPREAD_THIN_MULTIPLE), не подобранное под ответ число.
+    action: neutral
+    action_basis: >
+      neutral как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured:
+      source: ["agent_data/forward_bars/XAUUSD.json", "agent_data/forward_bars/XAGUSD.json", "agent_data/forward_bars/EURUSD.json", "agent_data/forward_bars/GBPUSD.json"]
+      generated_at: "2026-11-05"
+      timeframe: H1
+      metric: median_abs_rel_range_ratio_inside_vs_outside
+      baseline: pooled_day_background
+      symbols_measured: ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD"]
+      symbols_without_bars: ["USDJPY"]
+      n_inside_bars: 346
+      n_baseline_bars: 7654
+      n_event_days: 90
+      n_event_days_by_season: {dst: 90, std: 0}
+      season_in_effect_at_measurement: std
+      median_rel_range_inside: 0.003853
+      median_rel_range_baseline: 0.001944
+      ratio: 1.982
+      ratio_noise_band_p10_p90: [1.4, 2.593]
+      ratio_within_symbol_median: 1.724
+      ratio_within_symbol_note: "объединённая медиана смешивает металлы и валюту; по-символьные отношения — вот здесь, критерий при этом остаётся на предзарегистрированном объединённом числе"
+      ratio_within_symbol_span: [1.706, 1.856]
+      criterion: ">= 1.3"
+      criterion_holds: PASS
+      # вторая критериальная линия: СПРЕД, а не только диапазон
+      spread_metric: median_spread_points_ratio_inside_vs_outside
+      spread_baseline: pooled_day_background
+      spread_criterion: "<= 1.5"
+      spread_ratio: 0.947
+      spread_ratio_driver: "XAGUSD"
+      median_spread_points_inside: 18.0
+      median_spread_points_outside: 19.0
+      n_spread_bars_inside: 79
+      n_spread_bars_outside: 1713
+      spread_coverage_inside: 0.8778
+      spread_measurable_symbols: ["XAGUSD"]
+      spread_unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAUUSD"]
+      spread_column_audit: {EURUSD: {coverage: 0.0245, distinct_values: 4, modal_share: 0.9388, hour_median_spread: null, usable: false}, GBPUSD: {coverage: 0.0245, distinct_values: 5, modal_share: 0.898, hour_median_spread: null, usable: false}, XAGUSD: {coverage: 0.896, distinct_values: 39, modal_share: 0.3008, hour_median_spread: 1.889, usable: true}, XAUUSD: {coverage: 0.9175, distinct_values: 22, modal_share: 0.6038, hour_median_spread: 1.0, usable: false}}
+      spread_column_audit_note: "coverage — доля баров файла с записанным спредом; distinct/modal_share — вырожденность колонки; hour_median_spread — во сколько раз различаются часовые медианы (без этого колонка не различает окна, даже если значений много); usable — годится ли ею пользоваться"
+      spread_criterion_holds: PASS
+      crossing_cost_fraction_of_hour_range: 0.02624
+      crossing_cost_driver: "XAGUSD"
+      verdict: PASS
+      verdict_reasons:
+        - "оговорка (вердикта не снижает): окно привязано к чужим часам, сегодня действует зимняя (std) половина скобки, а её геометрия (dst=90, std=0) — это не измерена ни разу: расписание на эти недели торгует расчётным сдвигом, а не измеренным"
+      action: neutral
+      action_reasons:
+        - "действующая std-половина скобки не имеет ни одного измеренного срабатывания на записи"
+      action_note: "verdict — статистика (держится ли предзарегистрированный критерий диапазона на этой выборке); action — исполнимость (можно ли это торговать). PASS по тишине никогда не бывает enter"
+      per_symbol: {XAUUSD: {n_inside_bars: 90, n_base_bars: 1910, ratio: 1.706}, XAGUSD: {n_inside_bars: 90, n_base_bars: 1910, ratio: 1.856}, EURUSD: {n_inside_bars: 83, n_base_bars: 1917, ratio: 1.721}, GBPUSD: {n_inside_bars: 83, n_base_bars: 1917, ratio: 1.728}}
+      executability:
+        verdict: EXECUTABLE
+        bar_coverage_inside: 0.983
+        n_expected_slots: 704
+        n_present_bars: 692
+        n_occurrence_days_without_any_bars: 0
+        coverage_note: "доля слотов часа, которые окно требует, имеющих запись; в знаменателе только те дни срабатывания окна, по которым у символа есть хоть один бар (выходные и closures не размывают показатель, но учтены строкой n_occurrence_days_without_any_bars)"
+        dead_hour_slots_utc: ["15:00"]
+        sparse_hour_slots_utc: ["15:00"]
+        per_slot_fill: {13:00: {XAUUSD: "90/91", XAGUSD: "90/91", EURUSD: "83/83", GBPUSD: "83/83"}, 14:00: {XAUUSD: "90/92", XAGUSD: "90/92", EURUSD: "83/84", GBPUSD: "83/84"}, 15:00: {XAUUSD: "0/1", XAGUSD: "0/1", EURUSD: "0/1", GBPUSD: "0/1"}}
+        spread:
+          unit_note: "spread лента пишет в точках; точка — из digits реестра символов (XAUUSD: digits=2 из реестра символов; XAGUSD: digits=3 из реестра символов; EURUSD: digits=5 из реестра символов; GBPUSD: digits=5 из реестра символов); перевод в цены нужен только тем, чтобы сравнить спред с шириной бара"
+          baseline: pooled_day_background
+          coverage_threshold: 0.5
+          min_spread_bars: 20
+          by_symbol: {EURUSD: {n_inside_bars: 83, n_background_bars: 1917, spread_recorded: 2, spread_recorded_background: 47, spread_coverage_inside: 0.0241, spread_coverage_background: 0.0245, median_points_inside: 19.0, median_points_background: 19.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 4, modal_value: 19.0, modal_share: 0.9388, median_points: 19.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; лишь 4 различных значений; мод 19.0 занимает 94% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 2.4% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, GBPUSD: {n_inside_bars: 83, n_background_bars: 1917, spread_recorded: 2, spread_recorded_background: 47, spread_coverage_inside: 0.0241, spread_coverage_background: 0.0245, median_points_inside: 23.0, median_points_background: 23.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 5, modal_value: 23.0, modal_share: 0.898, median_points: 23.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; мод 23.0 занимает 90% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 2.4% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, XAGUSD: {n_inside_bars: 90, n_background_bars: 1910, spread_recorded: 79, spread_recorded_background: 1713, spread_coverage_inside: 0.8778, spread_coverage_background: 0.8969, median_points_inside: 18.0, median_points_background: 19.0, point_size: 0.001, ratio_inside_vs_background: 0.947, crossing_cost_fraction_of_hour_range: 0.02624, spread_column: {coverage: 0.896, distinct_values: 39, modal_value: 18.0, modal_share: 0.3008, median_points: 19.0, hour_median_spread: 1.889, usable: true, note: "колонка пригодна для сравнения окон"}, usable_column: true}, XAUUSD: {n_inside_bars: 90, n_background_bars: 1910, spread_recorded: 83, spread_recorded_background: 1752, spread_coverage_inside: 0.9222, spread_coverage_background: 0.9173, median_points_inside: 8.0, median_points_background: 8.0, point_size: 0.01, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.9175, distinct_values: 22, modal_value: 8.0, modal_share: 0.6038, median_points: 8.0, hour_median_spread: 1.0, usable: false, note: "колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы"}, usable_column: false, note: "колонка spread у этого символа вырождена (колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы) — отношением пользоваться нельзя, печатается только аудит колонки"}}
+          measurable_symbols: ["XAGUSD"]
+          unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAUUSD"]
+          ratio_inside_vs_background: 0.947
+          ratio_driver: "XAGUSD"
+          crossing_cost_fraction_of_hour_range: 0.02624
+          crossing_cost_driver: "XAGUSD"
+    measured_note: "перемерено scripts/windows_evidence.py на записи 2026-11-05; вердикт PASS (статистика) при n=90 срабатываний {'dst': 90, 'std': 0}; исполнимость EXECUTABLE, спред PASS (ratio=0.947, база pooled_day_background) -> action neutral"
+
+  - id: lon_ny_overlap
+    local_name: "Перекрытие Лондон–Нью-Йорк"
+    scale: daily
+    timezone_kind: local_anchored
+    season_region: us_eastern
+    anchor_local: "09:00–12:00 Нью-Йорк при работающем Лондоне"
+    applies_to: [gold, silver, fx]
+    utc: {start_minute: 780, end_minute: 960}
+    utc_seasons:
+      dst: {start_minute: 780, end_minute: 960}   # 13:00–16:00 UTC = 14:00–17:00 BST
+      std: {start_minute: 840, end_minute: 1020}  # 14:00–17:00 UTC = 14:00–17:00 GMT
+    rule: {kind: daily, weekdays: [0, 1, 2, 3, 4]}
+    why: >
+      Оба крупных офсета у станков одновременно — самая глубокая двухсторонняя
+      ликвидность FX и золота в сутках; здесь пробойные движения получают объёмное
+      подтверждение, а не остаются гэпом тонкого рынка.
+    expected: >
+      Предзарегистрированная гипотеза — максимальная дневная активность при минимальных
+      спредах; измеряемое утверждение относится к диапазону, спреды по форекс-барам
+      неизмеримы (поле spread в файлах заполнено на ~2 % — см. measured).
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_outside
+      op: ">="
+      value: 1.2
+      text: "медиана |high-low|/mid внутри >= 1.2 x медиана вне окна (записанные H1)."
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_outside
+      op: "<="
+      value: 1.5
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.5 x медиана общего фона
+        суток. Это линия про ИСПОЛНИМОСТЬ, а не про гипотезу: 0.01 лота металла стоит вход только
+        если проход не дороже обещанного движения. Предел 1.5 — общий константный порог движка
+        (SPREAD_THIN_MULTIPLE), не подобранное под ответ число.
+    action: neutral
+    action_basis: >
+      neutral как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured:
+      source: ["agent_data/forward_bars/XAUUSD.json", "agent_data/forward_bars/XAGUSD.json", "agent_data/forward_bars/EURUSD.json", "agent_data/forward_bars/GBPUSD.json"]
+      generated_at: "2026-11-05"
+      timeframe: H1
+      metric: median_abs_rel_range_ratio_inside_vs_outside
+      baseline: pooled_day_background
+      symbols_measured: ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD"]
+      symbols_without_bars: ["USDJPY"]
+      n_inside_bars: 1038
+      n_baseline_bars: 6962
+      n_event_days: 90
+      n_event_days_by_season: {dst: 90, std: 0}
+      season_in_effect_at_measurement: std
+      median_rel_range_inside: 0.003504
+      median_rel_range_baseline: 0.001828
+      ratio: 1.917
+      ratio_noise_band_p10_p90: [1.631, 2.222]
+      ratio_within_symbol_median: 1.75
+      ratio_within_symbol_note: "объединённая медиана смешивает металлы и валюту; по-символьные отношения — вот здесь, критерий при этом остаётся на предзарегистрированном объединённом числе"
+      ratio_within_symbol_span: [1.624, 1.869]
+      criterion: ">= 1.2"
+      criterion_holds: PASS
+      # вторая критериальная линия: СПРЕД, а не только диапазон
+      spread_metric: median_spread_points_ratio_inside_vs_outside
+      spread_baseline: pooled_day_background
+      spread_criterion: "<= 1.5"
+      spread_ratio: 0.9
+      spread_ratio_driver: "XAGUSD"
+      median_spread_points_inside: 18.0
+      median_spread_points_outside: 20.0
+      n_spread_bars_inside: 238
+      n_spread_bars_outside: 1554
+      spread_coverage_inside: 0.8815
+      spread_measurable_symbols: ["XAGUSD"]
+      spread_unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAUUSD"]
+      spread_column_audit: {EURUSD: {coverage: 0.0245, distinct_values: 4, modal_share: 0.9388, hour_median_spread: null, usable: false}, GBPUSD: {coverage: 0.0245, distinct_values: 5, modal_share: 0.898, hour_median_spread: null, usable: false}, XAGUSD: {coverage: 0.896, distinct_values: 39, modal_share: 0.3008, hour_median_spread: 1.889, usable: true}, XAUUSD: {coverage: 0.9175, distinct_values: 22, modal_share: 0.6038, hour_median_spread: 1.0, usable: false}}
+      spread_column_audit_note: "coverage — доля баров файла с записанным спредом; distinct/modal_share — вырожденность колонки; hour_median_spread — во сколько раз различаются часовые медианы (без этого колонка не различает окна, даже если значений много); usable — годится ли ею пользоваться"
+      spread_criterion_holds: PASS
+      crossing_cost_fraction_of_hour_range: 0.02908
+      crossing_cost_driver: "XAGUSD"
+      verdict: PASS
+      verdict_reasons:
+        - "оговорка (вердикта не снижает): окно привязано к чужим часам, сегодня действует зимняя (std) половина скобки, а её геометрия (dst=90, std=0) — это не измерена ни разу: расписание на эти недели торгует расчётным сдвигом, а не измеренным"
+      action: neutral
+      action_reasons:
+        - "действующая std-половина скобки не имеет ни одного измеренного срабатывания на записи"
+      action_note: "verdict — статистика (держится ли предзарегистрированный критерий диапазона на этой выборке); action — исполнимость (можно ли это торговать). PASS по тишине никогда не бывает enter"
+      per_symbol: {XAUUSD: {n_inside_bars: 270, n_base_bars: 1730, ratio: 1.624}, XAGUSD: {n_inside_bars: 270, n_base_bars: 1730, ratio: 1.692}, EURUSD: {n_inside_bars: 249, n_base_bars: 1751, ratio: 1.808}, GBPUSD: {n_inside_bars: 249, n_base_bars: 1751, ratio: 1.869}}
+      executability:
+        verdict: EXECUTABLE
+        bar_coverage_inside: 0.983
+        n_expected_slots: 1056
+        n_present_bars: 1038
+        n_occurrence_days_without_any_bars: 0
+        coverage_note: "доля слотов часа, которые окно требует, имеющих запись; в знаменателе только те дни срабатывания окна, по которым у символа есть хоть один бар (выходные и closures не размывают показатель, но учтены строкой n_occurrence_days_without_any_bars)"
+        dead_hour_slots_utc: ["16:00"]
+        sparse_hour_slots_utc: ["16:00"]
+        per_slot_fill: {13:00: {XAUUSD: "90/91", XAGUSD: "90/91", EURUSD: "83/83", GBPUSD: "83/83"}, 14:00: {XAUUSD: "90/92", XAGUSD: "90/92", EURUSD: "83/84", GBPUSD: "83/84"}, 15:00: {XAUUSD: "90/92", XAGUSD: "90/92", EURUSD: "83/84", GBPUSD: "83/84"}, 16:00: {XAUUSD: "0/1", XAGUSD: "0/1", EURUSD: "0/1", GBPUSD: "0/1"}}
+        spread:
+          unit_note: "spread лента пишет в точках; точка — из digits реестра символов (XAUUSD: digits=2 из реестра символов; XAGUSD: digits=3 из реестра символов; EURUSD: digits=5 из реестра символов; GBPUSD: digits=5 из реестра символов); перевод в цены нужен только тем, чтобы сравнить спред с шириной бара"
+          baseline: pooled_day_background
+          coverage_threshold: 0.5
+          min_spread_bars: 20
+          by_symbol: {EURUSD: {n_inside_bars: 249, n_background_bars: 1751, spread_recorded: 6, spread_recorded_background: 43, spread_coverage_inside: 0.0241, spread_coverage_background: 0.0246, median_points_inside: 19.0, median_points_background: 19.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 4, modal_value: 19.0, modal_share: 0.9388, median_points: 19.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; лишь 4 различных значений; мод 19.0 занимает 94% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 2.4% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, GBPUSD: {n_inside_bars: 249, n_background_bars: 1751, spread_recorded: 6, spread_recorded_background: 43, spread_coverage_inside: 0.0241, spread_coverage_background: 0.0246, median_points_inside: 23.0, median_points_background: 23.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 5, modal_value: 23.0, modal_share: 0.898, median_points: 23.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; мод 23.0 занимает 90% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 2.4% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, XAGUSD: {n_inside_bars: 270, n_background_bars: 1730, spread_recorded: 238, spread_recorded_background: 1554, spread_coverage_inside: 0.8815, spread_coverage_background: 0.8983, median_points_inside: 18.0, median_points_background: 20.0, point_size: 0.001, ratio_inside_vs_background: 0.9, crossing_cost_fraction_of_hour_range: 0.02908, spread_column: {coverage: 0.896, distinct_values: 39, modal_value: 18.0, modal_share: 0.3008, median_points: 19.0, hour_median_spread: 1.889, usable: true, note: "колонка пригодна для сравнения окон"}, usable_column: true}, XAUUSD: {n_inside_bars: 270, n_background_bars: 1730, spread_recorded: 249, spread_recorded_background: 1586, spread_coverage_inside: 0.9222, spread_coverage_background: 0.9168, median_points_inside: 8.0, median_points_background: 8.0, point_size: 0.01, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.9175, distinct_values: 22, modal_value: 8.0, modal_share: 0.6038, median_points: 8.0, hour_median_spread: 1.0, usable: false, note: "колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы"}, usable_column: false, note: "колонка spread у этого символа вырождена (колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы) — отношением пользоваться нельзя, печатается только аудит колонки"}}
+          measurable_symbols: ["XAGUSD"]
+          unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAUUSD"]
+          ratio_inside_vs_background: 0.9
+          ratio_driver: "XAGUSD"
+          crossing_cost_fraction_of_hour_range: 0.02908
+          crossing_cost_driver: "XAGUSD"
+    measured_note: "перемерено scripts/windows_evidence.py на записи 2026-11-05; вердикт PASS (статистика) при n=90 срабатываний {'dst': 90, 'std': 0}; исполнимость EXECUTABLE, спред PASS (ratio=0.9, база pooled_day_background) -> action neutral"
+
+  - id: rollover_window
+    local_name: "Ролловер / своп-окно"
+    scale: daily
+    timezone_kind: local_anchored
+    season_region: us_eastern
+    anchor_local: "17:00–18:30 Нью-Йорк (банк-кат-офф)"
+    applies_to: [gold, silver, fx]
+    utc: {start_minute: 1260, end_minute: 1350}
+    utc_seasons:
+      dst: {start_minute: 1260, end_minute: 1350}   # 21:00–22:30 UTC = 17:00–18:30 EDT
+      std: {start_minute: 1320, end_minute: 1410}   # 22:00–23:30 UTC = 17:00–18:30 EST
+    rule: {kind: daily, weekdays: [0, 1, 2, 3, 4]}
+    rule_note: >
+      Длительность скобки урезана с 120 до 90 минут: прежняя 21:00–23:00 UTC целиком
+      ложилась на ежедневный разрыв записи (XAUUSD: 0 баров из 91 недельных слотов в
+      21:00, 4 из 91 в 22:00), то есть меряла не рынок, а отсутствие книги.
+    why: >
+      Банковский отсеч 17:00 по Нью-Йорку (21:00/22:00 UTC по сезонам) — перекладка
+      tom-next и штамповка свопов на серверных полуночах; LP снимают размеры, спреды
+      расширяются, возможны ценовые рывки на тонкой книге. Для USD-счёта это ещё и
+      момент, когда платёж по свопам появляется в выписке.
+    expected: >
+      Предзарегистрированная гипотеза — падение средней активности при росте хвостов
+      (спред/гэп). Эта метрика по медианному диапазону предсказывает спад, но спад
+      медианы НЕ ЕСТЬ утверждение о торгуемости: если в окне нет баров, «тихо» означает
+      «закрыто», и вердикт обязан быть HYPOTHESIS, а не PASS.
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_outside
+      op: "<="
+      value: 0.85
+      text: >
+        медиана |high-low|/mid внутри <= 0.85 x медиана вне окна; расширение спреда в
+        этом окне по форекс-барам неизмеримо (поле spread не заполнено) и по металлам
+        измеряется в measured.executability.
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_outside
+      op: "<="
+      value: 1.5
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.5 x медиана общего фона
+        суток. Это линия про ИСПОЛНИМОСТЬ, а не про гипотезу: 0.01 лота металла стоит вход только
+        если проход не дороже обещанного движения. Предел 1.5 — общий константный порог движка
+        (SPREAD_THIN_MULTIPLE), не подобранное под ответ число.
+    # календарно опасные часы: avoid и с измерением, и без него
+    hazard: [rollover_server_midnight, broker_halt_21_23_utc, swap_widening]
+    action: avoid
+    action_basis: >
+      avoid как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured:
+      source: ["agent_data/forward_bars/XAUUSD.json", "agent_data/forward_bars/XAGUSD.json", "agent_data/forward_bars/EURUSD.json", "agent_data/forward_bars/GBPUSD.json"]
+      generated_at: "2026-11-05"
+      timeframe: H1
+      metric: median_abs_rel_range_ratio_inside_vs_outside
+      baseline: pooled_day_background
+      symbols_measured: ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD"]
+      symbols_without_bars: ["USDJPY"]
+      n_inside_bars: 311
+      n_baseline_bars: 7689
+      n_event_days: 88
+      n_event_days_by_season: {dst: 88, std: 0}
+      season_in_effect_at_measurement: std
+      median_rel_range_inside: 0.000584
+      median_rel_range_baseline: 0.002151
+      ratio: 0.272
+      ratio_noise_band_p10_p90: [0.233, 0.326]
+      ratio_within_symbol_median: 0.619
+      ratio_within_symbol_note: "объединённая медиана смешивает металлы и валюту; по-символьные отношения — вот здесь, критерий при этом остаётся на предзарегистрированном объединённом числе"
+      ratio_within_symbol_span: [0.51, 0.861]
+      criterion: "<= 0.85"
+      criterion_holds: PASS
+      # вторая критериальная линия: СПРЕД, а не только диапазон
+      spread_metric: median_spread_points_ratio_inside_vs_outside
+      spread_baseline: pooled_day_background
+      spread_criterion: "<= 1.5"
+      spread_ratio: null
+      spread_ratio_driver: null
+      median_spread_points_inside: null
+      median_spread_points_outside: null
+      n_spread_bars_inside: 0
+      n_spread_bars_outside: 0
+      spread_coverage_inside: null
+      spread_measurable_symbols: []
+      spread_unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAGUSD", "XAUUSD"]
+      spread_column_audit: {EURUSD: {coverage: 0.0245, distinct_values: 4, modal_share: 0.9388, hour_median_spread: null, usable: false}, GBPUSD: {coverage: 0.0245, distinct_values: 5, modal_share: 0.898, hour_median_spread: null, usable: false}, XAGUSD: {coverage: 0.896, distinct_values: 39, modal_share: 0.3008, hour_median_spread: 1.889, usable: true}, XAUUSD: {coverage: 0.9175, distinct_values: 22, modal_share: 0.6038, hour_median_spread: 1.0, usable: false}}
+      spread_column_audit_note: "coverage — доля баров файла с записанным спредом; distinct/modal_share — вырожденность колонки; hour_median_spread — во сколько раз различаются часовые медианы (без этого колонка не различает окна, даже если значений много); usable — годится ли ею пользоваться"
+      spread_criterion_holds: NOT_MEASURED
+      spread_criterion_note: "ни по одному символу окна spread не записан хотя бы на 50% его баров (20+ штук, колонка не вырождена) — это пропуск поля, а не нулевой спред; спред внутри окна НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"
+      crossing_cost_fraction_of_hour_range: null
+      crossing_cost_driver: null
+      verdict: PASS
+      verdict_reasons:
+        - "оговорка (вердикта не снижает): окно привязано к чужим часам, сегодня действует зимняя (std) половина скобки, а её геометрия (dst=88, std=0) — это не измерена ни разу: расписание на эти недели торгует расчётным сдвигом, а не измеренным"
+        - "оговорка (вердикта не снижает): книга в окне CLOSED_BOOK: покрытие баров 0.442, мёртвые часы ['23:00']"
+      action: avoid
+      action_reasons:
+        - "час по календарю известен расширением спреда и брокерскими остановками (hazard): rollover_server_midnight, broker_halt_21_23_utc, swap_widening"
+        - "PASS по критерию ТИШИНЫ (<= 0.85, измерено 0.272): окно измерено как спокойное — это не вход, а отсутствие движения; правило PASS-on-quiescence-never-enter"
+        - "книга в окне CLOSED_BOOK (покрытие 0.442, мёртвые часы ['23:00']): торговать не с чем"
+      action_note: "verdict — статистика (держится ли предзарегистрированный критерий диапазона на этой выборке); action — исполнимость (можно ли это торговать). PASS по тишине никогда не бывает enter"
+      per_symbol: {XAUUSD: {n_inside_bars: 4, n_base_bars: 1996, ratio: 0.51}, XAGUSD: {n_inside_bars: 9, n_base_bars: 1991, ratio: 0.544}, EURUSD: {n_inside_bars: 149, n_base_bars: 1851, ratio: 0.694}, GBPUSD: {n_inside_bars: 149, n_base_bars: 1851, ratio: 0.861}}
+      executability:
+        verdict: CLOSED_BOOK
+        bar_coverage_inside: 0.4418
+        n_expected_slots: 704
+        n_present_bars: 311
+        n_occurrence_days_without_any_bars: 0
+        coverage_note: "доля слотов часа, которые окно требует, имеющих запись; в знаменателе только те дни срабатывания окна, по которым у символа есть хоть один бар (выходные и closures не размывают показатель, но учтены строкой n_occurrence_days_without_any_bars)"
+        dead_hour_slots_utc: ["23:00"]
+        sparse_hour_slots_utc: ["21:00", "22:00", "23:00"]
+        per_slot_fill: {21:00: {XAUUSD: "0/91", XAGUSD: "5/91", EURUSD: "83/83", GBPUSD: "83/83"}, 22:00: {XAUUSD: "4/92", XAGUSD: "4/92", EURUSD: "66/84", GBPUSD: "66/84"}, 23:00: {XAUUSD: "0/1", XAGUSD: "0/1", EURUSD: "0/1", GBPUSD: "0/1"}}
+        spread:
+          unit_note: "spread лента пишет в точках; точка — из digits реестра символов (XAUUSD: digits=2 из реестра символов; XAGUSD: digits=3 из реестра символов; EURUSD: digits=5 из реестра символов; GBPUSD: digits=5 из реестра символов); перевод в цены нужен только тем, чтобы сравнить спред с шириной бара"
+          baseline: pooled_day_background
+          coverage_threshold: 0.5
+          min_spread_bars: 20
+          by_symbol: {EURUSD: {n_inside_bars: 149, n_background_bars: 1851, spread_recorded: 5, spread_recorded_background: 44, spread_coverage_inside: 0.0336, spread_coverage_background: 0.0238, median_points_inside: 19.0, median_points_background: 19.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 4, modal_value: 19.0, modal_share: 0.9388, median_points: 19.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; лишь 4 различных значений; мод 19.0 занимает 94% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 3.4% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, GBPUSD: {n_inside_bars: 149, n_background_bars: 1851, spread_recorded: 5, spread_recorded_background: 44, spread_coverage_inside: 0.0336, spread_coverage_background: 0.0238, median_points_inside: 24.0, median_points_background: 23.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 5, modal_value: 23.0, modal_share: 0.898, median_points: 23.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; мод 23.0 занимает 90% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 3.4% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, XAGUSD: {n_inside_bars: 9, n_background_bars: 1991, spread_recorded: 9, spread_recorded_background: 1783, spread_coverage_inside: 1.0, spread_coverage_background: 0.8955, median_points_inside: 15.0, median_points_background: 19.0, point_size: 0.001, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.896, distinct_values: 39, modal_value: 18.0, modal_share: 0.3008, median_points: 19.0, hour_median_spread: 1.889, usable: true, note: "колонка пригодна для сравнения окон"}, usable_column: true, note: "записанных спредов 9 внутри / 1783 в базе: нужно >= 20 с обеих сторон — отношение не считается"}, XAUUSD: {n_inside_bars: 4, n_background_bars: 1996, spread_recorded: 4, spread_recorded_background: 1831, spread_coverage_inside: 1.0, spread_coverage_background: 0.9173, median_points_inside: 8.5, median_points_background: 8.0, point_size: 0.01, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.9175, distinct_values: 22, modal_value: 8.0, modal_share: 0.6038, median_points: 8.0, hour_median_spread: 1.0, usable: false, note: "колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы"}, usable_column: false, note: "колонка spread у этого символа вырождена (колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы) — отношением пользоваться нельзя, печатается только аудит колонки"}}
+          measurable_symbols: []
+          unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAGUSD", "XAUUSD"]
+          ratio_inside_vs_background: null
+          ratio_driver: null
+          crossing_cost_fraction_of_hour_range: null
+          crossing_cost_driver: null
+          note: "ни по одному символу окна spread не записан хотя бы на 50% его баров (20+ штук, колонка не вырождена) — это пропуск поля, а не нулевой спред; спред внутри окна НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"
+    measured_note: "перемерено scripts/windows_evidence.py на записи 2026-11-05; вердикт PASS (статистика) при n=88 срабатываний {'dst': 88, 'std': 0}; исполнимость CLOSED_BOOK, спред NOT_MEASURED (ratio=None, база pooled_day_background) -> action avoid"
+
+  # ---------------- НЕДЕЛЬНЫЙ МАСШТАБ ----------------
+
+  - id: monday_open_gap
+    local_name: "Открытие недели: гэп выходных (вс 22:00 -> пн)"
+    scale: weekly
+    timezone_kind: utc_fixed
+    applies_to: [gold, silver, fx]
+    utc: {start_minute: 1320, end_minute: 180}
+    rule: {kind: weekly, weekday: 6}
+    rule_note: >
+      Прежняя скобка начиналась в 00:00 UTC понедельника и потому пропускала сам момент
+      открытия. ИЗМЕРЕНО на этой записи: после каждого из 17 weekend-разрывов первая
+      часовая свеча EURUSD/GBPUSD открывается в 22:00 UTC воскресенья (17 из 17), у
+      XAUUSD/XAGUSD — в 23:00 UTC (18 из 19). Скобка поставлена на измеренную точку:
+      вс 22:00 -> пн 03:00 UTC, переходящая через полночь. Держится UTC-фиксированной
+      намеренно: это серверный отсчёт брокера, а не сиднейские часы; реальный сиднейский
+      open уезжает на час дважды в год, и это видно по покрытию баров, а не по скобке.
+    why: >
+      Гео- и макроновости выходных не имеют адресата до открытия книги; первый час
+      торгов недели — где весь накопленный за уикенд риск превращается в цену на самой
+      тонкой книге суток, с гарантированным гэпом по золоту.
+    expected: >
+      Предзарегистрированная гипотеза — смещение выше обычного; база сравнения — ТЕ ЖЕ
+      часы других дней (hour-matched), иначе «гэп открытия недели» неотличим от «утро
+      активнее ночи».
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      op: ">="
+      value: 1.3
+      text: >
+        медиана |high-low|/mid внутри >= 1.3 x медиана той же скобки в дни, когда окно не
+        срабатывает (записанные H1).
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      op: "<="
+      value: 1.3
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.3 x медиана ТЕХ ЖЕ часов в
+        другие дни (hour-matched, как и у диапазона). Окна с короткой реакцией держат предел 1.3
+        жёстче обычных: у них и издержка, и горизонт короче, поэтому 30 % расширения спреда съедают
+        большую долю стояния. Порог взят из констант движка, а не подогнан под измерение.
+    # календарно опасные часы: avoid и с измерением, и без него
+    hazard: [weekend_gap_reopen, first_bar_spread_widening, sunday_reopen_broker_halt]
+    action: avoid
+    action_basis: >
+      avoid как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured:
+      source: ["agent_data/forward_bars/XAUUSD.json", "agent_data/forward_bars/XAGUSD.json", "agent_data/forward_bars/EURUSD.json", "agent_data/forward_bars/GBPUSD.json"]
+      generated_at: "2026-11-05"
+      timeframe: H1
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      baseline: hour_matched_other_days
+      symbols_measured: ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD"]
+      symbols_without_bars: ["USDJPY"]
+      n_inside_bars: 324
+      n_baseline_bars: 1244
+      n_event_days: 19
+      n_event_days_by_season: {fixed: 19}
+      season_in_effect_at_measurement: fixed
+      median_rel_range_inside: 0.001659
+      median_rel_range_baseline: 0.00121
+      ratio: 1.372
+      ratio_noise_band_p10_p90: [0.947, 2.003]
+      ratio_within_symbol_median: 1.319
+      ratio_within_symbol_note: "объединённая медиана смешивает металлы и валюту; по-символьные отношения — вот здесь, критерий при этом остаётся на предзарегистрированном объединённом числе"
+      ratio_within_symbol_span: [1.27, 1.572]
+      ratio_vs_pooled_day_background: 0.833
+      ratio_vs_pooled_day_background_note: "искажённая база: общий фон суток смешивает день недели с часом суток; вердикт по ней не выносится"
+      criterion: ">= 1.3"
+      criterion_holds: PASS
+      # вторая критериальная линия: СПРЕД, а не только диапазон
+      spread_metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      spread_baseline: hour_matched_other_days
+      spread_criterion: "<= 1.3"
+      spread_ratio: 0.938
+      spread_ratio_driver: "XAGUSD"
+      median_spread_points_inside: 30.0
+      median_spread_points_outside: 32.0
+      n_spread_bars_inside: 67
+      n_spread_bars_outside: 273
+      spread_coverage_inside: 0.8701
+      spread_measurable_symbols: ["XAGUSD"]
+      spread_unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAUUSD"]
+      spread_column_audit: {EURUSD: {coverage: 0.0245, distinct_values: 4, modal_share: 0.9388, hour_median_spread: null, usable: false}, GBPUSD: {coverage: 0.0245, distinct_values: 5, modal_share: 0.898, hour_median_spread: null, usable: false}, XAGUSD: {coverage: 0.896, distinct_values: 39, modal_share: 0.3008, hour_median_spread: 1.889, usable: true}, XAUUSD: {coverage: 0.9175, distinct_values: 22, modal_share: 0.6038, hour_median_spread: 1.0, usable: false}}
+      spread_column_audit_note: "coverage — доля баров файла с записанным спредом; distinct/modal_share — вырожденность колонки; hour_median_spread — во сколько раз различаются часовые медианы (без этого колонка не различает окна, даже если значений много); usable — годится ли ею пользоваться"
+      spread_criterion_holds: PASS
+      crossing_cost_fraction_of_hour_range: 0.05556
+      crossing_cost_driver: "XAGUSD"
+      verdict: PASS
+      verdict_reasons:
+        - "оговорка (вердикта не снижает): порог 1.3 лежит внутри шумового коридора [0.947, 2.003] — вердикт зависит от порога, а не опирается на него"
+      action: avoid
+      action_reasons:
+        - "час по календарю известен расширением спреда и брокерскими остановками (hazard): weekend_gap_reopen, first_bar_spread_widening, sunday_reopen_broker_halt"
+      action_note: "verdict — статистика (держится ли предзарегистрированный критерий диапазона на этой выборке); action — исполнимость (можно ли это торговать). PASS по тишине никогда не бывает enter"
+      per_symbol: {XAUUSD: {n_inside_bars: 77, n_base_bars: 292, ratio: 1.305}, XAGUSD: {n_inside_bars: 77, n_base_bars: 292, ratio: 1.572}, EURUSD: {n_inside_bars: 85, n_base_bars: 330, ratio: 1.332}, GBPUSD: {n_inside_bars: 85, n_base_bars: 330, ratio: 1.27}}
+      executability:
+        verdict: EXECUTABLE
+        bar_coverage_inside: 0.9
+        n_expected_slots: 360
+        n_present_bars: 324
+        n_occurrence_days_without_any_bars: 0
+        coverage_note: "доля слотов часа, которые окно требует, имеющих запись; в знаменателе только те дни срабатывания окна, по которым у символа есть хоть один бар (выходные и closures не размывают показатель, но учтены строкой n_occurrence_days_without_any_bars)"
+        dead_hour_slots_utc: []
+        sparse_hour_slots_utc: ["22:00"]
+        per_slot_fill: {00:00: {XAUUSD: "19/19", XAGUSD: "19/19", EURUSD: "17/17", GBPUSD: "17/17"}, 01:00: {XAUUSD: "19/19", XAGUSD: "19/19", EURUSD: "17/17", GBPUSD: "17/17"}, 02:00: {XAUUSD: "19/19", XAGUSD: "19/19", EURUSD: "17/17", GBPUSD: "17/17"}, 22:00: {XAUUSD: "1/19", XAGUSD: "1/19", EURUSD: "17/17", GBPUSD: "17/17"}, 23:00: {XAUUSD: "19/19", XAGUSD: "19/19", EURUSD: "17/17", GBPUSD: "17/17"}}
+        spread:
+          unit_note: "spread лента пишет в точках; точка — из digits реестра символов (XAUUSD: digits=2 из реестра символов; XAGUSD: digits=3 из реестра символов; EURUSD: digits=5 из реестра символов; GBPUSD: digits=5 из реестра символов); перевод в цены нужен только тем, чтобы сравнить спред с шириной бара"
+          baseline: hour_matched_other_days
+          coverage_threshold: 0.5
+          min_spread_bars: 20
+          by_symbol: {EURUSD: {n_inside_bars: 85, n_background_bars: 330, spread_recorded: 0, spread_recorded_background: 10, spread_coverage_inside: 0.0, spread_coverage_background: 0.0303, median_points_inside: null, median_points_background: 19.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 4, modal_value: 19.0, modal_share: 0.9388, median_points: 19.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; лишь 4 различных значений; мод 19.0 занимает 94% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 0.0% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, GBPUSD: {n_inside_bars: 85, n_background_bars: 330, spread_recorded: 0, spread_recorded_background: 10, spread_coverage_inside: 0.0, spread_coverage_background: 0.0303, median_points_inside: null, median_points_background: 23.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 5, modal_value: 23.0, modal_share: 0.898, median_points: 23.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; мод 23.0 занимает 90% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 0.0% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, XAGUSD: {n_inside_bars: 77, n_background_bars: 292, spread_recorded: 67, spread_recorded_background: 273, spread_coverage_inside: 0.8701, spread_coverage_background: 0.9349, median_points_inside: 30.0, median_points_background: 32.0, point_size: 0.001, ratio_inside_vs_background: 0.938, crossing_cost_fraction_of_hour_range: 0.05556, spread_column: {coverage: 0.896, distinct_values: 39, modal_value: 18.0, modal_share: 0.3008, median_points: 19.0, hour_median_spread: 1.889, usable: true, note: "колонка пригодна для сравнения окон"}, usable_column: true}, XAUUSD: {n_inside_bars: 77, n_background_bars: 292, spread_recorded: 69, spread_recorded_background: 268, spread_coverage_inside: 0.8961, spread_coverage_background: 0.9178, median_points_inside: 8.0, median_points_background: 8.0, point_size: 0.01, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.9175, distinct_values: 22, modal_value: 8.0, modal_share: 0.6038, median_points: 8.0, hour_median_spread: 1.0, usable: false, note: "колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы"}, usable_column: false, note: "колонка spread у этого символа вырождена (колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы) — отношением пользоваться нельзя, печатается только аудит колонки"}}
+          measurable_symbols: ["XAGUSD"]
+          unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAUUSD"]
+          ratio_inside_vs_background: 0.938
+          ratio_driver: "XAGUSD"
+          crossing_cost_fraction_of_hour_range: 0.05556
+          crossing_cost_driver: "XAGUSD"
+    measured_note: "перемерено scripts/windows_evidence.py на записи 2026-11-05; вердикт PASS (статистика) при n=19 срабатываний {'fixed': 19}; исполнимость EXECUTABLE, спред PASS (ratio=0.938, база hour_matched_other_days) -> action avoid"
+
+  - id: weekly_us_close
+    local_name: "Пятничное закрытие американских книг"
+    scale: weekly
+    timezone_kind: local_anchored
+    season_region: us_eastern
+    anchor_local: "15:30–17:30 Нью-Йорк"
+    applies_to: [gold, silver, fx]
+    utc: {start_minute: 1170, end_minute: 1290}
+    utc_seasons:
+      dst: {start_minute: 1170, end_minute: 1290}   # 19:30–21:30 UTC = 15:30–17:30 EDT
+      std: {start_minute: 1230, end_minute: 1350}   # 20:30–22:30 UTC = 15:30–17:30 EST
+    rule: {kind: weekly, weekday: 4}
+    why: >
+      Проп-столы и фонды разгружают позиции перед уикендом; маржа на выходные поднимается,
+      weekend-gap премия закладывается в цену — поток принудительный, а не информированный.
+    expected: >
+      Предзарегистрированная гипотеза — сжатие диапазона во второй половине пятницы
+      относительно тех же часов будних дней. ВАЖНО: «сжалось» — это не «можно
+      торговать»; хвост окна (21:00–22:30 UTC летом) попадает на ежедневный разрыв
+      записи, и measured.executability обязан это показать.
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      op: "<="
+      value: 0.9
+      text: >
+        медиана |high-low|/mid внутри <= 0.9 x медиана той же скобки в другие дни
+        (записанные H1).
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      op: "<="
+      value: 1.5
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.5 x медиана ТЕХ ЖЕ часов в
+        другие дни (hour-matched, как и у диапазона). Окна с короткой реакцией держат предел 1.5
+        жёстче обычных: у них и издержка, и горизонт короче, поэтому 30 % расширения спреда съедают
+        большую долю стояния. Порог взят из констант движка, а не подогнан под измерение.
+    action: avoid
+    action_basis: >
+      avoid как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured:
+      source: ["agent_data/forward_bars/XAUUSD.json", "agent_data/forward_bars/XAGUSD.json", "agent_data/forward_bars/EURUSD.json", "agent_data/forward_bars/GBPUSD.json"]
+      generated_at: "2026-11-05"
+      timeframe: H1
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      baseline: hour_matched_other_days
+      symbols_measured: ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD"]
+      symbols_without_bars: ["USDJPY"]
+      n_inside_bars: 104
+      n_baseline_bars: 413
+      n_event_days: 18
+      n_event_days_by_season: {dst: 18, std: 0}
+      season_in_effect_at_measurement: std
+      median_rel_range_inside: 0.00073
+      median_rel_range_baseline: 0.000705
+      ratio: 1.035
+      ratio_noise_band_p10_p90: [0.872, 1.266]
+      ratio_within_symbol_median: 1.05
+      ratio_within_symbol_note: "объединённая медиана смешивает металлы и валюту; по-символьные отношения — вот здесь, критерий при этом остаётся на предзарегистрированном объединённом числе"
+      ratio_within_symbol_span: [0.776, 1.198]
+      ratio_vs_pooled_day_background: 0.365
+      ratio_vs_pooled_day_background_note: "искажённая база: общий фон суток смешивает день недели с часом суток; вердикт по ней не выносится"
+      criterion: "<= 0.9"
+      criterion_holds: FAIL
+      # вторая критериальная линия: СПРЕД, а не только диапазон
+      spread_metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      spread_baseline: hour_matched_other_days
+      spread_criterion: "<= 1.5"
+      spread_ratio: null
+      spread_ratio_driver: null
+      median_spread_points_inside: null
+      median_spread_points_outside: null
+      n_spread_bars_inside: 0
+      n_spread_bars_outside: 0
+      spread_coverage_inside: null
+      spread_measurable_symbols: []
+      spread_unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAGUSD", "XAUUSD"]
+      spread_column_audit: {EURUSD: {coverage: 0.0245, distinct_values: 4, modal_share: 0.9388, hour_median_spread: null, usable: false}, GBPUSD: {coverage: 0.0245, distinct_values: 5, modal_share: 0.898, hour_median_spread: null, usable: false}, XAGUSD: {coverage: 0.896, distinct_values: 39, modal_share: 0.3008, hour_median_spread: 1.889, usable: true}, XAUUSD: {coverage: 0.9175, distinct_values: 22, modal_share: 0.6038, hour_median_spread: 1.0, usable: false}}
+      spread_column_audit_note: "coverage — доля баров файла с записанным спредом; distinct/modal_share — вырожденность колонки; hour_median_spread — во сколько раз различаются часовые медианы (без этого колонка не различает окна, даже если значений много); usable — годится ли ею пользоваться"
+      spread_criterion_holds: NOT_MEASURED
+      spread_criterion_note: "ни по одному символу окна spread не записан хотя бы на 50% его баров (20+ штук, колонка не вырождена) — это пропуск поля, а не нулевой спред; спред внутри окна НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"
+      crossing_cost_fraction_of_hour_range: null
+      crossing_cost_driver: null
+      verdict: FAIL
+      verdict_reasons:
+        - "оговорка (вердикта не снижает): окно привязано к чужим часам, сегодня действует зимняя (std) половина скобки, а её геометрия (dst=18, std=0) — это не измерена ни разу: расписание на эти недели торгует расчётным сдвигом, а не измеренным"
+        - "оговорка (вердикта не снижает): порог 0.9 лежит внутри шумового коридора [0.872, 1.266] — вердикт зависит от порога, а не опирается на него"
+        - "оговорка (вердикта не снижает): книга в окне THIN_BOOK: покрытие баров 0.801, мёртвые часы []"
+      action: avoid
+      action_reasons:
+        - "книга в окне THIN_BOOK (покрытие 0.801, редкие часы ['21:00'])"
+      action_note: "verdict — статистика (держится ли предзарегистрированный критерий диапазона на этой выборке); action — исполнимость (можно ли это торговать). PASS по тишине никогда не бывает enter"
+      per_symbol: {XAUUSD: {n_inside_bars: 18, n_base_bars: 71, ratio: 0.776}, XAGUSD: {n_inside_bars: 18, n_base_bars: 76, ratio: 0.923}, EURUSD: {n_inside_bars: 34, n_base_bars: 133, ratio: 1.178}, GBPUSD: {n_inside_bars: 34, n_base_bars: 133, ratio: 1.198}}
+      executability:
+        verdict: THIN_BOOK
+        bar_coverage_inside: 0.8009
+        n_expected_slots: 216
+        n_present_bars: 173
+        n_occurrence_days_without_any_bars: 0
+        coverage_note: "доля слотов часа, которые окно требует, имеющих запись; в знаменателе только те дни срабатывания окна, по которым у символа есть хоть один бар (выходные и closures не размывают показатель, но учтены строкой n_occurrence_days_without_any_bars)"
+        dead_hour_slots_utc: []
+        sparse_hour_slots_utc: ["21:00"]
+        per_slot_fill: {19:00: {XAUUSD: "18/19", XAGUSD: "17/19", EURUSD: "17/17", GBPUSD: "17/17"}, 20:00: {XAUUSD: "18/19", XAGUSD: "17/19", EURUSD: "17/17", GBPUSD: "17/17"}, 21:00: {XAUUSD: "0/19", XAGUSD: "1/19", EURUSD: "17/17", GBPUSD: "17/17"}}
+        spread:
+          unit_note: "spread лента пишет в точках; точка — из digits реестра символов (XAUUSD: digits=2 из реестра символов; XAGUSD: digits=3 из реестра символов; EURUSD: digits=5 из реестра символов; GBPUSD: digits=5 из реестра символов); перевод в цены нужен только тем, чтобы сравнить спред с шириной бара"
+          baseline: hour_matched_other_days
+          coverage_threshold: 0.5
+          min_spread_bars: 20
+          by_symbol: {EURUSD: {n_inside_bars: 34, n_background_bars: 133, spread_recorded: 1, spread_recorded_background: 4, spread_coverage_inside: 0.0294, spread_coverage_background: 0.0301, median_points_inside: 3.0, median_points_background: 19.5, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 4, modal_value: 19.0, modal_share: 0.9388, median_points: 19.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; лишь 4 различных значений; мод 19.0 занимает 94% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 2.9% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, GBPUSD: {n_inside_bars: 34, n_background_bars: 133, spread_recorded: 1, spread_recorded_background: 4, spread_coverage_inside: 0.0294, spread_coverage_background: 0.0301, median_points_inside: 7.0, median_points_background: 26.5, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 5, modal_value: 23.0, modal_share: 0.898, median_points: 23.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; мод 23.0 занимает 90% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 2.9% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, XAGUSD: {n_inside_bars: 18, n_background_bars: 76, spread_recorded: 15, spread_recorded_background: 70, spread_coverage_inside: 0.8333, spread_coverage_background: 0.9211, median_points_inside: 19.0, median_points_background: 19.0, point_size: 0.001, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.896, distinct_values: 39, modal_value: 18.0, modal_share: 0.3008, median_points: 19.0, hour_median_spread: 1.889, usable: true, note: "колонка пригодна для сравнения окон"}, usable_column: true, note: "записанных спредов 15 внутри / 70 в базе: нужно >= 20 с обеих сторон — отношение не считается"}, XAUUSD: {n_inside_bars: 18, n_background_bars: 71, spread_recorded: 17, spread_recorded_background: 65, spread_coverage_inside: 0.9444, spread_coverage_background: 0.9155, median_points_inside: 8.0, median_points_background: 8.0, point_size: 0.01, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.9175, distinct_values: 22, modal_value: 8.0, modal_share: 0.6038, median_points: 8.0, hour_median_spread: 1.0, usable: false, note: "колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы"}, usable_column: false, note: "колонка spread у этого символа вырождена (колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы) — отношением пользоваться нельзя, печатается только аудит колонки"}}
+          measurable_symbols: []
+          unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAGUSD", "XAUUSD"]
+          ratio_inside_vs_background: null
+          ratio_driver: null
+          crossing_cost_fraction_of_hour_range: null
+          crossing_cost_driver: null
+          note: "ни по одному символу окна spread не записан хотя бы на 50% его баров (20+ штук, колонка не вырождена) — это пропуск поля, а не нулевой спред; спред внутри окна НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"
+    measured_note: "перемерено scripts/windows_evidence.py на записи 2026-11-05; вердикт FAIL (статистика) при n=18 срабатываний {'dst': 18, 'std': 0}; исполнимость THIN_BOOK, спред NOT_MEASURED (ratio=None, база hour_matched_other_days) -> action avoid"
+
+  - id: wednesday_triple_swap
+    local_name: "Среда: тройной своп за выходные"
+    scale: weekly
+    timezone_kind: local_anchored
+    season_region: europe_frankfurt
+    anchor_local: "полночь по серверу брокера (EET/EEST)"
+    applies_to: [gold, silver, fx]
+    utc: {start_minute: 1260, end_minute: 1350}
+    utc_seasons:
+      dst: {start_minute: 1260, end_minute: 1350}   # GMT+3 летом -> 21:00–22:30 UTC
+      std: {start_minute: 1320, end_minute: 1410}   # GMT+2 зимой -> 22:00–23:30 UTC
+    rule: {kind: weekly, weekday: 2}
+    why: >
+      Конвенция своп-расчёта: брокер списывает своп за трое суток в один штампованный
+      Wednesday-ролловер, поэтому стоимость держания позиции через выходные концентрируется
+      в эти часы и фонды подстраивают книги под неё.
+    expected: >
+      Утверждение не про движение цены, а про издержку: по часовым барам неотделимо от
+      обычного ролловера; требует сверки со своп-строками выписки.
+    criterion:
+      metric: swap_charge_triple_on_wednesday_vs_other_days
+      op: "=="
+      value: 3
+      text: >
+        сумма свопов по позиции, открытой в будни и держанной через среду, за среду =
+        3x однодневного своп-платежа (сверка по account statement / audit events).
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      op: "<="
+      value: 1.3
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.3 x медиана ТЕХ ЖЕ часов в
+        другие дни (hour-matched, как и у диапазона). Окна с короткой реакцией держат предел 1.3
+        жёстче обычных: у них и издержка, и горизонт короче, поэтому 30 % расширения спреда съедают
+        большую долю стояния. Порог взят из констант движка, а не подогнан под измерение.
+    # календарно опасные часы: avoid и с измерением, и без него
+    hazard: [triple_swap_widening, broker_halt_server_midnight]
+    action: avoid
+    action_basis: >
+      avoid как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured: null
+    measured_note: "метрика не измерима по барам H1"
+
+  - id: friday_us_data
+    local_name: "Пятничные американские данные"
+    scale: weekly
+    timezone_kind: local_anchored
+    season_region: us_eastern
+    anchor_local: "08:00–11:00 Нью-Йорк"
+    applies_to: [gold, silver, fx]
+    utc: {start_minute: 720, end_minute: 900}
+    utc_seasons:
+      dst: {start_minute: 720, end_minute: 900}   # 12:00–15:00 UTC = 08:00–11:00 EDT
+      std: {start_minute: 780, end_minute: 960}   # 13:00–16:00 UTC = 08:00–11:00 EST
+    rule: {kind: weekly, weekday: 4}
+    rule_note: >
+      ДВЕ ошибки прежней ревизии, обе блокирующие. (1) Скобка 12:30–14:00 UTC не включала
+      релизы, ради которых окно заведено: ISM и Michigan выходят в 10:00 ET, то есть в
+      14:00 UTC летом и в 15:00 UTC зимой — ровно за правым краем. (2) Прежний PASS
+      считался против ФОНА ВСЕХ СУТОК, а скобка лежала внутри перекрытия Лондон–Нью-Йорк
+      (13:00–16:00 UTC): окно «пассило» потому, что послеобеденное время активнее ночи,
+      а не потому, что пятница особенная. Теперь якорь — локальные часы релизов, а база —
+      те же часы будних дней.
+    why: >
+      Регулярные пятничные релизы США: 08:30 ET — durable goods / personal income &
+      outlays / MNI по Чикаго (когда они выпадают на пятницу), 10:00 ET — ISM и
+      Michigan. Пятничный поток вынужден укладываться до закрытия книг на уикенд.
+    expected: >
+      Предзарегистрированная гипотеза — всплеск смещения в часы релизов ОТНОСИТЕЛЬНО тех
+      же часов будних дней. Если после честного сопоставления разница исчезнет, это
+      значит, что «пятничные данные» для нашего универсума — просто NY-послеобеденние
+      часы, и окно надо объединить с lon_ny_overlap.
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      op: ">="
+      value: 1.15
+      text: >
+        медиана |high-low|/mid внутри >= 1.15 x медиана той же скобки в будние дни
+        (записанные H1). Порог не поднимался и не опускался после смены базы — он
+        предзарегистрирован и остаётся прежним.
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      op: "<="
+      value: 1.5
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.5 x медиана ТЕХ ЖЕ часов в
+        другие дни (hour-matched, как и у диапазона). Окна с короткой реакцией держат предел 1.5
+        жёстче обычных: у них и издержка, и горизонт короче, поэтому 30 % расширения спреда съедают
+        большую долю стояния. Порог взят из констант движка, а не подогнан под измерение.
+    action: neutral
+    action_basis: >
+      neutral как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured:
+      source: ["agent_data/forward_bars/XAUUSD.json", "agent_data/forward_bars/XAGUSD.json", "agent_data/forward_bars/EURUSD.json", "agent_data/forward_bars/GBPUSD.json"]
+      generated_at: "2026-11-05"
+      timeframe: H1
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      baseline: hour_matched_other_days
+      symbols_measured: ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD"]
+      symbols_without_bars: ["USDJPY"]
+      n_inside_bars: 210
+      n_baseline_bars: 828
+      n_event_days: 18
+      n_event_days_by_season: {dst: 18, std: 0}
+      season_in_effect_at_measurement: std
+      median_rel_range_inside: 0.002797
+      median_rel_range_baseline: 0.002879
+      ratio: 0.971
+      ratio_noise_band_p10_p90: [0.768, 1.275]
+      ratio_within_symbol_median: 1.065
+      ratio_within_symbol_note: "объединённая медиана смешивает металлы и валюту; по-символьные отношения — вот здесь, критерий при этом остаётся на предзарегистрированном объединённом числе"
+      ratio_within_symbol_span: [0.962, 1.209]
+      ratio_vs_pooled_day_background: 1.43
+      ratio_vs_pooled_day_background_note: "искажённая база: общий фон суток смешивает день недели с часом суток; вердикт по ней не выносится"
+      criterion: ">= 1.15"
+      criterion_holds: FAIL
+      # вторая критериальная линия: СПРЕД, а не только диапазон
+      spread_metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      spread_baseline: hour_matched_other_days
+      spread_criterion: "<= 1.5"
+      spread_ratio: 1.0
+      spread_ratio_driver: "XAGUSD"
+      median_spread_points_inside: 18.0
+      median_spread_points_outside: 18.0
+      n_spread_bars_inside: 45
+      n_spread_bars_outside: 193
+      spread_coverage_inside: 0.8333
+      spread_measurable_symbols: ["XAGUSD"]
+      spread_unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAUUSD"]
+      spread_column_audit: {EURUSD: {coverage: 0.0245, distinct_values: 4, modal_share: 0.9388, hour_median_spread: null, usable: false}, GBPUSD: {coverage: 0.0245, distinct_values: 5, modal_share: 0.898, hour_median_spread: null, usable: false}, XAGUSD: {coverage: 0.896, distinct_values: 39, modal_share: 0.3008, hour_median_spread: 1.889, usable: true}, XAUUSD: {coverage: 0.9175, distinct_values: 22, modal_share: 0.6038, hour_median_spread: 1.0, usable: false}}
+      spread_column_audit_note: "coverage — доля баров файла с записанным спредом; distinct/modal_share — вырожденность колонки; hour_median_spread — во сколько раз различаются часовые медианы (без этого колонка не различает окна, даже если значений много); usable — годится ли ею пользоваться"
+      spread_criterion_holds: PASS
+      crossing_cost_fraction_of_hour_range: 0.03568
+      crossing_cost_driver: "XAGUSD"
+      verdict: FAIL
+      verdict_reasons:
+        - "оговорка (вердикта не снижает): окно привязано к чужим часам, сегодня действует зимняя (std) половина скобки, а её геометрия (dst=18, std=0) — это не измерена ни разу: расписание на эти недели торгует расчётным сдвигом, а не измеренным"
+        - "оговорка (вердикта не снижает): порог 1.15 лежит внутри шумового коридора [0.768, 1.275] — вердикт зависит от порога, а не опирается на него"
+      action: neutral
+      action_reasons:
+        - "критерий диапазона >= 1.15 не выполнен (измерено 0.971): окно не отличается от фона"
+        - "действующая std-половина скобки не имеет ни одного измеренного срабатывания на записи"
+      action_note: "verdict — статистика (держится ли предзарегистрированный критерий диапазона на этой выборке); action — исполнимость (можно ли это торговать). PASS по тишине никогда не бывает enter"
+      per_symbol: {XAUUSD: {n_inside_bars: 54, n_base_bars: 216, ratio: 1.001}, XAGUSD: {n_inside_bars: 54, n_base_bars: 216, ratio: 0.962}, EURUSD: {n_inside_bars: 51, n_base_bars: 198, ratio: 1.209}, GBPUSD: {n_inside_bars: 51, n_base_bars: 198, ratio: 1.13}}
+      executability:
+        verdict: EXECUTABLE
+        bar_coverage_inside: 0.9722
+        n_expected_slots: 216
+        n_present_bars: 210
+        n_occurrence_days_without_any_bars: 0
+        coverage_note: "доля слотов часа, которые окно требует, имеющих запись; в знаменателе только те дни срабатывания окна, по которым у символа есть хоть один бар (выходные и closures не размывают показатель, но учтены строкой n_occurrence_days_without_any_bars)"
+        dead_hour_slots_utc: []
+        sparse_hour_slots_utc: []
+        per_slot_fill: {12:00: {XAUUSD: "18/19", XAGUSD: "18/19", EURUSD: "17/17", GBPUSD: "17/17"}, 13:00: {XAUUSD: "18/19", XAGUSD: "18/19", EURUSD: "17/17", GBPUSD: "17/17"}, 14:00: {XAUUSD: "18/19", XAGUSD: "18/19", EURUSD: "17/17", GBPUSD: "17/17"}}
+        spread:
+          unit_note: "spread лента пишет в точках; точка — из digits реестра символов (XAUUSD: digits=2 из реестра символов; XAGUSD: digits=3 из реестра символов; EURUSD: digits=5 из реестра символов; GBPUSD: digits=5 из реестра символов); перевод в цены нужен только тем, чтобы сравнить спред с шириной бара"
+          baseline: hour_matched_other_days
+          coverage_threshold: 0.5
+          min_spread_bars: 20
+          by_symbol: {EURUSD: {n_inside_bars: 51, n_background_bars: 198, spread_recorded: 0, spread_recorded_background: 6, spread_coverage_inside: 0.0, spread_coverage_background: 0.0303, median_points_inside: null, median_points_background: 19.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 4, modal_value: 19.0, modal_share: 0.9388, median_points: 19.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; лишь 4 различных значений; мод 19.0 занимает 94% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 0.0% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, GBPUSD: {n_inside_bars: 51, n_background_bars: 198, spread_recorded: 0, spread_recorded_background: 6, spread_coverage_inside: 0.0, spread_coverage_background: 0.0303, median_points_inside: null, median_points_background: 23.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 5, modal_value: 23.0, modal_share: 0.898, median_points: 23.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; мод 23.0 занимает 90% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 0.0% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, XAGUSD: {n_inside_bars: 54, n_background_bars: 216, spread_recorded: 45, spread_recorded_background: 193, spread_coverage_inside: 0.8333, spread_coverage_background: 0.8935, median_points_inside: 18.0, median_points_background: 18.0, point_size: 0.001, ratio_inside_vs_background: 1.0, crossing_cost_fraction_of_hour_range: 0.03568, spread_column: {coverage: 0.896, distinct_values: 39, modal_value: 18.0, modal_share: 0.3008, median_points: 19.0, hour_median_spread: 1.889, usable: true, note: "колонка пригодна для сравнения окон"}, usable_column: true}, XAUUSD: {n_inside_bars: 54, n_background_bars: 216, spread_recorded: 51, spread_recorded_background: 198, spread_coverage_inside: 0.9444, spread_coverage_background: 0.9167, median_points_inside: 8.0, median_points_background: 8.0, point_size: 0.01, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.9175, distinct_values: 22, modal_value: 8.0, modal_share: 0.6038, median_points: 8.0, hour_median_spread: 1.0, usable: false, note: "колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы"}, usable_column: false, note: "колонка spread у этого символа вырождена (колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы) — отношением пользоваться нельзя, печатается только аудит колонки"}}
+          measurable_symbols: ["XAGUSD"]
+          unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAUUSD"]
+          ratio_inside_vs_background: 1.0
+          ratio_driver: "XAGUSD"
+          crossing_cost_fraction_of_hour_range: 0.03568
+          crossing_cost_driver: "XAGUSD"
+    measured_note: "перемерено scripts/windows_evidence.py на записи 2026-11-05; вердикт FAIL (статистика) при n=18 срабатываний {'dst': 18, 'std': 0}; исполнимость EXECUTABLE, спред PASS (ratio=1.0, база hour_matched_other_days) -> action neutral"
+
+  # ---------------- МЕСЯЧНЫЙ МАСШТАБ / ЯКОРЯ КАЛЕНДАРЯ ----------------
+
+  - id: nfp_employment_release
+    local_name: "NFP: занятость США (даты по графику BLS)"
+    scale: monthly
+    timezone_kind: local_anchored
+    season_region: us_eastern
+    anchor_local: "08:00–10:00 Нью-Йорк (релиз 08:30)"
+    applies_to: [gold, silver, fx]
+    utc: {start_minute: 720, end_minute: 840}
+    utc_seasons:
+      dst: {start_minute: 720, end_minute: 840}   # 12:00–14:00 UTC = 08:00–10:00 EDT
+      std: {start_minute: 780, end_minute: 900}   # 13:00–15:00 UTC = 08:00–10:00 EST
+    rule:
+      kind: dates
+      dates: ["2026-01-09", "2026-02-11", "2026-03-06", "2026-04-03", "2026-05-08",
+              "2026-06-05", "2026-07-02", "2026-08-07", "2026-09-04", "2026-10-02",
+              "2026-11-06", "2026-12-04"]
+    rule_note: >
+      Народное правило «первая пятница месяца» ошибается в 2026 ЧЕТЫРЕЖДЫ (в прошлой
+      ревизии было сказано «трижды» — недосчитали май): январь — пятница 9-е, вторая, а
+      не первая; февраль — среда 11-е; май — пятница 8-е, вторая; июль — четверг 2-е
+      (пятница 3-е — наблюдаемое закрытие по 4 июля). Даты взяты из графика BLS (Schedule
+      of Selected Releases 2026), публикуемого заранее. Релиз 08:30 по Нью-Йорку:
+      12:30 UTC в EDT и 13:30 UTC в EST — поэтому у окна ДВЕ скобки, а не одна.
+    dst_note: >
+      Скобка 750–840 (12:30–14:00 UTC) из прежней ревизии была летней geometrique,
+      наложенной на весь год. H1-свеча маркируется ВРЕМЕНЕМ ОТКРЫТИЯ, так что зимой
+      (релиз 13:30 UTC) внутрь неё попадала только свеча 13:00 — свеча, которая началась
+      ЗА 30 минут ДО релиза, то есть до-релизная тишина; реакция же в 14:00-15:00 UTC
+      оставалась за бортом. Это не «цена UTC-кронштейна», это неверная скобка.
+    measurement_honesty: >
+      В этой записи (26 июн – 2 ноя 2026) нет НИ ОДНОГО STD-срабатывания: весь сезон
+      измерений — EDT. Зимняя ветка скобки — календарная поправка, а не измерение;
+      n_event_days_by_season это печатает раздельно.
+    why: >
+      Крупнейший регулярный USD-релиз: сюрприз по зарплатам переписывает траекторию
+      ставки ФРС за минуты; золото идёт через канал реальных ставок, USD-пары напрямую.
+    expected: >
+      Предзарегистрированная гипотеза — самое сильное одиночное смещение месяца в этом
+      окне; база — та же скобка в другие дни, чтобы «час релиза» не подменялся
+      «американским днём».
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      op: ">="
+      value: 1.5
+      text: >
+        медиана |high-low|/mid внутри >= 1.5 x медиана той же скобки в другие дни
+        (записанные H1).
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      op: "<="
+      value: 1.3
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.3 x медиана ТЕХ ЖЕ часов в
+        другие дни (hour-matched, как и у диапазона). Окна с короткой реакцией держат предел 1.3
+        жёстче обычных: у них и издержка, и горизонт короче, поэтому 30 % расширения спреда съедают
+        большую долю стояния. Порог взят из констант движка, а не подогнан под измерение.
+    action: neutral
+    action_basis: >
+      neutral как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured:
+      source: ["agent_data/forward_bars/XAUUSD.json", "agent_data/forward_bars/XAGUSD.json", "agent_data/forward_bars/EURUSD.json", "agent_data/forward_bars/GBPUSD.json"]
+      generated_at: "2026-11-05"
+      timeframe: H1
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      baseline: hour_matched_other_days
+      symbols_measured: ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD"]
+      symbols_without_bars: ["USDJPY"]
+      n_inside_bars: 28
+      n_baseline_bars: 664
+      n_event_days: 4
+      n_event_days_by_season: {dst: 4, std: 0}
+      season_in_effect_at_measurement: std
+      median_rel_range_inside: 0.003926
+      median_rel_range_baseline: 0.002686
+      ratio: 1.461
+      ratio_noise_band_p10_p90: [0.979, 2.711]
+      ratio_within_symbol_median: 2.106
+      ratio_within_symbol_note: "объединённая медиана смешивает металлы и валюту; по-символьные отношения — вот здесь, критерий при этом остаётся на предзарегистрированном объединённом числе"
+      ratio_within_symbol_span: [1.881, 2.45]
+      ratio_vs_pooled_day_background: 1.983
+      ratio_vs_pooled_day_background_note: "искажённая база: общий фон суток смешивает день недели с часом суток; вердикт по ней не выносится"
+      criterion: ">= 1.5"
+      criterion_holds: FAIL
+      # вторая критериальная линия: СПРЕД, а не только диапазон
+      spread_metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      spread_baseline: hour_matched_other_days
+      spread_criterion: "<= 1.3"
+      spread_ratio: null
+      spread_ratio_driver: null
+      median_spread_points_inside: null
+      median_spread_points_outside: null
+      n_spread_bars_inside: 0
+      n_spread_bars_outside: 0
+      spread_coverage_inside: null
+      spread_measurable_symbols: []
+      spread_unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAGUSD", "XAUUSD"]
+      spread_column_audit: {EURUSD: {coverage: 0.0245, distinct_values: 4, modal_share: 0.9388, hour_median_spread: null, usable: false}, GBPUSD: {coverage: 0.0245, distinct_values: 5, modal_share: 0.898, hour_median_spread: null, usable: false}, XAGUSD: {coverage: 0.896, distinct_values: 39, modal_share: 0.3008, hour_median_spread: 1.889, usable: true}, XAUUSD: {coverage: 0.9175, distinct_values: 22, modal_share: 0.6038, hour_median_spread: 1.0, usable: false}}
+      spread_column_audit_note: "coverage — доля баров файла с записанным спредом; distinct/modal_share — вырожденность колонки; hour_median_spread — во сколько раз различаются часовые медианы (без этого колонка не различает окна, даже если значений много); usable — годится ли ею пользоваться"
+      spread_criterion_holds: NOT_MEASURED
+      spread_criterion_note: "ни по одному символу окна spread не записан хотя бы на 50% его баров (20+ штук, колонка не вырождена) — это пропуск поля, а не нулевой спред; спред внутри окна НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"
+      crossing_cost_fraction_of_hour_range: null
+      crossing_cost_driver: null
+      verdict: HYPOTHESIS
+      verdict_reasons:
+        - "вердикт HYPOTHESIS: 4 срабатываний <= 5 — при такой выборке арифметика (>= 1.5 против 1.461) не даёт права называть это доказательством, это анекдот про эти дни"
+        - "оговорка (вердикта не снижает): выборка 4 срабатываний < 10 — число срабатываний напечатано рядом"
+        - "оговорка (вердикта не снижает): окно привязано к чужим часам, сегодня действует зимняя (std) половина скобки, а её геометрия (dst=4, std=0) — это не измерена ни разу: расписание на эти недели торгует расчётным сдвигом, а не измеренным"
+        - "оговорка (вердикта не снижает): порог 1.5 лежит внутри шумового коридора [0.979, 2.711] — вердикт зависит от порога, а не опирается на него"
+      action: neutral
+      action_reasons:
+        - "вердикт HYPOTHESIS при n=4 срабатываний: доказательства нет, входа не обещаем"
+        - "спред в окне не измерен (поле `spread` в ленте непокрывающее либо колонка вырождена), значит цена стояния в окне не подтверждена"
+        - "действующая std-половина скобки не имеет ни одного измеренного срабатывания на записи"
+      action_note: "verdict — статистика (держится ли предзарегистрированный критерий диапазона на этой выборке); action — исполнимость (можно ли это торговать). PASS по тишине никогда не бывает enter"
+      caveat: "предварительно: в записи лишь 4 срабатываний (летом 4, зимой 0)"
+      per_symbol: {XAUUSD: {n_inside_bars: 8, n_base_bars: 172, ratio: 2.024}, XAGUSD: {n_inside_bars: 8, n_base_bars: 172, ratio: 2.187}, EURUSD: {n_inside_bars: 6, n_base_bars: 160, ratio: 2.45}, GBPUSD: {n_inside_bars: 6, n_base_bars: 160, ratio: 1.881}}
+      executability:
+        verdict: EXECUTABLE
+        bar_coverage_inside: 1.0
+        n_expected_slots: 28
+        n_present_bars: 28
+        n_occurrence_days_without_any_bars: 0
+        coverage_note: "доля слотов часа, которые окно требует, имеющих запись; в знаменателе только те дни срабатывания окна, по которым у символа есть хоть один бар (выходные и closures не размывают показатель, но учтены строкой n_occurrence_days_without_any_bars)"
+        dead_hour_slots_utc: []
+        sparse_hour_slots_utc: []
+        per_slot_fill: {12:00: {XAUUSD: "4/4", XAGUSD: "4/4", EURUSD: "3/3", GBPUSD: "3/3"}, 13:00: {XAUUSD: "4/4", XAGUSD: "4/4", EURUSD: "3/3", GBPUSD: "3/3"}}
+        spread:
+          unit_note: "spread лента пишет в точках; точка — из digits реестра символов (XAUUSD: digits=2 из реестра символов; XAGUSD: digits=3 из реестра символов; EURUSD: digits=5 из реестра символов; GBPUSD: digits=5 из реестра символов); перевод в цены нужен только тем, чтобы сравнить спред с шириной бара"
+          baseline: hour_matched_other_days
+          coverage_threshold: 0.5
+          min_spread_bars: 20
+          by_symbol: {EURUSD: {n_inside_bars: 6, n_background_bars: 160, spread_recorded: 0, spread_recorded_background: 4, spread_coverage_inside: 0.0, spread_coverage_background: 0.025, median_points_inside: null, median_points_background: 19.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 4, modal_value: 19.0, modal_share: 0.9388, median_points: 19.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; лишь 4 различных значений; мод 19.0 занимает 94% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 0.0% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, GBPUSD: {n_inside_bars: 6, n_background_bars: 160, spread_recorded: 0, spread_recorded_background: 4, spread_coverage_inside: 0.0, spread_coverage_background: 0.025, median_points_inside: null, median_points_background: 23.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 5, modal_value: 23.0, modal_share: 0.898, median_points: 23.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; мод 23.0 занимает 90% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 0.0% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, XAGUSD: {n_inside_bars: 8, n_background_bars: 172, spread_recorded: 8, spread_recorded_background: 151, spread_coverage_inside: 1.0, spread_coverage_background: 0.8779, median_points_inside: 18.0, median_points_background: 18.0, point_size: 0.001, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.896, distinct_values: 39, modal_value: 18.0, modal_share: 0.3008, median_points: 19.0, hour_median_spread: 1.889, usable: true, note: "колонка пригодна для сравнения окон"}, usable_column: true, note: "записанных спредов 8 внутри / 151 в базе: нужно >= 20 с обеих сторон — отношение не считается"}, XAUUSD: {n_inside_bars: 8, n_background_bars: 172, spread_recorded: 6, spread_recorded_background: 160, spread_coverage_inside: 0.75, spread_coverage_background: 0.9302, median_points_inside: 8.0, median_points_background: 8.0, point_size: 0.01, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.9175, distinct_values: 22, modal_value: 8.0, modal_share: 0.6038, median_points: 8.0, hour_median_spread: 1.0, usable: false, note: "колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы"}, usable_column: false, note: "колонка spread у этого символа вырождена (колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы) — отношением пользоваться нельзя, печатается только аудит колонки"}}
+          measurable_symbols: []
+          unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAGUSD", "XAUUSD"]
+          ratio_inside_vs_background: null
+          ratio_driver: null
+          crossing_cost_fraction_of_hour_range: null
+          crossing_cost_driver: null
+          note: "ни по одному символу окна spread не записан хотя бы на 50% его баров (20+ штук, колонка не вырождена) — это пропуск поля, а не нулевой спред; спред внутри окна НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"
+    measured_note: "перемерено scripts/windows_evidence.py на записи 2026-11-05; вердикт HYPOTHESIS (статистика) при n=4 срабатываний {'dst': 4, 'std': 0}; исполнимость EXECUTABLE, спред NOT_MEASURED (ratio=None, база hour_matched_other_days) -> action neutral"
+
+  - id: us_cpi_release
+    local_name: "CPI США (середина месяца, даты по графику BLS)"
+    scale: monthly
+    timezone_kind: local_anchored
+    season_region: us_eastern
+    anchor_local: "08:00–10:00 Нью-Йорк (релиз 08:30)"
+    applies_to: [gold, silver, fx]
+    utc: {start_minute: 720, end_minute: 840}
+    utc_seasons:
+      dst: {start_minute: 720, end_minute: 840}
+      std: {start_minute: 780, end_minute: 900}
+    rule:
+      kind: dates
+      dates: ["2026-01-13", "2026-02-13", "2026-03-11", "2026-04-10", "2026-05-12",
+              "2026-06-10", "2026-07-14", "2026-08-12", "2026-09-11", "2026-10-14",
+              "2026-11-10", "2026-12-10"]
+    rule_note: >
+      Правило «примерно 10–15 число, 08:30 ET» не даёт точного дня — поэтому якорь задан
+      списком дат из официального графика BLS на 2026 (публикуется заранее). Часы релиза
+      те же, что у NFP, и скобки у окон одинаковые по той же причине: 08:30 ET = 12:30
+      UTC летом, 13:30 UTC зимой.
+    why: >
+      Инфляционный релиз — прямой вход в функцию реакции ФРС; переоценка реальных ставок
+      бьёт по золоту и по USD-ногам всех мажоров одновременно.
+    expected: >
+      Предзарегистрированная гипотеза — всплеск смещения в часы релиза, затухание к
+      середине дня UTC.
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      op: ">="
+      value: 1.5
+      text: >
+        медиана |high-low|/mid внутри >= 1.5 x медиана той же скобки в другие дни
+        (записанные H1).
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      op: "<="
+      value: 1.3
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.3 x медиана ТЕХ ЖЕ часов в
+        другие дни (hour-matched, как и у диапазона). Окна с короткой реакцией держат предел 1.3
+        жёстче обычных: у них и издержка, и горизонт короче, поэтому 30 % расширения спреда съедают
+        большую долю стояния. Порог взят из констант движка, а не подогнан под измерение.
+    action: neutral
+    action_basis: >
+      neutral как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured:
+      source: ["agent_data/forward_bars/XAUUSD.json", "agent_data/forward_bars/XAGUSD.json", "agent_data/forward_bars/EURUSD.json", "agent_data/forward_bars/GBPUSD.json"]
+      generated_at: "2026-11-05"
+      timeframe: H1
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      baseline: hour_matched_other_days
+      symbols_measured: ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD"]
+      symbols_without_bars: ["USDJPY"]
+      n_inside_bars: 32
+      n_baseline_bars: 660
+      n_event_days: 4
+      n_event_days_by_season: {dst: 4, std: 0}
+      season_in_effect_at_measurement: std
+      median_rel_range_inside: 0.003803
+      median_rel_range_baseline: 0.002702
+      ratio: 1.408
+      ratio_noise_band_p10_p90: [0.878, 2.346]
+      ratio_within_symbol_median: 1.978
+      ratio_within_symbol_note: "объединённая медиана смешивает металлы и валюту; по-символьные отношения — вот здесь, критерий при этом остаётся на предзарегистрированном объединённом числе"
+      ratio_within_symbol_span: [1.61, 2.156]
+      ratio_vs_pooled_day_background: 1.921
+      ratio_vs_pooled_day_background_note: "искажённая база: общий фон суток смешивает день недели с часом суток; вердикт по ней не выносится"
+      criterion: ">= 1.5"
+      criterion_holds: FAIL
+      # вторая критериальная линия: СПРЕД, а не только диапазон
+      spread_metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      spread_baseline: hour_matched_other_days
+      spread_criterion: "<= 1.3"
+      spread_ratio: null
+      spread_ratio_driver: null
+      median_spread_points_inside: null
+      median_spread_points_outside: null
+      n_spread_bars_inside: 0
+      n_spread_bars_outside: 0
+      spread_coverage_inside: null
+      spread_measurable_symbols: []
+      spread_unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAGUSD", "XAUUSD"]
+      spread_column_audit: {EURUSD: {coverage: 0.0245, distinct_values: 4, modal_share: 0.9388, hour_median_spread: null, usable: false}, GBPUSD: {coverage: 0.0245, distinct_values: 5, modal_share: 0.898, hour_median_spread: null, usable: false}, XAGUSD: {coverage: 0.896, distinct_values: 39, modal_share: 0.3008, hour_median_spread: 1.889, usable: true}, XAUUSD: {coverage: 0.9175, distinct_values: 22, modal_share: 0.6038, hour_median_spread: 1.0, usable: false}}
+      spread_column_audit_note: "coverage — доля баров файла с записанным спредом; distinct/modal_share — вырожденность колонки; hour_median_spread — во сколько раз различаются часовые медианы (без этого колонка не различает окна, даже если значений много); usable — годится ли ею пользоваться"
+      spread_criterion_holds: NOT_MEASURED
+      spread_criterion_note: "ни по одному символу окна spread не записан хотя бы на 50% его баров (20+ штук, колонка не вырождена) — это пропуск поля, а не нулевой спред; спред внутри окна НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"
+      crossing_cost_fraction_of_hour_range: null
+      crossing_cost_driver: null
+      verdict: HYPOTHESIS
+      verdict_reasons:
+        - "вердикт HYPOTHESIS: 4 срабатываний <= 5 — при такой выборке арифметика (>= 1.5 против 1.408) не даёт права называть это доказательством, это анекдот про эти дни"
+        - "оговорка (вердикта не снижает): выборка 4 срабатываний < 10 — число срабатываний напечатано рядом"
+        - "оговорка (вердикта не снижает): окно привязано к чужим часам, сегодня действует зимняя (std) половина скобки, а её геометрия (dst=4, std=0) — это не измерена ни разу: расписание на эти недели торгует расчётным сдвигом, а не измеренным"
+        - "оговорка (вердикта не снижает): порог 1.5 лежит внутри шумового коридора [0.878, 2.346] — вердикт зависит от порога, а не опирается на него"
+      action: neutral
+      action_reasons:
+        - "вердикт HYPOTHESIS при n=4 срабатываний: доказательства нет, входа не обещаем"
+        - "спред в окне не измерен (поле `spread` в ленте непокрывающее либо колонка вырождена), значит цена стояния в окне не подтверждена"
+        - "действующая std-половина скобки не имеет ни одного измеренного срабатывания на записи"
+      action_note: "verdict — статистика (держится ли предзарегистрированный критерий диапазона на этой выборке); action — исполнимость (можно ли это торговать). PASS по тишине никогда не бывает enter"
+      caveat: "предварительно: в записи лишь 4 срабатываний (летом 4, зимой 0)"
+      per_symbol: {XAUUSD: {n_inside_bars: 8, n_base_bars: 172, ratio: 2.156}, XAGUSD: {n_inside_bars: 8, n_base_bars: 172, ratio: 1.61}, EURUSD: {n_inside_bars: 8, n_base_bars: 158, ratio: 2.111}, GBPUSD: {n_inside_bars: 8, n_base_bars: 158, ratio: 1.844}}
+      executability:
+        verdict: EXECUTABLE
+        bar_coverage_inside: 1.0
+        n_expected_slots: 32
+        n_present_bars: 32
+        n_occurrence_days_without_any_bars: 0
+        coverage_note: "доля слотов часа, которые окно требует, имеющих запись; в знаменателе только те дни срабатывания окна, по которым у символа есть хоть один бар (выходные и closures не размывают показатель, но учтены строкой n_occurrence_days_without_any_bars)"
+        dead_hour_slots_utc: []
+        sparse_hour_slots_utc: []
+        per_slot_fill: {12:00: {XAUUSD: "4/4", XAGUSD: "4/4", EURUSD: "4/4", GBPUSD: "4/4"}, 13:00: {XAUUSD: "4/4", XAGUSD: "4/4", EURUSD: "4/4", GBPUSD: "4/4"}}
+        spread:
+          unit_note: "spread лента пишет в точках; точка — из digits реестра символов (XAUUSD: digits=2 из реестра символов; XAGUSD: digits=3 из реестра символов; EURUSD: digits=5 из реестра символов; GBPUSD: digits=5 из реестра символов); перевод в цены нужен только тем, чтобы сравнить спред с шириной бара"
+          baseline: hour_matched_other_days
+          coverage_threshold: 0.5
+          min_spread_bars: 20
+          by_symbol: {EURUSD: {n_inside_bars: 8, n_background_bars: 158, spread_recorded: 0, spread_recorded_background: 4, spread_coverage_inside: 0.0, spread_coverage_background: 0.0253, median_points_inside: null, median_points_background: 19.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 4, modal_value: 19.0, modal_share: 0.9388, median_points: 19.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; лишь 4 различных значений; мод 19.0 занимает 94% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 0.0% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, GBPUSD: {n_inside_bars: 8, n_background_bars: 158, spread_recorded: 0, spread_recorded_background: 4, spread_coverage_inside: 0.0, spread_coverage_background: 0.0253, median_points_inside: null, median_points_background: 23.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 5, modal_value: 23.0, modal_share: 0.898, median_points: 23.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; мод 23.0 занимает 90% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 0.0% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, XAGUSD: {n_inside_bars: 8, n_background_bars: 172, spread_recorded: 8, spread_recorded_background: 151, spread_coverage_inside: 1.0, spread_coverage_background: 0.8779, median_points_inside: 18.0, median_points_background: 18.0, point_size: 0.001, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.896, distinct_values: 39, modal_value: 18.0, modal_share: 0.3008, median_points: 19.0, hour_median_spread: 1.889, usable: true, note: "колонка пригодна для сравнения окон"}, usable_column: true, note: "записанных спредов 8 внутри / 151 в базе: нужно >= 20 с обеих сторон — отношение не считается"}, XAUUSD: {n_inside_bars: 8, n_background_bars: 172, spread_recorded: 8, spread_recorded_background: 158, spread_coverage_inside: 1.0, spread_coverage_background: 0.9186, median_points_inside: 8.0, median_points_background: 8.0, point_size: 0.01, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.9175, distinct_values: 22, modal_value: 8.0, modal_share: 0.6038, median_points: 8.0, hour_median_spread: 1.0, usable: false, note: "колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы"}, usable_column: false, note: "колонка spread у этого символа вырождена (колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы) — отношением пользоваться нельзя, печатается только аудит колонки"}}
+          measurable_symbols: []
+          unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAGUSD", "XAUUSD"]
+          ratio_inside_vs_background: null
+          ratio_driver: null
+          crossing_cost_fraction_of_hour_range: null
+          crossing_cost_driver: null
+          note: "ни по одному символу окна spread не записан хотя бы на 50% его баров (20+ штук, колонка не вырождена) — это пропуск поля, а не нулевой спред; спред внутри окна НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"
+    measured_note: "перемерено scripts/windows_evidence.py на записи 2026-11-05; вердикт HYPOTHESIS (статистика) при n=4 срабатываний {'dst': 4, 'std': 0}; исполнимость EXECUTABLE, спред NOT_MEASURED (ratio=None, база hour_matched_other_days) -> action neutral"
+
+  - id: fomc_decision
+    local_name: "Решение FOMC (14:00 ET стейтмент, 14:30 ET пресс)"
+    scale: monthly
+    timezone_kind: local_anchored
+    season_region: us_eastern
+    anchor_local: "14:00–16:30 Нью-Йорк"
+    applies_to: [gold, silver, fx]
+    utc: {start_minute: 1080, end_minute: 1230}
+    utc_seasons:
+      dst: {start_minute: 1080, end_minute: 1230}   # 18:00–20:30 UTC = 14:00–16:30 EDT
+      std: {start_minute: 1140, end_minute: 1290}   # 19:00–21:30 UTC = 14:00–16:30 EST
+    rule:
+      kind: dates
+      dates: ["2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17", "2026-07-29",
+              "2026-09-16", "2026-10-28", "2026-12-09"]
+    rule_note: >
+      Даты решений (второй день заседания) из опубликованного календаря ФРС на 2026.
+      Статичный кронштейн 18:00–20:30 UTC из прежней ревизии накрывал летний выход
+      стейтмента и терял первый час зимнего (19:00 UTC): зима теперь отдельная скобка.
+    why: >
+      Решающий по ставке и её пути документ; пресс-конференция меняет диспозицию ещё раз
+      через 30 минут — весь день в позициях не держат, окно короткое и обязательное.
+    expected: >
+      Предзарегистрированная гипотеза — пиковое смещение и худшая ликвидность дня;
+      направление априори неизвестно, окно симметрично по смыслу.
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      op: ">="
+      value: 1.5
+      text: >
+        медиана |high-low|/mid внутри >= 1.5 x медиана той же скобки в другие дни
+        (записанные H1).
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      op: "<="
+      value: 1.3
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.3 x медиана ТЕХ ЖЕ часов в
+        другие дни (hour-matched, как и у диапазона). Окна с короткой реакцией держат предел 1.3
+        жёстче обычных: у них и издержка, и горизонт короче, поэтому 30 % расширения спреда съедают
+        большую долю стояния. Порог взят из констант движка, а не подогнан под измерение.
+    action: neutral
+    action_basis: >
+      neutral как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured:
+      source: ["agent_data/forward_bars/XAUUSD.json", "agent_data/forward_bars/XAGUSD.json", "agent_data/forward_bars/EURUSD.json", "agent_data/forward_bars/GBPUSD.json"]
+      generated_at: "2026-11-05"
+      timeframe: H1
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      baseline: hour_matched_other_days
+      symbols_measured: ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD"]
+      symbols_without_bars: ["USDJPY"]
+      n_inside_bars: 36
+      n_baseline_bars: 999
+      n_event_days: 3
+      n_event_days_by_season: {dst: 3, std: 0}
+      season_in_effect_at_measurement: std
+      median_rel_range_inside: 0.005882
+      median_rel_range_baseline: 0.001799
+      ratio: 3.269
+      ratio_noise_band_p10_p90: [2.055, 6.548]
+      ratio_within_symbol_median: 3.26
+      ratio_within_symbol_note: "объединённая медиана смешивает металлы и валюту; по-символьные отношения — вот здесь, критерий при этом остаётся на предзарегистрированном объединённом числе"
+      ratio_within_symbol_span: [2.378, 4.074]
+      ratio_vs_pooled_day_background: 2.974
+      ratio_vs_pooled_day_background_note: "искажённая база: общий фон суток смешивает день недели с часом суток; вердикт по ней не выносится"
+      criterion: ">= 1.5"
+      criterion_holds: PASS
+      # вторая критериальная линия: СПРЕД, а не только диапазон
+      spread_metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      spread_baseline: hour_matched_other_days
+      spread_criterion: "<= 1.3"
+      spread_ratio: null
+      spread_ratio_driver: null
+      median_spread_points_inside: null
+      median_spread_points_outside: null
+      n_spread_bars_inside: 0
+      n_spread_bars_outside: 0
+      spread_coverage_inside: null
+      spread_measurable_symbols: []
+      spread_unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAGUSD", "XAUUSD"]
+      spread_column_audit: {EURUSD: {coverage: 0.0245, distinct_values: 4, modal_share: 0.9388, hour_median_spread: null, usable: false}, GBPUSD: {coverage: 0.0245, distinct_values: 5, modal_share: 0.898, hour_median_spread: null, usable: false}, XAGUSD: {coverage: 0.896, distinct_values: 39, modal_share: 0.3008, hour_median_spread: 1.889, usable: true}, XAUUSD: {coverage: 0.9175, distinct_values: 22, modal_share: 0.6038, hour_median_spread: 1.0, usable: false}}
+      spread_column_audit_note: "coverage — доля баров файла с записанным спредом; distinct/modal_share — вырожденность колонки; hour_median_spread — во сколько раз различаются часовые медианы (без этого колонка не различает окна, даже если значений много); usable — годится ли ею пользоваться"
+      spread_criterion_holds: NOT_MEASURED
+      spread_criterion_note: "ни по одному символу окна spread не записан хотя бы на 50% его баров (20+ штук, колонка не вырождена) — это пропуск поля, а не нулевой спред; спред внутри окна НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"
+      crossing_cost_fraction_of_hour_range: null
+      crossing_cost_driver: null
+      verdict: HYPOTHESIS
+      verdict_reasons:
+        - "вердикт HYPOTHESIS: 3 срабатываний <= 5 — при такой выборке арифметика (>= 1.5 против 3.269) не даёт права называть это доказательством, это анекдот про эти дни"
+        - "оговорка (вердикта не снижает): выборка 3 срабатываний < 10 — число срабатываний напечатано рядом"
+        - "оговорка (вердикта не снижает): окно привязано к чужим часам, сегодня действует зимняя (std) половина скобки, а её геометрия (dst=3, std=0) — это не измерена ни разу: расписание на эти недели торгует расчётным сдвигом, а не измеренным"
+      action: neutral
+      action_reasons:
+        - "вердикт HYPOTHESIS при n=3 срабатываний: доказательства нет, входа не обещаем"
+        - "спред в окне не измерен (поле `spread` в ленте непокрывающее либо колонка вырождена), значит цена стояния в окне не подтверждена"
+        - "действующая std-половина скобки не имеет ни одного измеренного срабатывания на записи"
+      action_note: "verdict — статистика (держится ли предзарегистрированный критерий диапазона на этой выборке); action — исполнимость (можно ли это торговать). PASS по тишине никогда не бывает enter"
+      caveat: "предварительно: в записи лишь 3 срабатываний (летом 3, зимой 0)"
+      per_symbol: {XAUUSD: {n_inside_bars: 9, n_base_bars: 261, ratio: 4.074}, XAGUSD: {n_inside_bars: 9, n_base_bars: 258, ratio: 3.605}, EURUSD: {n_inside_bars: 9, n_base_bars: 240, ratio: 2.916}, GBPUSD: {n_inside_bars: 9, n_base_bars: 240, ratio: 2.378}}
+      executability:
+        verdict: EXECUTABLE
+        bar_coverage_inside: 1.0
+        n_expected_slots: 36
+        n_present_bars: 36
+        n_occurrence_days_without_any_bars: 0
+        coverage_note: "доля слотов часа, которые окно требует, имеющих запись; в знаменателе только те дни срабатывания окна, по которым у символа есть хоть один бар (выходные и closures не размывают показатель, но учтены строкой n_occurrence_days_without_any_bars)"
+        dead_hour_slots_utc: []
+        sparse_hour_slots_utc: []
+        per_slot_fill: {18:00: {XAUUSD: "3/3", XAGUSD: "3/3", EURUSD: "3/3", GBPUSD: "3/3"}, 19:00: {XAUUSD: "3/3", XAGUSD: "3/3", EURUSD: "3/3", GBPUSD: "3/3"}, 20:00: {XAUUSD: "3/3", XAGUSD: "3/3", EURUSD: "3/3", GBPUSD: "3/3"}}
+        spread:
+          unit_note: "spread лента пишет в точках; точка — из digits реестра символов (XAUUSD: digits=2 из реестра символов; XAGUSD: digits=3 из реестра символов; EURUSD: digits=5 из реестра символов; GBPUSD: digits=5 из реестра символов); перевод в цены нужен только тем, чтобы сравнить спред с шириной бара"
+          baseline: hour_matched_other_days
+          coverage_threshold: 0.5
+          min_spread_bars: 20
+          by_symbol: {EURUSD: {n_inside_bars: 9, n_background_bars: 240, spread_recorded: 3, spread_recorded_background: 3, spread_coverage_inside: 0.3333, spread_coverage_background: 0.0125, median_points_inside: 19.0, median_points_background: 19.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 4, modal_value: 19.0, modal_share: 0.9388, median_points: 19.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; лишь 4 различных значений; мод 19.0 занимает 94% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 33.3% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, GBPUSD: {n_inside_bars: 9, n_background_bars: 240, spread_recorded: 3, spread_recorded_background: 3, spread_coverage_inside: 0.3333, spread_coverage_background: 0.0125, median_points_inside: 23.0, median_points_background: 23.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 5, modal_value: 23.0, modal_share: 0.898, median_points: 23.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; мод 23.0 занимает 90% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 33.3% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, XAGUSD: {n_inside_bars: 9, n_background_bars: 258, spread_recorded: 9, spread_recorded_background: 232, spread_coverage_inside: 1.0, spread_coverage_background: 0.8992, median_points_inside: 19.0, median_points_background: 19.0, point_size: 0.001, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.896, distinct_values: 39, modal_value: 18.0, modal_share: 0.3008, median_points: 19.0, hour_median_spread: 1.889, usable: true, note: "колонка пригодна для сравнения окон"}, usable_column: true, note: "записанных спредов 9 внутри / 232 в базе: нужно >= 20 с обеих сторон — отношение не считается"}, XAUUSD: {n_inside_bars: 9, n_background_bars: 261, spread_recorded: 9, spread_recorded_background: 240, spread_coverage_inside: 1.0, spread_coverage_background: 0.9195, median_points_inside: 8.0, median_points_background: 8.0, point_size: 0.01, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.9175, distinct_values: 22, modal_value: 8.0, modal_share: 0.6038, median_points: 8.0, hour_median_spread: 1.0, usable: false, note: "колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы"}, usable_column: false, note: "колонка spread у этого символа вырождена (колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы) — отношением пользоваться нельзя, печатается только аудит колонки"}}
+          measurable_symbols: []
+          unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAGUSD", "XAUUSD"]
+          ratio_inside_vs_background: null
+          ratio_driver: null
+          crossing_cost_fraction_of_hour_range: null
+          crossing_cost_driver: null
+          note: "ни по одному символу окна spread не записан хотя бы на 50% его баров (20+ штук, колонка не вырождена) — это пропуск поля, а не нулевой спред; спред внутри окна НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"
+    measured_note: "перемерено scripts/windows_evidence.py на записи 2026-11-05; вердикт HYPOTHESIS (статистика) при n=3 срабатываний {'dst': 3, 'std': 0}; исполнимость EXECUTABLE, спред NOT_MEASURED (ratio=None, база hour_matched_other_days) -> action neutral"
+
+  - id: first_hour_of_month
+    local_name: "Первый час месяца (00:00–01:00 UTC первого торгового дня)"
+    scale: monthly
+    timezone_kind: utc_fixed
+    applies_to: [gold, silver, fx]
+    utc: {start_minute: 0, end_minute: 60}
+    rule:
+      kind: monthly_day
+      day: 1
+      skip_weekend: true
+    rule_note: >
+      skip_weekend: если 1-е число — суббота/воскресенье ИЛИ биржевой праздник, окно
+      переносится на первый торговый день месяца (праздничная фильтрация добавлена этим
+      раундом: без неё 1 января 2027, пятница и закрытие, давало бы «торговое окно» по
+      запертой книге). рыночная механика — поток первого торгового тика.
+    why: >
+      Систематические месячные потоки (ребаланс фондов, хеджирование, опционные страйки
+      по открытию месячной свечи) исполняются на первом доступном тике; тонкая азиатская
+      книга в эти часы даёт им усиленное ценовое воздействие.
+    expected: >
+      Предзарегистрированная гипотеза — повышенное смещение в первый час против тех же
+      часов других дней.
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      op: ">="
+      value: 1.2
+      text: >
+        медиана |high-low|/mid внутри >= 1.2 x медиана того же часа в другие дни
+        (записанные H1).
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      op: "<="
+      value: 1.3
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.3 x медиана ТЕХ ЖЕ часов в
+        другие дни (hour-matched, как и у диапазона). Окна с короткой реакцией держат предел 1.3
+        жёстче обычных: у них и издержка, и горизонт короче, поэтому 30 % расширения спреда съедают
+        большую долю стояния. Порог взят из констант движка, а не подогнан под измерение.
+    action: neutral
+    action_basis: >
+      avoid как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured:
+      source: ["agent_data/forward_bars/XAUUSD.json", "agent_data/forward_bars/XAGUSD.json", "agent_data/forward_bars/EURUSD.json", "agent_data/forward_bars/GBPUSD.json"]
+      generated_at: "2026-11-05"
+      timeframe: H1
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      baseline: hour_matched_other_days
+      symbols_measured: ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD"]
+      symbols_without_bars: ["USDJPY"]
+      n_inside_bars: 18
+      n_baseline_bars: 330
+      n_event_days: 5
+      n_event_days_by_season: {fixed: 5}
+      season_in_effect_at_measurement: fixed
+      median_rel_range_inside: 0.001549
+      median_rel_range_baseline: 0.001686
+      ratio: 0.919
+      ratio_noise_band_p10_p90: [0.42, 3.414]
+      ratio_within_symbol_median: 1.035
+      ratio_within_symbol_note: "объединённая медиана смешивает металлы и валюту; по-символьные отношения — вот здесь, критерий при этом остаётся на предзарегистрированном объединённом числе"
+      ratio_within_symbol_span: [0.806, 1.704]
+      ratio_vs_pooled_day_background: 0.779
+      ratio_vs_pooled_day_background_note: "искажённая база: общий фон суток смешивает день недели с часом суток; вердикт по ней не выносится"
+      criterion: ">= 1.2"
+      criterion_holds: FAIL
+      # вторая критериальная линия: СПРЕД, а не только диапазон
+      spread_metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      spread_baseline: hour_matched_other_days
+      spread_criterion: "<= 1.3"
+      spread_ratio: null
+      spread_ratio_driver: null
+      median_spread_points_inside: null
+      median_spread_points_outside: null
+      n_spread_bars_inside: 0
+      n_spread_bars_outside: 0
+      spread_coverage_inside: null
+      spread_measurable_symbols: []
+      spread_unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAGUSD", "XAUUSD"]
+      spread_column_audit: {EURUSD: {coverage: 0.0245, distinct_values: 4, modal_share: 0.9388, hour_median_spread: null, usable: false}, GBPUSD: {coverage: 0.0245, distinct_values: 5, modal_share: 0.898, hour_median_spread: null, usable: false}, XAGUSD: {coverage: 0.896, distinct_values: 39, modal_share: 0.3008, hour_median_spread: 1.889, usable: true}, XAUUSD: {coverage: 0.9175, distinct_values: 22, modal_share: 0.6038, hour_median_spread: 1.0, usable: false}}
+      spread_column_audit_note: "coverage — доля баров файла с записанным спредом; distinct/modal_share — вырожденность колонки; hour_median_spread — во сколько раз различаются часовые медианы (без этого колонка не различает окна, даже если значений много); usable — годится ли ею пользоваться"
+      spread_criterion_holds: NOT_MEASURED
+      spread_criterion_note: "ни по одному символу окна spread не записан хотя бы на 50% его баров (20+ штук, колонка не вырождена) — это пропуск поля, а не нулевой спред; спред внутри окна НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"
+      crossing_cost_fraction_of_hour_range: null
+      crossing_cost_driver: null
+      verdict: HYPOTHESIS
+      verdict_reasons:
+        - "вердикт HYPOTHESIS: 5 срабатываний <= 5 — при такой выборке арифметика (>= 1.2 против 0.919) не даёт права называть это доказательством, это анекдот про эти дни"
+        - "оговорка (вердикта не снижает): выборка 5 срабатываний < 10 — число срабатываний напечатано рядом"
+        - "оговорка (вердикта не снижает): порог 1.2 лежит внутри шумового коридора [0.42, 3.414] — вердикт зависит от порога, а не опирается на него"
+      action: neutral
+      action_reasons:
+        - "вердикт HYPOTHESIS при n=5 срабатываний: доказательства нет, входа не обещаем"
+        - "спред в окне не измерен (поле `spread` в ленте непокрывающее либо колонка вырождена), значит цена стояния в окне не подтверждена"
+      action_note: "verdict — статистика (держится ли предзарегистрированный критерий диапазона на этой выборке); action — исполнимость (можно ли это торговать). PASS по тишине никогда не бывает enter"
+      caveat: "предварительно: в записи лишь 5 срабатываний (несезонное окно: 5)"
+      per_symbol: {XAUUSD: {n_inside_bars: 5, n_base_bars: 86, ratio: 0.919}, XAGUSD: {n_inside_bars: 5, n_base_bars: 86, ratio: 0.806}, EURUSD: {n_inside_bars: 4, n_base_bars: 79, ratio: 1.704}, GBPUSD: {n_inside_bars: 4, n_base_bars: 79, ratio: 1.151}}
+      executability:
+        verdict: EXECUTABLE
+        bar_coverage_inside: 1.0
+        n_expected_slots: 18
+        n_present_bars: 18
+        n_occurrence_days_without_any_bars: 0
+        coverage_note: "доля слотов часа, которые окно требует, имеющих запись; в знаменателе только те дни срабатывания окна, по которым у символа есть хоть один бар (выходные и closures не размывают показатель, но учтены строкой n_occurrence_days_without_any_bars)"
+        dead_hour_slots_utc: []
+        sparse_hour_slots_utc: []
+        per_slot_fill: {00:00: {XAUUSD: "5/5", XAGUSD: "5/5", EURUSD: "4/4", GBPUSD: "4/4"}}
+        spread:
+          unit_note: "spread лента пишет в точках; точка — из digits реестра символов (XAUUSD: digits=2 из реестра символов; XAGUSD: digits=3 из реестра символов; EURUSD: digits=5 из реестра символов; GBPUSD: digits=5 из реестра символов); перевод в цены нужен только тем, чтобы сравнить спред с шириной бара"
+          baseline: hour_matched_other_days
+          coverage_threshold: 0.5
+          min_spread_bars: 20
+          by_symbol: {EURUSD: {n_inside_bars: 4, n_background_bars: 79, spread_recorded: 0, spread_recorded_background: 2, spread_coverage_inside: 0.0, spread_coverage_background: 0.0253, median_points_inside: null, median_points_background: 19.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 4, modal_value: 19.0, modal_share: 0.9388, median_points: 19.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; лишь 4 различных значений; мод 19.0 занимает 94% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 0.0% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, GBPUSD: {n_inside_bars: 4, n_background_bars: 79, spread_recorded: 0, spread_recorded_background: 2, spread_coverage_inside: 0.0, spread_coverage_background: 0.0253, median_points_inside: null, median_points_background: 23.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 5, modal_value: 23.0, modal_share: 0.898, median_points: 23.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; мод 23.0 занимает 90% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 0.0% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, XAGUSD: {n_inside_bars: 5, n_background_bars: 86, spread_recorded: 4, spread_recorded_background: 83, spread_coverage_inside: 0.8, spread_coverage_background: 0.9651, median_points_inside: 29.5, median_points_background: 30.0, point_size: 0.001, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.896, distinct_values: 39, modal_value: 18.0, modal_share: 0.3008, median_points: 19.0, hour_median_spread: 1.889, usable: true, note: "колонка пригодна для сравнения окон"}, usable_column: true, note: "записанных спредов 4 внутри / 83 в базе: нужно >= 20 с обеих сторон — отношение не считается"}, XAUUSD: {n_inside_bars: 5, n_background_bars: 86, spread_recorded: 4, spread_recorded_background: 79, spread_coverage_inside: 0.8, spread_coverage_background: 0.9186, median_points_inside: 8.5, median_points_background: 8.0, point_size: 0.01, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.9175, distinct_values: 22, modal_value: 8.0, modal_share: 0.6038, median_points: 8.0, hour_median_spread: 1.0, usable: false, note: "колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы"}, usable_column: false, note: "колонка spread у этого символа вырождена (колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы) — отношением пользоваться нельзя, печатается только аудит колонки"}}
+          measurable_symbols: []
+          unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAGUSD", "XAUUSD"]
+          ratio_inside_vs_background: null
+          ratio_driver: null
+          crossing_cost_fraction_of_hour_range: null
+          crossing_cost_driver: null
+          note: "ни по одному символу окна spread не записан хотя бы на 50% его баров (20+ штук, колонка не вырождена) — это пропуск поля, а не нулевой спред; спред внутри окна НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"
+    measured_note: "перемерено scripts/windows_evidence.py на записи 2026-11-05; вердикт HYPOTHESIS (статистика) при n=5 срабатываний {'fixed': 5}; исполнимость EXECUTABLE, спред NOT_MEASURED (ratio=None, база hour_matched_other_days) -> action neutral"
+
+  - id: month_end_flows
+    local_name: "Конец месяца: расчёты и ребаланс"
+    scale: monthly
+    timezone_kind: local_anchored
+    season_region: us_eastern
+    anchor_local: "15:00–17:30 Нью-Йорк"
+    applies_to: [gold, silver, fx]
+    utc: {start_minute: 1140, end_minute: 1290}
+    utc_seasons:
+      dst: {start_minute: 1140, end_minute: 1290}   # 19:00–21:30 UTC = 15:00–17:30 EDT
+      std: {start_minute: 1200, end_minute: 1350}   # 20:00–22:30 UTC = 15:00–17:30 EST
+    rule:
+      kind: monthly_nth_trading_day_from_end
+      nth_from_end: 1
+    rule_note: >
+      «Trading day» теперь считает и праздники: 31 декабря и канун Рождества из
+      последнего торгового дня месяца исключены, иначе ребаланс приписывался бы дню,
+      где книги нет.
+    why: >
+      Последний рабочий день месяца — расчёты фондов, стрим MMF, опционные экспирации и
+      фиксинги; принудительный поток концентрируется в US-послеобеденные часы.
+    expected: >
+      Предзарегистрированная гипотеза — рост смещения в US-послеобедние часы последнего
+      дня месяца относительно тех же часов других дней.
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      op: ">="
+      value: 1.1
+      text: >
+        медиана |high-low|/mid внутри >= 1.1 x медиана той же скобки в другие дни
+        (записанные H1).
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      op: "<="
+      value: 1.5
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.5 x медиана ТЕХ ЖЕ часов в
+        другие дни (hour-matched, как и у диапазона). Окна с короткой реакцией держат предел 1.5
+        жёстче обычных: у них и издержка, и горизонт короче, поэтому 30 % расширения спреда съедают
+        большую долю стояния. Порог взят из констант движка, а не подогнан под измерение.
+    action: avoid
+    action_basis: >
+      avoid как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured:
+      source: ["agent_data/forward_bars/XAUUSD.json", "agent_data/forward_bars/XAGUSD.json", "agent_data/forward_bars/EURUSD.json", "agent_data/forward_bars/GBPUSD.json"]
+      generated_at: "2026-11-05"
+      timeframe: H1
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      baseline: hour_matched_other_days
+      symbols_measured: ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD"]
+      symbols_without_bars: ["USDJPY"]
+      n_inside_bars: 45
+      n_baseline_bars: 817
+      n_event_days: 5
+      n_event_days_by_season: {dst: 5, std: 0}
+      season_in_effect_at_measurement: std
+      median_rel_range_inside: 0.001384
+      median_rel_range_baseline: 0.000935
+      ratio: 1.481
+      ratio_noise_band_p10_p90: [0.672, 2.548]
+      ratio_within_symbol_median: 1.103
+      ratio_within_symbol_note: "объединённая медиана смешивает металлы и валюту; по-символьные отношения — вот здесь, критерий при этом остаётся на предзарегистрированном объединённом числе"
+      ratio_within_symbol_span: [0.729, 1.323]
+      ratio_vs_pooled_day_background: 0.695
+      ratio_vs_pooled_day_background_note: "искажённая база: общий фон суток смешивает день недели с часом суток; вердикт по ней не выносится"
+      criterion: ">= 1.1"
+      criterion_holds: PASS
+      # вторая критериальная линия: СПРЕД, а не только диапазон
+      spread_metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      spread_baseline: hour_matched_other_days
+      spread_criterion: "<= 1.5"
+      spread_ratio: null
+      spread_ratio_driver: null
+      median_spread_points_inside: null
+      median_spread_points_outside: null
+      n_spread_bars_inside: 0
+      n_spread_bars_outside: 0
+      spread_coverage_inside: null
+      spread_measurable_symbols: []
+      spread_unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAGUSD", "XAUUSD"]
+      spread_column_audit: {EURUSD: {coverage: 0.0245, distinct_values: 4, modal_share: 0.9388, hour_median_spread: null, usable: false}, GBPUSD: {coverage: 0.0245, distinct_values: 5, modal_share: 0.898, hour_median_spread: null, usable: false}, XAGUSD: {coverage: 0.896, distinct_values: 39, modal_share: 0.3008, hour_median_spread: 1.889, usable: true}, XAUUSD: {coverage: 0.9175, distinct_values: 22, modal_share: 0.6038, hour_median_spread: 1.0, usable: false}}
+      spread_column_audit_note: "coverage — доля баров файла с записанным спредом; distinct/modal_share — вырожденность колонки; hour_median_spread — во сколько раз различаются часовые медианы (без этого колонка не различает окна, даже если значений много); usable — годится ли ею пользоваться"
+      spread_criterion_holds: NOT_MEASURED
+      spread_criterion_note: "ни по одному символу окна spread не записан хотя бы на 50% его баров (20+ штук, колонка не вырождена) — это пропуск поля, а не нулевой спред; спред внутри окна НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"
+      crossing_cost_fraction_of_hour_range: null
+      crossing_cost_driver: null
+      verdict: HYPOTHESIS
+      verdict_reasons:
+        - "вердикт HYPOTHESIS: 5 срабатываний <= 5 — при такой выборке арифметика (>= 1.1 против 1.481) не даёт права называть это доказательством, это анекдот про эти дни"
+        - "оговорка (вердикта не снижает): выборка 5 срабатываний < 10 — число срабатываний напечатано рядом"
+        - "оговорка (вердикта не снижает): окно привязано к чужим часам, сегодня действует зимняя (std) половина скобки, а её геометрия (dst=5, std=0) — это не измерена ни разу: расписание на эти недели торгует расчётным сдвигом, а не измеренным"
+        - "оговорка (вердикта не снижает): порог 1.1 лежит внутри шумового коридора [0.672, 2.548] — вердикт зависит от порога, а не опирается на него"
+        - "оговорка (вердикта не снижает): книга в окне THIN_BOOK: покрытие баров 0.833, мёртвые часы []"
+      action: avoid
+      action_reasons:
+        - "книга в окне THIN_BOOK (покрытие 0.833, редкие часы ['21:00'])"
+      action_note: "verdict — статистика (держится ли предзарегистрированный критерий диапазона на этой выборке); action — исполнимость (можно ли это торговать). PASS по тишине никогда не бывает enter"
+      caveat: "предварительно: в записи лишь 5 срабатываний (летом 5, зимой 0)"
+      per_symbol: {XAUUSD: {n_inside_bars: 10, n_base_bars: 169, ratio: 0.729}, XAGUSD: {n_inside_bars: 11, n_base_bars: 172, ratio: 0.988}, EURUSD: {n_inside_bars: 12, n_base_bars: 238, ratio: 1.323}, GBPUSD: {n_inside_bars: 12, n_base_bars: 238, ratio: 1.218}}
+      executability:
+        verdict: THIN_BOOK
+        bar_coverage_inside: 0.8333
+        n_expected_slots: 54
+        n_present_bars: 45
+        n_occurrence_days_without_any_bars: 0
+        coverage_note: "доля слотов часа, которые окно требует, имеющих запись; в знаменателе только те дни срабатывания окна, по которым у символа есть хоть один бар (выходные и closures не размывают показатель, но учтены строкой n_occurrence_days_without_any_bars)"
+        dead_hour_slots_utc: []
+        sparse_hour_slots_utc: ["21:00"]
+        per_slot_fill: {19:00: {XAUUSD: "5/5", XAGUSD: "5/5", EURUSD: "4/4", GBPUSD: "4/4"}, 20:00: {XAUUSD: "5/5", XAGUSD: "5/5", EURUSD: "4/4", GBPUSD: "4/4"}, 21:00: {XAUUSD: "0/5", XAGUSD: "1/5", EURUSD: "4/4", GBPUSD: "4/4"}}
+        spread:
+          unit_note: "spread лента пишет в точках; точка — из digits реестра символов (XAUUSD: digits=2 из реестра символов; XAGUSD: digits=3 из реестра символов; EURUSD: digits=5 из реестра символов; GBPUSD: digits=5 из реестра символов); перевод в цены нужен только тем, чтобы сравнить спред с шириной бара"
+          baseline: hour_matched_other_days
+          coverage_threshold: 0.5
+          min_spread_bars: 20
+          by_symbol: {EURUSD: {n_inside_bars: 12, n_background_bars: 238, spread_recorded: 1, spread_recorded_background: 6, spread_coverage_inside: 0.0833, spread_coverage_background: 0.0252, median_points_inside: 3.0, median_points_background: 19.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 4, modal_value: 19.0, modal_share: 0.9388, median_points: 19.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; лишь 4 различных значений; мод 19.0 занимает 94% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 8.3% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, GBPUSD: {n_inside_bars: 12, n_background_bars: 238, spread_recorded: 1, spread_recorded_background: 6, spread_coverage_inside: 0.0833, spread_coverage_background: 0.0252, median_points_inside: 7.0, median_points_background: 23.0, point_size: 1e-05, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.0245, distinct_values: 5, modal_value: 23.0, modal_share: 0.898, median_points: 23.0, hour_median_spread: null, usable: false, note: "колонка не годится для сравнения окон: покрытие 2.5% < 50%; мод 23.0 занимает 90% баров; часовых медиан меньше двух — суточной структуры не видно"}, usable_column: false, note: "покрытие поля 8.3% < 50% — спред НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"}, XAGUSD: {n_inside_bars: 11, n_background_bars: 172, spread_recorded: 9, spread_recorded_background: 156, spread_coverage_inside: 0.8182, spread_coverage_background: 0.907, median_points_inside: 19.0, median_points_background: 19.0, point_size: 0.001, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.896, distinct_values: 39, modal_value: 18.0, modal_share: 0.3008, median_points: 19.0, hour_median_spread: 1.889, usable: true, note: "колонка пригодна для сравнения окон"}, usable_column: true, note: "записанных спредов 9 внутри / 156 в базе: нужно >= 20 с обеих сторон — отношение не считается"}, XAUUSD: {n_inside_bars: 10, n_background_bars: 169, spread_recorded: 8, spread_recorded_background: 157, spread_coverage_inside: 0.8, spread_coverage_background: 0.929, median_points_inside: 8.0, median_points_background: 8.0, point_size: 0.01, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.9175, distinct_values: 22, modal_value: 8.0, modal_share: 0.6038, median_points: 8.0, hour_median_spread: 1.0, usable: false, note: "колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы"}, usable_column: false, note: "колонка spread у этого символа вырождена (колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы) — отношением пользоваться нельзя, печатается только аудит колонки"}}
+          measurable_symbols: []
+          unmeasurable_symbols: ["EURUSD", "GBPUSD", "XAGUSD", "XAUUSD"]
+          ratio_inside_vs_background: null
+          ratio_driver: null
+          crossing_cost_fraction_of_hour_range: null
+          crossing_cost_driver: null
+          note: "ни по одному символу окна spread не записан хотя бы на 50% его баров (20+ штук, колонка не вырождена) — это пропуск поля, а не нулевой спред; спред внутри окна НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"
+    measured_note: "перемерено scripts/windows_evidence.py на записи 2026-11-05; вердикт HYPOTHESIS (статистика) при n=5 срабатываний {'dst': 5, 'std': 0}; исполнимость THIN_BOOK, спред NOT_MEASURED (ratio=None, база hour_matched_other_days) -> action avoid"
+
+  # COMEX: ЗОЛОТО И СЕРЕБРО РАЗДЕЛЕНЫ.
+  # Прежнее окно comex_metals_roll было одним на оба металла, с одной скобкой
+  # 14:00–16:00 UTC и с правилом дня «второй с конца рабочий день». Это неверно по
+  # обеим половинам: у золота и серебра COMEX РАЗНЫЕ последние торговые дни месяца и
+  # разные окончания американской сессии (у серебра торги ближнего контракта
+  # прекращаются заметно раньше, чем у золота), а 14:00–16:00 UTC — это 09:00–11:00 по
+  # Чикаго, то есть середина сессии, а не её конец, и к моменту остановки торгов окно
+  # уже закрывалось. Спред разведён на два окна с собственными локальными скобками.
+  # САМО ПРАВИЛО ДНЯ ОСТАЁТСЯ ГИПОТЕЗОЙ: регламент CME (окончание торгов ближнего
+  # контракта по золоту и по серебру) на этой машине не верифицирован — ни выпиской,
+  # ни импортированным календарём. Поэтому оба окна несут rule_status: hypothesis, а
+  # их measured: читается строго наоборот: это замер НЕ тех часов, а НЕ тех дат.
+  # Отношение и вердикт в блоке относятся к набору «второй с конца рабочий день»,
+  # который может быть просто неверным; пока день ролла не сверен с rulebook CME,
+  # никакое отношение по этим датам свидетельством о ролле не считается, каким бы
+  # красивым оно ни вышло.
+
+  - id: comex_gold_roll
+    local_name: "Ролл COMEX: золото (американская сессия до конца торгов)"
+    scale: monthly
+    timezone_kind: local_anchored
+    season_region: america_chicago
+    anchor_local: "09:00–13:00 Чикаго (американская сессия COMEX)"
+    rule_status: >
+      hypothesis — «второй с конца рабочий день» взято из прежней заметки и не
+      сверено с rulebook CME на этой машине
+    applies_to: [gold]
+    utc: {start_minute: 840, end_minute: 1080}
+    utc_seasons:
+      dst: {start_minute: 840, end_minute: 1080}    # 14:00–18:00 UTC = 09:00–13:00 CDT
+      std: {start_minute: 900, end_minute: 1140}    # 15:00–19:00 UTC = 09:00–13:00 CST
+    rule:
+      kind: monthly_nth_trading_day_from_end
+      nth_from_end: 2
+    why: >
+      Переток открытого интереса в дальний контракт, межконтрактный базис и окно
+      физической поставки — структурный поток, независимый от «настроений».
+    expected: >
+      Гипотеза без права называться свидетельством, пока день экспирации не сверен с
+      регламентом: повышенная активность американской сессии дня ролла относительно тех
+      же часов других дней.
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      op: ">="
+      value: 1.1
+      text: >
+        медиана |high-low|/mid внутри >= 1.1 x медиана той же скобки в другие дни
+        (записанные H1).
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      op: "<="
+      value: 1.3
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.3 x медиана ТЕХ ЖЕ часов в
+        другие дни (hour-matched, как и у диапазона). Окна с короткой реакцией держат предел 1.3
+        жёстче обычных: у них и издержка, и горизонт короче, поэтому 30 % расширения спреда съедают
+        большую долю стояния. Порог взят из констант движка, а не подогнан под измерение.
+    action: neutral
+    action_basis: >
+      neutral как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured:
+      source: ["agent_data/forward_bars/XAUUSD.json"]
+      generated_at: "2026-11-05"
+      timeframe: H1
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      baseline: hour_matched_other_days
+      symbols_measured: ["XAUUSD"]
+      symbols_without_bars: []
+      n_inside_bars: 20
+      n_baseline_bars: 341
+      n_event_days: 5
+      n_event_days_by_season: {dst: 5, std: 0}
+      season_in_effect_at_measurement: std
+      median_rel_range_inside: 0.005239
+      median_rel_range_baseline: 0.004519
+      ratio: 1.159
+      ratio_noise_band_p10_p90: [0.869, 1.526]
+      ratio_vs_pooled_day_background: 1.481
+      ratio_vs_pooled_day_background_note: "искажённая база: общий фон суток смешивает день недели с часом суток; вердикт по ней не выносится"
+      criterion: ">= 1.1"
+      criterion_holds: PASS
+      # вторая критериальная линия: СПРЕД, а не только диапазон
+      spread_metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      spread_baseline: hour_matched_other_days
+      spread_criterion: "<= 1.3"
+      spread_ratio: null
+      spread_ratio_driver: null
+      median_spread_points_inside: null
+      median_spread_points_outside: null
+      n_spread_bars_inside: 0
+      n_spread_bars_outside: 0
+      spread_coverage_inside: null
+      spread_measurable_symbols: []
+      spread_unmeasurable_symbols: ["XAUUSD"]
+      spread_column_audit: {XAUUSD: {coverage: 0.9175, distinct_values: 22, modal_share: 0.6038, hour_median_spread: 1.0, usable: false}}
+      spread_column_audit_note: "coverage — доля баров файла с записанным спредом; distinct/modal_share — вырожденность колонки; hour_median_spread — во сколько раз различаются часовые медианы (без этого колонка не различает окна, даже если значений много); usable — годится ли ею пользоваться"
+      spread_criterion_holds: NOT_MEASURED
+      spread_criterion_note: "ни по одному символу окна spread не записан хотя бы на 50% его баров (20+ штук, колонка не вырождена) — это пропуск поля, а не нулевой спред; спред внутри окна НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"
+      crossing_cost_fraction_of_hour_range: null
+      crossing_cost_driver: null
+      verdict: HYPOTHESIS
+      verdict_reasons:
+        - "вердикт HYPOTHESIS: 5 срабатываний <= 5 — при такой выборке арифметика (>= 1.1 против 1.159) не даёт права называть это доказательством, это анекдот про эти дни"
+        - "оговорка (вердикта не снижает): выборка 5 срабатываний < 10 — число срабатываний напечатано рядом"
+        - "оговорка (вердикта не снижает): окно привязано к чужим часам, сегодня действует зимняя (std) половина скобки, а её геометрия (dst=5, std=0) — это не измерена ни разу: расписание на эти недели торгует расчётным сдвигом, а не измеренным"
+        - "оговорка (вердикта не снижает): порог 1.1 лежит внутри шумового коридора [0.869, 1.526] — вердикт зависит от порога, а не опирается на него"
+      action: neutral
+      action_reasons:
+        - "вердикт HYPOTHESIS при n=5 срабатываний: доказательства нет, входа не обещаем"
+        - "спред в окне не измерен (поле `spread` в ленте непокрывающее либо колонка вырождена), значит цена стояния в окне не подтверждена"
+        - "действующая std-половина скобки не имеет ни одного измеренного срабатывания на записи"
+      action_note: "verdict — статистика (держится ли предзарегистрированный критерий диапазона на этой выборке); action — исполнимость (можно ли это торговать). PASS по тишине никогда не бывает enter"
+      caveat: "предварительно: в записи лишь 5 срабатываний (летом 5, зимой 0)"
+      per_symbol: {XAUUSD: {n_inside_bars: 20, n_base_bars: 341, ratio: 1.159}}
+      executability:
+        verdict: EXECUTABLE
+        bar_coverage_inside: 1.0
+        n_expected_slots: 20
+        n_present_bars: 20
+        n_occurrence_days_without_any_bars: 0
+        coverage_note: "доля слотов часа, которые окно требует, имеющих запись; в знаменателе только те дни срабатывания окна, по которым у символа есть хоть один бар (выходные и closures не размывают показатель, но учтены строкой n_occurrence_days_without_any_bars)"
+        dead_hour_slots_utc: []
+        sparse_hour_slots_utc: []
+        per_slot_fill: {14:00: {XAUUSD: "5/5"}, 15:00: {XAUUSD: "5/5"}, 16:00: {XAUUSD: "5/5"}, 17:00: {XAUUSD: "5/5"}}
+        spread:
+          unit_note: "spread лента пишет в точках; точка — из digits реестра символов (XAUUSD: digits=2 из реестра символов); перевод в цены нужен только тем, чтобы сравнить спред с шириной бара"
+          baseline: hour_matched_other_days
+          coverage_threshold: 0.5
+          min_spread_bars: 20
+          by_symbol: {XAUUSD: {n_inside_bars: 20, n_background_bars: 341, spread_recorded: 16, spread_recorded_background: 316, spread_coverage_inside: 0.8, spread_coverage_background: 0.9267, median_points_inside: 8.0, median_points_background: 8.0, point_size: 0.01, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.9175, distinct_values: 22, modal_value: 8.0, modal_share: 0.6038, median_points: 8.0, hour_median_spread: 1.0, usable: false, note: "колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы"}, usable_column: false, note: "колонка spread у этого символа вырождена (колонка не годится для сравнения окон: часовые медианы различаются всего в 1.0x — по колонке окна не различимы) — отношением пользоваться нельзя, печатается только аудит колонки"}}
+          measurable_symbols: []
+          unmeasurable_symbols: ["XAUUSD"]
+          ratio_inside_vs_background: null
+          ratio_driver: null
+          crossing_cost_fraction_of_hour_range: null
+          crossing_cost_driver: null
+          note: "ни по одному символу окна spread не записан хотя бы на 50% его баров (20+ штук, колонка не вырождена) — это пропуск поля, а не нулевой спред; спред внутри окна НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"
+    measured_note: "перемерено scripts/windows_evidence.py на записи 2026-11-05; вердикт HYPOTHESIS (статистика) при n=5 срабатываний {'dst': 5, 'std': 0}; исполнимость EXECUTABLE, спред NOT_MEASURED (ratio=None, база hour_matched_other_days) -> action neutral"
+
+  - id: comex_silver_roll
+    local_name: "Ролл COMEX: серебро (короче: торги прекращаются раньше золотых)"
+    scale: monthly
+    timezone_kind: local_anchored
+    season_region: america_chicago
+    anchor_local: "09:00–12:25 Чикаго (до остановки торгов ближнего контракта)"
+    rule_status: >
+      hypothesis — и день, и минута остановки торгов взяты из заметки/прессы и не
+      сверены с rulebook CME на этой машине
+    applies_to: [silver]
+    utc: {start_minute: 840, end_minute: 1045}
+    utc_seasons:
+      dst: {start_minute: 840, end_minute: 1045}    # 14:00–17:25 UTC = 09:00–12:25 CDT
+      std: {start_minute: 900, end_minute: 1105}    # 15:00–18:25 UTC = 09:00–12:25 CST
+    rule:
+      kind: monthly_nth_trading_day_from_end
+      nth_from_end: 2
+    why: >
+      У серебра и своя дата последнего торгов дня, и более ранняя остановка торгов, и
+      заметно более тонкая книга, чем у золота: держать их в одном окне означало
+      мерить серебро часами, когда его уже не торгуют, и золото — недомерять.
+    expected: >
+      Гипотеза без права называться свидетельством (см. rule_status).
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      op: ">="
+      value: 1.1
+      text: >
+        медиана |high-low|/mid внутри >= 1.1 x медиана той же скобки в другие дни
+        (записанные H1, только XAGUSD).
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      op: "<="
+      value: 1.3
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.3 x медиана ТЕХ ЖЕ часов в
+        другие дни (hour-matched, как и у диапазона). Окна с короткой реакцией держат предел 1.3
+        жёстче обычных: у них и издержка, и горизонт короче, поэтому 30 % расширения спреда съедают
+        большую долю стояния. Порог взят из констант движка, а не подогнан под измерение.
+    action: neutral
+    action_basis: >
+      neutral как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured:
+      source: ["agent_data/forward_bars/XAGUSD.json"]
+      generated_at: "2026-11-05"
+      timeframe: H1
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      baseline: hour_matched_other_days
+      symbols_measured: ["XAGUSD"]
+      symbols_without_bars: []
+      n_inside_bars: 20
+      n_baseline_bars: 340
+      n_event_days: 5
+      n_event_days_by_season: {dst: 5, std: 0}
+      season_in_effect_at_measurement: std
+      median_rel_range_inside: 0.010225
+      median_rel_range_baseline: 0.00857
+      ratio: 1.193
+      ratio_noise_band_p10_p90: [0.931, 1.486]
+      ratio_vs_pooled_day_background: 1.624
+      ratio_vs_pooled_day_background_note: "искажённая база: общий фон суток смешивает день недели с часом суток; вердикт по ней не выносится"
+      criterion: ">= 1.1"
+      criterion_holds: PASS
+      # вторая критериальная линия: СПРЕД, а не только диапазон
+      spread_metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      spread_baseline: hour_matched_other_days
+      spread_criterion: "<= 1.3"
+      spread_ratio: null
+      spread_ratio_driver: null
+      median_spread_points_inside: null
+      median_spread_points_outside: null
+      n_spread_bars_inside: 0
+      n_spread_bars_outside: 0
+      spread_coverage_inside: null
+      spread_measurable_symbols: []
+      spread_unmeasurable_symbols: ["XAGUSD"]
+      spread_column_audit: {XAGUSD: {coverage: 0.896, distinct_values: 39, modal_share: 0.3008, hour_median_spread: 1.889, usable: true}}
+      spread_column_audit_note: "coverage — доля баров файла с записанным спредом; distinct/modal_share — вырожденность колонки; hour_median_spread — во сколько раз различаются часовые медианы (без этого колонка не различает окна, даже если значений много); usable — годится ли ею пользоваться"
+      spread_criterion_holds: NOT_MEASURED
+      spread_criterion_note: "ни по одному символу окна spread не записан хотя бы на 50% его баров (20+ штук, колонка не вырождена) — это пропуск поля, а не нулевой спред; спред внутри окна НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"
+      crossing_cost_fraction_of_hour_range: null
+      crossing_cost_driver: null
+      verdict: HYPOTHESIS
+      verdict_reasons:
+        - "вердикт HYPOTHESIS: 5 срабатываний <= 5 — при такой выборке арифметика (>= 1.1 против 1.193) не даёт права называть это доказательством, это анекдот про эти дни"
+        - "оговорка (вердикта не снижает): выборка 5 срабатываний < 10 — число срабатываний напечатано рядом"
+        - "оговорка (вердикта не снижает): окно привязано к чужим часам, сегодня действует зимняя (std) половина скобки, а её геометрия (dst=5, std=0) — это не измерена ни разу: расписание на эти недели торгует расчётным сдвигом, а не измеренным"
+        - "оговорка (вердикта не снижает): порог 1.1 лежит внутри шумового коридора [0.931, 1.486] — вердикт зависит от порога, а не опирается на него"
+      action: neutral
+      action_reasons:
+        - "вердикт HYPOTHESIS при n=5 срабатываний: доказательства нет, входа не обещаем"
+        - "спред в окне не измерен (поле `spread` в ленте непокрывающее либо колонка вырождена), значит цена стояния в окне не подтверждена"
+        - "действующая std-половина скобки не имеет ни одного измеренного срабатывания на записи"
+      action_note: "verdict — статистика (держится ли предзарегистрированный критерий диапазона на этой выборке); action — исполнимость (можно ли это торговать). PASS по тишине никогда не бывает enter"
+      caveat: "предварительно: в записи лишь 5 срабатываний (летом 5, зимой 0)"
+      per_symbol: {XAGUSD: {n_inside_bars: 20, n_base_bars: 340, ratio: 1.193}}
+      executability:
+        verdict: EXECUTABLE
+        bar_coverage_inside: 1.0
+        n_expected_slots: 20
+        n_present_bars: 20
+        n_occurrence_days_without_any_bars: 0
+        coverage_note: "доля слотов часа, которые окно требует, имеющих запись; в знаменателе только те дни срабатывания окна, по которым у символа есть хоть один бар (выходные и closures не размывают показатель, но учтены строкой n_occurrence_days_without_any_bars)"
+        dead_hour_slots_utc: []
+        sparse_hour_slots_utc: []
+        per_slot_fill: {14:00: {XAGUSD: "5/5"}, 15:00: {XAGUSD: "5/5"}, 16:00: {XAGUSD: "5/5"}, 17:00: {XAGUSD: "5/5"}}
+        spread:
+          unit_note: "spread лента пишет в точках; точка — из digits реестра символов (XAGUSD: digits=3 из реестра символов); перевод в цены нужен только тем, чтобы сравнить спред с шириной бара"
+          baseline: hour_matched_other_days
+          coverage_threshold: 0.5
+          min_spread_bars: 20
+          by_symbol: {XAGUSD: {n_inside_bars: 20, n_background_bars: 340, spread_recorded: 15, spread_recorded_background: 304, spread_coverage_inside: 0.75, spread_coverage_background: 0.8941, median_points_inside: 18.0, median_points_background: 18.0, point_size: 0.001, ratio_inside_vs_background: null, crossing_cost_fraction_of_hour_range: null, spread_column: {coverage: 0.896, distinct_values: 39, modal_value: 18.0, modal_share: 0.3008, median_points: 19.0, hour_median_spread: 1.889, usable: true, note: "колонка пригодна для сравнения окон"}, usable_column: true, note: "записанных спредов 15 внутри / 304 в базе: нужно >= 20 с обеих сторон — отношение не считается"}}
+          measurable_symbols: []
+          unmeasurable_symbols: ["XAGUSD"]
+          ratio_inside_vs_background: null
+          ratio_driver: null
+          crossing_cost_fraction_of_hour_range: null
+          crossing_cost_driver: null
+          note: "ни по одному символу окна spread не записан хотя бы на 50% его баров (20+ штук, колонка не вырождена) — это пропуск поля, а не нулевой спред; спред внутри окна НЕ ИЗМЕРЕН, пропуски в медиану не подставлены"
+    measured_note: "перемерено scripts/windows_evidence.py на записи 2026-11-05; вердикт HYPOTHESIS (статистика) при n=5 срабатываний {'dst': 5, 'std': 0}; исполнимость EXECUTABLE, спред NOT_MEASURED (ratio=None, база hour_matched_other_days) -> action neutral"
+
+  - id: quarterly_expiry_witching
+    local_name: "Четвертная экспирация «трёх ведьм» (3-я пятница мар/июн/сен/дек)"
+    scale: monthly
+    timezone_kind: local_anchored
+    season_region: us_eastern
+    anchor_local: "15:00–17:00 Нью-Йорк"
+    applies_to: [fx, gold, silver]
+    utc: {start_minute: 1140, end_minute: 1260}
+    utc_seasons:
+      dst: {start_minute: 1140, end_minute: 1260}   # 19:00–21:00 UTC = 15:00–17:00 EDT
+      std: {start_minute: 1200, end_minute: 1320}   # 20:00–22:00 UTC = 15:00–17:00 EST
+    rule:
+      kind: monthly_nth_weekday
+      weekday: 4
+      nth: 3
+      months: [3, 6, 9, 12]
+    why: >
+      Квадратная экспирация фьючерсов и опционов на индексы США смещает дилерское
+      хеджирование; канал к нашему универсуму — доллар как бета риска и риск-аппетит,
+      а не прямая поставка по металлу.
+    expected: >
+      Предзарегистрированная гипотеза — повышенная активность в US-закрытие 3-й пятницы
+      квартала относительно тех же часов других дней.
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      op: ">="
+      value: 1.1
+      text: >
+        медиана |high-low|/mid внутри >= 1.1 x медиана той же скобки в другие дни
+        (записанные H1).
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      op: "<="
+      value: 1.3
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.3 x медиана ТЕХ ЖЕ часов в
+        другие дни (hour-matched, как и у диапазона). Окна с короткой реакцией держат предел 1.3
+        жёстче обычных: у них и издержка, и горизонт короче, поэтому 30 % расширения спреда съедают
+        большую долю стояния. Порог взят из констант движка, а не подогнан под измерение.
+    action: neutral
+    action_basis: >
+      neutral как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured: null
+    measured_note: "событий в записи: 1 — это анекдот, не выборка"
+
+  - id: msci_rebalance_effective
+    local_name: "Индексная ребалансировка MSCI (последний рабочий день фев/май/авг/ноя)"
+    scale: monthly
+    timezone_kind: local_anchored
+    season_region: us_eastern
+    anchor_local: "15:30–17:00 Нью-Йорк (заключительный аукцион)"
+    applies_to: [fx]
+    utc: {start_minute: 1170, end_minute: 1260}
+    utc_seasons:
+      dst: {start_minute: 1170, end_minute: 1260}   # 19:30–21:00 UTC = 15:30–17:00 EDT
+      std: {start_minute: 1230, end_minute: 1320}   # 20:30–22:00 UTC = 15:30–17:00 EST
+    rule:
+      kind: monthly_nth_trading_day_from_end
+      nth_from_end: 1
+      months: [2, 5, 8, 11]
+    why: >
+      Изменения состава индексов MSCI вступают в силу по закрытию последнего рабочего дня
+      квартальных обзорных месяцев; индексные фонды исполняют принудительный поток в
+      заключительный аукцион, что отдаётся в спросе на USD и в EM-ногах G10.
+    expected: >
+      Предзарегистрированная гипотеза — повышенное смещение/объём в US-закрытие этого дня.
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      op: ">="
+      value: 1.1
+      text: >
+        медиана |high-low|/mid внутри >= 1.1 x медиана той же скобки в другие дни
+        (записанные H1).
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      op: "<="
+      value: 1.3
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.3 x медиана ТЕХ ЖЕ часов в
+        другие дни (hour-matched, как и у диапазона). Окна с короткой реакцией держат предел 1.3
+        жёстче обычных: у них и издержка, и горизонт короче, поэтому 30 % расширения спреда съедают
+        большую долю стояния. Порог взят из констант движка, а не подогнан под измерение.
+    action: neutral
+    action_basis: >
+      neutral как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured: null
+    measured_note: "событий в записи: 1 — это анекдот, не выборка"
+
+  # ---------------- СОБЫТИЯ, У КОТОРЫХ ЕСТЬ ЧАСЫ, НО НЕТ ВЕРИФИЦИРОВАННОГО КАЛЕНДАРЯ.
+  # Скобка правильная, список дат пустой: ведомственный календарь на этой машине не
+  # импортирован и не сверен, а вписать даты «по памяти» — ровно тот перенос непроверенного
+  # утверждения, который доктрина запрещает. Такие окна НЕ срабатывают (валидатор требует
+  # inactive_reason) и печатаются в выводе отдельной строкой, чтобы расписание не
+  # выглядело полным, когда оно таково не является.
+
+  - id: ecb_decision
+    local_name: "Решение ЕЦБ (12:45 по Франкфурту стейтмент, 13:45 пресс)"
+    scale: monthly
+    timezone_kind: local_anchored
+    season_region: europe_frankfurt
+    anchor_local: "12:30–14:30 Франкфурт"
+    applies_to: [fx]
+    inactive_reason: >
+      Список дат заседаний Governing Council на 2026–2027 на этой машине не верифицирован
+      (календарь ЕЦБ не импортирован). Окно заведено ради скобки и останется инертным,
+      пока даты не будут внесены из опубликованного графика.
+    utc: {start_minute: 630, end_minute: 750}
+    utc_seasons:
+      dst: {start_minute: 630, end_minute: 750}   # CEST = UTC+2 -> 10:30–12:30 UTC
+      std: {start_minute: 690, end_minute: 810}   # CET  = UTC+1 -> 11:30–13:30 UTC
+    rule:
+      kind: dates
+      dates: []
+    why: >
+      Для EURUSD это релиз того же ранга, что FOMC, а для золота — второй по силе
+      канал реальных ставок в developed-мире. В прежнем расписании его не было вовсе:
+      календарь был «американский», хотя универсум окна — мажоры.
+    expected: >
+      Гипотеза: всплеск смещения в часы стейтмента и пресс-конференции относительно тех
+      же часов других дней.
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      op: ">="
+      value: 1.3
+      text: >
+        медиана |high-low|/mid внутри >= 1.3 x медиана той же скобки в другие дни
+        (записанные H1).
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      op: "<="
+      value: 1.3
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.3 x медиана ТЕХ ЖЕ часов в
+        другие дни (hour-matched, как и у диапазона). Окна с короткой реакцией держат предел 1.3
+        жёстче обычных: у них и издержка, и горизонт короче, поэтому 30 % расширения спреда съедают
+        большую долю стояния. Порог взят из констант движка, а не подогнан под измерение.
+    action: neutral
+    action_basis: >
+      neutral как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured: null
+    measured_note: "окно инертно: якорных дат в правиле нет. Список дат заседаний Governing Council на 2026–2027 на этой машине не верифицирован (календарь ЕЦБ не импортирован). Окно заведено ради скобки и останется инертным, пока даты не будут внесены из опубликованного графика."
+
+  - id: us_treasury_long_auctions
+    local_name: "Аукционы Treasury (13:00 ET, 10-летние и длинные ноги)"
+    scale: monthly
+    timezone_kind: local_anchored
+    season_region: us_eastern
+    anchor_local: "13:00–15:00 Нью-Йорк"
+    applies_to: [fx, gold, silver]
+    inactive_reason: >
+      График аукционов Минфина США (advance calendar, публикуется за месяц) на этой
+      машине не импортирован и не сверен; вписать «середину месяца на глаз» значит
+      выдать память за календарь.
+    utc: {start_minute: 1020, end_minute: 1140}
+    utc_seasons:
+      dst: {start_minute: 1020, end_minute: 1140}   # 17:00–19:00 UTC = 13:00–15:00 EDT
+      std: {start_minute: 1080, end_minute: 1200}   # 18:00–20:00 UTC = 13:00–15:00 EST
+    rule:
+      kind: dates
+      dates: []
+    why: >
+      Аукцион 10-летних и 30-летних выпусков в 13:00 ET задаёт кривую на остаток дня, а
+      через реальные ставки — цену золота; аукционы «канач» (13:00 ET) — то, что ломает
+      межрелизное затишье. В прежнем расписании этого события не было.
+    expected: >
+      Гипотеза: смещение в часы аукциона относительно тех же часов других дней.
+    criterion:
+      metric: median_abs_rel_range_ratio_inside_vs_hour_matched_outside
+      op: ">="
+      value: 1.1
+      text: >
+        медиана |high-low|/mid внутри >= 1.1 x медиана той же скобки в другие дни
+        (записанные H1).
+    # вторая критериальная линия окна: СПРЕД, то есть «чем тут торговать»,
+    # а не только «заметно ли движение».
+    spread_criterion:
+      metric: median_spread_points_ratio_inside_vs_hour_matched_outside
+      op: "<="
+      value: 1.3
+      text: >
+        медиана записанного лентой спреда внутри окна должна быть <= 1.3 x медиана ТЕХ ЖЕ часов в
+        другие дни (hour-matched, как и у диапазона). Окна с короткой реакцией держат предел 1.3
+        жёстче обычных: у них и издержка, и горизонт короче, поэтому 30 % расширения спреда съедают
+        большую долю стояния. Порог взят из констант движка, а не подогнан под измерение.
+    action: neutral
+    action_basis: >
+      neutral как авторское ожидание до замера; окончательное значение
+      выводит измерение (scripts/windows_evidence.py --apply сверяет его
+      с этим полем и переписывает, если они разошлись).
+    measured: null
+    measured_note: "окно инертно: якорных дат в правиле нет. График аукционов Минфина США (advance calendar, публикуется за месяц) на этой машине не импортирован и не сверен; вписать «середину месяца на глаз» значит выдать память за календарь."
