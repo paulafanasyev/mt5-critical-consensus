@@ -67,12 +67,23 @@ def _registry_by_key(config) -> dict:
 
 
 def _shared_login_word(census_rows: list[dict], key: str, account) -> str:
-    """One sentence for a login that answers from several windows: the chosen driver, or the block."""
-    owner = worker.shared_demo_driver(census_rows, key, account)[0]
-    if owner:
-        return (f"тот же демо-счёт, окно-водитель {owner} ({worker.DRIVER_ORDER}) — "
-                "входы идут; выбор записан событием `driver_chosen`")
-    return "входы по этому счёту закрыты"
+    """One sentence for a login that answers from several windows: the chosen driver, or the block.
+
+    The sentence has to say whether that driver can actually trade. `terminal_info().trade_allowed` is
+    the client-side ALGO TRADING button of the terminal: the park reads it and never touches it, so a
+    window with the button off means entries that look open and an order that dies on retcode 10027 —
+    which is a machine setting the operator flips, not a rule the park can work around.
+    """
+    owner, _rest, reason = worker.shared_demo_driver_choice(census_rows, key, account)
+    if not owner:
+        return "входы по этому счёту закрыты"
+    if reason == worker.DRIVER_NONE_ENABLED:
+        return (f"тот же демо-счёт, окно-водитель {owner} ({worker.DRIVER_ORDER}) — входы идут, "
+                "но алгоритмическое торговление не включено ни в одном окне этого счёта: это кнопка "
+                "ALGO TRADING в терминале, её включает только человек, парк её не обходит и не "
+                "обгоняет повторами; выбор записан событием `driver_chosen`")
+    return (f"тот же демо-счёт, окно-водитель {owner} ({worker.DRIVER_ORDER}) — в этом окне "
+            "алгоритмическое торговление включено, входы идут; выбор записан событием `driver_chosen`")
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -168,9 +179,16 @@ def cmd_terminals(args: argparse.Namespace) -> int:
     duplicates = worker.duplicated_accounts(rows)
     by_key = _registry_by_key(config)
     for key, dirs in sorted(duplicates.items()):
-        owner = worker.shared_demo_driver(rows, key, by_key.get(key))[0]
-        word = ("входы по этому счёту парк закрывает" if not owner else
-                f"окно-водитель названо ({worker.DRIVER_ORDER}): {owner}, входы идут")
+        owner, _rest, reason = worker.shared_demo_driver_choice(rows, key, by_key.get(key))
+        if not owner:
+            word = "входы по этому счёту парк закрывает"
+        elif reason == worker.DRIVER_NONE_ENABLED:
+            word = (f"окно-водитель названо ({worker.DRIVER_ORDER}): {owner}, входы идут, но "
+                    "алгоритмическое торговление не включено ни в одном окне этого счёта: кнопка "
+                    "ALGO TRADING в терминале, её включает только человек, парк её не обходит")
+        else:
+            word = (f"окно-водитель названо ({worker.DRIVER_ORDER}): {owner}, входы идут, "
+                    "алгоритмическое торговление в этом окне включено")
         print(f"\nВНИМАНИЕ: счёт {key} открыт в {len(dirs)} окнах: {', '.join(dirs)}."
               f" Свободные деньги у них общие: {word}.")
     blind = worker.blind_windows(rows)

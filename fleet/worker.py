@@ -51,10 +51,32 @@ ROSTER_PROBE_TIMEOUT_MS = 4000
 # somebody logs in. It holds no margin, so it is not a second driver. Anything else that cannot be
 # read — a silent process whose path the OS would not name, a probe that threw — is a blind spot.
 ROSTER_SILENT_ERROR = "-10005"
-# How a login that answers from several windows gets one named driver: the directory the registry
-# names for this account, and otherwise the first path in the casefolded sort. Said next to the
-# choice in the journal so the operator does not have to read the code to learn why this window.
-DRIVER_ORDER = "папка из реестра, иначе первая по casefold-сортировке пути"
+# How a login that answers from several windows gets one named driver: a window whose own terminal
+# reports algorithmic trading switched on comes first — among those the directory the registry names
+# for this account, otherwise the first path in the casefolded sort — and only when no window reports
+# itself enabled does the old order decide. Said next to the choice in the journal so the operator
+# does not have to read the code to learn why this window: measured 2026-11-05 the bare sort named
+# `c:\\mt5-exness`, whose ALGO TRADING button is off (retcode 10027 on every entry), while
+# `c:\\mt5-team` on the same demo login reports `terminal_info().trade_allowed = True`.
+DRIVER_ORDER = ("окно с включённым алгоритмическим торговлением: сначала папка из реестра, иначе "
+                "первая по casefold-сортировке пути; если не включено нигде — прежний порядок")
+# Why this window was named, written into the `driver_chosen` event: the registry folder reports
+# itself enabled, another enabled window did, or no window reported itself enabled and the old order
+# decided. The third is a machine setting only a human can change, so it is said, not retried.
+DRIVER_REGISTRY = "registry"
+DRIVER_ENABLED = "enabled"
+DRIVER_NONE_ENABLED = "none-enabled"
+# What the choice means for the money, said in the journal: the second window still spends the same
+# margin either way, and when nothing is enabled the order dies on the client-side switch, not on a
+# rule of the park.
+DRIVER_DETAIL = ("тот же демо-счёт отвечает ещё из одного окна: окно-водитель названо раз на процесс; "
+                 "в нём включено алгоритмическое торговление, ордера идут через копию из реестра, "
+                 "которую доказал attach(), и второе окно по-прежнему тратит ту же маржу")
+DRIVER_NONE_ENABLED_DETAIL = ("тот же демо-счёт отвечает ещё из одного окна, и ни в одном из них "
+                              "перепись не видела включённого алгоритмического торговления "
+                              "(кнопка ALGO TRADING в терминале): это машинная настройка, её включает "
+                              "человек, парк её не трогает и не обходит; входы открыты, но брокер "
+                              "ответит 10027, пока настройка выключена")
 # The choice is announced once per process, not once per cycle: it is a fact about the census, and the
 # book the operator reads does not need the same sentence every 36 seconds. Deliberately not a note in
 # the book — a park that restarted would then make the choice again and stay silent about it.
@@ -103,7 +125,8 @@ def scan_roster(paths: list[str] | None = None) -> list[dict]:
     rows: list[dict] = []
     for exe in sorted(paths, key=str.lower):
         row = {"exe": exe, "dir": window_dir(exe), "login": None, "server": "",
-               "currency": "", "balance": None, "equity": None, "trade_mode": None, "error": ""}
+               "currency": "", "balance": None, "equity": None, "trade_mode": None,
+               "trade_allowed": None, "error": ""}
         if not str(exe).strip():
             # Win32_Process hides ExecutablePath from another user's or an elevated session. An
             # empty path is not "no terminal": initialize(path="") means the default registered
@@ -129,6 +152,11 @@ def scan_roster(paths: list[str] | None = None) -> list[dict]:
                 # that name the same login but disagree about this are not one account answered
                 # twice, and the gate below compares modes rather than trusting the registry label.
                 row["trade_mode"] = getattr(account, "trade_mode", None)
+                # Whether this window would take an order at all: the terminal's own ALGO TRADING
+                # button, read-only. None means the window did not name it, which is not a claim that
+                # it is off — it is only the absence of a reason to prefer it as the driver.
+                allowed = getattr(window, "trade_allowed", None) if window is not None else None
+                row["trade_allowed"] = None if allowed is None else bool(allowed)
                 row["currency"] = str(getattr(account, "currency", "") or "")
                 if row["login"] is None:
                     row["error"] = "терминал открыл канал, но не назвал счёт"
@@ -216,36 +244,85 @@ def shared_windows_agree(group: list[dict]) -> bool:
     return all(window_dir(str(row.get("dir") or row.get("exe") or "")) for row in group)
 
 
-def choose_driver_window(group: list[dict], registry_dir: str = "") -> tuple[str, list[str]]:
-    """Name the driver of record among windows that share one account, and the rest.
+def window_trade_allowed(row: dict) -> bool:
+    """Whether THIS window reports algorithmic trading switched on, in the terminal's own words.
+
+    `terminal_info().trade_allowed` is the client-side ALGO TRADING button: a machine setting the
+    operator flips, which the park only reads and never touches. An unmeasured row — a census written
+    before the field existed, or a window that answered without naming its terminal — reads as "not
+    seen enabled": that loses the preference and nothing else, because refusing entries over a button
+    would be the park closing its own door on a setting it cannot see from inside.
+    """
+    return bool(row.get("trade_allowed"))
+
+
+def enabled_driver_dirs(group: list[dict]) -> list[str]:
+    """Folders of the windows in one group that report themselves allowed to trade, casefolded sort."""
+    return sorted({window_dir(str(row.get("dir") or row.get("exe") or ""))
+                   for row in group if window_trade_allowed(row)} - {""})
+
+
+def driver_window_choice(group: list[dict],
+                         registry_dir: str = "") -> tuple[str, list[str], str]:
+    """Name the driver of record among windows that share one account, the rest, and why this one.
 
     Deterministic by construction, because a choice that flipped between cycles would move the orders
-    between two API sessions on one balance: the directory the registry names for this account wins —
-    that is the copy `attach()` proves before anything is sent — and otherwise the casefolded path
-    sort decides, first wins, same answer every cycle for the same field.
+    between two API sessions on one balance: a window whose terminal reports algorithmic trading
+    enabled comes first — a driver that cannot send an order only parks the account on retcode 10027,
+    which is what the bare sort did on 2026-10-30 — and among those the directory the registry names
+    for this account wins, that being the copy `attach()` proves before anything is sent, otherwise
+    the casefolded path sort decides, same answer every cycle for the same field.
+
+    When no window reports itself enabled the OLD order decides and says `none-enabled`: the park does
+    not get to blame a button it cannot read as off, so it keeps its entries and hands the operator
+    the one sentence he can act on, once per process, instead of retrying into the journal.
     """
     dirs = sorted({window_dir(str(row.get("dir") or row.get("exe") or "")) for row in group})
     dirs = [directory for directory in dirs if directory]
+    if not dirs:
+        return "", [], DRIVER_NONE_ENABLED
     named = window_dir(registry_dir)
-    owner = named if named in dirs else (dirs[0] if dirs else "")
-    return owner, [directory for directory in dirs if directory != owner]
+    enabled = enabled_driver_dirs(group)
+    if named in enabled:
+        owner, reason = named, DRIVER_REGISTRY
+    elif enabled:
+        owner, reason = enabled[0], DRIVER_ENABLED
+    else:
+        owner, reason = (named if named in dirs else dirs[0]), DRIVER_NONE_ENABLED
+    return owner, [directory for directory in dirs if directory != owner], reason
 
 
-def shared_demo_driver(rows: list[dict], key: str, account: Account | None) -> tuple[str, list[str]]:
-    """The window that drives a login several windows name, or ("", []) to keep the door shut.
+def choose_driver_window(group: list[dict], registry_dir: str = "") -> tuple[str, list[str]]:
+    """The driver of record and the rest, without the reason: the rule lives in `driver_window_choice`.
+    """
+    owner, rest, _reason = driver_window_choice(group, registry_dir)
+    return owner, rest
+
+
+def shared_demo_driver_choice(rows: list[dict], key: str,
+                              account: Account | None) -> tuple[str, list[str], str]:
+    """The window that drives a login several windows name, the rest, and why; ("", [], "") to block.
 
     Only demo money gets a chosen session: a real account never has one window picked for it silently,
     so an account that is real, missing from the registry, or sharing its field with a window nobody
-    could read answers with ("", []) and the caller keeps blocking.
+    could read answers with ("", [], "") and the caller keeps blocking. Which of the agreed windows
+    drives is `driver_window_choice`'s business: the one that can actually trade.
     """
     if account is None or account.is_real:
-        return "", []
+        return "", [], ""
     if blind_windows(rows):
-        return "", []
+        return "", [], ""
     group = windows_by_account(rows).get(key) or []
     if len(group) < 2 or not shared_windows_agree(group):
-        return "", []
-    return choose_driver_window(group, window_dir(str(account.data_dir)))
+        return "", [], ""
+    return driver_window_choice(group, window_dir(str(account.data_dir)))
+
+
+def shared_demo_driver(rows: list[dict], key: str, account: Account | None) -> tuple[str, list[str]]:
+    """The driver of record and the rest, without the reason: see `shared_demo_driver_choice`.
+    """
+    owner, rest, _reason = shared_demo_driver_choice(rows, key, account)
+    return owner, rest
 
 
 def _server_key(text) -> str:
@@ -704,8 +781,11 @@ class Worker:
         seen twice, not two drivers of two piles. What that leaves ambiguous is only "through which
         session do we act", and `attach()` settles that already by proving the registry's own copy
         before a single order. So a DEMO login that every window describes identically gets one window
-        named as its driver of record and keeps its entries; the operator reads the choice in the
-        journal (`driver_chosen`) instead of inferring it from a book that traded anyway.
+        named as its driver of record and keeps its entries; that window is the one whose terminal
+        reports algorithmic trading enabled, because a driver that cannot send an order is only a
+        taller refusal, and `none-enabled` says so once per process instead of retrying into the
+        journal; the operator reads the choice and its reason in the journal (`driver_chosen`)
+        instead of inferring it from a book that traded anyway.
 
         What still stands, with its wording unchanged: a real account — real money is never given a
         silently chosen session —, windows that disagree about the broker's mode or hide their folder,
@@ -723,6 +803,7 @@ class Worker:
         blind: list[str] = []
         reason = ""
         driver = ""
+        driver_reason = ""
         if rows is None:
             fingerprint = "no-census"
             reason = ("переписи окон этой машины нет (или она старше часа): непонятно, кто ещё "
@@ -737,8 +818,8 @@ class Worker:
             blind = sorted(str(row.get("dir") or row.get("exe") or "") or "<окно без пути>"
                            for row in blind_windows(rows))
             if others and not blind:
-                driver = shared_demo_driver(rows, account_key(account.login, account.server),
-                                            account)[0]
+                driver, _rest, driver_reason = shared_demo_driver_choice(
+                    rows, account_key(account.login, account.server), account)
             if others and not driver:
                 fingerprint = "|".join(others)
                 reason = (f"счёт {account.login}@{account.server} открыт ещё в {len(others)} окне "
@@ -764,7 +845,7 @@ class Worker:
             # would file two drivers as one. The driver sentence above is what lifts the door.
             if self.store.get_meta(key):
                 self.store.set_meta(key, "")
-            self._announce_driver(account, driver, others)
+            self._announce_driver(account, driver, others, driver_reason)
             return ""
         if self.store.get_meta(key):
             # Only a census that actually saw the field can lift the block, so the all-clear always
@@ -774,7 +855,8 @@ class Worker:
                              server=account.server, census="fresh")
         return ""
 
-    def _announce_driver(self, account: Account, owner: str, others: list[str]) -> None:
+    def _announce_driver(self, account: Account, owner: str, others: list[str],
+                         reason: str) -> None:
         """Write which window the park chose for a login that answers from several, once per process.
 
         Deliberately not a `meta` note: a note in the book would let the next start of this park make
@@ -782,18 +864,24 @@ class Worker:
         the decision rather than inferring it from a book that traded anyway. Keyed by the book as well
         as the account, so two stores in one process each get their own sentence, and re-announced
         within one process when the windows move and the choice moves with them.
+
+        The reason travels with the choice: `registry` when the registry's own folder reports
+        algorithmic trading enabled, `enabled` when a different enabled window won, `none-enabled`
+        when no window reported itself enabled and the old order decided. The last is the sentence the
+        operator can act on — ALGO TRADING is a button in someone else's terminal, so it is said once
+        per process rather than chased with retries the terminal refuses every time.
         """
         rest = sorted(d for d in others if d != owner)
-        fingerprint = "|".join([owner, *rest])
+        fingerprint = "|".join([owner, *rest, reason])
         note = (account.name, str(self.store.path))
         if _DRIVERS_ANNOUNCED.get(note) == fingerprint:
             return
         _DRIVERS_ANNOUNCED[note] = fingerprint
         self.store.event(account.name, "driver_chosen", window=owner, login=account.login,
                          server=account.server, others=rest, order=DRIVER_ORDER, mode="demo",
-                         detail="тот же демо-счёт отвечает ещё из одного окна: окно-водитель названо "
-                                "раз на процесс; ордера идут через копию из реестра, которую доказал "
-                                "attach(), и второе окно по-прежнему тратит ту же маржу")
+                         reason=reason, trade_allowed=reason != DRIVER_NONE_ENABLED,
+                         detail=DRIVER_DETAIL if reason != DRIVER_NONE_ENABLED else
+                         DRIVER_NONE_ENABLED_DETAIL)
 
     # --- position management ------------------------------------------------------------
     def _manage_positions(self, account: Account, day: risk.DayState, positions: list,

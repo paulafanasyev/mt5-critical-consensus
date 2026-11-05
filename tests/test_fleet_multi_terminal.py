@@ -925,12 +925,15 @@ def _forget_census(store: Store) -> None:
     store.set_meta(f"{worker.ROSTER_META_KEY}@{fleet_config.local_host()}", "")
 
 
-def _row(directory: str, login: int | None, server: str = "S", trade_mode=None) -> dict:
+def _row(directory: str, login: int | None, server: str = "S", trade_mode=None,
+        trade_allowed=None) -> dict:
     """One census row. `trade_mode` stays None unless a test says it: that is what a census written
-    before the field existed looks like, and the gate reads an unnamed mode as no agreement."""
+    before the field existed looks like, and the gate reads an unnamed mode as no agreement.
+    `trade_allowed` is the same story for the ALGO TRADING button of that window."""
     return {"exe": f"{directory}\\terminal64.exe", "dir": worker.window_dir(directory),
             "login": login, "server": server, "currency": "USD", "balance": 1000.0,
-            "equity": 1000.0, "trade_mode": trade_mode, "error": ""}
+            "equity": 1000.0, "trade_mode": trade_mode, "trade_allowed": trade_allowed,
+            "error": ""}
 
 
 class CensusMT5:
@@ -939,7 +942,8 @@ class CensusMT5:
     A window is given as `path: (login, server)` and may add a third element — the folder it
     actually reports. That crossing (we ask A, B answers) is measured behaviour of the API and the
     one thing the census must not paper over, so the fake cannot echo the requested path back. A
-    fourth element is the mode the broker names for that window.
+    fourth element is the mode the broker names for that window, a fifth whether that window has
+    algorithmic trading switched on (`terminal_info().trade_allowed`).
     """
 
     ACCOUNT_TRADE_MODE_REAL = 2
@@ -949,8 +953,9 @@ class CensusMT5:
         for path, value in windows.items():
             reported = value[2] if len(value) > 2 else path
             mode = value[3] if len(value) > 3 else None
+            allowed = value[4] if len(value) > 4 else None
             self.windows[worker.window_dir(path)] = (value[0], value[1],
-                                                     worker.window_dir(reported), mode)
+                                                     worker.window_dir(reported), mode, allowed)
         self.initialize_calls: list[dict] = []
         self.shutdowns = 0
         self.current: tuple | None = None
@@ -964,7 +969,8 @@ class CensusMT5:
         return (-10005, "IPC timeout")
 
     def terminal_info(self):
-        return types.SimpleNamespace(path=self.current[2] if self.current else "")
+        return types.SimpleNamespace(path=self.current[2] if self.current else "",
+                                     trade_allowed=self.current[4] if self.current else None)
 
     def account_info(self):
         login, server = (self.current[0], self.current[1]) if self.current else (None, "")
@@ -1321,6 +1327,166 @@ def test_the_census_records_the_mode_of_every_window_it_reads(tmp_path, monkeypa
     assert {row["dir"]: row["trade_mode"] for row in rows} == {
         "c:\\mt5-team": _REAL_MODE, "c:\\mt5-exness": _DEMO_MODE}
     assert not worker.shared_windows_agree(rows)  # one login, two modes: nobody chooses a session
+
+
+# --- the driver is the window that can actually trade -------------------------------------------
+#
+# Measured on this machine 2026-11-05: the rule of the previous commit named `c:\\mt5-exness` because it
+# sorts first, and that window answers `terminal_info().trade_allowed = False`; fourteen `entry_failed
+# ... autotrading disabled by client (retcode 10027)` later the park had opened nothing while
+# `c:\\mt5-team`, on the very same login, had the switch on. ALGO TRADING is a machine setting only a
+# human can change, so the park reads it, prefers a window that has it, says what it saw once, and
+# never tries to bypass or retry around it.
+
+def _algo_rows(*directories: str, enabled: tuple[str, ...] = ()) -> list[dict]:
+    """Windows naming one demo login, with the ALGO TRADING button on for the directories named."""
+    on = {worker.window_dir(directory) for directory in enabled}
+    return [_row(directory, 1, "S", trade_mode=_DEMO_MODE,
+                 trade_allowed=worker.window_dir(directory) in on) for directory in directories]
+
+
+def test_the_census_records_whether_a_window_is_allowed_to_trade(tmp_path, monkeypatch) -> None:
+    """The preference reads `terminal_info().trade_allowed` per window, and writes nothing anywhere."""
+    store = Store(tmp_path / "book.sqlite")
+    fake = CensusMT5({r"C:\mt5-exness": (114929502, "MetaQuotes-Demo", r"C:\mt5-exness",
+                                         _DEMO_MODE, True),
+                      r"C:\mt5-team": (114929502, "MetaQuotes-Demo", r"C:\mt5-team",
+                                       _DEMO_MODE, False)})
+    monkeypatch.setattr(worker, "mt5", fake)
+    monkeypatch.setattr(terminals, "running_terminals",
+                        lambda: [(1, r"C:\mt5-team\terminal64.exe"),
+                                 (2, r"C:\mt5-exness\terminal64.exe")])
+    rows = worker.refresh_roster(store)
+    assert {row["dir"]: row["trade_allowed"] for row in rows} == {
+        "c:\\mt5-team": False, "c:\\mt5-exness": True}
+    group = worker.windows_by_account(rows)[worker.account_key(114929502, "MetaQuotes-Demo")]
+    assert worker.enabled_driver_dirs(group) == ["c:\\mt5-exness"]
+
+
+def test_the_enabled_window_is_the_driver_when_the_first_cannot_trade(tmp_path, monkeypatch) -> None:
+    """The preference is the fix: `c:\\mt5-team` has the switch on, so `c:\\mt5-team` is named."""
+    account, runner, store, sent, snapshot, day, _spec = _gate(tmp_path, monkeypatch, [])
+    _census(store, _algo_rows(r"C:\mt5-exness", r"C:\mt5-team", enabled=(r"C:\mt5-team",)))
+    assert runner._second_window(account) == ""
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 1
+    assert sent == [1]
+    drivers = [json.loads(payload) for _, _, kind, payload in store.recent_events(30)
+               if kind == "driver_chosen"]
+    assert len(drivers) == 1
+    assert drivers[0]["window"] == "c:\\mt5-team"
+    assert drivers[0]["others"] == ["c:\\mt5-exness"]
+    assert drivers[0]["reason"] == worker.DRIVER_ENABLED
+    assert drivers[0]["trade_allowed"] is True
+
+
+def test_the_enabled_window_is_chosen_whatever_order_the_census_answered() -> None:
+    """Determinism still decides the choice: the enabled window wins from either end of the field."""
+    rows = _algo_rows(r"C:\mt5-exness", r"C:\mt5-team", enabled=(r"C:\mt5-team",))
+    assert (worker.choose_driver_window(rows, "")
+            == worker.choose_driver_window(list(reversed(rows)), "")
+            == ("c:\\mt5-team", ["c:\\mt5-exness"]))
+
+
+def test_the_enabled_window_wins_over_a_registry_folder_that_cannot_trade() -> None:
+    """Decided and pinned: an enabled window is named the driver even when the registry names the
+    disabled one, because a driver that cannot send an order is only a taller refusal.
+
+    The registry copy stays the session `attach()` proves and trades through — that is what the reason
+    `enabled` tells the operator: it is the registry's own window whose ALGO TRADING he has to switch
+    on. The registry folder keeps the choice when it is itself enabled, which is reason `registry` and
+    is pinned on the last line here.
+    """
+    account = make_account("a", 1, "S")
+    mine = worker.window_dir(str(account.data_dir))
+    other = _row(r"C:\mt5-z-team", 1, "S", trade_mode=_DEMO_MODE, trade_allowed=True)
+    rows = [other, _row(str(account.data_dir), 1, "S", trade_mode=_DEMO_MODE, trade_allowed=False)]
+    assert mine < other["dir"]  # so even the old bare sort named the registry folder first
+    assert worker.choose_driver_window(rows, mine) == (other["dir"], [mine])
+    assert worker.driver_window_choice(rows, mine)[2] == worker.DRIVER_ENABLED
+    rows = [other, _row(str(account.data_dir), 1, "S", trade_mode=_DEMO_MODE, trade_allowed=True)]
+    assert worker.driver_window_choice(rows, mine) == (mine, [other["dir"]], worker.DRIVER_REGISTRY)
+
+
+def test_the_gate_names_the_enabled_window_when_the_registry_copy_cannot_trade(
+        tmp_path, monkeypatch) -> None:
+    """The same decision reaches the journal while the park's own copy is in the field."""
+    account, runner, store, sent, snapshot, day, _spec = _gate(tmp_path, monkeypatch, [])
+    _census(store, [_row(r"C:\mt5-z-team", 1, "S", trade_mode=_DEMO_MODE, trade_allowed=True),
+                    _row(str(account.data_dir), 1, "S", trade_mode=_DEMO_MODE,
+                         trade_allowed=False)])
+    assert runner._second_window(account) == ""
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 1
+    assert sent == [1]
+    drivers = [json.loads(payload) for _, _, kind, payload in store.recent_events(30)
+               if kind == "driver_chosen"]
+    assert drivers[0]["window"] == "c:\\mt5-z-team"
+    assert drivers[0]["reason"] == worker.DRIVER_ENABLED
+    assert drivers[0]["others"] == []  # the park's own copy was never an "other" window
+
+
+def test_no_window_enabled_keeps_entries_and_names_the_machine_setting_once(
+        tmp_path, monkeypatch) -> None:
+    """Nothing to bypass: the door stays open, the switch is named, and the journal says it once.
+
+    A park that retried an order the terminal refuses into the journal every cycle would be the same
+    10027 noise this rule exists to explain, so the word rides on the once-per-process `driver_chosen`
+    and the old deterministic order keeps naming the driver.
+    """
+    account, runner, store, sent, snapshot, day, _spec = _gate(tmp_path, monkeypatch, [])
+    _census(store, _algo_rows(r"C:\mt5-exness", r"C:\mt5-team"))
+    assert runner._second_window(account) == ""
+    assert runner._try_entries(account, snapshot, [], day, 1.0) == 1
+    assert sent == [1]
+    drivers = [json.loads(payload) for _, _, kind, payload in store.recent_events(30)
+               if kind == "driver_chosen"]
+    assert len(drivers) == 1
+    assert drivers[0]["reason"] == worker.DRIVER_NONE_ENABLED
+    assert drivers[0]["trade_allowed"] is False
+    assert drivers[0]["window"] == "c:\\mt5-exness"  # the old order decides, unchanged
+    assert "ALGO TRADING" in drivers[0]["detail"]
+    for _ in range(3):
+        assert runner._second_window(account) == ""
+    assert worker.Worker(runner.config, store)._second_window(account) == ""
+    kinds = [kind for _, _, kind, _ in store.recent_events(30)]
+    assert kinds.count("driver_chosen") == 1  # more cycles, another Worker: one sentence
+    assert kinds.count("account_second_window") == 0
+
+
+def test_status_says_the_chosen_window_can_trade(tmp_path, monkeypatch, capsys) -> None:
+    """`status` names the window that can actually send, not merely the first path it saw."""
+    store = Store(tmp_path / "book.sqlite")
+    registry = tmp_path / "accounts.yaml"
+    registry.write_text(_TWO_WINDOWS, encoding="utf-8")
+    _census(store, [_row(r"C:\mt5-exness", 114929502, "MetaQuotes-Demo", trade_mode=_DEMO_MODE),
+                    _row(r"C:\mt5-team", 114929502, "MetaQuotes-Demo", trade_mode=_DEMO_MODE,
+                         trade_allowed=True)])
+    monkeypatch.setattr(worker, "scan_roster",
+                        lambda paths=None: pytest.fail("status must not probe terminals"))
+    fleet_cli.main(["--config", str(registry), "--store", str(tmp_path / "book.sqlite"), "status"])
+    out = capsys.readouterr().out
+    assert "окно-водитель c:\\mt5-team" in out
+    assert "алгоритмическое торговление включено" in out
+    assert "входы по этому счёту закрыты" not in out
+
+
+def test_status_names_the_machine_setting_when_no_window_can_trade(tmp_path, monkeypatch,
+                                                                   capsys) -> None:
+    """The one sentence the operator can act on: the terminal switch is off, and only he can flip it."""
+    store = Store(tmp_path / "book.sqlite")
+    registry = tmp_path / "accounts.yaml"
+    registry.write_text(_TWO_WINDOWS, encoding="utf-8")
+    _census(store, [_row(r"C:\mt5-exness", 114929502, "MetaQuotes-Demo", trade_mode=_DEMO_MODE,
+                         trade_allowed=False),
+                    _row(r"C:\mt5-team", 114929502, "MetaQuotes-Demo", trade_mode=_DEMO_MODE,
+                         trade_allowed=False)])
+    monkeypatch.setattr(worker, "scan_roster",
+                        lambda paths=None: pytest.fail("status must not probe terminals"))
+    fleet_cli.main(["--config", str(registry), "--store", str(tmp_path / "book.sqlite"), "status"])
+    out = capsys.readouterr().out
+    assert "окно-водитель c:\\mt5-exness" in out
+    assert "ALGO TRADING" in out
+    assert "входы по этому счёту закрыты" not in out
+    assert "парк закрывает" not in out
 
 
 
