@@ -406,6 +406,65 @@ def test_real_account_enables_live_trading_in_the_startup_file(tmp_path: pathlib
     assert "AllowLiveTrading=1" in _startup_lines(account)
 
 
+def test_provision_carries_the_broker_licence_and_addresses_into_the_copy(
+        tmp_path: pathlib.Path) -> None:
+    """A copy without `terminal.lic` is a generic terminal: it has no address to dial.
+
+    Measured 2026-11-05 on the park's GTC copies: assembled from hardlinks with `Config` deliberately
+    skipped, the window started, named "GTC Global SA (Pty) Ltd" in its own log header and wrote not
+    one `Network` line — and `initialize(login=...)` could not rescue it, because an unlicensed build
+    has no server list to look the name up in. Copying the licence and the address data (and nothing
+    that carries a login) is what makes a hardlinked skeleton a terminal OF a broker.
+    """
+    source = _source(tmp_path)
+    (source / "Config" / "terminal.lic").write_bytes(b"licence-of-this-broker")
+    (source / "Config" / "servers.dat").write_bytes(b"server-addresses")
+    (source / "Config" / "dnsperf.dat").write_bytes(b"dns-measurements")
+    (source / "Config" / "accounts.dat").write_bytes(b"a-saved-login-belongs-to-a-person")
+    account = Account(name="a", login=131, server="Broker-Live", mode="demo",
+                      terminal_source=source)
+
+    terminals.provision(account)
+
+    config_dir = account.data_dir / "config"
+    assert (config_dir / "terminal.lic").read_bytes() == b"licence-of-this-broker"
+    assert (config_dir / "servers.dat").read_bytes() == b"server-addresses"
+    assert (config_dir / "dnsperf.dat").read_bytes() == b"dns-measurements"
+    # The licence and the address book travel; a saved login never does.
+    assert not (config_dir / "accounts.dat").exists()
+
+
+def test_a_real_copy_never_inherits_another_terminals_saved_login(
+        tmp_path: pathlib.Path) -> None:
+    """A live account is not provisioned with somebody's credentials — it earns its own session.
+
+    Measured 2026-11-05: the copy of the registry's `gtc-real` entry, seeded from the operator's own
+    branded install, started, dialled `GTCGlobalSA-Server 2` and authorised as 52183174 with the
+    password inside that `accounts.dat` — real money, on an account the registry did not name, with
+    no order ever having passed the park's risk gates. A real account's session is written by its own
+    `password_env` login into its own folder, and the window restarted against that is the one state
+    MT5 keeps ALGO TRADING up in, so a borrowed login is both dangerous and unnecessary.
+    """
+    source = _source(tmp_path)
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    (seed / "accounts.dat").write_bytes(b"operators-live-login-and-password")
+    (seed / "settings.ini").write_bytes(b"harmless-window-layout")
+    account = Account(name="r", login=132, server="Broker-Live", mode="real",
+                      terminal_source=source, seed_config=seed)
+
+    terminals.provision(account)
+
+    config_dir = account.data_dir / "config"
+    assert not (config_dir / "accounts.dat").exists()
+    assert (config_dir / "settings.ini").read_bytes() == b"harmless-window-layout"
+
+    # Re-provisioning must not erase the session THIS account's own login left behind.
+    (config_dir / "accounts.dat").write_bytes(b"this-accounts-own-session")
+    terminals.provision(account)
+    assert (config_dir / "accounts.dat").read_bytes() == b"this-accounts-own-session"
+
+
 def test_provision_refreshes_binaries_replaced_at_source(tmp_path: pathlib.Path,
                                                          monkeypatch) -> None:
     source = _source(tmp_path)

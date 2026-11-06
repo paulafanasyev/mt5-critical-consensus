@@ -372,6 +372,29 @@ def spread_within_stop(spec: BrokerSymbol, stop_distance: float,
     return ticks <= stop_distance * max_fraction
 
 
+# Замер 2026-11-05 вечером на живом GTC (52183174, XAUUSD, `trade_stops_level = 150` = 1.50 цены):
+# приказ со стопом в 1.60 ниже bid сервер отверг `invalid stops (10016)`, а `order_check` ровно той
+# же геометрии в ту же минуту ответил «проверка пройдена». Разница — круг пути: уровень сервер меряет
+# от bid того момента, когда приказ до него дошёл, а золото за секунды делает 0.10–0.30 цены. Стоп с
+# запасом в 20 пункта сверх заявленного уровня этот же приказ принял (лот 363922616 открыт с 1.70).
+STOP_MOVEMENT_POINTS = 20
+
+
+def min_level_distance(spec: BrokerSymbol, spread: float) -> float:
+    """The narrowest distance either level may hang from the price the fill pays, on this broker.
+
+    Two costs the published `trade_stops_level` does not carry. The server judges a long's levels by
+    the bid while the fill pays the ask, so the plan pays the spread before it starts measuring; and
+    it judges them at the moment the order arrives, not the moment the plan was made, so a level
+    parked exactly on the minimum is a level the next tick can cross — which is a rejection after
+    the money is already in flight. The margin buys the round trip.
+    """
+    if spec.point <= 0:
+        return 0.0
+    level = (max(int(spec.stops_level), 0) + STOP_MOVEMENT_POINTS) * spec.point
+    return level + max(float(spread), 0.0)
+
+
 def open_positions(symbol_name: str | None = None, magic: int | None = None) -> list[Any]:
     positions = mt5.positions_get(symbol=symbol_name) if symbol_name else mt5.positions_get()
     if positions is None:

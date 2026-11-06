@@ -91,8 +91,9 @@ def trend_signal(account: Account, base_symbol: str) -> Signal | None:
         return None
     last_close = float(bars[-1]["close"])
     fast = broker.ema(spec.name, mt5.TIMEFRAME_H1, 21)
-    stop_distance = atr * account.risk.stop_atr
-    take_distance = atr * _take_atr(account)
+    floor = broker.min_level_distance(spec, ask - bid)
+    stop_distance = max(atr * account.risk.stop_atr, floor)
+    take_distance = max(atr * _take_atr(account), floor)
     if direction == "up":
         if last_close < fast:
             return None
@@ -122,8 +123,9 @@ def breakout_signal(account: Account, base_symbol: str, lookback: int = 24) -> S
     low = min(float(row["low"]) for row in window)
     close = float(bars[-1]["close"])
     direction = _trend(spec.name)
-    stop_distance = atr * account.risk.stop_atr
-    take_distance = atr * _take_atr(account)
+    floor = broker.min_level_distance(spec, ask - bid)
+    stop_distance = max(atr * account.risk.stop_atr, floor)
+    take_distance = max(atr * _take_atr(account), floor)
     if close > high and direction == "up":
         price = _side_price(bid, ask, "buy")
         return Signal(base_symbol, "buy", f"пробой {lookback}-часового максимума",
@@ -135,14 +137,55 @@ def breakout_signal(account: Account, base_symbol: str, lookback: int = 24) -> S
     return None
 
 
-KINDS = {"trend": trend_signal, "breakout": breakout_signal}
+def pullback_signal(account: Account, base_symbol: str) -> Signal | None:
+    """Ждём откат к EMA21 внутри тренда, а не гонимся за уехавшей ценой.
+
+    «Тренд вверх, цена над EMA21» покупает на ноже: после резкого часа EMA21 отстаёт и цена ещё
+    над ней, хотя весь день идёт вниз. Здесь вход только там, где текущий час уже коснулся EMA21 и
+    вернулся на свою сторону линии: в downtrend час бил вверх по EMA21 и закрылся под ней — шорт;
+    в uptrend час проваливался к EMA21 и вернулся над ней — лонг.
+    """
+    spec = broker.symbol(base_symbol)
+    if spec is None:
+        return None
+    atr = broker.atr(spec.name, mt5.TIMEFRAME_H1)
+    if atr <= 0:
+        return None
+    bid, ask = _prices(spec.name)
+    if not _passes_filters(account, spec, atr, ask):
+        return None
+    direction = _trend(spec.name)
+    if not direction:
+        return None
+    bars = mt5.copy_rates_from_pos(spec.name, mt5.TIMEFRAME_H1, 0, 2)
+    if bars is None or len(bars) < 2:
+        return None
+    current = bars[-1]
+    fast = broker.ema(spec.name, mt5.TIMEFRAME_H1, 21)
+    floor = broker.min_level_distance(spec, ask - bid)
+    stop_distance = max(atr * account.risk.stop_atr, floor)
+    take_distance = max(atr * _take_atr(account), floor)
+    if direction == "up":
+        if float(current["low"]) > fast or float(current["close"]) <= fast:
+            return None
+        price = _side_price(bid, ask, "buy")
+        return Signal(base_symbol, "buy", "тренд H4+H1 вверх, час откатился к EMA21 и вернулся над ней",
+                      price, price - stop_distance, price + take_distance, atr)
+    if float(current["high"]) < fast or float(current["close"]) >= fast:
+        return None
+    price = _side_price(bid, ask, "sell")
+    return Signal(base_symbol, "sell", "тренд H4+H1 вниз, час откатился к EMA21 и вернулся под неё",
+                  price, price + stop_distance, price - take_distance, atr)
+
+
+KINDS = {"trend": trend_signal, "breakout": breakout_signal, "pullback": pullback_signal}
 
 
 def signals(account: Account) -> list[Signal]:
     found: list[Signal] = []
     for base_symbol in account.symbols:
         for kind in account.strategy.kinds:
-            if kind == "trend" and "H4" not in account.strategy.timeframes:
+            if kind in ("trend", "pullback") and "H4" not in account.strategy.timeframes:
                 continue
             builder = KINDS.get(kind)
             if builder is None:

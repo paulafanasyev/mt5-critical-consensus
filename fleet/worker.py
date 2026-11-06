@@ -51,6 +51,16 @@ ROSTER_PROBE_TIMEOUT_MS = 4000
 # somebody logs in. It holds no margin, so it is not a second driver. Anything else that cannot be
 # read — a silent process whose path the OS would not name, a probe that threw — is a blind spot.
 ROSTER_SILENT_ERROR = "-10005"
+# A restarted portable terminal is not instant: measured 2026-11-05 on a real GTC copy, its log ran
+# "full recompilation" for 79 s (131 files) before the window answered anything, and the session
+# authorisation lands inside that window. This is the ceiling on one recovery of the ALGO TRADING
+# switch, not a poll interval.
+_ALGO_RESTART_SECONDS = 150.0
+# How many times a window that answers with the switch down is restarted for one attach. Measured
+# sequence (2026-11-05): the API login writes the session, the restart after it comes back up. More
+# than two passes is a broker or a terminal that is not going to change in this cycle, and the park
+# says so instead of spending the account's cycle on a loop.
+_ALGO_RESTART_PASSES = 2
 # How a login that answers from several windows gets one named driver: a window whose own terminal
 # reports algorithmic trading switched on comes first — among those the directory the registry names
 # for this account, otherwise the first path in the casefolded sort — and only when no window reports
@@ -485,6 +495,18 @@ def roster_rows(store: Store, *, now: float | None = None) -> list[dict] | None:
     return rows
 
 
+def algo_enabled() -> bool:
+    """Whether the window we are attached to reports its ALGO TRADING switch up.
+
+    This is the terminal's own word (`terminal_info().trade_allowed`), read after a successful
+    initialize. A window with it down is a reader, not a driver: it refuses orders, and the park's
+    driver gate already treats it as not enabled — the attach path now says so too, in the same words
+    the census uses.
+    """
+    info = mt5.terminal_info()
+    return bool(info is not None and getattr(info, "trade_allowed", False))
+
+
 def answered_by(account: Account) -> tuple[bool, str]:
     """Is the terminal that answered to initialize() the one this account owns?
 
@@ -513,6 +535,19 @@ class Worker:
         self.allow_live = allow_live
 
     # --- connection ---------------------------------------------------------------------
+    @staticmethod
+    def _init_kwargs(account: Account) -> dict:
+        """How this account is addressed: its own executable, and its own secret if it has one.
+
+        The password never comes from disk: `password_env` names an environment variable, and an
+        account without one is logged in by the session its own copy saved.
+        """
+        kwargs = {"path": str(account.terminal_exe), "timeout": 20000}
+        password = terminals.password_for(account)
+        if password:
+            kwargs.update(login=account.login, password=password, server=account.server)
+        return kwargs
+
     def prepare_cycle(self) -> None:
         """Take the census of running windows before anything is attached.
 
@@ -542,10 +577,7 @@ class Worker:
             terminals.provision(account)
         if terminals.running_pid(account) is None:
             terminals.launch(account)
-        password = terminals.password_for(account)
-        kwargs = {"path": str(account.terminal_exe), "timeout": 20000}
-        if password:
-            kwargs.update(login=account.login, password=password, server=account.server)
+        kwargs = self._init_kwargs(account)
         for attempt in range(3):
             if mt5.initialize(**kwargs):
                 break
@@ -585,7 +617,48 @@ class Worker:
             mt5.shutdown()
             return (f"несовпадение режима: в реестре {'real' if account.is_real else 'demo'}, "
                     f"у брокера {'real' if broker_real else 'demo'} — торговля запрещена")
+        # Measured 2026-11-05 on the park's own real GTC window: a terminal that was logged in
+        # through the API comes back with ALGO TRADING down — its log reads "automated trading is
+        # disabled because the account has been changed" and it rewrites our `[Experts] Enabled=1` to
+        # `Enabled=0`. Such a window answers every read and refuses every order, so accepting it as a
+        # driver would spend the cycle queueing commands that cannot leave. One restart is the
+        # measured cure: the login has already left a session for exactly this account in the copy's
+        # own Config, launch() re-asserts Enabled=1, and the window comes back self-authorised with
+        # the switch up.
+        if not algo_enabled():
+            return self._restore_algo(account)
         return ""
+
+    def _restore_algo(self, account: Account) -> str:
+        """Restart this account's own window until the terminal reports algorithmic trading up.
+
+        Returns "" with the connection left open for the cycle, or the reason this window is not a
+        driver. Only this account's terminal is ever stopped — the census rule holds here as it does
+        everywhere else in the park.
+        """
+        for _ in range(_ALGO_RESTART_PASSES):
+            self.detach()
+            terminals.stop(account)
+            time.sleep(2)
+            terminals.launch(account)
+            deadline = time.time() + _ALGO_RESTART_SECONDS
+            while time.time() < deadline:
+                if not mt5.initialize(**self._init_kwargs(account)):
+                    time.sleep(5)  # окно ещё перекомпилирует MQL5 и не отвечает по IPC
+                    continue
+                if algo_enabled():
+                    ok, detail = answered_by(account)
+                    if ok:
+                        return ""
+                    self.detach()
+                    return detail
+                # It answers and says the switch is down. Waiting inside this process cannot change
+                # that; only this window restarting against its own session can.
+                self.detach()
+                break
+        tail = " | ".join(terminals.last_log_lines(account, 3))
+        return (f"ALGO TRADING не поднялся после {_ALGO_RESTART_PASSES} перезапусков "
+                f"окна {account.data_dir}: {tail}")
 
     def detach(self) -> None:
         try:

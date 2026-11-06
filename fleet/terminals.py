@@ -26,6 +26,16 @@ WRITABLE_DIRS = ("config", "logs", "MQL5", "MQL5/Experts", "MQL5/Scripts", "prof
                  "Tester")
 # Session material a manual login leaves behind; copied from seed_config, cleared before every copy.
 _SEED_FILES = ("accounts.dat", "servers.dat", "srvsettings.dat", "settings.ini")
+# The same list for a live account, whose saved login is never carried anywhere: see
+# `_seed_saved_session`.
+_SESSION_FILES_WITHOUT_LOGIN = tuple(name for name in _SEED_FILES if name != "accounts.dat")
+# Broker identity, and it is not optional: `Config` is skipped as a directory, so a copy assembled
+# from hardlinks arrives with no `terminal.lic` and no server list. Measured 2026-11-05 on the park's
+# own GTC copies of a branded install — the window started, reported its broker in the header and
+# wrote not one `Network` line to its log: an unlicensed build is the generic MetaQuotes terminal, it
+# has no addresses to dial, and it cannot be told to by `initialize(login=...)` either. Copying these
+# three files (never `accounts.dat`) is what turns a hardlinked skeleton into a terminal of a broker.
+_BRAND_FILES = ("terminal.lic", "servers.dat", "dnsperf.dat")
 
 _PID_CACHE: dict[str, tuple[float, int | None]] = {}
 _CACHE_TTL = 15.0
@@ -103,10 +113,30 @@ def provision(account: Account, source: pathlib.Path | None = None,
     for relative in WRITABLE_DIRS:
         (target / relative).mkdir(parents=True, exist_ok=True)
     _seed_saved_session(account)
+    _brand_copy(account)  # after the seed: the install this copy is built from owns the identity
     write_startup_config(account)  # always ours: never a hardlinked copy of another account
     if current:
         fingerprint_file.write_text(current, encoding="utf-8")
     return target
+
+
+def _brand_copy(account: Account) -> None:
+    """Copy the broker's licence and address list into the copy's own `Config`.
+
+    These are our bytes, never links: `Config` is a directory the hardlink walk skips, so linking one
+    account's server list would make it the same inode as the install's, and the `terminal.ini`-style
+    files MT5 rewrites in place would then rewrite the operator's install through it.
+    """
+    source = pathlib.Path(account.terminal_source) / "Config"
+    target = account.data_dir / "config"
+    target.mkdir(parents=True, exist_ok=True)
+    for name in _BRAND_FILES:
+        candidate = source / name
+        if not candidate.is_file():
+            continue
+        destination = target / name
+        destination.unlink(missing_ok=True)
+        shutil.copy2(candidate, destination)
 
 
 def seed_status(account: Account) -> tuple[bool, str]:
@@ -154,12 +184,30 @@ def _seed_saved_session(account: Account) -> None:
     working login this portable directory already has and copy nothing back: the terminal then
     starts at a password prompt the park cannot answer, and every entry of that account is gone for
     the day. `seed_status` says the same thing to the operator before a launch.
+
+    A REAL account is never handed another terminal's saved login. Measured 2026-11-05: a copy of the
+    park's `gtc-real` entry, seeded from the operator's own branded install, started, dialled
+    `GTCGlobalSA-Server 2` and authorised as 52183174 with the password stored in that file — real
+    money on a live server, with the registry naming a different login and no order ever having asked
+    the park's risk gates. A live account's session is not provisioning material: it is something this
+    account earns by logging in with its own `password_env`, which measured to write the session into
+    this copy's own `Config` — and the window restarted against that is the one state MT5 leaves
+    ALGO TRADING up in. So for a real account `accounts.dat` is left exactly as it is found, including
+    when it is not found at all.
     """
     config_dir = account.data_dir / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     if not account.seed_config:
         return
     seed_dir = pathlib.Path(account.seed_config)
+    if not seed_dir.exists():
+        return
+    if account.is_real:
+        for pattern in _SESSION_FILES_WITHOUT_LOGIN:
+            candidate = seed_dir / pattern
+            if candidate.exists():
+                shutil.copy2(candidate, config_dir / pattern)
+        return
     if not (seed_dir / "accounts.dat").exists():
         return
     for pattern in _SEED_FILES:

@@ -306,16 +306,15 @@ def h1_ema_state(symbol: str) -> tuple[str, float] | None:
 
 
 STATE = ROOT / "agent_data" / "swarm_state.json"
-SYMBOL_CAP = {"XAUUSD": 0.10, "XAGUSD": 0.10, "EURUSD": 0.07, "GBPUSD": 0.07,
-              "USDJPY": 0.07, "AUDUSD": 0.07, "USDCHF": 0.07, "USDCAD": 0.07,
-              "NZDUSD": 0.07, "US500": 0.3, "UK100": 0.3, "US30": 0.3, "JPN225": 1.0}
+SYMBOL_CAP = {"XAUUSD": 0.03, "XAGUSD": 0.03, "EURUSD": 0.03, "GBPUSD": 0.03,
+              "USDJPY": 0.03, "AUDUSD": 0.03, "USDCAD": 0.03, "NZDUSD": 0.03}
 MAX_DRAWDOWN = 0.01      # close everything if the account loses 1% from the baseline
 PAUSE_SECONDS = 1800
 DOLLAR_STOP = 10.0       # absolute floor: never hold a position ten dollars under water
 STOP_RISK_FRACTION = 0.4 # ...but at least a fraction of the position's own risk
 SCALE_TRIGGER = 15.0     # one position is fifteen dollars up, add half again
-COOLDOWN_SECONDS = 1800  # after a stop, that symbol rests for half an hour
-MAX_ENTRIES_PER_HOUR = 3 # more than this on one symbol is churn, not trading
+COOLDOWN_SECONDS = 600   # a stopped symbol rests 10 minutes, so the swarm keeps trading
+MAX_ENTRIES_PER_HOUR = 999  # no hourly cap: if a setup pays, take it
 TRAIL_ARM = 5.0          # once a position is five dollars up, protect it
 GIVEBACK_FRACTION = 0.15 # close once a sixth of the peak profit is given back
 SCALE_TIERS = (15.0, 30.0, 50.0, 75.0)  # add half again at each of these
@@ -513,7 +512,7 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
         add = round(position.volume * 0.5, 2)
         if add <= 0:
             continue
-        cap = SYMBOL_CAP.get(position.symbol, 0.04)
+        cap = SYMBOL_CAP.get(position.symbol, 0.03)
         if swarm_exposure(position.symbol) + add > cap + 1e-9:
             levels[key] = level + 1
             continue
@@ -542,7 +541,9 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
         if position.magic in magics:
             current[str(position.ticket)] = position.symbol
     our_comments = {"dollar stop", "trail exit", "breaker", "parallel cleanup", "cap trim",
-                    "scale-in", "flatten", "orphan", "supervisor"}
+                    "scale-in", "flatten", "orphan", "supervisor",
+                    "peak-exit", "net-exit", "risk-5usd", "true-5usd", "fix-5usd", "breakeven",
+                    "fallback-exit", "cleanup", "risk-fix", "protect", "trail", "close-by-deal"}
     for ticket, symbol in known.items():
         if ticket in current:
             continue
@@ -558,7 +559,7 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
                 last_side = "BUY" if deals[-1].type == 1 else "SELL"
         except Exception:  # noqa: BLE001 - history is a nicety, never a reason to crash
             pass
-        if comment not in our_comments:
+        if comment not in our_comments and not comment.startswith(("[sl", "[tp")):
             cooldowns = state.setdefault("cooldowns", {})
             cooldowns[symbol] = max(cooldowns.get(symbol, 0.0), time.time() + 300)
             state["cooldowns"] = cooldowns
@@ -591,7 +592,7 @@ def manage_portfolio(mt5, magics: set[int], state: dict) -> None:
                                 "type_filling": mt5.ORDER_FILLING_FOK,
                                 "comment": "conflict"})
             continue
-        cap = SYMBOL_CAP.get(symbol, 0.04)
+        cap = SYMBOL_CAP.get(symbol, 0.03)
         total = sum(position.volume for position in positions)
         if total > cap + 1e-9:
             excess = total - cap

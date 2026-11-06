@@ -49,13 +49,19 @@ class FakeMT5:
     ACCOUNT_TRADE_MODE_REAL = 2
 
     def __init__(self, answering_dir: str | None, login: int, server: str,
-                 trade_mode: int = 0) -> None:
+                 trade_mode: int = 0, algo_up_from_launch: int = 0) -> None:
         self.answers_with = answering_dir
         self.login = login
         self.server = server
         self.trade_mode = trade_mode
         self.initialize_calls: list[dict] = []
         self.shutdowns = 0
+        # Measured 2026-11-05 on a real window: the terminal reports ALGO TRADING down for the
+        # lifetime of the process that changed its account, and up again in a window that started
+        # from the session that login left behind. `launches` counts the starts the fake has seen, so
+        # a test says which start number begins reporting the switch up.
+        self.algo_up_from_launch = algo_up_from_launch
+        self.launches = 0
 
     def initialize(self, **kwargs) -> bool:
         self.initialize_calls.append(kwargs)
@@ -70,7 +76,8 @@ class FakeMT5:
     def terminal_info(self):
         if self.answers_with is None:
             return None
-        return types.SimpleNamespace(path=self.answers_with)
+        return types.SimpleNamespace(path=self.answers_with,
+                                     trade_allowed=self.launches >= self.algo_up_from_launch)
 
     def account_info(self):
         return types.SimpleNamespace(login=self.login, server=self.server,
@@ -175,6 +182,60 @@ def test_attach_still_refuses_a_mode_that_the_registry_gets_wrong(tmp_path, flee
 
 
 # --- no killing for room ---------------------------------------------------------------------
+
+# --- ALGO TRADING: a window with the switch down is not a driver --------------------------------
+
+def _algo_engine(fleet, monkeypatch, account: Account, algo_up_from_launch: int):
+    """A worker attached to a fake terminal that reports the switch down until restart number N."""
+    store, events = fleet
+    engine = worker.Worker(FleetConfig(accounts=[account]), store)
+    fake = FakeMT5(str(account.data_dir), account.login, account.server, trade_mode=2,
+                   algo_up_from_launch=algo_up_from_launch)
+    monkeypatch.setattr(worker, "mt5", fake)
+    monkeypatch.setattr(worker.time, "sleep", lambda _seconds: None)
+    started = terminals.launch  # the fixture's recorder, before this test counts on top of it
+
+    def counting_launch(target, extra_args=()):
+        fake.launches += 1
+        return started(target, extra_args)
+
+    monkeypatch.setattr(terminals, "launch", counting_launch)
+    return store, events, engine, fake
+
+
+def test_attach_restarts_its_own_window_until_algo_trading_is_up(tmp_path, fleet,
+                                                                monkeypatch) -> None:
+    """A changed account meets a downed ALGO TRADING switch; restarting that window is the cure.
+
+    Measured 2026-11-05 on the park's real GTC copy: after `initialize(login=...)` the terminal's own
+    log reads «automated trading is disabled because the account has been changed» and it rewrites
+    `[Experts] Enabled=1` to `0`, so `trade_allowed` is False for the lifetime of that process. The
+    login does leave a session for exactly this account in the copy's own `Config`, and the window
+    restarted with it (launch() re-asserts Enabled=1) comes back self-authorised with the switch up —
+    which is the only way this account can be driven at all.
+    """
+    account = make_account("gtc", 888001, "GTC-Go", mode="real")
+    _store, events, engine, fake = _algo_engine(fleet, monkeypatch, account,
+                                                algo_up_from_launch=2)
+    assert engine.attach(account) == ""
+    assert events["launched"] == [str(account.terminal_exe)] * 2
+    assert events["stopped"] == [str(account.data_dir)]  # only this account's own window
+    assert events["killed"] == []
+
+
+def test_attach_refuses_a_window_that_keeps_algo_trading_down(tmp_path, fleet,
+                                                             monkeypatch) -> None:
+    """Restarting does not raise the switch: the account is reported, not traded through a reader."""
+    account = make_account("gtc", 888001, "GTC-Go", mode="real")
+    _store, events, engine, fake = _algo_engine(fleet, monkeypatch, account,
+                                                algo_up_from_launch=99)
+    error = engine.attach(account)
+    assert "ALGO TRADING" in error
+    assert events["launched"] == [str(account.terminal_exe)] * (1 + worker._ALGO_RESTART_PASSES)
+    assert events["stopped"] == [str(account.data_dir)] * worker._ALGO_RESTART_PASSES
+    assert fake.shutdowns > 0  # the window was released, not kept as a driver
+    assert events["killed"] == []
+
 
 def test_attaching_one_account_starts_its_terminal_and_touches_no_other(tmp_path, fleet, attach) -> None:
     store, events = fleet

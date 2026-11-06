@@ -528,3 +528,50 @@ def test_a_calculator_that_stays_silent_is_called_twice_and_reported_in_its_own_
     assert money == 0.0 and asked == [] and "нет лота" in why
 
 
+
+
+# --- the stop level the broker measures at the moment the order arrives ----------------------
+
+def test_a_stop_planned_at_the_published_minimum_is_a_stop_the_next_tick_crosses() -> None:
+    """GTC live, XAUUSD, 2026-11-05 evening: `order_check` of a stop 1.60 below the bid answers
+    «check passed», `order_send` of the same geometry answers `invalid stops (10016)`.
+
+    The level is measured from the bid *when the order arrives*, and gold makes 0.10–0.30 of price a
+    second, so a plan parked on the published minimum is a plan the round trip can cross. The floor
+    pays the spread (the fill pays ask, the server judges bid) and 20 points of movement.
+    """
+    gold = make_gold_spec(stops_level=150, spread=48)
+    assert broker.min_level_distance(gold, spread=0.48) == pytest.approx(1.50 + 0.20 + 0.48)
+    # A server naming no minimum still gets the round trip, and nothing is invented for it.
+    assert broker.min_level_distance(make_gold_spec(stops_level=0), 0.13) == pytest.approx(0.20 + 0.13)
+    assert broker.min_level_distance(make_gold_spec(stops_level=-5), 0.0) == pytest.approx(0.20)
+
+
+def test_a_signal_never_plans_a_level_the_guard_would_refuse(monkeypatch) -> None:
+    """Where the plan is made is where the broker's floor belongs: an ATR level on its own can sit
+    inside the distance the server publishes, and then the lot is billed for a geometry already refused.
+    """
+    account = make_account(stop_atr=1.6, take_atr=2.6)
+    account.strategy.min_atr_pct = 0.0
+    wide = make_gold_spec(stops_level=1500, spread=10)  # 15.0 цены минимума при спреде 0.10
+    bid, ask = 4119.95, 4120.05
+    tick = lambda name: types.SimpleNamespace(bid=bid, ask=ask)
+    monkeypatch.setattr(strategy.broker, "symbol", lambda name: wide)
+    monkeypatch.setattr(strategy.broker, "atr", lambda *a, **k: 5.0)
+    monkeypatch.setattr(strategy.broker, "ema",
+                        lambda name, tf, period: 4110.0 if period == 21 else 4100.0)
+    monkeypatch.setattr(strategy.broker.mt5, "symbol_info_tick", tick)
+    monkeypatch.setattr(strategy, "mt5", types.SimpleNamespace(
+        TIMEFRAME_H1=1, TIMEFRAME_H4=2, symbol_info_tick=tick,
+        copy_rates_from_pos=lambda *a, **k: [{"close": 4120.0}] * 3))
+
+    signal = strategy.trend_signal(account, "XAUUSD")
+
+    assert signal is not None
+    # 1.6 ATR alone is 8.0 and 2.6 ATR alone is 13.0 — both inside the 15.0 the server wants.
+    assert "стоп" in broker.stops_refusal(wide, True, bid, ask - 8.0, ask + 20.0)
+    assert "тейк" in broker.stops_refusal(wide, True, bid, ask - 20.0, ask + 13.0)
+    floor = broker.min_level_distance(wide, ask - bid)
+    assert signal.stop_distance == pytest.approx(floor)
+    assert signal.target - ask == pytest.approx(floor)
+    assert broker.stops_refusal(wide, True, bid, signal.stop, signal.target) == ""
