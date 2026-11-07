@@ -20,6 +20,23 @@ def test_yaml_configs_parse_to_objects():
         assert isinstance(data, dict), path.name
 
 
+def test_kill_switch_migration_defaults_to_active():
+    sql = (ROOT / "db" / "migrations" / "003_risk_controls.sql").read_text(encoding="utf-8")
+    # The safety property lives in the schema default, not only in bootstrap code.
+    assert "kill_switch_active BOOLEAN NOT NULL DEFAULT TRUE" in sql
+    assert "VALUES (TRUE, TRUE, 'system-bootstrap'" in sql
+
+
+def test_authorization_permission_tombstone_is_enforced_by_the_schema():
+    sql = (ROOT / "db" / "migrations" / "006_authorization_permissions.sql").read_text(encoding="utf-8")
+    assert "CREATE TABLE IF NOT EXISTS authorization_permissions" in sql
+    assert "permission_id TEXT PRIMARY KEY" in sql
+    assert "ON CONFLICT" not in sql  # the conflict handling lives in the parameterized query
+    repo = (ROOT / "src" / "critical_consensus" / "persistence.py").read_text(encoding="utf-8")
+    assert "INSERT INTO authorization_permissions" in repo
+    assert "ON CONFLICT (permission_id) DO NOTHING" in repo
+
+
 def test_agent_verdict_abstain_requires_formal_reason():
     schema = json.loads((ROOT / "schemas" / "agent_verdict_v2.schema.json").read_text(encoding="utf-8"))
     validator = Draft202012Validator(schema)

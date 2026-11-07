@@ -1,0 +1,86 @@
+# Реестр торговых счетов парка. Копируется в config/accounts.yaml и правится под себя.
+# Пароли НЕ хранятся здесь: только имя переменной окружения (password_env).
+# Неизвестный ключ — ошибка запуска: опечатка в риске не должна тихо менять риск.
+#
+# Обязательные поля: name, login, server, mode (demo|real).
+# network: vpn требует vpn_profile — путь к .ovpn.
+# currency_scale: 0.01 для центовых счетов (100000 «центов» = $1000), иначе не задавать.
+#
+# Счета с разных платформ живут в одном парке и в нескольких терминалах сразу: у каждого счёта
+# своя portable-папка и свой канал (pipe), поэтому брокеры не мешают друг другу. terminal_source —
+# установка именно того брокера, чей это счёт; если не указан, берётся C:\Program Files\MetaTrader 5.
+# Имена инструментов у брокеров разные (XAUUSDc, EURUSD.pro), поиск по суффиксу делается сам.
+# host — закрепление счёта за машиной: с другой машины он не подключается и не торгуется.
+
+accounts:
+  - name: demo-metaquotes
+    login: 114929502
+    server: MetaQuotes-Demo
+    mode: demo
+    enabled: true
+    network: direct
+    shard: 0
+    magic: 7000001
+    seed_config: C:\path\to\demo\config
+    symbols: [EURUSD, GBPUSD, USDJPY, XAUUSD]
+    strategy:
+      kinds: [trend]
+      timeframes: [H1, H4]
+      min_atr_pct: 0.0004
+      cooldown_minutes: 45
+    risk:
+      risk_per_trade_pct: 0.25
+      daily_stop_pct: 1.0
+      max_open_positions: 3
+      max_lots: 0.10
+      min_lots: 0.01
+
+  - name: exness-real
+    login: 12345678
+    server: BrokerX-Live
+    mode: real
+    enabled: false
+    network: vpn
+    vpn_profile: C:\path\to\profile.ovpn
+    shard: 1
+    magic: 7000002
+    password_env: EXNESS_REAL_PASSWORD
+    terminal_source: C:\Program Files\Exness MT5Real26
+    seed_config: C:\path\to\broker-x\config
+    symbols: [GBPUSD, EURUSD, XAUUSD]
+    strategy:
+      kinds: [trend]
+      timeframes: [H1, H4]
+      cooldown_minutes: 60
+    risk:
+      risk_per_trade_pct: 0.20
+      daily_stop_pct: 0.50
+      max_open_positions: 2
+      max_lots: 0.01
+      stop_atr: 1.8
+      take_atr: 2.2
+      take_atr_real: 1.6
+      break_even_atr: 0.4
+
+  - name: gtc-real
+    login: 12345679
+    server: BrokerY-Live
+    mode: real
+    enabled: false
+    network: direct
+    shard: 2
+    magic: 7000003
+    terminal_source: C:\Program Files\GTC Go MT5
+    symbols: [EURUSD, GBPUSD]
+    risk:
+      risk_per_trade_pct: 0.20
+      daily_stop_pct: 0.50
+      max_open_positions: 2
+      max_lots: 0.01
+
+portfolio:
+  max_total_risk_pct: 2.0
+  max_gold_lots: 0.30
+  max_usd_lots: 1.00
+  max_open_positions: 60
+  daily_stop_pct: 2.0

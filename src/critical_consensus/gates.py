@@ -2,10 +2,13 @@
 from __future__ import annotations
 from datetime import datetime, timezone
 import math
+import re
 import uuid
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from .audit import canonical_hash
+
+_AUTH_NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 
 
 def _now_utc() -> datetime:
@@ -13,14 +16,24 @@ def _now_utc() -> datetime:
 
 
 def _finite_float(value: Any) -> float | None:
-    """Return a finite float or None; NaN/inf must never pass a policy comparison."""
-    if isinstance(value, bool):
+    """Return a finite float or None.
+
+    Numeric strings and booleans are rejected rather than coerced: a policy or
+    evidence field that is not a JSON number must fail closed, not be interpreted.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
+    number = float(value)
     return number if math.isfinite(number) else None
+
+
+def _policy_bool(policy: Mapping[str, Any], key: str, *, default: bool,
+                 blockers: list[str]) -> bool:
+    value = policy.get(key, default)
+    if not isinstance(value, bool):
+        blockers.append(f"INVALID_POLICY_BOOLEAN:{key}")
+        return default
+    return value
 
 
 def _current_utc(now: datetime | None) -> datetime:
@@ -41,12 +54,34 @@ def _parse_time(value: str | datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _source_observed_at(source: Mapping[str, Any]) -> datetime | None:
+    """Absolute observation time; caller-declared ages are not trusted."""
+    value = source.get("observed_at")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
 def self_adversarial_pass(verdict: Mapping[str, Any], *, counterarguments: Sequence[str],
                           contradictions: Sequence[Mapping[str, Any]],
                           sources: Sequence[Mapping[str, Any]], now: datetime | None = None,
                           required_independent_sources: int = 2,
-                          news_or_rumor: bool = False) -> dict[str, Any]:
-    """Validate self-critique, source freshness, independent evidence and MNPI flags."""
+                          news_or_rumor: bool = False,
+                          min_source_credibility: float = 0.75,
+                          source_max_age_seconds: float = 900) -> dict[str, Any]:
+    """Validate self-critique, source freshness, independent evidence and MNPI flags.
+
+    The credibility floor and freshness ceiling are caller-policy values. A source
+    record may not supply its own ``min_credibility`` or an inflated TTL: freshness is
+    computed from an absolute ``observed_at`` against ``now``, never from a
+    self-declared ``age_seconds``.
+    """
     if not isinstance(verdict, Mapping):
         verdict = {}
     reasons: list[str] = []
@@ -67,18 +102,21 @@ def self_adversarial_pass(verdict: Mapping[str, Any], *, counterarguments: Seque
             invalid_source_seen = True
             continue
         credibility = _finite_float(source.get("credibility"))
-        min_credibility = _finite_float(source.get("min_credibility", 0.75))
-        age = _finite_float(source.get("age_seconds"))
+        observed = _source_observed_at(source)
+        age = (current - observed).total_seconds() if observed is not None else None
         ttl = _finite_float(source.get("ttl_seconds"))
-        if (not source.get("source_id") or credibility is None or min_credibility is None or age is None or ttl is None
-                or age < 0 or ttl <= 0 or credibility < min_credibility or age > ttl):
+        if (not source.get("source_id") or credibility is None or observed is None or age is None or ttl is None
+                or age < -30 or ttl <= 0 or credibility < min_source_credibility
+                or age > min(source_max_age_seconds, ttl)):
             invalid_source_seen = True
             continue
         valid_sources.append(source)
     if invalid_source_seen or not valid_sources:
         reasons.append("SOURCE_STALE_LOW_CREDIBILITY_OR_INVALID")
 
-    if news_or_rumor and len({s.get("independence_group", s.get("source_id")) for s in valid_sources}) < required_independent_sources:
+    if news_or_rumor is not True and news_or_rumor is not False:
+        reasons.append("NEWS_OR_RUMOR_FLAG_MISSING_OR_INVALID")
+    if news_or_rumor is True and len({s.get("independence_group", s.get("source_id")) for s in valid_sources}) < required_independent_sources:
         reasons.append("INSUFFICIENT_INDEPENDENT_FRESH_SOURCES")
     raw_confidence = _finite_float(verdict.get("confidence", 0.0))
     confidence = raw_confidence if raw_confidence is not None and 0 <= raw_confidence <= 1 else 0.0
@@ -98,7 +136,10 @@ def self_adversarial_pass(verdict: Mapping[str, Any], *, counterarguments: Seque
         normalized = "ABSTAIN" if not contradictions else "REJECT"
     else:
         normalized = supplied_verdict
-    if any(str(s.get("legal_tag", "")).upper() == "MNPI-SUSPECT" for s in sources if isinstance(s, Mapping)):
+    # Any tag in the MNPI family vetoes here too: the exact label "MNPI-SUSPECT" is not the
+    # only spelling an upstream feed may emit.
+    if any(str(s.get("legal_tag", "")).strip().upper().replace("_", "-").startswith("MNPI")
+           for s in sources if isinstance(s, Mapping)):
         normalized = "VETO"
         reasons.append("MNPI_SUSPECT_SOURCE_BLOCKED")
     return {
@@ -177,44 +218,256 @@ async def anonymized_peer_review(
 def challenge_resolution_loop(challenges: Sequence[Mapping[str, Any]],
                               resolver: Callable[[dict[str, Any], int], Mapping[str, Any]],
                               *, max_rounds: int = 3) -> dict[str, Any]:
-    """Resolve each challenge with bounded rounds; unresolved at the limit escalates."""
+    """Resolve challenges in at most three rounds and return both resolved and open records."""
     if max_rounds < 1 or max_rounds > 3:
         raise ValueError("max_rounds must be 1..3")
     transcript: list[dict[str, Any]] = []
+    resolved_challenges: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
     for original in challenges:
-        challenge = dict(original)
-        if challenge.get("status") in ("RESOLVED", "CLOSED"):
+        if not isinstance(original, Mapping):
+            unresolved.append({"status": "OPEN", "resolution_error": "INVALID_CHALLENGE_RECORD"})
             continue
+        challenge = dict(original)
+        challenge_id = str(challenge.get("challenge_id", "")).strip()
+        target_verdict_id = str(challenge.get("target_verdict_id", "")).strip()
+        challenge_type = str(challenge.get("challenge_type", "")).strip().upper()
+        refs = challenge.get("evidence_refs")
+        refs_valid = (
+            isinstance(refs, Sequence) and not isinstance(refs, (str, bytes))
+            and bool(refs) and all(isinstance(ref, str) and ref.strip() for ref in refs)
+        )
+        if not challenge_id or not target_verdict_id or not challenge_type or not refs_valid:
+            challenge["status"] = "OPEN"
+            challenge["resolution_error"] = "CHALLENGE_ID_TARGET_TYPE_OR_EVIDENCE_INVALID"
+            unresolved.append(challenge)
+            continue
+        if str(challenge.get("status", "")).upper() == "RESOLVED":
+            resolution_refs = challenge.get("resolution_evidence_refs")
+            if (isinstance(resolution_refs, Sequence) and not isinstance(resolution_refs, (str, bytes))
+                    and bool(resolution_refs) and all(isinstance(ref, str) and ref.strip() for ref in resolution_refs)):
+                resolved_challenges.append(challenge)
+            else:
+                challenge["status"] = "OPEN"
+                challenge["resolution_error"] = "PRE_RESOLVED_CHALLENGE_MISSING_RESOLUTION_EVIDENCE"
+                unresolved.append(challenge)
+            continue
+
         resolved = False
         for round_no in range(1, max_rounds + 1):
             try:
                 raw_response = resolver(dict(challenge), round_no)
-                response = dict(raw_response) if isinstance(raw_response, Mapping) else {"resolved": False, "error_code": "INVALID_RESOLVER_RESPONSE"}
+                response = dict(raw_response) if isinstance(raw_response, Mapping) else {
+                    "resolved": False, "error_code": "INVALID_RESOLVER_RESPONSE"
+                }
             except Exception as exc:
                 response = {"resolved": False, "error_code": f"RESOLVER_FAILED:{type(exc).__name__}"}
-            transcript.append({"challenge_id": challenge.get("challenge_id"), "round": round_no,
-                               "response": response})
-            if response.get("resolved") is True and response.get("evidence_refs"):
+            transcript.append({"challenge_id": challenge_id, "round": round_no, "response": response})
+            response_refs = response.get("evidence_refs")
+            valid_response_refs = (
+                isinstance(response_refs, Sequence) and not isinstance(response_refs, (str, bytes))
+                and bool(response_refs) and all(isinstance(ref, str) and ref.strip() for ref in response_refs)
+            )
+            if response.get("resolved") is True and valid_response_refs:
+                resolved_challenges.append({
+                    **challenge, "status": "RESOLVED",
+                    "resolution_evidence_refs": [str(ref) for ref in response_refs],
+                    "resolution_round": round_no,
+                    "resolution_summary": str(response.get("summary", "")).strip()[:2000],
+                })
                 resolved = True
                 break
             challenge["last_resolution_attempt"] = response
         if not resolved:
             challenge["status"] = "OPEN"
             unresolved.append(challenge)
+
     deadlock = bool(unresolved)
-    return {"status": "ESCALATE" if deadlock else "RESOLVED",
-            "open_challenges": unresolved, "transcript": transcript,
-            "max_rounds": max_rounds, "trade_allowed": False if deadlock else None}
+    return {
+        "status": "ESCALATE" if deadlock else "RESOLVED",
+        "resolved_challenges": resolved_challenges,
+        "open_challenges": unresolved,
+        "transcript": transcript,
+        "max_rounds": max_rounds,
+        "trade_allowed": False,
+    }
 
 
-def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, Any]:
-    """Conjunctive certainty checks. PASS forwards evidence to ChiefAgent only."""
+_VALID_CHALLENGE_TYPES = frozenset({
+    "DATA_CONTRADICTION", "SOURCE_WEAK", "STALE_DATA", "LOGIC_GAP",
+    "REGIME_MISMATCH", "CORRELATION_RISK",
+})
+
+
+def revalidate_review_evidence(payload: Mapping[str, Any], verdicts: Sequence[Mapping[str, Any]],
+                               *, min_reviewers_per_verdict: int = 2) -> dict[str, Any]:
+    """Recompute reviewer counts and open-challenge state from raw records.
+
+    The bridge must not be able to assert its own aggregates: a supplied
+    ``reviewer_count`` larger than the validated review records, a consensus score
+    detached from the verdicts, or an open challenge hidden from the ledger is a
+    trust-boundary violation. Callers overwrite their aggregates with these values.
+    """
+    blockers: list[str] = []
+    if (isinstance(min_reviewers_per_verdict, bool) or not isinstance(min_reviewers_per_verdict, int)
+            or min_reviewers_per_verdict < 1):
+        blockers.append("INVALID_REVIEWER_POLICY")
+        min_reviewers = 2
+    else:
+        min_reviewers = min_reviewers_per_verdict
+    if not isinstance(verdicts, Sequence) or isinstance(verdicts, (str, bytes)):
+        return {"blockers": sorted(set(blockers + ["VERDICTS_MISSING_OR_INVALID"])),
+                "reviewer_counts": {}, "open_challenges": None}
+
+    verdict_ids: set[str] = set()
+    verdict_authors: dict[str, str] = {}
+    for verdict in verdicts:
+        if not isinstance(verdict, Mapping):
+            blockers.append("VERDICT_RECORD_INVALID")
+            continue
+        verdict_id = str(verdict.get("verdict_id", "")).strip()
+        if not verdict_id or verdict_id in verdict_ids:
+            blockers.append("MISSING_OR_DUPLICATE_VERDICT_ID")
+        else:
+            verdict_ids.add(verdict_id)
+            author = str(verdict.get("agent_id", "")).strip()
+            if author:
+                verdict_authors[verdict_id] = author
+
+    reviewer_sets: dict[str, set[str]] = {verdict_id: set() for verdict_id in verdict_ids}
+    challenge_review_keys: set[tuple[str, str]] = set()
+    raw_reviews = payload.get("peer_reviews")
+    if not isinstance(raw_reviews, Sequence) or isinstance(raw_reviews, (str, bytes)) or not raw_reviews:
+        blockers.append("PEER_REVIEWS_MISSING_OR_INVALID")
+    else:
+        for review in raw_reviews:
+            if not isinstance(review, Mapping):
+                blockers.append("INVALID_PEER_REVIEW_RECORD")
+                continue
+            target = str(review.get("target_verdict_id", "")).strip()
+            alias = str(review.get("reviewer_alias", "")).strip()
+            stance = str(review.get("stance", "")).upper()
+            challenge_type = str(review.get("challenge_type", "")).upper()
+            refs = review.get("evidence_refs")
+            refs_ok = (isinstance(refs, Sequence) and not isinstance(refs, (str, bytes))
+                       and bool(refs) and all(str(ref).strip() for ref in refs))
+            if (target not in reviewer_sets or not alias or stance not in {"CONFIRM", "CHALLENGE"}
+                    or review.get("status") != "VALIDATED"
+                    or not str(review.get("argument", "")).strip() or not refs_ok
+                    or (stance == "CHALLENGE" and challenge_type not in _VALID_CHALLENGE_TYPES)):
+                blockers.append("INVALID_PEER_REVIEW_RECORD")
+                continue
+            if alias in reviewer_sets[target]:
+                blockers.append("DUPLICATE_PEER_REVIEWER_FOR_VERDICT")
+                continue
+            # A verdict author is never an independent reviewer of its own verdict.
+            if verdict_authors.get(target) == alias:
+                blockers.append(f"PEER_REVIEWER_IS_VERDICT_AUTHOR:{target}")
+                continue
+            reviewer_sets[target].add(alias)
+            if stance == "CHALLENGE":
+                challenge_review_keys.add((target, challenge_type))
+
+    reviewer_counts: dict[str, int] = {}
+    for verdict_id, aliases in reviewer_sets.items():
+        reviewer_counts[verdict_id] = len(aliases)
+        if len(aliases) < min_reviewers:
+            blockers.append(f"INSUFFICIENT_OR_INVALID_PEER_REVIEWS:{verdict_id}")
+    for verdict in verdicts:
+        if not isinstance(verdict, Mapping):
+            continue
+        verdict_id = str(verdict.get("verdict_id", "")).strip()
+        supplied = verdict.get("reviewer_count")
+        if not isinstance(supplied, bool) and isinstance(supplied, int) and verdict_id in reviewer_counts:
+            if supplied != reviewer_counts[verdict_id]:
+                blockers.append(f"REVIEWER_COUNT_DOES_NOT_MATCH_RECORDS:{verdict_id}")
+
+    open_challenges: list[str] | None = None
+    registered_challenges: set[tuple[str, str]] = set()
+    raw_ledger = payload.get("challenge_records")
+    if not isinstance(raw_ledger, Sequence) or isinstance(raw_ledger, (str, bytes)):
+        blockers.append("CHALLENGE_LEDGER_MISSING_OR_INVALID")
+    else:
+        seen_challenge_ids: set[str] = set()
+        derived_open: list[str] = []
+        for challenge in raw_ledger:
+            if not isinstance(challenge, Mapping):
+                blockers.append("CHALLENGE_LEDGER_HAS_INVALID_RECORDS")
+                continue
+            challenge_id = str(challenge.get("challenge_id", "")).strip()
+            target = str(challenge.get("target_verdict_id", "")).strip()
+            challenge_type = str(challenge.get("challenge_type", "")).upper()
+            status = str(challenge.get("status", "OPEN")).upper()
+            rounds = challenge.get("rounds")
+            refs = challenge.get("evidence_refs", [])
+            if (not challenge_id or challenge_id in seen_challenge_ids or target not in verdict_ids
+                    or not str(challenge.get("argument", "")).strip()
+                    or status not in {"OPEN", "RESOLVED", "ESCALATED"}
+                    or not isinstance(rounds, Sequence) or isinstance(rounds, (str, bytes))
+                    or len(rounds) > 3
+                    or not isinstance(refs, Sequence) or isinstance(refs, (str, bytes))):
+                blockers.append("CHALLENGE_LEDGER_HAS_INVALID_RECORDS")
+                continue
+            seen_challenge_ids.add(challenge_id)
+            registered_challenges.add((target, challenge_type))
+            resolution_refs = challenge.get("resolution_evidence_refs")
+            if status == "RESOLVED":
+                resolution_ok = (
+                    isinstance(resolution_refs, Sequence) and not isinstance(resolution_refs, (str, bytes))
+                    and bool(resolution_refs) and all(str(ref).strip() for ref in resolution_refs)
+                )
+                initial_refs = ({str(ref).strip() for ref in refs}
+                                if isinstance(refs, Sequence) else set())
+                new_evidence = resolution_ok and bool(
+                    {str(ref).strip() for ref in resolution_refs} - initial_refs)
+                if not resolution_ok:
+                    blockers.append("CHALLENGE_RESOLUTION_MISSING_RESOLUTION_EVIDENCE")
+                    status = "OPEN"
+                elif not new_evidence:
+                    blockers.append("CHALLENGE_RESOLUTION_MISSING_NEW_EVIDENCE")
+                    status = "OPEN"
+            if status != "RESOLVED":
+                derived_open.append(challenge_id)
+        open_challenges = derived_open
+    for target, challenge_type in challenge_review_keys:
+        if (target, challenge_type) not in registered_challenges:
+            blockers.append("PEER_CHALLENGE_NOT_REGISTERED_IN_CHALLENGE_LEDGER")
+
+    supplied_open = payload.get("open_challenges")
+    if not isinstance(supplied_open, Sequence) or isinstance(supplied_open, (str, bytes)):
+        blockers.append("OPEN_CHALLENGE_STATE_MISSING_OR_INVALID")
+    elif open_challenges is not None:
+        supplied_ids = {str(challenge.get("challenge_id", "")).strip()
+                        for challenge in supplied_open if isinstance(challenge, Mapping)}
+        if len(supplied_ids) != len(supplied_open) or supplied_ids != set(open_challenges):
+            blockers.append("OPEN_CHALLENGE_STATE_CONTRADICTS_LEDGER")
+    return {"blockers": sorted(set(blockers)), "reviewer_counts": reviewer_counts,
+            "open_challenges": open_challenges, "min_reviewers": min_reviewers}
+
+
+def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any], *,
+                   governance: Mapping[str, Any] | None = None,
+                   now: datetime | None = None) -> dict[str, Any]:
+    """Conjunctive certainty checks. PASS forwards evidence to ChiefAgent only.
+
+    ``mandatory_agents`` comes from policy, never from the payload. Historical
+    dissent/false-certainty metrics and per-agent calibration come from a verified
+    calibration-service attestation, never from caller-supplied payload fields. An
+    MNPI-SUSPECT source returns VETO regardless of every other check.
+    """
     if not isinstance(payload, Mapping):
         return {"status": "GATHER_MORE", "passed": False, "trade_allowed": False,
                 "blockers": ["INVALID_CERTAINTY_PAYLOAD"], "checks": {}}
     reasons: list[str] = []
     checks: dict[str, bool] = {}
+    try:
+        current = _current_utc(now)
+    except (ValueError, TypeError, OverflowError):
+        return {"status": "GATHER_MORE", "passed": False, "trade_allowed": False,
+                "blockers": ["INVALID_CURRENT_TIME"], "checks": {}}
+    governance_issuer = (
+        str(governance.get("issuer", "")).strip() if isinstance(governance, Mapping) else ""
+    )
     thresholds = policy.get("certainty_thresholds", policy) if isinstance(policy, Mapping) else {}
     if not isinstance(thresholds, Mapping):
         thresholds = {}
@@ -227,18 +480,43 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dic
             return default
         return value
 
+    def policy_count(key: str, default: int, *, lower: int, upper: int) -> int:
+        value = policy_number(key, default, lower=lower, upper=upper)
+        if not float(value).is_integer():
+            # int(29.9) would silently lower the sample-size floor to 29.
+            reasons.append(f"INVALID_POLICY_VALUE:{key}")
+            return int(math.ceil(value))
+        return int(value)
+
     near = policy_number("near_certainty_threshold", 0.98, lower=0.0, upper=1.0)
     consensus_threshold = policy_number("consensus_score_threshold", 0.98, lower=0.0, upper=1.0)
     brier_threshold = policy_number("brier_threshold", 0.12, lower=0.0, upper=1.0)
     source_floor = policy_number("source_credibility_threshold", 0.75, lower=0.0, upper=1.0)
     source_max_age = policy_number("source_max_age_seconds", 900, lower=0.001, upper=31_536_000)
-    min_calibration_samples = int(policy_number("min_calibration_sample_size", 30, lower=1, upper=10_000_000))
+    min_calibration_samples = policy_count("min_calibration_sample_size", 30, lower=1, upper=10_000_000)
     min_reviewers_raw = _finite_float(thresholds.get("min_reviewers_per_verdict", 2))
     if min_reviewers_raw is None or min_reviewers_raw < 1 or not min_reviewers_raw.is_integer():
         reasons.append("INVALID_POLICY_VALUE:min_reviewers_per_verdict")
         min_reviewers = 2
     else:
         min_reviewers = int(min_reviewers_raw)
+
+    raw_source_rows = payload.get("key_sources", [])
+    pre_sources = (list(raw_source_rows)
+                   if isinstance(raw_source_rows, Sequence) and not isinstance(raw_source_rows, (str, bytes))
+                   else [])
+    # Any tag in the MNPI family (MNPI, MNPI-SUSPECT, ...) is treated as suspect; matching only
+    # the exact hyphenated label would let a relabelled source bypass the veto.
+    mnpi_suspect = any(
+        isinstance(source, Mapping)
+        and str(source.get("legal_tag", "")).strip().upper().replace("_", "-").startswith("MNPI")
+        for source in pre_sources
+    )
+    if mnpi_suspect:
+        return {"status": "VETO", "passed": False, "trade_allowed": False,
+                "blockers": ["MNPI_SUSPECT_SOURCE_VETO"],
+                "checks": {"no_mnpi_suspect_sources": False},
+                "message": "An MNPI-SUSPECT source triggers an unconditional veto."}
 
     if payload.get("challenge_resolution_status") == "DEADLOCK":
         return {"status": "ESCALATE", "passed": False, "trade_allowed": False,
@@ -251,11 +529,9 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dic
         verdicts = [v for v in verdicts if isinstance(v, Mapping)]
 
     configured_mandatory = thresholds.get("mandatory_agents")
-    if configured_mandatory is None:
-        configured_mandatory = payload.get("mandatory_agents", [])
     if not isinstance(configured_mandatory, Sequence) or isinstance(configured_mandatory, (str, bytes)):
         configured_mandatory = []
-        reasons.append("MANDATORY_AGENT_POLICY_INVALID")
+        reasons.append("MANDATORY_AGENT_POLICY_MISSING_OR_INVALID")
     mandatory = {str(x).strip() for x in configured_mandatory if str(x).strip()}
     checks["mandatory_agent_policy_present"] = bool(mandatory)
     if not mandatory:
@@ -311,9 +587,11 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dic
         brier = _finite_float(calibration.get("brier_score"))
         sample_size = _finite_float(calibration.get("sample_size"))
         calibration_status = str(calibration.get("calibration_status", "")).upper()
+        calibration_source = str(calibration.get("source", "")).strip()
         if (brier is None or not 0 <= brier <= brier_threshold or sample_size is None
                 or sample_size < min_calibration_samples or not sample_size.is_integer()
-                or calibration_status != "CALIBRATED"):
+                or calibration_status != "CALIBRATED"
+                or not governance_issuer or calibration_source != governance_issuer):
             brier_ok = False
             reasons.append(f"{agent_id}:CALIBRATION_MISSING_UNVERIFIED_OR_OUT_OF_LIMIT")
 
@@ -348,7 +626,12 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dic
         reasons.append("CONTRADICTION_SCAN_RESULT_MISSING")
     else:
         contradiction_count = _finite_float(payload.get("contradictions_last_n_hours"))
-        clear = contradiction_count is not None and contradiction_count == 0 and contradiction_count.is_integer()
+        lookback_hours = policy_number("contradiction_lookback_hours", 6, lower=1, upper=168)
+        supplied_lookback = _finite_float(payload.get("contradiction_lookback_hours"))
+        window_ok = (supplied_lookback is not None and supplied_lookback.is_integer()
+                     and supplied_lookback == lookback_hours)
+        clear = (window_ok and contradiction_count is not None and contradiction_count == 0
+                 and contradiction_count.is_integer())
         checks["no_recent_contradictions"] = clear
         if not clear:
             reasons.append("RECENT_KNOWLEDGE_GRAPH_CONTRADICTIONS_OR_INVALID_COUNT")
@@ -364,11 +647,13 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dic
             continue
         source_id = str(source.get("source_id", "")).strip()
         credibility = _finite_float(source.get("credibility"))
-        age = _finite_float(source.get("age_seconds"))
+        observed = _source_observed_at(source)
+        age = (current - observed).total_seconds() if observed is not None else None
         ttl = _finite_float(source.get("ttl_seconds"))
-        tag = str(source.get("legal_tag", "")).upper()
-        if (not source_id or credibility is None or age is None or ttl is None or ttl <= 0 or age < 0
-                or credibility < source_floor or age > min(source_max_age, ttl) or tag == "MNPI-SUSPECT"):
+        tag = str(source.get("legal_tag", "")).strip().upper().replace("_", "-")
+        if (not source_id or credibility is None or age is None or ttl is None or ttl <= 0
+                or age < -30 or credibility < source_floor
+                or age > min(source_max_age, ttl) or tag.startswith("MNPI")):
             sources_ok = False
         if source_id:
             seen_source_ids.add(source_id)
@@ -376,15 +661,22 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dic
             if group:
                 independence_groups.add(group)
     checks["key_sources_fresh_and_credible"] = sources_ok
+    checks["no_mnpi_suspect_sources"] = True  # MNPI pre-check returns VETO before this point.
     if not sources_ok:
         reasons.append("KEY_SOURCE_MISSING_STALE_LOW_CREDIBILITY_OR_MNPI_SUSPECT")
-    if payload.get("news_or_rumor") is True:
-        min_independent_raw = _finite_float(thresholds.get("required_independent_sources_for_news_or_rumor", 2))
-        min_independent = int(min_independent_raw) if min_independent_raw is not None and min_independent_raw >= 1 else 2
-        independent_ok = len(independence_groups) >= min_independent and len(seen_source_ids) >= min_independent
-        checks["independent_sources_sufficient"] = independent_ok
-        if not independent_ok:
-            reasons.append("INSUFFICIENT_INDEPENDENT_SOURCES_FOR_NEWS_OR_RUMOR")
+    news_flag = payload.get("news_or_rumor")
+    if not isinstance(news_flag, bool):
+        checks["news_or_rumor_declared"] = False
+        reasons.append("NEWS_OR_RUMOR_FLAG_MISSING_OR_INVALID")
+    else:
+        checks["news_or_rumor_declared"] = True
+        if news_flag is True:
+            min_independent_raw = _finite_float(thresholds.get("required_independent_sources_for_news_or_rumor", 2))
+            min_independent = int(min_independent_raw) if min_independent_raw is not None and min_independent_raw >= 1 else 2
+            independent_ok = len(independence_groups) >= min_independent and len(seen_source_ids) >= min_independent
+            checks["independent_sources_sufficient"] = independent_ok
+            if not independent_ok:
+                reasons.append("INSUFFICIENT_INDEPENDENT_SOURCES_FOR_NEWS_OR_RUMOR")
 
     da = payload.get("devil_advocate_report")
     hypotheses = da.get("counter_hypotheses", []) if isinstance(da, Mapping) else []
@@ -406,20 +698,39 @@ def certainty_gate(payload: Mapping[str, Any], policy: Mapping[str, Any]) -> dic
 
     # System-health guardrails: confidence thresholds cannot stay permissive when
     # historical false-certainty rises or adversarial disagreement becomes rare.
+    # Only a verified attestation counts; an unverified mapping is not evidence.
+    governance_ok = (
+        isinstance(governance, Mapping)
+        and governance.get("valid") is True
+        and not governance.get("blockers")
+        and bool(governance_issuer)
+    )
+    checks["governance_attestation_verified"] = governance_ok
+    if not governance_ok:
+        reasons.append("GOVERNANCE_ATTESTATION_MISSING_OR_INVALID")
+        governance = {}
     dissent_floor = policy_number("dissent_rate_floor", 0.10, lower=0.0, upper=1.0)
     false_certainty_limit = policy_number("false_certainty_rate_max", 0.05, lower=0.0, upper=1.0)
-    min_dissent_samples = int(policy_number("min_dissent_samples", 30, lower=1, upper=10_000_000))
-    min_false_certainty_samples = int(policy_number("min_false_certainty_samples", 30, lower=1, upper=10_000_000))
-    dissent_rate = _finite_float(payload.get("dissent_rate"))
-    dissent_sample_size = _finite_float(payload.get("dissent_sample_size"))
+
+    def policy_count(key: str, default: int, *, lower: int, upper: int) -> int:
+        value = policy_number(key, default, lower=lower, upper=upper)
+        if not float(value).is_integer():
+            reasons.append(f"INVALID_POLICY_VALUE:{key}")
+            return int(math.ceil(value))
+        return int(value)
+
+    min_dissent_samples = policy_count("min_dissent_samples", 30, lower=1, upper=10_000_000)
+    min_false_certainty_samples = policy_count("min_false_certainty_samples", 30, lower=1, upper=10_000_000)
+    dissent_rate = _finite_float(governance.get("dissent_rate"))
+    dissent_sample_size = _finite_float(governance.get("dissent_sample_size"))
     dissent_ok = (dissent_rate is not None and 0 <= dissent_rate <= 1 and dissent_rate >= dissent_floor
                   and dissent_sample_size is not None and dissent_sample_size >= min_dissent_samples
                   and dissent_sample_size.is_integer())
     checks["groupthink_guard"] = dissent_ok
     if not dissent_ok:
         reasons.append("GROUPTHINK_ALARM_OR_DISSENT_METRIC_MISSING")
-    false_certainty_rate = _finite_float(payload.get("false_certainty_rate"))
-    false_certainty_samples = _finite_float(payload.get("false_certainty_sample_size"))
+    false_certainty_rate = _finite_float(governance.get("false_certainty_rate"))
+    false_certainty_samples = _finite_float(governance.get("false_certainty_sample_size"))
     false_certainty_ok = (false_certainty_rate is not None and 0 <= false_certainty_rate <= 1
                           and false_certainty_rate <= false_certainty_limit
                           and false_certainty_samples is not None
@@ -454,7 +765,8 @@ def devil_advocate_pass(signal: Mapping[str, Any], counter_hypotheses: Sequence[
 
 
 def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probability: float = 0.05,
-                       now: datetime | None = None) -> dict[str, Any]:
+                       now: datetime | None = None,
+                       max_age_seconds: float = 900) -> dict[str, Any]:
     """Require evidence-backed completion of all nine ChiefAgent skepticism checks."""
     if not isinstance(reasoning, Mapping):
         return {"verdict": "HOLD", "passed": False, "blockers": ["INVALID_CHIEF_REASONING"], "trade_allowed": False}
@@ -465,6 +777,10 @@ def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probabilit
         blockers_identity = []
     if not str(reasoning.get("signal_id", "")).strip():
         blockers_identity.append("CHIEF_SIGNAL_ID_MISSING")
+    age_limit = _finite_float(max_age_seconds)
+    if age_limit is None or age_limit <= 0:
+        blockers_identity.append("INVALID_CHIEF_MAX_AGE_POLICY")
+        age_limit = 900.0
     created_at = reasoning.get("created_at")
     if not created_at:
         blockers_identity.append("CHIEF_CREATED_AT_MISSING")
@@ -472,8 +788,11 @@ def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probabilit
         try:
             chief_created_at = _parse_time(created_at)
             current_for_chief = _current_utc(now)
-            if (chief_created_at - current_for_chief).total_seconds() > 30:
+            age_seconds = (current_for_chief - chief_created_at).total_seconds()
+            if age_seconds < -30:
                 blockers_identity.append("CHIEF_CREATED_AT_IN_FUTURE")
+            elif age_seconds > age_limit:
+                blockers_identity.append("CHIEF_REASONING_EXPIRED")
         except (ValueError, TypeError, OverflowError):
             blockers_identity.append("CHIEF_CREATED_AT_INVALID")
     raw_scenarios = reasoning.get("tail_risk_scenarios")
@@ -543,6 +862,10 @@ def chief_skeptic_pass(reasoning: Mapping[str, Any], *, max_tail_risk_probabilit
             blockers.append("CHIEF_CHALLENGE_LEDGER_HASH_MISMATCH")
     if not tail_risk_valid or raw_tail_risk > max_tail_risk:
         blockers.append("TAIL_RISK_MISSING_INVALID_OR_TOO_HIGH")
+    scenario_max = max((_finite_float(s.get("probability")) or 0.0 for s in valid_scenarios), default=0.0)
+    if not tail_risk_valid or raw_tail_risk + 1e-12 < scenario_max:
+        # The aggregate cannot be smaller than any single scenario it summarizes.
+        blockers.append("TAIL_RISK_BELOW_SCENARIO_PROBABILITY")
     reasoning_hash = str(reasoning.get("reasoning_hash", "")).strip()
     unsigned_reasoning = dict(reasoning)
     unsigned_reasoning.pop("reasoning_hash", None)
@@ -607,9 +930,9 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
     max_size = _finite_float(policy.get("max_size_per_trade"))
     if size is None or max_size is None or size <= 0 or max_size <= 0 or size > max_size:
         blockers.append("SIZE_INVALID_OR_OUT_OF_POLICY")
-    if mode == "live" and policy.get("live_enabled") is not True:
+    if mode == "live" and _policy_bool(policy, "live_enabled", default=False, blockers=blockers) is not True:
         blockers.append("LIVE_MODE_DISABLED")
-    if mode == "demo" and policy.get("demo_enabled") is not True:
+    if mode == "demo" and _policy_bool(policy, "demo_enabled", default=False, blockers=blockers) is not True:
         blockers.append("DEMO_MODE_DISABLED")
     if mode not in ("demo", "live"):
         blockers.append("INVALID_MODE")
@@ -625,9 +948,12 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
     flags = {str(x).strip().lower() for x in raw_flags if str(x).strip()}
     blocked = {str(x).strip().lower() for x in policy.get("blocked_flags", [])}
     if flags & blocked: blockers.append("BLOCKED_RISK_FLAGS:" + ",".join(sorted(flags & blocked)))
-    if "mnpi-suspect" in flags or "mnpi" in flags:
+    # Substring match on the normalised flag: "mnpi", "mnpi-suspect", "mnpi_new" and
+    # "escalate-mnpi-review" must all veto, not only the two exact spellings.
+    normalized_flags = {flag.replace("_", "-") for flag in flags}
+    if any("mnpi" in flag for flag in normalized_flags):
         blockers.append("MNPI_VETO")
-    if "kill_switch" in flags or "kill-switch" in flags:
+    if any(flag.startswith("kill-switch") for flag in normalized_flags):
         blockers.append("KILL_SWITCH_ACTIVE")
 
     # Session and rollover controls use UTC by design. Invalid policy blocks.
@@ -650,7 +976,7 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
                     blockers.append("ROLLOVER_TIME_BLOCK")
             except (KeyError, ValueError, TypeError):
                 blockers.append("INVALID_ROLLOVER_POLICY")
-    if policy.get("blocked_around_news", True) is True:
+    if _policy_bool(policy, "blocked_around_news", default=True, blockers=blockers):
         if request.get("within_high_impact_news_window") is not False:
             blockers.append("NEWS_WINDOW_ACTIVE_OR_UNKNOWN")
 
@@ -658,7 +984,8 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
     if not isinstance(risk, Mapping):
         blockers.append("RISK_SNAPSHOT_MISSING")
         risk = {}
-    required_risk_fields = ("risk_fraction", "daily_loss_fraction", "drawdown_fraction", "open_positions", "correlated_open_positions")
+    required_risk_fields = ("risk_fraction", "daily_loss_fraction", "drawdown_fraction",
+                            "open_stop_risk_fraction", "open_positions", "correlated_open_positions")
     missing_risk = [key for key in required_risk_fields if risk.get(key) is None]
     if missing_risk:
         blockers.append("RISK_SNAPSHOT_FIELDS_MISSING:" + ",".join(missing_risk))
@@ -672,12 +999,38 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
         for key, value in risk_values.items():
             if value is None or value < 0 or value > 1 or risk_limits[key] is None or risk_limits[key] < 0 or risk_limits[key] > 1:
                 blockers.append(f"INVALID_RISK_VALUE:{key}")
+        # Open positions carry committed stop risk that is not yet realised. It adds to the
+        # realised loss, so several individually-small open orders cannot jointly breach the
+        # session caps. A present-but-unusable value is a blocker, not an implicit zero.
+        open_stop_risk = _finite_float(risk.get("open_stop_risk_fraction"))
+        if risk.get("open_stop_risk_fraction") is not None and open_stop_risk is None:
+            blockers.append("INVALID_RISK_VALUE:open_stop_risk_fraction")
+        elif open_stop_risk is not None and not 0 <= open_stop_risk <= 1:
+            blockers.append("INVALID_RISK_VALUE:open_stop_risk_fraction")
+            open_stop_risk = None
+        exposure = open_stop_risk or 0.0
+        effective_daily_loss = (risk_values["daily_loss_fraction"] + exposure
+                                if risk_values["daily_loss_fraction"] is not None else None)
+        effective_drawdown = (risk_values["drawdown_fraction"] + exposure
+                              if risk_values["drawdown_fraction"] is not None else None)
         if risk_values["risk_fraction"] is not None and risk_limits["risk_fraction"] is not None and risk_values["risk_fraction"] > risk_limits["risk_fraction"]:
             blockers.append("RISK_PER_TRADE_LIMIT_EXCEEDED")
-        if risk_values["daily_loss_fraction"] is not None and risk_limits["daily_loss_fraction"] is not None and risk_values["daily_loss_fraction"] >= risk_limits["daily_loss_fraction"]:
+        if effective_daily_loss is not None and risk_limits["daily_loss_fraction"] is not None and effective_daily_loss >= risk_limits["daily_loss_fraction"]:
             blockers.append("DAILY_LOSS_LIMIT_REACHED")
-        if risk_values["drawdown_fraction"] is not None and risk_limits["drawdown_fraction"] is not None and risk_values["drawdown_fraction"] >= risk_limits["drawdown_fraction"]:
+        if effective_drawdown is not None and risk_limits["drawdown_fraction"] is not None and effective_drawdown >= risk_limits["drawdown_fraction"]:
             blockers.append("MAX_DRAWDOWN_REACHED")
+        # Caps are prospective: a trade that would breach the limit if its stop is hit
+        # must not be admitted just because the loss has not been realized yet.
+        proposed_risk = risk_values["risk_fraction"]
+        if proposed_risk is not None and proposed_risk >= 0:
+            if (effective_daily_loss is not None
+                    and risk_limits["daily_loss_fraction"] is not None
+                    and effective_daily_loss + proposed_risk >= risk_limits["daily_loss_fraction"] - 1e-12):
+                blockers.append("PROJECTED_DAILY_LOSS_EXCEEDS_LIMIT")
+            if (effective_drawdown is not None
+                    and risk_limits["drawdown_fraction"] is not None
+                    and effective_drawdown + proposed_risk >= risk_limits["drawdown_fraction"] - 1e-12):
+                blockers.append("PROJECTED_DRAWDOWN_EXCEEDS_LIMIT")
         for key, limit_key, message in (("open_positions", "max_positions", "MAX_OPEN_POSITIONS_REACHED"),
                                         ("correlated_open_positions", "max_correlated_positions", "CORRELATED_EXPOSURE_LIMIT_REACHED")):
             count = _finite_float(risk.get(key))
@@ -698,8 +1051,10 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
         blockers.append("SL_TP_INVALID")
     stop = _finite_float(sl.get("sl"))
     take = _finite_float(sl.get("tp"))
-    if policy.get("require_stop_loss", True) and stop is None: blockers.append("STOP_LOSS_REQUIRED_OR_INVALID")
-    if policy.get("require_take_profit", True) and take is None: blockers.append("TAKE_PROFIT_REQUIRED_OR_INVALID")
+    if _policy_bool(policy, "require_stop_loss", default=True, blockers=blockers) and stop is None:
+        blockers.append("STOP_LOSS_REQUIRED_OR_INVALID")
+    if _policy_bool(policy, "require_take_profit", default=True, blockers=blockers) and take is None:
+        blockers.append("TAKE_PROFIT_REQUIRED_OR_INVALID")
     if stop is not None and take is not None:
         entry = _finite_float(request.get("expected_price"))
         if entry is None or entry <= 0:
@@ -717,11 +1072,15 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
                 risk_distance = abs(entry - stop)
                 reward_distance = abs(take - entry)
                 calculated_rr = reward_distance / risk_distance if risk_distance > 0 else None
-                tolerance_fraction = _finite_float(policy.get("expected_rr_tolerance_fraction", 0.10))
+                tolerance_fraction = _finite_float(policy.get("expected_rr_tolerance_fraction", 0.01))
                 if calculated_rr is None or rr is None or tolerance_fraction is None or not 0 <= tolerance_fraction <= 0.25:
                     blockers.append("EXPECTED_RR_RECALCULATION_FAILED")
-                elif abs(rr - calculated_rr) > max(0.01, calculated_rr * tolerance_fraction):
-                    blockers.append("EXPECTED_RR_DOES_NOT_MATCH_SL_TP")
+                else:
+                    # Binary float error must not turn an exactly-at-floor RR into a pass.
+                    if min_rr is None or calculated_rr + 1e-9 < min_rr:
+                        blockers.append("EXPECTED_RR_BELOW_POLICY_AFTER_RECALCULATION")
+                    if abs(rr - calculated_rr) > max(0.01, calculated_rr * tolerance_fraction):
+                        blockers.append("EXPECTED_RR_DOES_NOT_MATCH_SL_TP")
 
     expiry = request.get("expires_at")
     if not expiry:
@@ -745,20 +1104,32 @@ def permission_gate(request: Mapping[str, Any], matrix: Mapping[str, Any], *,
 
 def user_authorization_gate(permission_result: Mapping[str, Any], decision: Mapping[str, Any], *,
                             now: datetime | None = None, max_ttl_seconds: int = 600,
-                            max_future_skew_seconds: int = 30) -> dict[str, Any]:
-    """Validate one-time authorization metadata; does not sign or dispatch an order."""
+                            max_future_skew_seconds: int = 30,
+                            nonce_store: Any | None = None,
+                            order_scope: str | None = None) -> dict[str, Any]:
+    """Validate one-time authorization metadata; does not sign or dispatch an order.
+
+    The nonce is consumed atomically through ``nonce_store``. Without a store the
+    gate fails closed, because a client-supplied approval object cannot prove that
+    the permission was not already used.
+    """
     blockers: list[str] = []
     if not isinstance(permission_result, Mapping) or not isinstance(decision, Mapping):
         return {"status": "DENY", "authorized": False, "blockers": ["INVALID_AUTHORIZATION_PAYLOAD"], "trade_allowed": False}
     if permission_result.get("status") != "REQUIRE_HUMAN": blockers.append("PERMISSION_NOT_PENDING_HUMAN_APPROVAL")
     if str(decision.get("decision", "")).upper() != "APPROVE": blockers.append("USER_DID_NOT_APPROVE")
+    if not str(decision.get("decision_id", "")).strip(): blockers.append("DECISION_ID_MISSING")
     if not str(decision.get("user_id", "")).strip(): blockers.append("USER_ID_MISSING")
     if not str(decision.get("reason", "")).strip(): blockers.append("DECISION_REASON_MISSING")
+    nonce = decision.get("nonce")
+    if not isinstance(nonce, str) or _AUTH_NONCE_RE.fullmatch(nonce) is None:
+        blockers.append("AUTHORIZATION_NONCE_INVALID")
     if not permission_result.get("permission_id") or decision.get("permission_id") != permission_result.get("permission_id"):
         blockers.append("PERMISSION_ID_MISMATCH")
     mode = str(permission_result.get("mode", "")).lower()
     if mode not in ("demo", "live"):
         blockers.append("PERMISSION_MODE_MISSING_OR_INVALID")
+    permission_expires: datetime | None = None
     try:
         current = _current_utc(now)
         decision_at = _parse_time(decision.get("timestamp", ""))
@@ -779,12 +1150,66 @@ def user_authorization_gate(permission_result: Mapping[str, Any], decision: Mapp
     except (ValueError, TypeError, OverflowError):
         blockers.append("INVALID_AUTHORIZATION_TIMESTAMP")
     if mode == "live":
+        # No server-side 2FA or signature verifier exists in this scaffold, so a client-supplied
+        # `two_fa_verified`/`signature_verified` boolean is not proof of anything. Live approval
+        # stays denied until a verifier is implemented and wired in.
+        blockers.append("LIVE_AUTHORIZATION_NOT_IMPLEMENTED")
         if decision.get("two_fa_verified") is not True: blockers.append("LIVE_2FA_REQUIRED")
         if decision.get("signature_verified") is not True: blockers.append("LIVE_SIGNATURE_REQUIRED")
     if blockers:
         return {"status": "DENY", "authorized": False, "blockers": sorted(set(blockers)), "trade_allowed": False}
+
+    store = nonce_store if nonce_store is not None and callable(getattr(nonce_store, "consume", None)) else None
+    if store is None:
+        return {"status": "DENY", "authorized": False,
+                "blockers": ["AUTHORIZATION_NONCE_STORE_REQUIRED"], "trade_allowed": False}
+    try:
+        # The nonce is one-time per operator, not per permission/decision pair: scoping it to
+        # those fields would let the identical nonce be replayed against a second approval.
+        consumed = store.consume(
+            scope=str(decision.get("user_id")).strip(),
+            nonce=nonce,
+            expires_at=permission_expires if permission_expires is not None else current,
+            now=current,
+        )
+    except Exception:
+        return {"status": "DENY", "authorized": False,
+                "blockers": ["AUTHORIZATION_NONCE_STORE_UNAVAILABLE"], "trade_allowed": False}
+    if consumed is not True:
+        return {"status": "DENY", "authorized": False,
+                "blockers": ["AUTHORIZATION_NONCE_REPLAYED"], "trade_allowed": False}
+    permission_store = (store if callable(getattr(store, "consume_permission", None)) else None)
+    if permission_store is None:
+        # A fresh nonce must not buy a second authorization for an already-used permission.
+        return {"status": "DENY", "authorized": False,
+                "blockers": ["AUTHORIZATION_PERMISSION_STORE_REQUIRED"], "trade_allowed": False}
+    # The tombstone key must identify the order, not a caller-chosen permission_id: a client
+    # could otherwise authorize the identical order twice with two different labels. Callers
+    # that can derive an order identity server-side pass it as ``order_scope``.
+    if order_scope is not None:
+        if (not isinstance(order_scope, str) or not order_scope.strip()
+                or order_scope != order_scope.strip()):
+            return {"status": "DENY", "authorized": False,
+                    "blockers": ["AUTHORIZATION_ORDER_SCOPE_INVALID"], "trade_allowed": False}
+        permission_key = order_scope
+    else:
+        permission_key = str(permission_result.get("permission_id")).strip()
+    try:
+        permission_consumed = permission_store.consume_permission(
+            permission_id=permission_key,
+            expires_at=permission_expires if permission_expires is not None else current,
+            now=current,
+        )
+    except Exception:
+        return {"status": "DENY", "authorized": False,
+                "blockers": ["AUTHORIZATION_PERMISSION_STORE_UNAVAILABLE"], "trade_allowed": False}
+    if permission_consumed is not True:
+        return {"status": "DENY", "authorized": False,
+                "blockers": ["AUTHORIZATION_PERMISSION_ALREADY_USED"], "trade_allowed": False}
     return {"status": "ALLOW_ONCE", "authorized": True, "blockers": [],
             "user_id": decision.get("user_id"), "timestamp": decision.get("timestamp"),
-            "permission_id": decision.get("permission_id"), "trade_allowed": False,
+            "decision_id": decision.get("decision_id"), "nonce_consumed": True,
+            "permission_id": decision.get("permission_id"), "order_scope": permission_key,
+            "trade_allowed": False,
             "note": "One-time authorization metadata only; execution must revalidate signature, expiry, current price, SL/TP and idempotency."}
 

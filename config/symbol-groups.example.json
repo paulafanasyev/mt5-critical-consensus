@@ -1,0 +1,8 @@
+{
+  "EURUSD": "fx-majors",
+  "GBPUSD": "fx-majors",
+  "USDJPY": "fx-majors",
+  "AUDUSD": "fx-majors",
+  "USDCAD": "fx-majors",
+  "XAUUSD": "metals"
+}

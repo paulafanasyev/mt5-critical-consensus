@@ -1,0 +1,338 @@
+{
+ "EURUSD": {
+  "candles": 105120,
+  "variants": [
+   {
+    "name": "SMA 12/50 raw",
+    "in_sample": {
+     "trades": 1942,
+     "winrate": 27.8,
+     "total_pct": -58.5,
+     "pf": 0.69,
+     "max_dd_pct": 61.0
+    },
+    "out_of_sample": {
+     "trades": 799,
+     "winrate": 30.8,
+     "total_pct": 1.3,
+     "pf": 1.03,
+     "max_dd_pct": 5.1
+    }
+   },
+   {
+    "name": "SMA 12/50 + trend 200",
+    "in_sample": {
+     "trades": 2280,
+     "winrate": 46.0,
+     "total_pct": -22.6,
+     "pf": 0.78,
+     "max_dd_pct": 23.9
+    },
+    "out_of_sample": {
+     "trades": 900,
+     "winrate": 45.2,
+     "total_pct": -6.9,
+     "pf": 0.76,
+     "max_dd_pct": 8.6
+    }
+   },
+   {
+    "name": "SMA 12/50 + trend + flat",
+    "in_sample": {
+     "trades": 519,
+     "winrate": 56.3,
+     "total_pct": -0.9,
+     "pf": 0.97,
+     "max_dd_pct": 7.6
+    },
+    "out_of_sample": {
+     "trades": 74,
+     "winrate": 43.2,
+     "total_pct": -0.2,
+     "pf": 0.95,
+     "max_dd_pct": 1.7
+    }
+   }
+  ]
+ },
+ "BTCUSD": {
+  "candles": 105120,
+  "variants": [
+   {
+    "name": "SMA 12/50 raw",
+    "in_sample": {
+     "trades": 1902,
+     "winrate": 31.1,
+     "total_pct": -37.2,
+     "pf": 0.96,
+     "max_dd_pct": 61.7
+    },
+    "out_of_sample": {
+     "trades": 834,
+     "winrate": 28.1,
+     "total_pct": -34.7,
+     "pf": 0.9,
+     "max_dd_pct": 45.7
+    }
+   },
+   {
+    "name": "SMA 12/50 + trend 200",
+    "in_sample": {
+     "trades": 2219,
+     "winrate": 56.2,
+     "total_pct": -106.3,
+     "pf": 0.81,
+     "max_dd_pct": 112.9
+    },
+    "out_of_sample": {
+     "trades": 953,
+     "winrate": 54.8,
+     "total_pct": -35.2,
+     "pf": 0.83,
+     "max_dd_pct": 38.8
+    }
+   },
+   {
+    "name": "SMA 12/50 + trend + flat",
+    "in_sample": {
+     "trades": 2196,
+     "winrate": 56.6,
+     "total_pct": -103.8,
+     "pf": 0.82,
+     "max_dd_pct": 110.4
+    },
+    "out_of_sample": {
+     "trades": 933,
+     "winrate": 55.4,
+     "total_pct": -33.9,
+     "pf": 0.84,
+     "max_dd_pct": 37.8
+    }
+   }
+  ]
+ },
+ "ETHUSD": {
+  "candles": 105120,
+  "variants": [
+   {
+    "name": "SMA 12/50 raw",
+    "in_sample": {
+     "trades": 1858,
+     "winrate": 32.1,
+     "total_pct": 87.3,
+     "pf": 1.07,
+     "max_dd_pct": 51.9
+    },
+    "out_of_sample": {
+     "trades": 836,
+     "winrate": 28.7,
+     "total_pct": -39.8,
+     "pf": 0.92,
+     "max_dd_pct": 69.1
+    }
+   },
+   {
+    "name": "SMA 12/50 + trend 200",
+    "in_sample": {
+     "trades": 2236,
+     "winrate": 58.0,
+     "total_pct": -64.3,
+     "pf": 0.92,
+     "max_dd_pct": 75.3
+    },
+    "out_of_sample": {
+     "trades": 946,
+     "winrate": 54.3,
+     "total_pct": -65.9,
+     "pf": 0.76,
+     "max_dd_pct": 65.9
+    }
+   },
+   {
+    "name": "SMA 12/50 + trend + flat",
+    "in_sample": {
+     "trades": 2236,
+     "winrate": 58.0,
+     "total_pct": -64.3,
+     "pf": 0.92,
+     "max_dd_pct": 75.3
+    },
+    "out_of_sample": {
+     "trades": 942,
+     "winrate": 54.5,
+     "total_pct": -65.0,
+     "pf": 0.76,
+     "max_dd_pct": 65.0
+    }
+   }
+  ]
+ },
+ "SOLUSD": {
+  "candles": 105120,
+  "variants": [
+   {
+    "name": "SMA 12/50 raw",
+    "in_sample": {
+     "trades": 1912,
+     "winrate": 34.0,
+     "total_pct": -3.8,
+     "pf": 1.0,
+     "max_dd_pct": 167.6
+    },
+    "out_of_sample": {
+     "trades": 813,
+     "winrate": 32.0,
+     "total_pct": -14.6,
+     "pf": 0.97,
+     "max_dd_pct": 66.4
+    }
+   },
+   {
+    "name": "SMA 12/50 + trend 200",
+    "in_sample": {
+     "trades": 2141,
+     "winrate": 58.8,
+     "total_pct": -143.4,
+     "pf": 0.87,
+     "max_dd_pct": 164.7
+    },
+    "out_of_sample": {
+     "trades": 919,
+     "winrate": 57.5,
+     "total_pct": -41.5,
+     "pf": 0.87,
+     "max_dd_pct": 48.2
+    }
+   },
+   {
+    "name": "SMA 12/50 + trend + flat",
+    "in_sample": {
+     "trades": 2141,
+     "winrate": 58.8,
+     "total_pct": -143.4,
+     "pf": 0.87,
+     "max_dd_pct": 164.7
+    },
+    "out_of_sample": {
+     "trades": 919,
+     "winrate": 57.5,
+     "total_pct": -41.5,
+     "pf": 0.87,
+     "max_dd_pct": 48.2
+    }
+   }
+  ]
+ },
+ "XRPUSD": {
+  "candles": 105120,
+  "variants": [
+   {
+    "name": "SMA 12/50 raw",
+    "in_sample": {
+     "trades": 1976,
+     "winrate": 31.8,
+     "total_pct": -234.9,
+     "pf": 0.85,
+     "max_dd_pct": 309.7
+    },
+    "out_of_sample": {
+     "trades": 807,
+     "winrate": 32.5,
+     "total_pct": -2.4,
+     "pf": 1.0,
+     "max_dd_pct": 58.0
+    }
+   },
+   {
+    "name": "SMA 12/50 + trend 200",
+    "in_sample": {
+     "trades": 2405,
+     "winrate": 59.4,
+     "total_pct": -199.9,
+     "pf": 0.79,
+     "max_dd_pct": 212.1
+    },
+    "out_of_sample": {
+     "trades": 1005,
+     "winrate": 59.4,
+     "total_pct": -15.4,
+     "pf": 0.95,
+     "max_dd_pct": 47.5
+    }
+   },
+   {
+    "name": "SMA 12/50 + trend + flat",
+    "in_sample": {
+     "trades": 2405,
+     "winrate": 59.4,
+     "total_pct": -199.9,
+     "pf": 0.79,
+     "max_dd_pct": 212.1
+    },
+    "out_of_sample": {
+     "trades": 1005,
+     "winrate": 59.4,
+     "total_pct": -15.4,
+     "pf": 0.95,
+     "max_dd_pct": 47.5
+    }
+   }
+  ]
+ },
+ "GOLD": {
+  "candles": 105120,
+  "variants": [
+   {
+    "name": "SMA 12/50 raw",
+    "in_sample": {
+     "trades": 2137,
+     "winrate": 22.0,
+     "total_pct": -150.7,
+     "pf": 0.65,
+     "max_dd_pct": 150.8
+    },
+    "out_of_sample": {
+     "trades": 806,
+     "winrate": 26.9,
+     "total_pct": -28.1,
+     "pf": 0.88,
+     "max_dd_pct": 48.2
+    }
+   },
+   {
+    "name": "SMA 12/50 + trend 200",
+    "in_sample": {
+     "trades": 2940,
+     "winrate": 46.7,
+     "total_pct": -73.0,
+     "pf": 0.71,
+     "max_dd_pct": 73.7
+    },
+    "out_of_sample": {
+     "trades": 914,
+     "winrate": 48.2,
+     "total_pct": -44.2,
+     "pf": 0.67,
+     "max_dd_pct": 44.9
+    }
+   },
+   {
+    "name": "SMA 12/50 + trend + flat",
+    "in_sample": {
+     "trades": 2668,
+     "winrate": 47.9,
+     "total_pct": -60.4,
+     "pf": 0.74,
+     "max_dd_pct": 61.3
+    },
+    "out_of_sample": {
+     "trades": 722,
+     "winrate": 54.0,
+     "total_pct": -30.4,
+     "pf": 0.74,
+     "max_dd_pct": 33.8
+    }
+   }
+  ]
+ }
+}

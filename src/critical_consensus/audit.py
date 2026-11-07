@@ -6,13 +6,18 @@ from typing import Any, Mapping
 
 
 def canonical_hash(payload: Mapping[str, Any]) -> str:
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str).encode("utf-8")
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
-def make_audit_event(event_type: str, payload: Mapping[str, Any], previous_hash: str | None = None) -> dict[str, Any]:
+def make_audit_event(event_type: str, payload: Mapping[str, Any], previous_hash: str | None = None,
+                     run_id: str | None = None) -> dict[str, Any]:
     body = {"event_type": event_type, "timestamp": datetime.now(timezone.utc).isoformat(),
             "previous_hash": previous_hash, "payload": dict(payload)}
+    # A run id that sits only in a column next to the hashed body can be reassigned between
+    # runs without breaking the chain. When one is supplied it is part of what gets signed.
+    if run_id is not None:
+        body["run_id"] = run_id
     body["event_hash"] = canonical_hash(body)
     return body
 

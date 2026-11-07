@@ -18,6 +18,8 @@ min_false_certainty_samples: 30
 fail_action: GATHER_MORE
 deadlock_action: ESCALATE
 
+compliance_agent_id: ComplianceAgent
+
 mandatory_agents:
   - PlatformScoutAgent
   - GlobalNewsAgent

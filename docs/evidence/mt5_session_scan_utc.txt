@@ -1,0 +1,28 @@
+top 15 intraday windows by t-statistic (costs included, one round trip per day)
+hours are true UTC; this server was 2 h ahead of UTC at the read
+symbol        window      n     mean%      t   annual%
+USDCHF   22:00-23:00    835   +0.0303  11.30      +7.6
+AUDUSD   22:00-23:00    835   +0.0256   8.61      +6.5
+GBPUSD   22:00-23:00    835   +0.0152   7.59      +3.8
+USDCAD   22:00-23:00    835   +0.0109   6.11      +2.7
+EURUSD   21:00-23:00    660   +0.0148   5.69      +3.7
+USDCAD   21:00-23:00    660   +0.0122   5.66      +3.1
+EURUSD   22:00-23:00    835   +0.0115   5.07      +2.9
+GBPUSD   21:00-23:00    660   +0.0117   4.99      +3.0
+USDJPY   22:00-23:00    835   +0.0153   4.57      +3.8
+EURUSD   20:00-23:00    660   +0.0130   4.44      +3.3
+USDCHF   21:00-23:00    660   +0.0127   4.13      +3.2
+AUDUSD   21:00-23:00    660   +0.0132   3.90      +3.3
+XAUUSD   19:00-23:00    695   +0.0493   3.31     +12.4
+XAUUSD   21:00-23:00    510   +0.0347   3.27      +8.7
+EURUSD   21:00-22:00    661   +0.0042   3.16      +1.1
+
+worst 5:
+AUDUSD   20:00-21:00    820   -0.0169  -7.80      -4.3
+USDCHF   19:00-21:00    819   -0.0293  -9.30      -7.4
+USDCHF   19:00-22:00    660   -0.0404 -11.22     -10.2
+USDCHF   20:00-21:00    820   -0.0270 -13.52      -6.8
+USDCHF   20:00-22:00    661   -0.0373 -14.67      -9.4
+
+windows with |t| > 3: 74 of 1912 tested (expected by chance at 5%: about 95)
+A candidate needs out-of-sample confirmation before any money; this table is a search over thousands of hypotheses, not a discovery.

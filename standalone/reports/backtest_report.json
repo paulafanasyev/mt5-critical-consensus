@@ -1,0 +1,462 @@
+{
+ "variants": [
+  {
+   "name": "SMA 8/50 (raw)",
+   "in_sample": {
+    "trades": 2244,
+    "winrate": 26.3,
+    "total_pips": -6099.0,
+    "pf": 0.72,
+    "max_dd_pips": 6344.0,
+    "avg_pips": -2.72
+   },
+   "out_of_sample": {
+    "trades": 905,
+    "winrate": 29.2,
+    "total_pips": 905.0,
+    "pf": 1.17,
+    "max_dd_pips": 291.0,
+    "avg_pips": 1.0
+   }
+  },
+  {
+   "name": "SMA 12/50 (raw)",
+   "in_sample": {
+    "trades": 1942,
+    "winrate": 27.9,
+    "total_pips": -6217.0,
+    "pf": 0.7,
+    "max_dd_pips": 6492.0,
+    "avg_pips": -3.2
+   },
+   "out_of_sample": {
+    "trades": 799,
+    "winrate": 30.9,
+    "total_pips": 271.0,
+    "pf": 1.05,
+    "max_dd_pips": 534.0,
+    "avg_pips": 0.34
+   }
+  },
+  {
+   "name": "SMA 8/50 + flat filter",
+   "in_sample": {
+    "trades": 1427,
+    "winrate": 34.8,
+    "total_pips": -5470.0,
+    "pf": 0.66,
+    "max_dd_pips": 5604.0,
+    "avg_pips": -3.83
+   },
+   "out_of_sample": {
+    "trades": 475,
+    "winrate": 38.9,
+    "total_pips": 250.0,
+    "pf": 1.08,
+    "max_dd_pips": 622.0,
+    "avg_pips": 0.53
+   }
+  },
+  {
+   "name": "SMA 20/26 + flat filter",
+   "in_sample": {
+    "trades": 1925,
+    "winrate": 38.5,
+    "total_pips": -7265.0,
+    "pf": 0.62,
+    "max_dd_pips": 7420.0,
+    "avg_pips": -3.77
+   },
+   "out_of_sample": {
+    "trades": 602,
+    "winrate": 41.5,
+    "total_pips": 131.0,
+    "pf": 1.04,
+    "max_dd_pips": 649.0,
+    "avg_pips": 0.22
+   }
+  },
+  {
+   "name": "SMA 8/50 + trend 200 + flat filter",
+   "in_sample": {
+    "trades": 1017,
+    "winrate": 51.9,
+    "total_pips": -918.0,
+    "pf": 0.86,
+    "max_dd_pips": 1443.0,
+    "avg_pips": -0.9
+   },
+   "out_of_sample": {
+    "trades": 271,
+    "winrate": 49.1,
+    "total_pips": 22.0,
+    "pf": 1.02,
+    "max_dd_pips": 200.0,
+    "avg_pips": 0.08
+   }
+  },
+  {
+   "name": "SMA 12/26 + flat filter",
+   "in_sample": {
+    "trades": 1748,
+    "winrate": 35.5,
+    "total_pips": -6288.0,
+    "pf": 0.65,
+    "max_dd_pips": 6365.0,
+    "avg_pips": -3.6
+   },
+   "out_of_sample": {
+    "trades": 577,
+    "winrate": 37.3,
+    "total_pips": -2.0,
+    "pf": 1.0,
+    "max_dd_pips": 706.0,
+    "avg_pips": -0.0
+   }
+  },
+  {
+   "name": "SMA 20/26 + trend 200 + flat filter",
+   "in_sample": {
+    "trades": 1326,
+    "winrate": 50.5,
+    "total_pips": -1916.0,
+    "pf": 0.77,
+    "max_dd_pips": 2217.0,
+    "avg_pips": -1.44
+   },
+   "out_of_sample": {
+    "trades": 356,
+    "winrate": 48.6,
+    "total_pips": -42.0,
+    "pf": 0.97,
+    "max_dd_pips": 279.0,
+    "avg_pips": -0.12
+   }
+  },
+  {
+   "name": "SMA 20/50 (raw)",
+   "in_sample": {
+    "trades": 1758,
+    "winrate": 29.1,
+    "total_pips": -7212.0,
+    "pf": 0.65,
+    "max_dd_pips": 7438.0,
+    "avg_pips": -4.1
+   },
+   "out_of_sample": {
+    "trades": 696,
+    "winrate": 32.0,
+    "total_pips": -42.0,
+    "pf": 0.99,
+    "max_dd_pips": 474.0,
+    "avg_pips": -0.06
+   }
+  },
+  {
+   "name": "SMA 12/26 (raw)",
+   "in_sample": {
+    "trades": 3237,
+    "winrate": 29.7,
+    "total_pips": -6796.0,
+    "pf": 0.74,
+    "max_dd_pips": 7027.0,
+    "avg_pips": -2.1
+   },
+   "out_of_sample": {
+    "trades": 1420,
+    "winrate": 30.1,
+    "total_pips": -78.0,
+    "pf": 0.99,
+    "max_dd_pips": 825.0,
+    "avg_pips": -0.05
+   }
+  },
+  {
+   "name": "SMA 12/26 + trend 200 + flat filter",
+   "in_sample": {
+    "trades": 1230,
+    "winrate": 49.5,
+    "total_pips": -1416.0,
+    "pf": 0.83,
+    "max_dd_pips": 1657.0,
+    "avg_pips": -1.15
+   },
+   "out_of_sample": {
+    "trades": 352,
+    "winrate": 46.9,
+    "total_pips": -126.0,
+    "pf": 0.93,
+    "max_dd_pips": 486.0,
+    "avg_pips": -0.36
+   }
+  },
+  {
+   "name": "SMA 8/26 + trend 200 + flat filter",
+   "in_sample": {
+    "trades": 1241,
+    "winrate": 48.3,
+    "total_pips": -1181.0,
+    "pf": 0.85,
+    "max_dd_pips": 1465.0,
+    "avg_pips": -0.95
+   },
+   "out_of_sample": {
+    "trades": 360,
+    "winrate": 44.4,
+    "total_pips": -227.0,
+    "pf": 0.87,
+    "max_dd_pips": 613.0,
+    "avg_pips": -0.63
+   }
+  },
+  {
+   "name": "SMA 12/50 + trend 200 + flat filter",
+   "in_sample": {
+    "trades": 977,
+    "winrate": 53.9,
+    "total_pips": -1016.0,
+    "pf": 0.84,
+    "max_dd_pips": 1538.0,
+    "avg_pips": -1.04
+   },
+   "out_of_sample": {
+    "trades": 277,
+    "winrate": 48.4,
+    "total_pips": -231.0,
+    "pf": 0.83,
+    "max_dd_pips": 334.0,
+    "avg_pips": -0.83
+   }
+  },
+  {
+   "name": "SMA 12/50 + flat filter",
+   "in_sample": {
+    "trades": 1317,
+    "winrate": 36.7,
+    "total_pips": -5631.0,
+    "pf": 0.65,
+    "max_dd_pips": 5772.0,
+    "avg_pips": -4.28
+   },
+   "out_of_sample": {
+    "trades": 462,
+    "winrate": 39.4,
+    "total_pips": -250.0,
+    "pf": 0.93,
+    "max_dd_pips": 728.0,
+    "avg_pips": -0.54
+   }
+  },
+  {
+   "name": "SMA 8/26 + flat filter",
+   "in_sample": {
+    "trades": 1822,
+    "winrate": 34.5,
+    "total_pips": -5860.0,
+    "pf": 0.67,
+    "max_dd_pips": 6007.0,
+    "avg_pips": -3.22
+   },
+   "out_of_sample": {
+    "trades": 617,
+    "winrate": 33.5,
+    "total_pips": -253.0,
+    "pf": 0.94,
+    "max_dd_pips": 1012.0,
+    "avg_pips": -0.41
+   }
+  },
+  {
+   "name": "SMA 20/26 (raw)",
+   "in_sample": {
+    "trades": 3819,
+    "winrate": 32.3,
+    "total_pips": -8066.0,
+    "pf": 0.7,
+    "max_dd_pips": 8267.0,
+    "avg_pips": -2.11
+   },
+   "out_of_sample": {
+    "trades": 1685,
+    "winrate": 31.0,
+    "total_pips": -357.0,
+    "pf": 0.95,
+    "max_dd_pips": 796.0,
+    "avg_pips": -0.21
+   }
+  },
+  {
+   "name": "SMA 8/50 + trend 200 (raw)",
+   "in_sample": {
+    "trades": 2399,
+    "winrate": 44.6,
+    "total_pips": -2214.0,
+    "pf": 0.81,
+    "max_dd_pips": 2312.0,
+    "avg_pips": -0.92
+   },
+   "out_of_sample": {
+    "trades": 937,
+    "winrate": 42.5,
+    "total_pips": -368.0,
+    "pf": 0.88,
+    "max_dd_pips": 679.0,
+    "avg_pips": -0.39
+   }
+  },
+  {
+   "name": "SMA 20/50 + trend 200 + flat filter",
+   "in_sample": {
+    "trades": 959,
+    "winrate": 54.4,
+    "total_pips": -1534.0,
+    "pf": 0.77,
+    "max_dd_pips": 2016.0,
+    "avg_pips": -1.6
+   },
+   "out_of_sample": {
+    "trades": 262,
+    "winrate": 49.2,
+    "total_pips": -394.0,
+    "pf": 0.73,
+    "max_dd_pips": 462.0,
+    "avg_pips": -1.5
+   }
+  },
+  {
+   "name": "SMA 8/26 (raw)",
+   "in_sample": {
+    "trades": 3511,
+    "winrate": 28.5,
+    "total_pips": -6786.0,
+    "pf": 0.74,
+    "max_dd_pips": 7036.0,
+    "avg_pips": -1.93
+   },
+   "out_of_sample": {
+    "trades": 1524,
+    "winrate": 27.0,
+    "total_pips": -440.0,
+    "pf": 0.94,
+    "max_dd_pips": 1340.0,
+    "avg_pips": -0.29
+   }
+  },
+  {
+   "name": "SMA 20/50 + flat filter",
+   "in_sample": {
+    "trades": 1261,
+    "winrate": 36.6,
+    "total_pips": -6603.0,
+    "pf": 0.59,
+    "max_dd_pips": 6776.0,
+    "avg_pips": -5.24
+   },
+   "out_of_sample": {
+    "trades": 438,
+    "winrate": 40.9,
+    "total_pips": -600.0,
+    "pf": 0.82,
+    "max_dd_pips": 659.0,
+    "avg_pips": -1.37
+   }
+  },
+  {
+   "name": "SMA 12/50 + trend 200 (raw)",
+   "in_sample": {
+    "trades": 2280,
+    "winrate": 46.4,
+    "total_pips": -2291.0,
+    "pf": 0.8,
+    "max_dd_pips": 2416.0,
+    "avg_pips": -1.0
+   },
+   "out_of_sample": {
+    "trades": 900,
+    "winrate": 45.4,
+    "total_pips": -681.0,
+    "pf": 0.79,
+    "max_dd_pips": 867.0,
+    "avg_pips": -0.76
+   }
+  },
+  {
+   "name": "SMA 12/26 + trend 200 (raw)",
+   "in_sample": {
+    "trades": 2888,
+    "winrate": 42.5,
+    "total_pips": -2584.0,
+    "pf": 0.81,
+    "max_dd_pips": 2674.0,
+    "avg_pips": -0.89
+   },
+   "out_of_sample": {
+    "trades": 1194,
+    "winrate": 40.4,
+    "total_pips": -821.0,
+    "pf": 0.81,
+    "max_dd_pips": 1303.0,
+    "avg_pips": -0.69
+   }
+  },
+  {
+   "name": "SMA 20/50 + trend 200 (raw)",
+   "in_sample": {
+    "trades": 2201,
+    "winrate": 48.2,
+    "total_pips": -2823.0,
+    "pf": 0.76,
+    "max_dd_pips": 3051.0,
+    "avg_pips": -1.28
+   },
+   "out_of_sample": {
+    "trades": 847,
+    "winrate": 46.4,
+    "total_pips": -851.0,
+    "pf": 0.74,
+    "max_dd_pips": 1005.0,
+    "avg_pips": -1.0
+   }
+  },
+  {
+   "name": "SMA 20/26 + trend 200 (raw)",
+   "in_sample": {
+    "trades": 3182,
+    "winrate": 43.0,
+    "total_pips": -3239.0,
+    "pf": 0.78,
+    "max_dd_pips": 3380.0,
+    "avg_pips": -1.02
+   },
+   "out_of_sample": {
+    "trades": 1330,
+    "winrate": 39.0,
+    "total_pips": -983.0,
+    "pf": 0.78,
+    "max_dd_pips": 1289.0,
+    "avg_pips": -0.74
+   }
+  },
+  {
+   "name": "SMA 8/26 + trend 200 (raw)",
+   "in_sample": {
+    "trades": 2996,
+    "winrate": 40.7,
+    "total_pips": -2506.0,
+    "pf": 0.82,
+    "max_dd_pips": 2610.0,
+    "avg_pips": -0.84
+   },
+   "out_of_sample": {
+    "trades": 1224,
+    "winrate": 36.8,
+    "total_pips": -1004.0,
+    "pf": 0.77,
+    "max_dd_pips": 1506.0,
+    "avg_pips": -0.82
+   }
+  }
+ ],
+ "candles": 105120,
+ "split_date": "2025-12-06"
+}

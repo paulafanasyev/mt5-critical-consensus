@@ -1,0 +1,68 @@
+{
+  "ema": [
+    {
+      "cycles": 1175,
+      "trades": 42,
+      "wins": 12,
+      "pnl": -283.99,
+      "return": -0.0284,
+      "open_at_end": 0
+    },
+    {
+      "cycles": 1175,
+      "trades": 34,
+      "wins": 7,
+      "pnl": -627.66,
+      "return": -0.0628,
+      "open_at_end": 0
+    },
+    {
+      "cycles": 1175,
+      "trades": 59,
+      "wins": 30,
+      "pnl": 1660.31,
+      "return": 0.166,
+      "open_at_end": 1
+    },
+    {
+      "cycles": 1175,
+      "trades": 50,
+      "wins": 20,
+      "pnl": 523.17,
+      "return": 0.0523,
+      "open_at_end": 1
+    },
+    {
+      "cycles": 1175,
+      "trades": 39,
+      "wins": 14,
+      "pnl": 175.27,
+      "return": 0.0175,
+      "open_at_end": 0
+    },
+    {
+      "cycles": 1175,
+      "trades": 40,
+      "wins": 11,
+      "pnl": -400.43,
+      "return": -0.04,
+      "open_at_end": 0
+    },
+    {
+      "cycles": 1175,
+      "trades": 40,
+      "wins": 12,
+      "pnl": -186.7,
+      "return": -0.0187,
+      "open_at_end": 0
+    },
+    {
+      "cycles": 1175,
+      "trades": 45,
+      "wins": 20,
+      "pnl": 789.44,
+      "return": 0.0789,
+      "open_at_end": 1
+    }
+  ]
+}

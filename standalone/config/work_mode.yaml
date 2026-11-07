@@ -1,0 +1,20 @@
+# Work mode selected by the operator. Values: "confirmation" | "autonomous".
+# Default and fallback: "confirmation" — every action waits for explicit human approval.
+# An unknown or missing work_mode value is treated as "confirmation" (fail closed).
+#
+# NOTE: until a worker service is deployed (roadmap), this file is the operator's
+# contract and must be loaded explicitly by the caller and passed to
+# evaluate_signal_bundle(work_mode_policy=...). Nothing in src/ reads it automatically yet.
+work_mode: confirmation
+
+autonomous:
+  # Autonomy is opt-in twice: work_mode=autonomous AND enabled=true. Anything else
+  # falls back to confirmation mode with an explicit blocker, never silently proceeds.
+  enabled: false
+  # Autonomous actions are demo-only. Setting this to false is rejected by the gate:
+  # this scaffold ships no live-execution path at all.
+  demo_only: true
+  # Hard cap on the size of an autonomous action. The gate enforces this cap and
+  # also rejects a cap above the permission matrix's max_size_per_trade
+  # (AUTONOMOUS_CAP_ABOVE_MATRIX_CAP) — the outer cap stays with the matrix.
+  max_size_per_trade: 0.05

@@ -131,10 +131,29 @@
         "risk_fraction",
         "daily_loss_fraction",
         "drawdown_fraction",
+        "open_stop_risk_fraction",
         "open_positions",
-        "correlated_open_positions"
+        "correlated_open_positions",
+        "account_login",
+        "account_server",
+        "position_symbols"
       ],
       "properties": {
+        "account_login": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "account_server": {
+          "type": "string",
+          "minLength": 1
+        },
+        "position_symbols": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
         "risk_fraction": {
           "type": "number",
           "minimum": 0,
@@ -146,6 +165,11 @@
           "maximum": 1
         },
         "drawdown_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "open_stop_risk_fraction": {
           "type": "number",
           "minimum": 0,
           "maximum": 1

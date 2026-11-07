@@ -1,0 +1,357 @@
+"""Fleet configuration: hundreds of MT5 accounts across many brokers, described in code.
+
+Every account gets its own records; nothing about trading is configured by clicking in a terminal.
+Unknown keys are an error, not a silent default: a typo in a risk limit must stop the fleet, not
+quietly trade with a different one.
+"""
+from __future__ import annotations
+
+import dataclasses
+import json
+import pathlib
+import socket
+import sys
+from typing import Any
+
+DEFAULT_TERMINAL_SOURCE = pathlib.Path(r"C:\Program Files\MetaTrader 5")
+FLEET_ROOT = pathlib.Path(r"C:\mt5-fleet")
+DEFAULT_STORE = FLEET_ROOT / "fleet.sqlite"
+CONFIG_PATH = pathlib.Path(__file__).resolve().parents[1] / "config" / "accounts.yaml"
+# The stand is one file, in one place, and every process that can spend money looks at the same one.
+# A shard started by hand with no flag is the case that must not be able to trade.
+PAUSE_FILE = FLEET_ROOT / "PAUSE"
+
+
+class ConfigError(ValueError):
+    """The registry cannot be trusted: refuse to trade rather than trade the wrong numbers."""
+
+
+@dataclasses.dataclass(slots=True)
+class RiskProfile:
+    """Per-account money rules. Percentages are of that account's balance."""
+
+    risk_per_trade_pct: float = 0.25
+    daily_stop_pct: float = 1.0
+    max_open_positions: int = 3
+    max_lots: float = 0.10
+    min_lots: float = 0.01
+    max_spread_points: int = 60
+    stop_atr: float = 1.6
+    take_atr: float = 2.6
+    trail_arm_atr: float = 0.8
+    giveback_fraction: float = 0.35
+    max_hold_minutes: int = 0
+    # real money takes profit earlier and protects a winner harder than the laboratory
+    take_atr_real: float = 1.8
+    trail_arm_atr_real: float = 0.5
+    giveback_fraction_real: float = 0.25
+    break_even_atr: float = 0.4
+
+
+@dataclasses.dataclass(slots=True)
+class StrategyProfile:
+    kinds: tuple[str, ...] = ("trend",)
+    timeframes: tuple[str, ...] = ("H1", "H4")
+    min_atr_pct: float = 0.0004
+    max_positions_per_symbol: int = 1
+    cooldown_minutes: int = 45
+
+
+@dataclasses.dataclass(slots=True)
+class Account:
+    """One trading account at one broker, driven by its own terminal copy."""
+
+    name: str
+    login: int
+    server: str
+    terminal_source: pathlib.Path = DEFAULT_TERMINAL_SOURCE
+    mode: str = "real"  # demo | real; fail-closed: an unlabelled account is treated as real
+    enabled: bool = True
+    network: str = "direct"  # direct | vpn
+    vpn_profile: str = ""
+    symbols: tuple[str, ...] = ("EURUSD", "GBPUSD", "XAUUSD", "USDJPY")
+    risk: RiskProfile = dataclasses.field(default_factory=RiskProfile)
+    strategy: StrategyProfile = dataclasses.field(default_factory=StrategyProfile)
+    magic: int = 7000000
+    shard: int = 0
+    host: str = ""  # empty: this account may run on any worker; set to pin it to one machine
+    password_env: str = ""
+    seed_config: str = ""
+    currency_scale: float = 1.0  # 0.01 for cent accounts: 100 "cents" are one dollar
+    allow_public_relay: bool = False  # real money over VPN Gate is refused by default
+    keep_running: bool = False
+
+    @property
+    def data_dir(self) -> pathlib.Path:
+        return FLEET_ROOT / "terminals" / f"{self.login}-{_slug(self.server)}"
+
+    @property
+    def terminal_exe(self) -> pathlib.Path:
+        return self.data_dir / "terminal64.exe"
+
+    @property
+    def is_real(self) -> bool:
+        return self.mode == "real"
+
+
+@dataclasses.dataclass(slots=True)
+class PortfolioLimits:
+    max_total_risk_pct: float = 2.0
+    max_gold_lots: float = 0.30
+    max_usd_lots: float = 1.00
+    max_open_positions: int = 60
+    daily_stop_pct: float = 2.0
+
+
+@dataclasses.dataclass(slots=True)
+class FleetConfig:
+    accounts: list[Account] = dataclasses.field(default_factory=list)
+    portfolio: PortfolioLimits = dataclasses.field(default_factory=PortfolioLimits)
+
+    def enabled(self) -> list[Account]:
+        return [a for a in self.accounts if a.enabled]
+
+    def by_name(self, name: str) -> Account | None:
+        return next((a for a in self.accounts if a.name == name), None)
+
+    def runs_here(self, account: Account) -> bool:
+        """A pinned account belongs to exactly one machine: never log into it from another."""
+        return not account.host or account.host.casefold() == local_host()
+
+    def local(self) -> list[Account]:
+        """Enabled accounts this machine owns.
+
+        The book is a file on this machine, so only these rows are ever refreshed here: counting a
+        row of an account pinned elsewhere would weigh a number nobody on this host keeps current.
+        """
+        return [a for a in self.enabled() if self.runs_here(a)]
+
+    def by_shard(self, shard: int) -> list[Account]:
+        return [a for a in self.enabled() if a.shard == shard and self.runs_here(a)]
+
+    def shards(self) -> list[int]:
+        return sorted({a.shard for a in self.enabled() if self.runs_here(a)})
+
+
+def _slug(text: str) -> str:
+    return "".join(c if c.isalnum() else "-" for c in str(text)).strip("-").lower()
+
+
+def local_host() -> str:
+    """This machine's name, compared casefolded: Windows host names are not stable in case."""
+    return (socket.gethostname() or "").casefold()
+
+
+# --- loading and validation -----------------------------------------------------------------
+
+_ACCOUNT_KEYS = {f.name for f in dataclasses.fields(Account)} - {"risk", "strategy"}
+_RISK_KEYS = {f.name for f in dataclasses.fields(RiskProfile)}
+_STRATEGY_KEYS = {f.name for f in dataclasses.fields(StrategyProfile)}
+_PORTFOLIO_KEYS = {f.name for f in dataclasses.fields(PortfolioLimits)}
+# Keys a real registry may still carry from before the one-terminal-per-session rule was measured
+# away. They are ignored with a warning; a genuinely unknown key stays a hard error.
+_RETIRED_PORTFOLIO_KEYS = ("max_worker_processes",)
+
+
+def server_key(text) -> str:
+    """One server name, however it was typed.
+
+    The broker writes its own spelling into `account_info`, the registry is hand-edited, and the
+    terminal log is a text file someone saved with a trailing space. Every comparison of two account
+    identities — attach, the gate before a send, the `authorized on <server>` line, the real-money
+    permission — has to use this one normalisation, or a hand-typed registry refuses its own account.
+    """
+    return str(text or "").strip().casefold()
+
+
+def _check_keys(where: str, data: dict[str, Any], allowed: set[str]) -> None:
+    unknown = sorted(set(data) - allowed)
+    if unknown:
+        raise ConfigError(f"{where}: неизвестные ключи {unknown}; "
+                          f"допустимые: {sorted(allowed)}")
+
+
+def _coerce(value: Any, kind: type, where: str) -> Any:
+    if isinstance(value, bool) and kind in (int, float):
+        raise ConfigError(f"{where}: ожидалось число, получено {value!r}")
+    if kind is int and isinstance(value, float) and not value.is_integer():
+        raise ConfigError(f"{where}: ожидалось целое, получено {value!r}")
+    if kind is int and isinstance(value, str) and not value.strip().lstrip("+-").isdigit():
+        raise ConfigError(f"{where}: ожидалось целое, получено {value!r}")
+    try:
+        return kind(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{where}: ожидалось {kind.__name__}, получено {value!r}") from exc
+
+
+def _typed(data: dict[str, Any], where: str, fields: dict[str, type]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in data.items():
+        out[key] = _coerce(value, fields[key], f"{where}.{key}")
+    return out
+
+
+def _risk(data: dict[str, Any], where: str) -> RiskProfile:
+    _check_keys(where, data, _RISK_KEYS)
+    kinds = {f.name: (int if f.type in ("int", "bool") else float)
+             for f in dataclasses.fields(RiskProfile)}
+    kinds["max_hold_minutes"] = int
+    kinds["max_open_positions"] = int
+    kinds["max_spread_points"] = int
+    return RiskProfile(**_typed(data, where, kinds))
+
+
+def _strategy(data: dict[str, Any], where: str) -> StrategyProfile:
+    _check_keys(where, data, _STRATEGY_KEYS)
+    cleaned = dict(data)
+    for key in ("kinds", "timeframes"):
+        if key in cleaned:
+            value = cleaned[key]
+            if isinstance(value, str) or not all(isinstance(item, str) for item in value):
+                raise ConfigError(f"{where}.{key}: ожидался список строк")
+            cleaned[key] = tuple(value)
+    for key in ("min_atr_pct",):
+        if key in cleaned:
+            cleaned[key] = _coerce(cleaned[key], float, f"{where}.{key}")
+    for key in ("max_positions_per_symbol", "cooldown_minutes"):
+        if key in cleaned:
+            cleaned[key] = _coerce(cleaned[key], int, f"{where}.{key}")
+    return StrategyProfile(**cleaned)
+
+
+def account_from_dict(data: dict[str, Any]) -> Account:
+    where = f"accounts[{data.get('name', '?')}]"
+    _check_keys(where, data, _ACCOUNT_KEYS | {"risk", "strategy"})
+    payload = {k: v for k, v in data.items() if k in _ACCOUNT_KEYS}
+    if "symbols" in payload:
+        symbols = payload["symbols"]
+        if isinstance(symbols, str) or not all(isinstance(s, str) for s in symbols):
+            raise ConfigError(f"{where}: symbols должен быть списком строк")
+        payload["symbols"] = tuple(symbols)
+    if "login" in payload and not isinstance(payload["login"], int):
+        raise ConfigError(f"{where}: login должен быть числом")
+    if "enabled" in payload and not isinstance(payload["enabled"], bool):
+        raise ConfigError(f"{where}: enabled должен быть true/false")
+    if "terminal_source" in payload:
+        payload["terminal_source"] = pathlib.Path(str(payload["terminal_source"]))
+    if "host" in payload:
+        # `host:` with no value parses as None, and a None pin must not mean "run me everywhere".
+        if not isinstance(payload["host"], str):
+            raise ConfigError(f"{where}: host должен быть именем машины (строкой), "
+                              f"получено {payload['host']!r}; без закрепления ключ просто убери")
+        payload["host"] = payload["host"].strip()
+    for key, kind in (("login", int), ("magic", int), ("shard", int),
+                      ("currency_scale", float)):
+        if key in payload:
+            payload[key] = _coerce(payload[key], kind, f"{where}.{key}")
+    try:
+        account = Account(**payload)
+    except TypeError as exc:
+        raise ConfigError(f"{where}: {exc}") from exc
+    if account.mode not in ("demo", "real"):
+        raise ConfigError(f"{where}: mode={account.mode!r}, допустимо demo|real")
+    if not server_key(account.server):
+        # An identity is a pair. A row that names a login but no server matches the silent window
+        # that answers `server=""` for the same login, and every identity check downstream compares
+        # normalised strings — the row written for `Exness-MT5Real26` would then authorise a terminal
+        # that refuses to say where it is.
+        raise ConfigError(f"{where}: сервер не назван — нужна строка вида Exness-MT5Real26 или "
+                          f"MetaQuotes-Demo; без него запись не отличает это окно от любого другого")
+    if account.magic <= 0:
+        # Magic is the only thing that separates the park's lots from the operator's on a shared
+        # account, and a manual trade is marked with 0. A 0 here would make every manual lot an
+        # owned one — the trailing rule would close trades nobody asked it to manage.
+        raise ConfigError(f"{where}: magic={account.magic}, нужен положительный номер "
+                          f"(0 — это метка ручной сделки)")
+    if not 0 < account.currency_scale <= 100:
+        raise ConfigError(f"{where}: currency_scale={account.currency_scale!r} вне (0, 100]")
+    if account.network not in ("direct", "vpn"):
+        raise ConfigError(f"{where}: network={account.network!r}, допустимо direct|vpn")
+    if account.network == "vpn":
+        if not account.vpn_profile:
+            raise ConfigError(f"{where}: network=vpn требует vpn_profile (путь к .ovpn)")
+        # An enabled account must have a real profile; a disabled placeholder may not exist yet.
+        if account.enabled and not pathlib.Path(account.vpn_profile).exists():
+            raise ConfigError(f"{where}: нет файла профиля {account.vpn_profile}")
+        if account.is_real and not account.allow_public_relay and "vgate" in account.vpn_profile:
+            raise ConfigError(
+                f"{where}: реальный счёт через публичный VPN Gate запрещён; "
+                "нужен выделенный VPN или allow_public_relay: true с пониманием риска")
+    account.risk = _risk(data.get("risk", {}), f"{where}.risk")
+    account.strategy = _strategy(data.get("strategy", {}), f"{where}.strategy")
+    from .risk import validate_risk_profile
+
+    problems = validate_risk_profile(account)
+    if problems:
+        raise ConfigError("; ".join(problems))
+    return account
+
+
+def load(path: pathlib.Path | None = None) -> FleetConfig:
+    """Read and validate the registry; raise ConfigError instead of trading bad numbers."""
+    target = pathlib.Path(path) if path else CONFIG_PATH
+    if not target.exists():
+        raise ConfigError(f"нет реестра счетов: {target}")
+    raw = target.read_text(encoding="utf-8")
+    data = _parse_yaml(raw) if target.suffix.lower() in {".yaml", ".yml"} else json.loads(raw)
+    _check_keys("реестр", data, {"accounts", "portfolio"})
+    items = data.get("accounts", [])
+    if not isinstance(items, list):
+        raise ConfigError("accounts должен быть списком")
+    accounts = [account_from_dict(item) for item in items]
+    portfolio_data = dict(data.get("portfolio", {}))
+    if isinstance(data.get("portfolio"), dict):
+        retired = [key for key in _RETIRED_PORTFOLIO_KEYS if key in portfolio_data]
+        for key in retired:
+            portfolio_data.pop(key)
+        if retired:
+            # A retired ceiling must not brick a park that boots from a task scheduler: the key
+            # limited nothing real (the one-terminal-per-session rule it encoded was a myth).
+            print(f"реестр: {retired} в portfolio больше не используется — убери из файла",
+                  file=sys.stderr)
+    _check_keys("portfolio", portfolio_data, _PORTFOLIO_KEYS)
+    portfolio = PortfolioLimits(**_typed(
+        portfolio_data, "portfolio",
+        {f.name: (int if f.type in ("int", "bool") else float)
+         for f in dataclasses.fields(PortfolioLimits)}))
+    config = FleetConfig(accounts=accounts, portfolio=portfolio)
+    _validate_uniqueness(config)
+    return config
+
+
+def _validate_uniqueness(config: FleetConfig) -> None:
+    names: dict[str, int] = {}
+    logins: dict[tuple[int, str], str] = {}
+    dirs: dict[pathlib.Path, str] = {}
+    for account in config.accounts:
+        if account.name in names:
+            raise ConfigError(f"дубликат имени счёта: {account.name}")
+        names[account.name] = 1
+        key = (account.login, account.server)
+        if key in logins:
+            raise ConfigError(f"дубликат счёта {account.login}/{account.server}: "
+                              f"{logins[key]} и {account.name}")
+        logins[key] = account.name
+        directory = account.data_dir
+        if directory in dirs:
+            raise ConfigError(f"счета {dirs[directory]} и {account.name} делят папку {directory}")
+        dirs[directory] = account.name
+
+
+def _parse_yaml(text: str) -> dict[str, Any]:
+    """Parse the registry with PyYAML. A hand-rolled fallback silently misread valid YAML."""
+    try:
+        import yaml  # type: ignore
+    except ImportError as exc:  # pragma: no cover - the dependency is declared
+        raise ConfigError("нужен PyYAML: pip install PyYAML") from exc
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        # A registry caught half-saved is one nobody can vouch for, and every caller already treats
+        # ConfigError as "refuse to trade". The parser's own error is not a ValueError, so left alone
+        # it walks out of `load()` as a traceback: the gate that was supposed to answer is the thing
+        # that crashed, and the process dies mid-message instead of saying why it is idle.
+        raise ConfigError(f"реестр не разобран как YAML: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ConfigError("реестр должен быть отображением верхнего уровня")
+    return data

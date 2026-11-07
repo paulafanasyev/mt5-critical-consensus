@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="380" viewBox="0 0 940 380" role="img" aria-label="Chained equity return vs cost per side, real H1 bars">
+<rect width="940.0" height="380.0" fill="#ffffff"/>
+<text x="72.0" y="20" font-family="sans-serif" font-size="14" fill="#1a1f29">Chained equity return vs cost per side, real H1 bars</text>
+<text x="72.0" y="368.0" font-family="sans-serif" font-size="11" fill="#5b6470">One year of broker history per symbol, walk-forward, nothing fitted to the test window.</text>
+<line x1="72.0" y1="34.0" x2="924.0" y2="34.0" stroke="#d7dce2" stroke-width="1"/>
+<text x="64.0" y="38.0" text-anchor="end" font-family="sans-serif" font-size="10" fill="#5b6470">-98.7</text>
+<line x1="72.0" y1="109.0" x2="924.0" y2="109.0" stroke="#d7dce2" stroke-width="1"/>
+<text x="64.0" y="113.0" text-anchor="end" font-family="sans-serif" font-size="10" fill="#5b6470">-58.1</text>
+<line x1="72.0" y1="184.0" x2="924.0" y2="184.0" stroke="#d7dce2" stroke-width="1"/>
+<text x="64.0" y="188.0" text-anchor="end" font-family="sans-serif" font-size="10" fill="#5b6470">-17.5</text>
+<line x1="72.0" y1="259.0" x2="924.0" y2="259.0" stroke="#d7dce2" stroke-width="1"/>
+<text x="64.0" y="263.0" text-anchor="end" font-family="sans-serif" font-size="10" fill="#5b6470">23.1</text>
+<line x1="72.0" y1="334.0" x2="924.0" y2="334.0" stroke="#d7dce2" stroke-width="1"/>
+<text x="64.0" y="338.0" text-anchor="end" font-family="sans-serif" font-size="10" fill="#5b6470">63.6</text>
+<text x="18" y="22.0" font-family="sans-serif" font-size="11" fill="#5b6470">chained return, %</text>
+<line x1="72.0" y1="216.4" x2="924.0" y2="216.4" stroke="#5b6470" stroke-width="1.5" stroke-dasharray="4 3"/>
+<path d="M72.0,154.5 L143.0,141.7 L214.0,130.3 L356.0,110.8 L640.0,82.6 L924.0,64.4" fill="none" stroke="#1f77b4" stroke-width="1.8"/>
+<path d="M72.0,317.9 L143.0,272.7 L214.0,234.6 L356.0,175.5 L640.0,103.8 L924.0,67.8" fill="none" stroke="#d62728" stroke-width="1.8"/>
+<path d="M72.0,220.3 L143.0,196.1 L214.0,174.9 L356.0,140.4 L640.0,94.3 L924.0,67.7" fill="none" stroke="#2ca02c" stroke-width="1.8"/>
+<path d="M72.0,215.8 L143.0,183.8 L214.0,157.3 L356.0,117.3 L640.0,71.4 L924.0,50.1" fill="none" stroke="#9467bd" stroke-width="1.8"/>
+<rect x="72.0" y="14.0" width="11" height="11" fill="#1f77b4"/>
+<text x="88.0" y="22.0" font-family="sans-serif" font-size="11" fill="#1a1f29">XAUUSD Bollinger(20,2.0)</text>
+<rect x="262.0" y="14.0" width="11" height="11" fill="#d62728"/>
+<text x="278.0" y="22.0" font-family="sans-serif" font-size="11" fill="#1a1f29">XAUUSD SMA(5/20)</text>
+<rect x="452.0" y="14.0" width="11" height="11" fill="#2ca02c"/>
+<text x="468.0" y="22.0" font-family="sans-serif" font-size="11" fill="#1a1f29">EURUSD Bollinger(20,2.0)</text>
+<rect x="642.0" y="14.0" width="11" height="11" fill="#9467bd"/>
+<text x="658.0" y="22.0" font-family="sans-serif" font-size="11" fill="#1a1f29">EURUSD SMA(5/20)</text>
+</svg>

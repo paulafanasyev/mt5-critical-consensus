@@ -1,0 +1,18 @@
+window dev (2004-06-11 .. 2019-12-31), confidence 0.9833, 3 candidate(s), cache 73d4359f901e
+candidate                  n clust   win%    meanR     lowR    highR   costR
+c1_inside_breakout       221   164  49.8%  +0.0233  -0.1291  +0.1749 +0.0803
+    FAIL: mean net R +0.0233, 98.33% interval [-0.1291, +0.1749] straddles zero; the edge is also negative at double cost (-0.0570 R)
+    detectable edge at this confidence/cluster count: 0.186 R
+    exits {'end': 1, 'stop': 71, 'target': 19, 'time': 130}  by symbol {'XAUUSD': {'n': 221, 'mean': 0.023312225538861222}}  by direction {'long': {'n': 127, 'mean': 0.13921763680781896}, 'short': {'n': 94, 'mean': -0.13328338330324124}}
+    cost sweep {'zero': {'n': 221, 'mean': 0.10363421553000805}, 'transaction_only': {'n': 221, 'mean': 0.0580841822038662}, 'base': {'n': 221, 'mean': 0.023312225538861222}, 'double': {'n': 221, 'mean': -0.05700976445228561}}
+c2_ratio_reversion       157   100  38.9%  -0.1332  -0.2950  +0.0367 +0.0662
+    FAIL: mean net R -0.1332, 98.33% interval [-0.2950, +0.0367] straddles zero; the edge is also negative at double cost (-0.1994 R)
+    detectable edge at this confidence/cluster count: 0.182 R
+    exits {'end': 1, 'stop': 37, 'target': 2, 'time': 117}  by symbol {'XAUUSD': {'n': 157, 'mean': -0.13318306238591532}}  by direction {'long': {'n': 75, 'mean': -0.09276328038100479}, 'short': {'n': 82, 'mean': -0.17015237519528467}}
+    cost sweep {'zero': {'n': 157, 'mean': -0.06701490697889649}, 'transaction_only': {'n': 157, 'mean': -0.11355147713530146}, 'base': {'n': 157, 'mean': -0.13318306238591532}, 'double': {'n': 157, 'mean': -0.1993512177929341}}
+c3_fx_tsmom              540   180  38.3%  -0.0983  -0.2320  +0.0389 +0.0686
+    FAIL: mean net R -0.0983, 98.33% interval [-0.2320, +0.0389] straddles zero; the edge is also negative at double cost (-0.1669 R)
+    detectable edge at this confidence/cluster count: 0.209 R
+    exits {'rebalance': 173, 'stop': 277, 'stop_gap': 2, 'target': 88}  by symbol {'AUDUSD': {'n': 180, 'mean': -0.07706445307395281}, 'EURUSD': {'n': 180, 'mean': -0.157931744194369}, 'NZDUSD': {'n': 180, 'mean': -0.05983148949103053}}  by direction {'long': {'n': 286, 'mean': -0.14086339621742958}, 'short': {'n': 254, 'mean': -0.05032304054526994}}
+    cost sweep {'zero': {'n': 540, 'mean': -0.02966852702911272}, 'transaction_only': {'n': 540, 'mean': -0.043641587610266465}, 'base': {'n': 540, 'mean': -0.09827589558645078}, 'double': {'n': 540, 'mean': -0.16688326414378882}}
+evidence: docs/evidence/candidates_dev_2026_11.json

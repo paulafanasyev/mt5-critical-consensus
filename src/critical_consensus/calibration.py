@@ -1,7 +1,7 @@
 """Calibration utilities. Shrinkage is a conservative heuristic, not a calibrator."""
 from __future__ import annotations
 import math
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 
 def brier_score(probabilities: Sequence[float], outcomes: Sequence[int]) -> float:
@@ -77,23 +77,64 @@ def weighted_consensus(verdicts: Sequence[Mapping], *, base_rate: float = 0.5,
     """Weighted mean of conservatively adjusted confidences; not a majority vote.
 
     Weights use 1-Brier as a simple bounded reliability weight. For production, use
-    out-of-sample reliability bins and a documented weighting model.
+    out-of-sample reliability bins and a documented weighting model. Every record is
+    validated strictly: numeric strings, booleans, missing or non-object calibration
+    metadata and non-finite values raise ``ValueError`` instead of being coerced.
     """
-    if not verdicts:
+    if not isinstance(verdicts, Sequence) or isinstance(verdicts, (str, bytes)) or not verdicts:
         raise ValueError("at least one verdict is required")
+    numeric_base_rate, numeric_brier_threshold = _finite_numbers(
+        base_rate, brier_threshold, names=("base_rate", "brier_threshold"),
+    )
+    if not (0.0 <= numeric_base_rate <= 1.0 and 0.0 <= numeric_brier_threshold <= 1.0):
+        raise ValueError("base_rate and brier_threshold must be in [0,1]")
+
     numerator = denominator = 0.0
-    for item in verdicts:
-        p = float(item.get("confidence", 0.0))
-        score = float(item.get("calibration_meta", {}).get("brier_score", 1.0))
-        accuracy = item.get("calibration_meta", {}).get("high_confidence_accuracy")
+    for index, item in enumerate(verdicts):
+        if not isinstance(item, Mapping):
+            raise ValueError(f"verdict {index} is not an object")
+        probability = _finite_numbers(item.get("confidence"), names=(f"verdict {index} confidence",))[0]
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError(f"verdict {index} confidence must be in [0,1]")
+        calibration = item.get("calibration_meta")
+        if not isinstance(calibration, Mapping):
+            raise ValueError(f"verdict {index} calibration_meta must be an object")
+        brier = _finite_numbers(calibration.get("brier_score"), names=(f"verdict {index} brier_score",))[0]
+        if not 0.0 <= brier <= 1.0:
+            raise ValueError(f"verdict {index} brier_score must be in [0,1]")
+        raw_accuracy = calibration.get("high_confidence_accuracy")
+        if raw_accuracy is None:
+            accuracy = None
+        else:
+            accuracy = _finite_numbers(raw_accuracy, names=(f"verdict {index} high_confidence_accuracy",))[0]
+            if not 0.0 <= accuracy <= 1.0:
+                raise ValueError(f"verdict {index} high_confidence_accuracy must be in [0,1]")
         adjusted = calibration_shrinkage(
-            p, base_rate=base_rate, brier=score, brier_threshold=brier_threshold,
-            high_confidence_accuracy=accuracy,
+            probability, base_rate=numeric_base_rate, brier=brier,
+            brier_threshold=numeric_brier_threshold, high_confidence_accuracy=accuracy,
         )
-        weight = max(0.01, 1.0 - score)
+        weight = max(0.01, 1.0 - brier)
         numerator += adjusted * weight
         denominator += weight
-    return numerator / denominator
+    result = numerator / denominator
+    if not math.isfinite(result):
+        raise ValueError("weighted consensus is not finite")
+    return result
+
+
+def _finite_numbers(*values: Any, names: Sequence[str]) -> list[float]:
+    """Strictly convert finite numeric values; strings and booleans are rejected."""
+    if len(values) != len(names):
+        raise ValueError("internal numeric validation mismatch")
+    converted: list[float] = []
+    for value, name in zip(values, names):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} must be a finite number")
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError(f"{name} must be a finite number")
+        converted.append(number)
+    return converted
 
 
 def source_credibility(*, verified_accuracy: float, authenticity: float, independence: float,

@@ -1,0 +1,52 @@
+{
+  "query": {
+    "start": "2004-01-01T00:00:00+00:00",
+    "end": "2026-11-02T00:00:00+00:00",
+    "timeframe": "D1",
+    "symbols": [
+      "XAUUSD",
+      "XAGUSD",
+      "EURUSD",
+      "AUDUSD",
+      "NZDUSD"
+    ]
+  },
+  "files": {
+    "XAUUSD": {
+      "rows": 5753,
+      "first": "2004-06-11",
+      "last": "2026-10-30",
+      "sha256": "7060f38d7217fb4469965931e1cc86dad203ec49760f4f4a20f17a569b929481",
+      "bytes": 600367
+    },
+    "XAGUSD": {
+      "rows": 4633,
+      "first": "2008-11-07",
+      "last": "2026-10-30",
+      "sha256": "2af8cc03d1269ac420b2b236fb696629dbaaaee2e90501cc2f0245c9f8966ffb",
+      "bytes": 470780
+    },
+    "EURUSD": {
+      "rows": 5932,
+      "first": "2004-01-01",
+      "last": "2026-10-30",
+      "sha256": "b283ee56dec31799bc36561ca9fd19d0cedc8d8b24ec7527c45d65173f195428",
+      "bytes": 644398
+    },
+    "AUDUSD": {
+      "rows": 5933,
+      "first": "2004-01-01",
+      "last": "2026-10-30",
+      "sha256": "d56a23f1c4e1a052ac156998cdcfc28e524d18bbc72b17c686fdb79f80cc8320",
+      "bytes": 622905
+    },
+    "NZDUSD": {
+      "rows": 5931,
+      "first": "2004-01-01",
+      "last": "2026-10-30",
+      "sha256": "852ca214f5f29c58a871372ece5e76c63e88e8362e2ebf2224142e83e53e9e9d",
+      "bytes": 621860
+    }
+  },
+  "fetched_at": "2026-11-01T08:18:00+00:00"
+}
